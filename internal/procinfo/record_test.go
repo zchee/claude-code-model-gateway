@@ -147,6 +147,74 @@ func TestRecordPublicationOrder(t *testing.T) {
 	}
 }
 
+func TestPublicationBoundaries(t *testing.T) {
+	const jsonName, pidName = "guardian.pid.json", "guardian.pid"
+	tests := map[string]struct {
+		failAt      string
+		calls       []string
+		finalJSON   int
+		finalMirror string
+	}{
+		"json_fails":     {jsonName, []string{jsonName}, 701, "701"},
+		"mirror_fails":   {pidName, []string{jsonName, pidName}, 702, "701"},
+		"both_published": {"", []string{jsonName, pidName}, 702, "702"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			record, wire := recordFixture(root)
+			jsonPath := filepath.Join(root, jsonName)
+			mirror := filepath.Join(root, pidName)
+			putFile(t, jsonPath, strings.Replace(wire, `"pid":702`, `"pid":701`, 1))
+			putFile(t, mirror, "701")
+			checkFiles := func(wantPID int, wantMirror string) {
+				t.Helper()
+				var got Record
+				if err := json.Unmarshal([]byte(readFile(t, jsonPath)), &got); err != nil {
+					t.Fatal(err)
+				}
+				want := record
+				want.PID = wantPID
+				if diff := gocmp.Diff(want, got); diff != "" {
+					t.Errorf("visible authoritative record (-want +got): %s", diff)
+				}
+				if got := strings.TrimSpace(readFile(t, mirror)); got != wantMirror {
+					t.Errorf("visible decimal mirror = %q, want %q", got, wantMirror)
+				}
+			}
+			var calls []string
+			fault := errors.New("publication interrupted")
+			replace := func(path string, data []byte) error {
+				switch path {
+				case jsonPath:
+					checkFiles(701, "701")
+				case mirror:
+					checkFiles(702, "701")
+				default:
+					t.Fatalf("unexpected publication path: %s", path)
+				}
+				name := filepath.Base(path)
+				calls = append(calls, name)
+				if name == tt.failAt {
+					return fault
+				}
+				return os.WriteFile(path, data, 0o600)
+			}
+			var wantErr error
+			if tt.failAt != "" {
+				wantErr = fault
+			}
+			if err := writeRecord(root, "guardian", record, replace); !errors.Is(err, wantErr) {
+				t.Errorf("publish = %v, want %v", err, wantErr)
+			}
+			if diff := gocmp.Diff(tt.calls, calls); diff != "" {
+				t.Errorf("publication order (-want +got): %s", diff)
+			}
+			checkFiles(tt.finalJSON, tt.finalMirror)
+		})
+	}
+}
+
 func TestDecimalAloneIsNotARecord(t *testing.T) {
 	root := t.TempDir()
 	putFile(t, filepath.Join(root, "guardian.pid"), "702")

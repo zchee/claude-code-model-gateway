@@ -19,8 +19,6 @@ import (
 	"context"
 	"errors"
 	"time"
-
-	gnet "github.com/shirou/gopsutil/v4/net"
 )
 
 var errNotImplemented = errors.New("procinfo: not implemented")
@@ -44,12 +42,20 @@ type Identity struct {
 	Image     Image
 }
 
+// socketEvidence represents one TCP socket, not one endpoint. All visible holders
+// of its descriptors are retained; an empty list means no holder could be resolved.
+type socketEvidence struct {
+	port      uint16
+	listening bool
+	owners    []int
+}
+
 // Probe reads process facts from the operating system when zero-valued.
 type Probe struct {
-	inspect     func(context.Context, int) (Identity, error)
-	existence   func(context.Context, int) error
-	processes   func(context.Context) ([]Identity, error)
-	connections func(context.Context, string) ([]gnet.ConnectionStat, error)
+	inspect   func(context.Context, int) (Identity, error)
+	existence func(context.Context, int) error
+	processes func(context.Context) ([]Identity, error)
+	sockets   func(context.Context) ([]socketEvidence, error)
 }
 
 // Identity returns the live identity, os.ErrNotExist for confirmed absence, or ErrUnknown for inconclusive inspection.
@@ -106,7 +112,11 @@ type Record struct {
 }
 
 // WriteRecord atomically publishes name.pid.json before updating its decimal mirror.
-func WriteRecord(root, name string, record Record) error { return errNotImplemented }
+func WriteRecord(root, name string, record Record) error { return writeRecord(root, name, record, nil) }
+
+func writeRecord(root, name string, record Record, replace func(string, []byte) error) error {
+	return errNotImplemented
+}
 
 // ReadRecord reads the authoritative JSON and repairs a stale or missing mirror.
 func ReadRecord(root, name string) (Record, error) { return Record{}, errNotImplemented }

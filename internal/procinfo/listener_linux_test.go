@@ -22,15 +22,43 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"syscall"
 	"testing"
 
 	"github.com/shirou/gopsutil/v4/common"
+	"golang.org/x/sys/unix"
 )
+
+// restrictedProc exposes real network tables but only the specified process descriptors.
+func restrictedProc(t *testing.T, visiblePIDs ...int) context.Context {
+	t.Helper()
+	proc := t.TempDir()
+	if err := os.Symlink("/proc/self/net", filepath.Join(proc, "net")); err != nil {
+		t.Fatal(err)
+	}
+	for _, pid := range visiblePIDs {
+		name := strconv.Itoa(pid)
+		if err := os.Mkdir(filepath.Join(proc, name), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join("/proc", name, "fd"), filepath.Join(proc, name, "fd")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return context.WithValue(t.Context(), common.EnvKey, common.EnvMap{common.HostProcEnvKey: proc})
+}
 
 func TestLinuxListenerWithoutLsof(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
+	lc := net.ListenConfig{Control: func(_, _ string, raw syscall.RawConn) error {
+		var sockErr error
+		if err := raw.Control(func(fd uintptr) { sockErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1) }); err != nil {
+			return err
+		}
+		return sockErr
+	}}
 	p := Probe{}
-	first := listenerOn(t, "127.0.0.1", 0)
+	first := listenerOn(t, lc, "127.0.0.1", 0)
 	t.Cleanup(func() { _ = first.Close() })
 	port := uint16(first.Addr().(*net.TCPAddr).Port)
 	t.Run("identifiable", func(t *testing.T) {
@@ -39,37 +67,46 @@ func TestLinuxListenerWithoutLsof(t *testing.T) {
 		}
 	})
 	t.Run("inaccessible", func(t *testing.T) {
-		// Expose the real socket table but not the owner's file descriptors, as on a restricted procfs mount.
-		proc := t.TempDir()
-		if err := os.Symlink("/proc/self/net", filepath.Join(proc, "net")); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Mkdir(filepath.Join(proc, strconv.Itoa(os.Getpid())), 0o700); err != nil {
-			t.Fatal(err)
-		}
-		ctx := context.WithValue(t.Context(), common.EnvKey, common.EnvMap{common.HostProcEnvKey: proc})
-		got := p.Listener(ctx, port)
-		if got.PID != 0 || (got.State != ListenerUnresolved && got.State != ListenerUnknown) {
-			t.Errorf("bound listener without accessible owner = %+v, want unresolved or unknown and no pid", got)
+		if got := p.Listener(restrictedProc(t), port); got != (Listener{State: ListenerUnresolved}) {
+			t.Errorf("visible listening socket without visible descriptors = %+v, want unresolved and no pid", got)
 		}
 	})
-	t.Run("ambiguous", func(t *testing.T) {
-		second := listenerOn(t, "127.0.0.2", int(port))
-		t.Cleanup(func() { _ = second.Close() })
-		fd, err := second.File()
+	t.Run("shared_descriptor", func(t *testing.T) {
+		fd, err := first.File()
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = fd.Close() })
 		child := startChild(t, "/bin/cat", fd)
-		if err := second.Close(); err != nil {
-			t.Fatal(err)
-		}
-		if err := fd.Close(); err != nil {
-			t.Fatal(err)
-		}
 		if got := p.Listener(t.Context(), port); got != (Listener{State: ListenerAmbiguous}) {
-			t.Errorf("listeners in pids %d and %d = %+v, want ambiguous and no pid", os.Getpid(), child, got)
+			t.Errorf("one socket held by pids %d and %d = %+v, want ambiguous without pid", os.Getpid(), child, got)
 		}
 	})
+	tests := map[string]struct{ restrict bool }{"ambiguous": {}, "identified_plus_unresolved": {restrict: true}}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			// Two sockets have exactly the same local and remote endpoints, but distinct inodes.
+			second := listenerOn(t, lc, "127.0.0.1", int(port))
+			t.Cleanup(func() { _ = second.Close() })
+			fd, err := second.File()
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = fd.Close() })
+			child := startChild(t, "/bin/cat", fd)
+			if err := second.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := fd.Close(); err != nil {
+				t.Fatal(err)
+			}
+			ctx := t.Context()
+			if tt.restrict {
+				ctx = restrictedProc(t, os.Getpid())
+			}
+			if got := p.Listener(ctx, port); got != (Listener{State: ListenerAmbiguous}) {
+				t.Errorf("two sockets held by pids %d and %d (restricted=%t) = %+v, want ambiguous without pid", os.Getpid(), child, tt.restrict, got)
+			}
+		})
+	}
 }

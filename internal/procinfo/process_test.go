@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -48,9 +49,8 @@ func startChild(t *testing.T, path string, files ...*os.File) int {
 	return cmd.Process.Pid
 }
 
-func listenerOn(t *testing.T, host string, port int) *net.TCPListener {
+func listenerOn(t *testing.T, lc net.ListenConfig, host string, port int) *net.TCPListener {
 	t.Helper()
-	var lc net.ListenConfig
 	start := rand.IntN(40001)
 	for i := range 32 {
 		candidate := port
@@ -94,7 +94,7 @@ func TestProcessAlive(t *testing.T) {
 }
 
 func TestLocalListener(t *testing.T) {
-	l := listenerOn(t, "127.0.0.1", 0)
+	l := listenerOn(t, net.ListenConfig{}, "127.0.0.1", 0)
 	t.Cleanup(func() { _ = l.Close() })
 	port := uint16(l.Addr().(*net.TCPAddr).Port)
 	want := Listener{ListenerIdentified, os.Getpid()}
@@ -116,26 +116,57 @@ func TestNativeIdentity(t *testing.T) {
 	if diff := gocmp.Diff([]string{"/bin/cat", "-"}, id.Argv); diff != "" {
 		t.Errorf("argv (-want +got): %s", diff)
 	}
+}
+
+func TestNativeTable(t *testing.T) {
+	pid := startChild(t, "/bin/cat")
+	parent := os.Getppid()
+	table, err := (Probe{}).Table(t.Context())
+	if err != nil {
+		t.Fatalf("enumerate native processes: %v", err)
+	}
+	if row, ok := table[parent]; !ok || row.PID != parent {
+		t.Errorf("parent pid %d outside the test's descendants is not in the same snapshot", parent)
+	}
+	row, ok := table[pid]
+	if !ok || row.PID != pid || row.ParentPID != os.Getpid() || row.Birth.IsZero() || !slices.Equal(row.Argv, []string{"/bin/cat", "-"}) {
+		t.Errorf("own child pid %d missing or incomplete in the same snapshot: %+v", pid, row)
+	}
+}
+
+func TestNativeBirthInLocalZone(t *testing.T) {
+	const zone = "Asia/Tokyo"
+	if os.Getenv("PROCINFO_TEST_BIRTH_ZONE") != zone {
+		binary, err := os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.CommandContext(t.Context(), binary, "-test.run=^TestNativeBirthInLocalZone$")
+		cmd.Env = append(cmd.Environ(), "TZ="+zone, "LC_ALL=C", "PROCINFO_TEST_BIRTH_ZONE="+zone)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("native non-UTC check: %v\n%s", err, out)
+		}
+		return
+	}
+	if _, offset := time.Now().Zone(); offset != 9*3600 {
+		t.Fatalf("child has local offset %d, want Tokyo", offset)
+	}
+	pid := os.Getpid()
 	cmd := exec.CommandContext(t.Context(), "ps", "-p", strconv.Itoa(pid), "-o", "lstart=")
-	cmd.Env = []string{"LC_ALL=C", "TZ=Asia/Tokyo", "PATH=/usr/bin:/bin"}
 	out, err := cmd.Output()
 	if err != nil {
 		t.Fatal(err)
 	}
-	loc, err := time.LoadLocation("Asia/Tokyo")
+	want, err := time.ParseInLocation(time.ANSIC, strings.TrimSpace(string(out)), time.Local)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("native ps birth %q: %v", out, err)
 	}
-	if got, want := LegacyStart(id.Birth.In(loc)), strings.TrimSpace(string(out)); got != want {
-		t.Errorf("non-UTC native birth = %q, ps reports %q", got, want)
-	}
-	table, err := p.Table(t.Context())
+	id, err := (Probe{}).Identity(t.Context(), pid)
 	if err != nil {
-		t.Fatalf("enumerate native processes: %v", err)
+		t.Fatalf("native birth in %s: %v", zone, err)
 	}
-	row, ok := table[pid]
-	if !ok || row.ParentPID != os.Getpid() || !row.Birth.Equal(id.Birth) {
-		t.Errorf("child table evidence inconsistent with identity; present=%t parent=%d birth=%v", ok, row.ParentPID, row.Birth)
+	if !id.Birth.Truncate(time.Second).Equal(want) {
+		t.Errorf("native birth instant = %s, ps reports %s", id.Birth.UTC(), want.UTC())
 	}
 }
 
