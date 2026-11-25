@@ -66,8 +66,8 @@ all plan replacements.
 
 ### Collect hosted Go evidence
 
-From the clean checkout of the gated commit, list completed push runs of the
-build, lint and test workflow. Select a successful run whose two hosted jobs
+From the clean checkout of the gated commit, list its completed push runs.
+Select a successful run named `Build, lint, and test` whose two hosted jobs
 both ran in the same attempt. If rerunning, use **Re-run all jobs**, not a
 single-job rerun. Keep the separate Linux development-venue logs required by
 the verification plan; use the hosted artifacts as the Go JSON inputs below.
@@ -75,8 +75,8 @@ the verification plan; use the hosted artifacts as the Go JSON inputs below.
 ```sh
 phase=phase-0
 commit=$(git rev-parse HEAD)
-gh run list --workflow test.yaml --event push --commit "$commit" --status completed \
-  --json databaseId,attempt,headSha,conclusion,url
+gh run list --event push --commit "$commit" --status completed \
+  --json name,databaseId,attempt,headSha,conclusion,url
 ```
 
 Enter that run's `databaseId` and `attempt`, separated by a space, at `read`.
@@ -95,7 +95,21 @@ mkdir -p "$dir" && out=$(mktemp -d "$dir/gha-$run-$attempt.XXXXXXXX") &&
   gh run download "$run" --name "go-test-xcode-27-$attempt" --dir "$out/xcode-27"
 ```
 
+Check all four headers against the selected run and commit before running the
+results check. The checker only compares run identifiers across its inputs.
+
 ```sh
+for runner in ubuntu-26.04 xcode-27; do
+  for suite in plain process; do
+    file="$out/$runner/go-test-$suite.jsonl"
+    if ! head -n 1 "$file" | jq -es --arg commit "$commit" --arg run_id "gha-$run-$attempt" \
+      'length == 1 and .[0].commit == $commit and .[0].run_id == $run_id' >/dev/null; then
+      printf 'wrong or missing evidence metadata: %s\n' "$file" >&2
+      exit 1
+    fi
+  done
+done
+
 ./hack/parity-check results "$phase" --commit "$commit" \
   --go-json "$out/ubuntu-26.04/go-test-plain.jsonl" \
   --go-json "$out/ubuntu-26.04/go-test-process.jsonl" \

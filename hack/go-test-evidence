@@ -28,11 +28,34 @@ case $2 in
 esac
 [ -n "$3" ] || fail 'missing output path'
 
-commit=$(git rev-parse --verify HEAD) || fail 'cannot resolve checkout commit'
-status=$(git status --porcelain --untracked-files=all) || fail 'cannot check worktree status'
+[ ! -L "$0" ] || fail 'script must not be a symbolic link'
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P) || fail 'cannot resolve checkout root'
+# Do not let the caller's Git or make context redirect this checkout or its guard.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR MAKEFLAGS GNUMAKEFLAGS MFLAGS MAKEFILES
+commit=$(git -C "$root" rev-parse --verify HEAD) || fail 'cannot resolve checkout commit'
+status=$(git -C "$root" status --porcelain --untracked-files=all) || fail 'cannot check worktree status'
 [ -z "$status" ] || fail 'worktree must be clean'
 
+make_in_tree() { make --no-print-directory -C "$root" -f "$root/Makefile" "$@"; }
+require_new_output() {
+    if [ -e "$1" ] || [ -L "$1" ]; then
+        fail 'output path already exists'
+    fi
+}
+
+require_new_output "$3"
+make_in_tree check-test-venue
+raw=$(mktemp "${TMPDIR:-/tmp}/go-test-evidence.XXXXXXXX")
+trap 'rm -f -- "$raw"' EXIT
+rc=
+make_in_tree "$target" >| "$raw" || rc=$?
+# The target repeats the venue check. Do not publish a header-only refusal.
+if [ -n "$rc" ] && [ ! -s "$raw" ]; then
+    exit "$rc"
+fi
+require_new_output "$3"
 {
     printf '{"run_id":"%s","commit":"%s"}\n' "$2" "$commit" &&
-        make --no-print-directory "$target"
-} > "$3"
+        cat -- "$raw"
+} > "$3" || rc=${rc:-$?}
+exit "${rc:-0}"

@@ -45,7 +45,7 @@ override run_script = if [ -f "hack/$@" ] && [ -x "hack/$@" ]; then \
 TRIPWIRE_NAME ?= phase-0-baseline
 unexport TRIPWIRE_NAME
 
-.PHONY: build vet build-windows fmt fmt-check env-doc lint test test-process test-json test-process-json conformance baseline-node assertion-sites bench tripwire tools
+.PHONY: build vet build-windows fmt fmt-check env-doc lint check-test-venue test test-process test-json test-process-json conformance baseline-node assertion-sites bench tripwire tools
 
 build:
 	go build ./...
@@ -94,6 +94,9 @@ lint:
 	./hack/parity-check structure
 	golangci-lint run
 	golangci-lint run --build-tags process
+
+check-test-venue:
+	@$(require_test_venue)
 
 test:
 	@$(require_test_venue) && go test -count=1 ./...
