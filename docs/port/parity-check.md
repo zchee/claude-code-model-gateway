@@ -99,22 +99,24 @@ Check all four headers against the selected run and commit before running the
 results check. The checker only compares run identifiers across its inputs.
 
 ```sh
-for runner in ubuntu-26.04 xcode-27; do
-  for suite in plain process; do
-    file="$out/$runner/go-test-$suite.jsonl"
-    if ! head -n 1 "$file" | jq -es --arg commit "$commit" --arg run_id "gha-$run-$attempt" \
-      'length == 1 and .[0].commit == $commit and .[0].run_id == $run_id' >/dev/null; then
-      printf 'wrong or missing evidence metadata: %s\n' "$file" >&2
-      exit 1
-    fi
+(
+  for runner in ubuntu-26.04 xcode-27; do
+    for suite in plain process; do
+      file="$out/$runner/go-test-$suite.jsonl"
+      if ! head -n 1 "$file" | jq -es --arg commit "$commit" --arg run_id "gha-$run-$attempt" \
+        'length == 1 and .[0].commit == $commit and .[0].run_id == $run_id' >/dev/null; then
+        printf 'wrong or missing evidence metadata: %s\n' "$file" >&2
+        exit 1
+      fi
+    done
   done
-done
 
-./hack/parity-check results "$phase" --commit "$commit" \
-  --go-json "$out/ubuntu-26.04/go-test-plain.jsonl" \
-  --go-json "$out/ubuntu-26.04/go-test-process.jsonl" \
-  --go-json "$out/xcode-27/go-test-plain.jsonl" \
-  --go-json "$out/xcode-27/go-test-process.jsonl"
+  ./hack/parity-check results "$phase" --commit "$commit" \
+    --go-json "$out/ubuntu-26.04/go-test-plain.jsonl" \
+    --go-json "$out/ubuntu-26.04/go-test-process.jsonl" \
+    --go-json "$out/xcode-27/go-test-plain.jsonl" \
+    --go-json "$out/xcode-27/go-test-process.jsonl"
+)
 ```
 
 Add `--census` and `--launches` for phases with due conformance cases. Reject

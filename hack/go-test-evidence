@@ -29,11 +29,17 @@ esac
 [ -n "$3" ] || fail 'missing output path'
 
 [ ! -L "$0" ] || fail 'script must not be a symbolic link'
-root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P) || fail 'cannot resolve checkout root'
+case $0 in
+    */*) script_dir=${0%/*} ;;
+    *) script_dir=. ;;
+esac
+# A sentinel keeps command substitution from trimming newlines in the root name.
+root=$(CDPATH='' cd -P -- "$script_dir/.." && pwd -P && printf .) || fail 'cannot resolve checkout root'
+root=${root%??}
 # Do not let the caller's Git or make context redirect this checkout or its guard.
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR MAKEFLAGS GNUMAKEFLAGS MFLAGS MAKEFILES
 commit=$(git -C "$root" rev-parse --verify HEAD) || fail 'cannot resolve checkout commit'
-status=$(git -C "$root" status --porcelain --untracked-files=all) || fail 'cannot check worktree status'
+status=$(git --no-optional-locks -C "$root" status --porcelain --untracked-files=all) || fail 'cannot check worktree status'
 [ -z "$status" ] || fail 'worktree must be clean'
 
 make_in_tree() { make --no-print-directory -C "$root" -f "$root/Makefile" "$@"; }
@@ -45,13 +51,16 @@ require_new_output() {
 
 require_new_output "$3"
 make_in_tree check-test-venue
+raw=
+trap 'if [ -n "$raw" ]; then rm -f -- "$raw"; fi' EXIT
+trap 'exit 1' HUP INT TERM
 raw=$(mktemp "${TMPDIR:-/tmp}/go-test-evidence.XXXXXXXX")
-trap 'rm -f -- "$raw"' EXIT
 rc=
 make_in_tree "$target" >| "$raw" || rc=$?
-# The target repeats the venue check. Do not publish a header-only refusal.
-if [ -n "$rc" ] && [ ! -s "$raw" ]; then
-    exit "$rc"
+# A refusal at the repeated venue check emits no events.
+if [ ! -s "$raw" ]; then
+    [ -z "$rc" ] || exit "$rc"
+    fail 'test suite succeeded without emitting Go events'
 fi
 require_new_output "$3"
 {
