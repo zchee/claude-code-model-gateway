@@ -21,25 +21,38 @@ venue_refuse() {
 }
 
 venue_home() {
-    local os home record
+    local os home
     os=$(uname -s 2>/dev/null) || venue_refuse 'cannot establish account home'
     case $os in
-        Linux)
-            record=$(getent passwd "$EUID" 2>/dev/null) || venue_refuse 'cannot establish account home'
-            home=$(awk -F: -v u="$EUID" 'NF==7 && $1!="" && $3 ~ /^[0-9]+$/ && $3==u && $4 ~ /^[0-9]+$/ { print $6; ok=1 } END {exit !(NR==1 && ok)}' <<< "$record") || venue_refuse 'cannot establish account home'
-            ;;
-        Darwin)
-            record=$(dscacheutil -q user -a uid "$EUID" 2>/dev/null) || venue_refuse 'cannot establish account home'
-            home=$(awk -v u="$EUID" '
-                !/^[a-z]+: / { bad=1; next }
-                { k=$1; if (seen[k]++) bad=1; v=substr($0,length(k)+2) }
-                k=="uid:" && (v !~ /^[0-9]+$/ || v!=u) { bad=1 }
-                k=="gid:" && v !~ /^[0-9]+$/ { bad=1 }
-                k=="dir:" { print v }
-                END { exit !(!bad && seen["name:"] && seen["uid:"] && seen["gid:"] && seen["dir:"]) }' <<< "$record") || venue_refuse 'cannot establish account home'
-            ;;
+        Linux) set -- /usr/bin/getent passwd "$EUID" ;;
+        Darwin) set -- /usr/bin/dscacheutil -q user -a uid "$EUID" ;;
         *) venue_refuse 'cannot establish account home' ;;
     esac
+    home=$(
+        set -o pipefail
+        # Keep the record on fd 3 and count stderr bytes separately. Even a
+        # newline-only warning must invalidate an otherwise successful lookup.
+        { n=$(LC_ALL=C "$@" 2>&1 >&3 | wc -c) && (( n == 0 )); } 3>&1 |
+            perl -e '
+                my ($os,$uid) = @ARGV;
+                local $/; my $record = <STDIN> // "";
+                exit 1 unless $record =~ s/\n\z// && $record !~ /[\r\0]/;
+                if ($os eq "Linux") {
+                    my @f = split /:/,$record,-1;
+                    exit 1 unless $record !~ /\n/ && @f == 7 && $f[2] eq $uid && length $f[5];
+                    print $f[5];
+                } else {
+                    $record =~ s/\n\z//; # optional trailing record separator
+                    my %f;
+                    for (split /\n/,$record,-1) {
+                        exit 1 unless /\A(name|password|uid|gid|dir|shell|gecos): (.*)\z/ && !exists $f{$1};
+                        $f{$1}=$2;
+                    }
+                    exit 1 unless keys(%f)==7 && $f{uid} eq $uid && length $f{dir};
+                    print $f{dir};
+                }
+            ' "$os" "$EUID"
+    ) || venue_refuse 'cannot establish account home'
     if [[ $home != / && ( $home != /* || $home == */ || $home == *//* || /$home/ == */./* || /$home/ == */../* ) ]]; then
         venue_refuse 'account home is not a clean absolute path'
     fi
