@@ -40,6 +40,7 @@ import (
 const (
 	helperTest   = "-test.run=^TestEmptyEnvironmentHelper$"
 	helperPrefix = "--gatewaytest-helper="
+	poisonKey    = "MODEL_GATEWAY_TEST_POISON"
 	reportName   = "report.json"
 )
 
@@ -56,7 +57,7 @@ func privateWorkdir(t *testing.T) string {
 	if err := os.WriteFile(filepath.Join(dir, ".fixture"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Mkdir(filepath.Join(dir, "home"), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Join(dir, "tmp", "home"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	return dir
@@ -104,22 +105,24 @@ func writeReport(t *testing.T, value any) {
 }
 
 type fixtureObservation struct {
-	Home, Profile, Config, Binary, Sandbox, Runner string
-	Refused                                        bool
-	WriteCalls                                     int
+	Home, Profile, Config, Binary, Sandbox, Runner, TempDir string
+	PoisonPresent                                           bool
+	Refused                                                 bool
+	WriteCalls                                              int
 }
 
 func TestFixtureProcess(t *testing.T) {
 	for _, key := range []string{sandbox, runner} {
 		t.Run(key, func(t *testing.T) {
 			root := privateWorkdir(t)
-			home := filepath.Join(root, "home")
-			parent := map[string]string{"HOME": "/inherited-home", "USERPROFILE": "/inherited-profile", "CLAUDE_CONFIG_DIR": "/inherited-config", "CODEX_GATEWAY_CLAUDE_BIN": "claude", "PATH": root}
+			tempDir := filepath.Join(root, "tmp")
+			home := filepath.Join(tempDir, "home")
+			t.Setenv(poisonKey, "ambient")
+			parent := map[string]string{"HOME": "/inherited-home", "USERPROFILE": "/inherited-profile", "CLAUDE_CONFIG_DIR": "/inherited-config", "CODEX_GATEWAY_CLAUDE_BIN": "claude", "PATH": root, "TMPDIR": tempDir, poisonKey: "inherited"}
 			var wantSandbox, wantRunner string
 			if key == runner {
 				wantRunner = "child"
 				parent[runner] = wantRunner
-				parent["TMPDIR"] = home
 			} else {
 				wantSandbox = home
 			}
@@ -128,6 +131,7 @@ func TestFixtureProcess(t *testing.T) {
 				delete(env, sandbox)
 			}
 			cmd := helperCommand(t, root, "fixture")
+			cmd.Env = []string{poisonKey + "=command"}
 			var output bytes.Buffer
 			cmd.Stdout, cmd.Stderr = &output, &output
 			if err := env.RunFixture(cmd); err != nil {
@@ -135,11 +139,14 @@ func TestFixtureProcess(t *testing.T) {
 			}
 			var got fixtureObservation
 			readReport(t, root, &got)
+			if got.TempDir != tempDir || got.PoisonPresent {
+				t.Errorf("child temp root=%q poison present=%t; want %q and false", got.TempDir, got.PoisonPresent, tempDir)
+			}
 			t.Run("home", func(t *testing.T) {
 				if got.Home != home || got.Profile != home {
 					t.Errorf("effective home=%q profile=%q, want %q", got.Home, got.Profile, home)
 				}
-				insideDirectory(t, os.TempDir(), got.Home)
+				insideDirectory(t, got.TempDir, got.Home)
 			})
 			t.Run("config", func(t *testing.T) {
 				if want := filepath.Join(home, ".claude"); got.Config != want {
@@ -150,7 +157,7 @@ func TestFixtureProcess(t *testing.T) {
 				if want := filepath.Join(home, "missing-claude"); got.Binary != want {
 					t.Errorf("child probe executable=%q, want %q", got.Binary, want)
 				}
-				insideDirectory(t, os.TempDir(), filepath.Dir(got.Binary))
+				insideDirectory(t, got.TempDir, filepath.Dir(got.Binary))
 			})
 			t.Run("guarded_write", func(t *testing.T) {
 				if got.Sandbox != wantSandbox || got.Runner != wantRunner || !got.Refused || got.WriteCalls != 0 {
@@ -196,24 +203,40 @@ func TestEphemeralBind(t *testing.T) {
 func probeChild(t *testing.T, key, mode string) string {
 	t.Helper()
 	dir := privateWorkdir(t)
-	home := filepath.Join(dir, "home")
-	bin := filepath.Join(dir, "claude")
-	marker := filepath.Join(dir, "launched")
-	// The marker belongs to the executable, even if its caller drops every variable.
-	if err := os.WriteFile(bin, []byte("#!/bin/sh\n: > \"${0%/*}/launched\"\nprintf '9.9.9\\n'\n"), 0o700); err != nil {
+	home := filepath.Join(dir, "tmp", "home")
+	named := mode == "named-alias" || mode == "named-pins"
+	bin, script := filepath.Join(dir, "claude"), launchCanary
+	if named {
+		bin = filepath.Join(home, "fixture-claude")
+		script = `#!/bin/sh
+: > "${0%/*}/launched"
+if [ "$1" = '--version' ]; then printf '9.9.9\n'; exit 0; fi
+while [ "$#" -gt 1 ]; do
+  if [ "$1" = '--model' ]; then
+    case "$2" in opus|sonnet|fable) printf '{"type":"system","subtype":"init","model":"claude-%s-fixture"}\n' "$2"; exit 0;; esac
+  fi
+  shift
+done
+exit 1
+`
+	}
+	marker := filepath.Join(filepath.Dir(bin), "launched")
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	env := []string{"HOME=" + home, "PATH=" + dir, "TMPDIR=" + home}
+	env := []string{"HOME=" + home, "PATH=" + dir, "TMPDIR=" + filepath.Dir(home)}
 	if key == sandbox {
 		env = append(env, sandbox+"="+home)
 	} else {
 		env = append(env, runner+"=child")
 	}
-	if mode == "alias" {
-		// An ambient fallback would start only our canary. The explicit probe environment lacks this override.
+	if named || mode == "alias" {
+		// The unnamed alias check removes this override from its explicit map only.
 		env = append(env, "CODEX_GATEWAY_CLAUDE_BIN="+bin)
 	}
-	canary := exec.CommandContext(t.Context(), bin, "--version")
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	canary := exec.CommandContext(ctx, bin, "--version")
 	canary.Dir = dir
 	canary.Env = env
 	canary.WaitDelay = time.Second
@@ -228,7 +251,13 @@ func probeChild(t *testing.T, key, mode string) string {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Errorf("probe helper: %v; %s", err, out)
 	}
-	wantAbsent(t, marker)
+	if named {
+		if _, err := os.Stat(marker); err != nil {
+			t.Errorf("named fixture was not launched: %v", err)
+		}
+	} else {
+		wantAbsent(t, marker)
+	}
 	return dir
 }
 
@@ -264,10 +293,34 @@ func TestPathClaudeNeverLaunched(t *testing.T) {
 	}
 }
 
+func TestNamedClaudeProbes(t *testing.T) {
+	for _, key := range []string{sandbox, runner} {
+		t.Run(key, func(t *testing.T) {
+			t.Run("alias", func(t *testing.T) {
+				dir := probeChild(t, key, "named-alias")
+				var got string
+				readReport(t, dir, &got)
+				if got != "claude-sonnet-fixture[1m]" {
+					t.Errorf("ProbeAlias=%q, want claude-sonnet-fixture[1m]", got)
+				}
+			})
+			t.Run("pins", func(t *testing.T) {
+				dir := probeChild(t, key, "named-pins")
+				var got map[string]string
+				readReport(t, dir, &got)
+				want := map[string]string{"sonnet": "claude-sonnet-fixture[1m]", "opus": "claude-opus-fixture[1m]", "fable": "claude-fable-fixture[1m]"}
+				if diff := gocmp.Diff(want, got); diff != "" {
+					t.Errorf("DetectedPins (-want +got):\n%s", diff)
+				}
+			})
+		})
+	}
+}
+
 func TestEmptyEnvironmentHelper(t *testing.T) {
 	if len(os.Args) == 4 && os.Args[1] == helperTest && os.Args[2] == "--" {
 		switch os.Args[3] {
-		case helperPrefix + "fixture", helperPrefix + "alias", helperPrefix + "pins", helperPrefix + "empty":
+		case helperPrefix + "fixture", helperPrefix + "alias", helperPrefix + "pins", helperPrefix + "empty", helperPrefix + "named-alias", helperPrefix + "named-pins":
 			runChild(t, strings.TrimPrefix(os.Args[3], helperPrefix))
 			return
 		}
@@ -298,7 +351,7 @@ func runChild(t *testing.T, mode string) {
 	if err != nil || !marker.Mode().IsRegular() || marker.Mode().Perm() != 0o600 || marker.Size() != 0 {
 		t.Fatal("helper requires a private fixture marker")
 	}
-	home := filepath.Join(dir, "home")
+	home := filepath.Join(dir, "tmp", "home")
 	if mode == "empty" {
 		// TestMain has already checked the password-database home and both listener tables without connecting.
 		if n := len(os.Environ()); n != 0 {
@@ -323,13 +376,33 @@ func runChild(t *testing.T, mode string) {
 			t.Error(err)
 		}
 		calls, err := refusedWrite(env, filepath.Join(dir, "untouched", ".claude", "settings.json"))
-		writeReport(t, fixtureObservation{effectiveHome, env["USERPROFILE"], env["CLAUDE_CONFIG_DIR"], env["CODEX_GATEWAY_CLAUDE_BIN"], env[sandbox], env[runner], errors.Is(err, gatewaytest.ErrOutsideSandbox), calls})
+		_, poisonPresent := os.LookupEnv(poisonKey)
+		writeReport(t, fixtureObservation{Home: effectiveHome, Profile: env["USERPROFILE"], Config: env["CLAUDE_CONFIG_DIR"], Binary: env["CODEX_GATEWAY_CLAUDE_BIN"], Sandbox: env[sandbox], Runner: env[runner], TempDir: os.TempDir(), PoisonPresent: poisonPresent, Refused: errors.Is(err, gatewaytest.ErrOutsideSandbox), WriteCalls: calls})
 		return
 	}
 	sandboxOnly := env[sandbox] == home && env[runner] == ""
 	runnerOnly := env[runner] == "child" && env[sandbox] == ""
-	if env["HOME"] != home || env["PATH"] != dir || env["TMPDIR"] != home || (!sandboxOnly && !runnerOnly) {
+	if env["HOME"] != home || env["PATH"] != dir || env["TMPDIR"] != filepath.Dir(home) || (!sandboxOnly && !runnerOnly) {
 		t.Fatal("probe helper environment is not isolated")
+	}
+	if mode == "named-alias" || mode == "named-pins" {
+		if env["CODEX_GATEWAY_CLAUDE_BIN"] != filepath.Join(home, "fixture-claude") {
+			t.Fatal("unexpected named probe executable")
+		}
+		if mode == "named-alias" {
+			alias, err := env.ProbeAlias(t.Context(), "sonnet", "http://127.0.0.1:9")
+			if err != nil {
+				t.Errorf("ProbeAlias: %v", err)
+			}
+			writeReport(t, alias)
+		} else {
+			pins, err := env.DetectedPins(t.Context())
+			if err != nil {
+				t.Errorf("DetectedPins: %v", err)
+			}
+			writeReport(t, pins)
+		}
+		return
 	}
 	if mode == "alias" {
 		if env["CODEX_GATEWAY_CLAUDE_BIN"] != filepath.Join(dir, "claude") {

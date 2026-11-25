@@ -31,15 +31,20 @@ import (
 )
 
 const (
-	sandbox = "MODEL_GATEWAY_TEST_SANDBOX"
-	runner  = "NODE_TEST_CONTEXT"
+	sandbox      = "MODEL_GATEWAY_TEST_SANDBOX"
+	runner       = "NODE_TEST_CONTEXT"
+	launchCanary = "#!/bin/sh\n: > \"${0%/*}/launched\"\nprintf '9.9.9\\n'\n"
 )
 
 // Both sides of the boundary belong to the test, even if the guard regresses.
 func guardFixture(t *testing.T, trigger string) (gatewaytest.Environment, string) {
 	t.Helper()
 	root, outside := t.TempDir(), filepath.Join(t.TempDir(), "untouched")
-	env := gatewaytest.Environment{"HOME": root, "USERPROFILE": root, "TMPDIR": root}
+	home := filepath.Join(root, "home")
+	if err := os.Mkdir(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	env := gatewaytest.Environment{"HOME": home, "USERPROFILE": home, "TMPDIR": root}
 	if trigger == runner {
 		env[runner] = "child"
 	} else {
@@ -66,7 +71,7 @@ func TestUserSettingsPath(t *testing.T) {
 			if want := filepath.Join(env["HOME"], ".claude", "settings.json"); file != want {
 				t.Errorf("settings path=%q, want %q", file, want)
 			}
-			insideDirectory(t, os.TempDir(), filepath.Dir(filepath.Dir(file)))
+			insideDirectory(t, env["TMPDIR"], filepath.Dir(filepath.Dir(file)))
 		})
 	}
 }
@@ -128,6 +133,7 @@ func TestAllowSandboxSettingsWrite(t *testing.T) {
 			env, _ := guardFixture(t, key)
 			file := filepath.Join(env["HOME"], ".claude", "settings.json")
 			calls := 0
+			// The content assertion covers the complete operation only with the product settings writer as the leaf.
 			err := env.WriteSettings(file, map[string]any{"env": map[string]any{"OK": "1"}}, func(path string, settings map[string]any) error {
 				calls++
 				if path != file {
@@ -160,13 +166,24 @@ func TestAllowSandboxSettingsWrite(t *testing.T) {
 	}
 }
 
+func TestSettingsWriterError(t *testing.T) {
+	env, _ := guardFixture(t, sandbox)
+	path := filepath.Join(env["HOME"], ".claude", "settings.json")
+	want := &os.PathError{Op: "write", Path: path, Err: fs.ErrPermission}
+	calls := 0
+	got := env.WriteSettings(path, map[string]any{}, func(string, map[string]any) error { calls++; return want })
+	if cause, ok := got.(*os.PathError); !ok || cause != want || calls != 1 { //nolint:errorlint // The caller needs the original error, not a wrapper.
+		t.Errorf("WriteSettings returned %v after %d calls, want the original writer error after one call", got, calls)
+	}
+}
+
 func TestClaudeLaunchGuard(t *testing.T) {
 	for _, key := range []string{sandbox, runner} {
 		t.Run(key, func(t *testing.T) {
 			env, outside := guardFixture(t, key)
 			fixture := filepath.Join(env["HOME"], "claude")
 			for _, name := range []string{fixture, outside} {
-				if err := os.WriteFile(name, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+				if err := os.WriteFile(name, []byte(launchCanary), 0o700); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -174,6 +191,7 @@ func TestClaudeLaunchGuard(t *testing.T) {
 			if err := os.Symlink(outside, link); err != nil {
 				t.Fatal(err)
 			}
+			env["PATH"] = env["HOME"]
 			t.Setenv("PATH", env["HOME"])
 			t.Setenv("CODEX_GATEWAY_CLAUDE_BIN", fixture)
 			tests := map[string]struct {
@@ -202,6 +220,8 @@ func TestClaudeLaunchGuard(t *testing.T) {
 						}
 						return nil
 					})
+					wantAbsent(t, filepath.Join(env["HOME"], "launched"))
+					wantAbsent(t, filepath.Join(filepath.Dir(outside), "launched"))
 					if calls != tt.calls || !errors.Is(err, tt.err) {
 						t.Errorf("StartClaude: error=%v calls=%d, want %v and %d calls", err, calls, tt.err, tt.calls)
 					}
