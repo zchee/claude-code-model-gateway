@@ -20,22 +20,25 @@ import (
 	"errors"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/shirou/gopsutil/v4/process"
 	"golang.org/x/sys/unix"
 )
 
-func darwinRow(ctx context.Context, info *unix.KinfoProc) (Identity, error) {
-	p := process.Process{Pid: info.Proc.P_pid}
-	argv, err := p.CmdlineSliceWithContext(ctx)
+func procArgs(pid int) (string, []string, error) {
+	raw, err := unix.SysctlRaw("kern.procargs2", pid)
 	if err != nil {
-		return Identity{}, err
+		return "", nil, err
 	}
+	return decodeProcArgs(raw)
+}
+
+func darwinRow(info *unix.KinfoProc) Identity {
 	birth := info.Proc.P_starttime
-	return Identity{PID: int(p.Pid), ParentPID: int(info.Eproc.Ppid), Argv: argv, Birth: time.Unix(birth.Sec, int64(birth.Usec)*1000)}, nil
+	return Identity{PID: int(info.Proc.P_pid), ParentPID: int(info.Eproc.Ppid), Birth: time.Unix(birth.Sec, int64(birth.Usec)*1000)}
 }
 
 func nativeTable(ctx context.Context) ([]Identity, error) {
@@ -48,8 +51,20 @@ func nativeTable(ctx context.Context) ([]Identity, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if row, err := darwinRow(ctx, &procs[i]); err == nil {
-			rows = append(rows, row)
+		row := darwinRow(&procs[i])
+		if row.PID <= 0 {
+			continue
+		}
+		_, args, _ := procArgs(row.PID) // A failed sample carries nil argv.
+		after, err := unix.SysctlKinfoProc("kern.proc.pid", row.PID)
+		var current Identity
+		if err == nil {
+			current = darwinRow(after)
+		} else if errors.Is(unix.Kill(row.PID, 0), unix.ESRCH) {
+			continue
+		}
+		if checked, keep := checkedTableRow(row, current, args); keep {
+			rows = append(rows, checked)
 		}
 	}
 	return rows, nil
@@ -60,34 +75,23 @@ func nativeIdentity(ctx context.Context, pid int) (Identity, error) {
 	if err != nil {
 		return Identity{}, err
 	}
-	id, err := darwinRow(ctx, info)
+	id := darwinRow(info)
+	launchPath, argv, err := procArgs(pid)
 	if err != nil {
 		return Identity{}, err
 	}
+	id.Argv = argv
 	p := process.Process{Pid: int32(pid)}
 	path, err := p.ExeWithContext(ctx)
 	if err != nil || path == "" {
-		// proc_pidpath can fail after unlink. The launch path in kern.procargs2
-		// precedes argv and is not the user-controlled argv[0].
-		args, err := unix.SysctlRaw("kern.procargs2", pid)
-		if err != nil {
-			return Identity{}, err
-		}
-		if len(args) < 5 {
-			return Identity{}, ErrUnknown
-		}
-		name, _, ok := bytes.Cut(args[4:], []byte{0})
-		if !ok {
-			return Identity{}, ErrUnknown
-		}
-		path = string(name)
+		path = launchPath
 	}
 	if !filepath.IsAbs(path) {
 		return Identity{}, ErrUnknown
 	}
 	// lsof's txt records contain device and inode from the mapped vnode, not
 	// from stat(path), which could already identify a replacement executable.
-	out, err := darwinCommand(ctx, "/usr/sbin/lsof", "-nP", "-a", "-p", strconv.Itoa(pid), "-d", "txt", "-F0pDfni")
+	out, err := darwinCommand(ctx, "/usr/sbin/lsof", "+w", "-nP", "-a", "-p", strconv.Itoa(pid), "-d", "txt", "-F0pDfni")
 	if err != nil {
 		return Identity{}, err
 	}
@@ -95,14 +99,21 @@ func nativeIdentity(ctx context.Context, pid int) (Identity, error) {
 	if err != nil {
 		return Identity{}, err
 	}
+	secondPath, secondArgs, err := procArgs(pid)
+	if err != nil || launchPath != secondPath || !slices.Equal(argv, secondArgs) {
+		return Identity{}, ErrUnknown
+	}
 	after, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
-	if err != nil || after.Proc.P_starttime != info.Proc.P_starttime {
+	if err != nil || after.Proc.P_pid != info.Proc.P_pid || after.Proc.P_starttime != info.Proc.P_starttime {
 		return Identity{}, ErrUnknown
 	}
 	return id, nil
 }
 
 func mappedImage(out []byte, pid int, path string) (Image, error) {
+	if !bytes.HasSuffix(out, []byte{0, '\n'}) {
+		return Image{}, ErrUnknown
+	}
 	var match Image
 	var current Image
 	var seenPID, text, device bool
@@ -163,69 +174,25 @@ func mappedImage(out []byte, pid int, path string) (Image, error) {
 	return match, nil
 }
 
-func darwinCommand(ctx context.Context, path string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, path, args...)
-	cmd.Env = []string{"LC_ALL=C", "PATH=/usr/bin:/bin:/usr/sbin:/sbin"}
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
-	}
-	if stderr.Len() != 0 {
-		return nil, ErrUnknown
-	}
-	return out, err
-}
-
-func nativeSockets(ctx context.Context, port uint16) ([]socketEvidence, error) {
+func nativeSockets(ctx context.Context, port uint16, _ func()) ([]socketEvidence, error) {
 	// lsof reports descriptors visible to this user, not every kernel socket.
 	// Cross-check the listening rows before calling a port vacant or uniquely owned.
 	out, err := darwinCommand(ctx, "/usr/sbin/netstat", "-an", "-p", "tcp")
 	if err != nil {
 		return nil, err
 	}
-	count := 0
-	for line := range strings.SplitSeq(string(out), "\n") {
-		f := strings.Fields(line)
-		if len(f) == 0 || !strings.HasPrefix(f[0], "tcp") {
-			continue
-		}
-		if len(f) < 6 {
-			return nil, ErrUnknown
-		}
-		if f[5] != "LISTEN" {
-			continue
-		}
-		_, suffix, ok := strings.CutLast(f[3], ".")
-		n, err := strconv.ParseUint(suffix, 10, 16)
-		if !ok || err != nil {
-			return nil, ErrUnknown
-		}
-		if uint16(n) == port {
-			count++
-		}
+	count, err := countTCPListeners(out, port)
+	if err != nil {
+		return nil, err
 	}
 	if count == 0 {
 		return nil, nil
 	}
-	rows := make([]socketEvidence, count)
-	for i := range rows {
-		rows[i] = socketEvidence{port: port, listening: true}
-	}
-	out, err = darwinCommand(ctx, "/usr/sbin/lsof", "-nP", "-iTCP:"+strconv.Itoa(int(port)), "-sTCP:LISTEN", "-t")
+	out, err = darwinCommand(ctx, "/usr/sbin/lsof", "+w", "-nP", "-iTCP:"+strconv.Itoa(int(port)), "-sTCP:LISTEN", "-F0pfd")
 	if err != nil {
-		if e, ok := errors.AsType[*exec.ExitError](err); ok && e.ExitCode() == 1 && len(out) == 0 {
-			return rows, nil
+		if e, ok := errors.AsType[*exec.ExitError](err); !ok || e.ExitCode() != 1 || len(out) != 0 {
+			return nil, err
 		}
-		return nil, err
 	}
-	for field := range strings.FieldsSeq(string(out)) {
-		pid, err := strconv.ParseInt(field, 10, 32)
-		if err != nil || pid <= 0 {
-			return nil, ErrUnknown
-		}
-		rows[0].owners = append(rows[0].owners, int(pid))
-	}
-	return rows, nil
+	return listenerFiles(out, port, count)
 }

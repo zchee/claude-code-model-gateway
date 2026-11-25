@@ -13,6 +13,9 @@
 // limitations under the License.
 
 // Package procinfo supplies process and listener evidence to the supervisor.
+// An identified listener has one holder visible to this user. A process whose
+// descriptors are unreadable may share its socket; ownership evidence alone
+// is never authority to signal a process.
 package procinfo
 
 import (
@@ -22,6 +25,7 @@ import (
 	"math"
 	"os"
 	"runtime"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -38,7 +42,8 @@ const ErrUnknown = probeError("process identity unknown")
 // ErrUnsupported means the operating system has no native process probe.
 const ErrUnsupported = probeError("native process inspection unsupported on this platform")
 
-// Image identifies an executable file independently of its current name.
+// Image identifies an executable by device and inode. On Linux Path is raw kernel
+// link text, including the " (deleted)" suffix after unlink, not a relaunch path.
 type Image struct {
 	Path   string `json:"path"`
 	Device uint64 `json:"device"`
@@ -46,6 +51,8 @@ type Image struct {
 }
 
 // Identity describes a running process. ParentPID zero denotes a proven root.
+// Linux Birth adds start ticks to the boot wall clock; a clock step can change
+// that computed birth for the same process. LegacyStart retains whole seconds.
 type Identity struct {
 	PID       int
 	ParentPID int
@@ -62,15 +69,21 @@ type socketEvidence struct {
 	owners    []int
 }
 
-// Probe reads process facts from the operating system when zero-valued.
+// Probe reads native process facts. A zero-valued Probe uses the default budget.
+// Its configuration never falls back to the process environment.
 type Probe struct {
+	lookup    config.LookupEnv
 	inspect   func(context.Context, int) (Identity, error)
 	existence func(context.Context, int) error
 	processes func(context.Context) ([]Identity, error)
 	sockets   func(context.Context) ([]socketEvidence, error)
 }
 
+// New returns a Probe whose budget uses lookup. A nil lookup selects the platform default.
+func New(lookup config.LookupEnv) Probe { return Probe{lookup: lookup} }
+
 // Identity returns the live identity, os.ErrNotExist for confirmed absence, or ErrUnknown for inconclusive inspection.
+// A pending kernel read may not return when the context expires.
 func (p Probe) Identity(ctx context.Context, pid int) (Identity, error) {
 	if pid <= 0 || pid > math.MaxInt32 {
 		return Identity{}, os.ErrNotExist
@@ -79,10 +92,10 @@ func (p Probe) Identity(ctx context.Context, pid int) (Identity, error) {
 	if inspect == nil {
 		inspect = nativeIdentity
 	}
-	ctx, cancel := context.WithTimeout(ctx, ProbeTimeout(runtime.GOOS))
+	ctx, cancel := context.WithTimeout(ctx, p.timeout(runtime.GOOS))
 	defer cancel()
 	id, err := inspect(ctx, pid)
-	if err == nil && ctx.Err() == nil && id.PID == pid && id.ParentPID >= 0 && !id.Birth.IsZero() && len(id.Argv) > 0 {
+	if err == nil && ctx.Err() == nil && id.PID == pid && id.ParentPID >= 0 && !id.Birth.IsZero() && len(id.Argv) > 0 && id.Argv[0] != "" {
 		return id, nil
 	}
 	if errors.Is(err, ErrUnsupported) {
@@ -95,12 +108,14 @@ func (p Probe) Identity(ctx context.Context, pid int) (Identity, error) {
 }
 
 // Table returns a snapshot keyed by pid, or no table when the query fails.
+// On Darwin a row with nil argv lacks readable arguments; it does not prove exit.
+// A kernel read already in progress cannot necessarily be canceled.
 func (p Probe) Table(ctx context.Context) (map[int]Identity, error) {
 	query := p.processes
 	if query == nil {
 		query = nativeTable
 	}
-	ctx, cancel := context.WithTimeout(ctx, ProbeTimeout(runtime.GOOS))
+	ctx, cancel := context.WithTimeout(ctx, p.timeout(runtime.GOOS))
 	defer cancel()
 	rows, err := query(ctx)
 	if err != nil {
@@ -162,20 +177,23 @@ const (
 )
 
 // Listener returns TCP listener evidence within the configured probe budget.
+// Identified means the only holder visible to this user, not authority to signal.
+// A deadline abandons this call's worker; it cannot interrupt a stuck kernel read.
 func (p Probe) Listener(ctx context.Context, port uint16) Listener {
 	if port == 0 {
 		return Listener{State: ListenerAbsent}
 	}
-	ctx, cancel := context.WithTimeout(ctx, ProbeTimeout(runtime.GOOS))
+	ctx, cancel := context.WithTimeout(ctx, p.timeout(runtime.GOOS))
 	defer cancel()
 	// Some kernel reads cannot be canceled. Let the caller leave at the deadline
 	// without leaving the query waiting on a receiver when it eventually returns.
+	var inconsistent atomic.Bool
 	done := make(chan Listener, 1)
 	go func() {
 		var rows []socketEvidence
 		var err error
 		if p.sockets == nil {
-			rows, err = nativeSockets(ctx, port)
+			rows, err = nativeSockets(ctx, port, func() { inconsistent.Store(true) })
 		} else {
 			rows, err = p.sockets(ctx)
 		}
@@ -187,6 +205,9 @@ func (p Probe) Listener(ctx context.Context, port uint16) Listener {
 			return result
 		}
 	case <-ctx.Done():
+	}
+	if inconsistent.Load() {
+		return Listener{State: ListenerUnknown}
 	}
 	return classifyListener(nil, ctx.Err(), port)
 }
@@ -230,9 +251,11 @@ func classifyListener(rows []socketEvidence, err error, port uint16) Listener {
 	}
 }
 
-// ProbeTimeout reads CODEX_GATEWAY_PROBE_TIMEOUT_MS for the given GOOS.
-func ProbeTimeout(goos string) time.Duration {
-	ms := config.ProbeTimeoutFor(os.LookupEnv, goos)
+// ProbeTimeout returns the default probe budget for the given GOOS.
+func ProbeTimeout(goos string) time.Duration { return (Probe{}).timeout(goos) }
+
+func (p Probe) timeout(goos string) time.Duration {
+	ms := config.ProbeTimeoutFor(p.lookup, goos)
 	if ms >= float64(math.MaxInt64)/float64(time.Millisecond) {
 		return time.Duration(math.MaxInt64)
 	}
@@ -243,6 +266,8 @@ func ProbeTimeout(goos string) time.Duration {
 func LegacyStart(birth time.Time) string { return birth.Format(time.ANSIC) }
 
 // Record is the authoritative on-disk process identity for one instance and role.
+// StartedAt is legacy local wall time at whole-second precision. On Linux a
+// clock step can change the boot wall clock from which it is computed.
 type Record struct {
 	PID        int    `json:"pid"`
 	Command    string `json:"command"`

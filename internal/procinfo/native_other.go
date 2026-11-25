@@ -16,9 +16,19 @@
 
 package procinfo
 
-import "context"
+import (
+	"context"
+	"os"
+)
 
-func nativeExistence(context.Context, int) error                      { return ErrUnsupported }
-func nativeIdentity(context.Context, int) (Identity, error)           { return Identity{}, ErrUnsupported }
-func nativeTable(context.Context) ([]Identity, error)                 { return nil, ErrUnsupported }
-func nativeSockets(context.Context, uint16) ([]socketEvidence, error) { return nil, ErrUnsupported }
+func openRecordRoot(string) (*os.File, error) { return nil, ErrUnsupported }
+
+func checkRecordEntry(*os.File, string) error          { return ErrUnsupported }
+func readRecordEntry(*os.File, string) ([]byte, error) { return nil, ErrUnsupported }
+
+func nativeExistence(context.Context, int) error            { return ErrUnsupported }
+func nativeIdentity(context.Context, int) (Identity, error) { return Identity{}, ErrUnsupported }
+func nativeTable(context.Context) ([]Identity, error)       { return nil, ErrUnsupported }
+func nativeSockets(context.Context, uint16, func()) ([]socketEvidence, error) {
+	return nil, ErrUnsupported
+}

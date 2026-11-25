@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -71,7 +72,7 @@ func readAt(dir *os.File, name string) ([]byte, error) {
 		return nil, err
 	}
 	f := os.NewFile(uintptr(fd), name)
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	return io.ReadAll(f)
 }
 
@@ -81,7 +82,7 @@ func (c procClock) inspect(root string, pid int, withImage bool) (Identity, erro
 	if err != nil {
 		return Identity{}, err
 	}
-	defer dir.Close()
+	defer func() { _ = dir.Close() }()
 	stat, err := readAt(dir, "stat")
 	if err != nil {
 		return Identity{}, err
@@ -114,7 +115,7 @@ func (c procClock) inspect(root string, pid int, withImage bool) (Identity, erro
 	if err != nil {
 		return Identity{}, err
 	}
-	defer unix.Close(fd)
+	defer func() { _ = unix.Close(fd) }()
 	var st unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
 		return Identity{}, err
@@ -122,6 +123,13 @@ func (c procClock) inspect(root string, pid int, withImage bool) (Identity, erro
 	path, err := os.Readlink("/proc/self/fd/" + strconv.Itoa(fd))
 	if err != nil {
 		return Identity{}, err
+	}
+	after, err := readAt(dir, "cmdline")
+	if err != nil {
+		return Identity{}, err
+	}
+	if !bytes.Equal(cmd, after) {
+		return Identity{}, ErrUnknown
 	}
 	id.Image = Image{Path: path, Device: uint64(st.Dev), Inode: st.Ino}
 	return id, nil
@@ -162,12 +170,8 @@ func nativeTable(ctx context.Context) ([]Identity, error) {
 	return rows, nil
 }
 
-func nativeSockets(ctx context.Context, port uint16) ([]socketEvidence, error) {
-	root := procRoot(ctx)
-	// Keep per-inode descriptors: endpoint deduplication would lose reuse-port
-	// listeners, and retaining only the first descriptor would lose inherited ones.
-	inodes := make(map[string]int)
-	var rows []socketEvidence
+func listeningInodes(root string, port uint16) ([]uint64, error) {
+	var inodes []uint64
 	for _, name := range []string{"tcp", "tcp6"} {
 		data, err := os.ReadFile(filepath.Join(root, "net", name))
 		if name == "tcp6" && errors.Is(err, os.ErrNotExist) {
@@ -200,11 +204,50 @@ func nativeSockets(ctx context.Context, port uint16) ([]socketEvidence, error) {
 			if err != nil {
 				return nil, ErrUnknown
 			}
-			if inode != 0 {
-				inodes[fmt.Sprintf("socket:[%d]", inode)] = len(rows)
-			}
-			rows = append(rows, socketEvidence{port: port, listening: true})
+			inodes = append(inodes, inode)
 		}
+	}
+	slices.Sort(inodes)
+	return inodes, nil
+}
+
+func nativeSockets(ctx context.Context, port uint16, changed func()) ([]socketEvidence, error) {
+	return stableSocketHolders(ctx, procRoot(ctx), port, changed, listeningInodes)
+}
+
+func stableSocketHolders(ctx context.Context, root string, port uint16, changed func(), read func(string, uint16) ([]uint64, error)) ([]socketEvidence, error) {
+	before, err := read(root, port)
+	if err != nil {
+		return nil, err
+	}
+	for ctx.Err() == nil {
+		rows, err := socketHolders(ctx, root, port, before)
+		if err != nil {
+			return nil, err
+		}
+		after, err := read(root, port)
+		if err != nil {
+			return nil, err
+		}
+		if slices.Equal(before, after) {
+			return rows, nil
+		}
+		changed()
+		before = after
+	}
+	return nil, ctx.Err()
+}
+
+func socketHolders(ctx context.Context, root string, port uint16, ids []uint64) ([]socketEvidence, error) {
+	// Keep per-inode descriptors: endpoint deduplication would lose reuse-port
+	// listeners, and retaining only the first descriptor would lose inherited ones.
+	inodes := make(map[string]int, len(ids))
+	rows := make([]socketEvidence, len(ids))
+	for i, inode := range ids {
+		if inode != 0 {
+			inodes[fmt.Sprintf("socket:[%d]", inode)] = i
+		}
+		rows[i] = socketEvidence{port: port, listening: true}
 	}
 	if len(inodes) == 0 {
 		return rows, nil
