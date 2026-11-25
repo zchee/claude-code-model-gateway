@@ -1,0 +1,38 @@
+#!/bin/sh
+# Copyright 2026 The claude-code-model-gateway Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+set -euC
+
+fail() { printf 'go-test-evidence: %s\n' "$*" >&2; exit 1; }
+
+[ "$#" -eq 3 ] || fail 'usage: hack/go-test-evidence {plain|process} RUN_ID OUTPUT'
+case $1 in
+    plain) target=test-json ;;
+    process) target=test-process-json ;;
+    *) fail 'suite must be plain or process' ;;
+esac
+case $2 in
+    ''|*[!a-zA-Z0-9_-]*) fail 'run ID must contain only letters, digits, hyphens or underscores' ;;
+esac
+[ -n "$3" ] || fail 'missing output path'
+
+commit=$(git rev-parse --verify HEAD) || fail 'cannot resolve checkout commit'
+status=$(git status --porcelain --untracked-files=all) || fail 'cannot check worktree status'
+[ -z "$status" ] || fail 'worktree must be clean'
+
+{
+    printf '{"run_id":"%s","commit":"%s"}\n' "$2" "$commit" &&
+        make --no-print-directory "$target"
+} > "$3"

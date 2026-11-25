@@ -64,8 +64,51 @@ backquoted Go test target followed by its phase in parentheses. The preceding
 prose column is not evidence. The final phase includes the earlier ledgers and
 all plan replacements.
 
-Future producers must assign a fresh identifier to each run, derive its commit
-from the gated checkout, collect unfiltered Go events without caching, and
-record the executable path and measured digest from the actual Go launch.
+### Collect hosted Go evidence
+
+From the clean checkout of the gated commit, list completed push runs of the
+build, lint and test workflow. Select a successful run whose two hosted jobs
+both ran in the same attempt. If rerunning, use **Re-run all jobs**, not a
+single-job rerun. Keep the separate Linux development-venue logs required by
+the verification plan; use the hosted artifacts as the Go JSON inputs below.
+
+```sh
+phase=phase-0
+commit=$(git rev-parse HEAD)
+gh run list --workflow test.yaml --event push --commit "$commit" --status completed \
+  --json databaseId,attempt,headSha,conclusion,url
+```
+
+Enter that run's `databaseId` and `attempt`, separated by a space, at `read`.
+Check that both `checks` jobs are present and passed before downloading. Use
+a fresh download directory so an old file cannot fill in for a missing suite.
+
+```sh
+read -r run attempt
+gh run view "$run" --attempt "$attempt" --exit-status
+```
+
+```sh
+dir="$PWD/.omc/artifacts/verify/$phase"
+mkdir -p "$dir" && out=$(mktemp -d "$dir/gha-$run-$attempt.XXXXXXXX") &&
+  gh run download "$run" --name "go-test-ubuntu-26.04-$attempt" --dir "$out/ubuntu-26.04" &&
+  gh run download "$run" --name "go-test-xcode-27-$attempt" --dir "$out/xcode-27"
+```
+
+```sh
+./hack/parity-check results "$phase" --commit "$commit" \
+  --go-json "$out/ubuntu-26.04/go-test-plain.jsonl" \
+  --go-json "$out/ubuntu-26.04/go-test-process.jsonl" \
+  --go-json "$out/xcode-27/go-test-plain.jsonl" \
+  --go-json "$out/xcode-27/go-test-process.jsonl"
+```
+
+Add `--census` and `--launches` for phases with due conformance cases. Reject
+files for a different commit or a different run ID (`gha-<run>-<attempt>`),
+a single-job rerun, and concatenated or edited files. Suite failures may still
+produce artifacts; they do not count as passing evidence.
+
+Producers must collect unfiltered Go events without caching and record the
+executable path and measured digest from the actual Go launch for conformance.
 The checker matches those claims but cannot authenticate the producers, prove
 when a run occurred, or inspect an executable in another venue.

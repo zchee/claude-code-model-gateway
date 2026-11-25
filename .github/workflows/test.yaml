@@ -23,6 +23,8 @@ jobs:
           - ubuntu-26.04
           - xcode-27
     runs-on: ${{ matrix.runner }}
+    env:
+      TEST_EVIDENCE_RUN_ID: gha-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -62,9 +64,32 @@ jobs:
         run: ./hack/venue-attest-ci
       - name: Run tests
         id: tests
-        run: make test
+        run: |
+          evidence="$RUNNER_TEMP/go-test-plain.jsonl"
+          rc=
+          ./hack/go-test-evidence plain "$TEST_EVIDENCE_RUN_ID" "$evidence" || rc=$?
+          if [ -f "$evidence" ]; then
+            jq -j 'select(.Action == "output" or .Action == "build-output") | .Output // empty' "$evidence" || rc=${rc:-$?}
+          fi
+          exit "${rc:-0}"
       - name: Run process tests
         # A failure in the plain suite must not hide the process suite's result.
         # Both run only on an attested runner.
         if: ${{ !cancelled() && steps.attest.outcome == 'success' && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure') }}
-        run: make test-process
+        run: |
+          evidence="$RUNNER_TEMP/go-test-process.jsonl"
+          rc=
+          ./hack/go-test-evidence process "$TEST_EVIDENCE_RUN_ID" "$evidence" || rc=$?
+          if [ -f "$evidence" ]; then
+            jq -j 'select(.Action == "output" or .Action == "build-output") | .Output // empty' "$evidence" || rc=${rc:-$?}
+          fi
+          exit "${rc:-0}"
+      - name: Upload test evidence
+        if: ${{ !cancelled() && steps.attest.outcome == 'success' && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure') }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: go-test-${{ matrix.runner }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/go-test-plain.jsonl
+            ${{ runner.temp }}/go-test-process.jsonl
+          if-no-files-found: error
