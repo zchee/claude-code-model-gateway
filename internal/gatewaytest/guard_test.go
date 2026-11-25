@@ -16,18 +16,23 @@ package gatewaytest_test
 
 import (
 	"context"
+	"encoding/json/jsontext"
 	json "encoding/json/v2"
 	"errors"
 	"io/fs"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"testing"
 
 	gocmp "github.com/google/go-cmp/cmp"
 
+	"github.com/zchee/claude-code-model-gateway/internal/atomicfile"
 	"github.com/zchee/claude-code-model-gateway/internal/gatewaytest"
+	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
 )
 
 const (
@@ -133,20 +138,21 @@ func TestAllowSandboxSettingsWrite(t *testing.T) {
 			env, _ := guardFixture(t, key)
 			file := filepath.Join(env["HOME"], ".claude", "settings.json")
 			calls := 0
-			// The content assertion covers the complete operation only with the product settings writer as the leaf.
+			// The leaf is the product's settings writer, so the content assertion covers the complete operation.
 			err := env.WriteSettings(file, map[string]any{"env": map[string]any{"OK": "1"}}, func(path string, settings map[string]any) error {
 				calls++
 				if path != file {
 					t.Fatalf("writer received %q, want %q", path, file)
 				}
-				if err := os.MkdirAll(filepath.Dir(file), 0o700); err != nil {
-					return err
+				edits := make([]jsonx.Edit, 0, len(settings))
+				for _, key := range slices.Sorted(maps.Keys(settings)) {
+					value, err := json.Marshal(settings[key], json.Deterministic(true))
+					if err != nil {
+						return err
+					}
+					edits = append(edits, jsonx.Edit{Path: jsontext.Pointer("").AppendToken(key), Value: value})
 				}
-				data, err := json.Marshal(settings)
-				if err != nil {
-					return err
-				}
-				return os.WriteFile(file, data, 0o600)
+				return atomicfile.ReplaceSettings(path, func(doc []byte) ([]byte, error) { return jsonx.EditSettings(doc, edits...) })
 			})
 			if err != nil || calls != 1 {
 				t.Errorf("allowed write: error=%v calls=%d, want nil and one call", err, calls)
