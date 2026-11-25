@@ -1142,6 +1142,60 @@
       "wire": "{\"$schema\":42,\"$ref\":\"#absent\",\"pattern\":\"[\",\"oneOf\":\"invalid\"}",
       "edits": []
     },
+    "__proto__": {
+      "same": true,
+      "wire": "false",
+      "edits": []
+    },
+    "engine-invalid-after-removal": {
+      "before": [],
+      "same": false,
+      "wire": "{\"type\":\"string\",\"pattern\":\"[^\\\\01]\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "[^\\01]"
+        }
+      ],
+      "after": {
+        "compiled": false
+      }
+    },
+    "schema-dialect-nonstring": {
+      "error": {
+        "reasonCode": "unsupported-dialect",
+        "pointer": "/tools/0/input_schema/$schema",
+        "toolName": "artifact_tool"
+      }
+    },
+    "regex-double-hyphen-in-property-name": {
+      "error": {
+        "reasonCode": "range-or-set-character-class",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "regex-inline-group-flags": {
+      "error": {
+        "reasonCode": "capture-or-unsupported-group",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "schema-malformed-pattern-key": {
+      "error": {
+        "reasonCode": "affected-pattern-properties-key",
+        "pointer": "/tools/0/input_schema/patternProperties",
+        "toolName": "artifact_tool"
+      }
+    },
+    "numeric-property-order-first-refusal": {
+      "error": {
+        "reasonCode": "property-outside-negated-character-class",
+        "pointer": "/tools/0/input_schema/properties/2/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
     "untouched-known-scalar-value": {
       "same": true,
       "wire": "{\"title\":{\"pattern\":\"[^\\\\p{Cc}a]\"},\"pattern\":42}",

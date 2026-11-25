@@ -121,8 +121,10 @@ json-goldens:
 toolschema-goldens:
 	@$(require_test_venue) && source_root=$$(./hack/pinned-source) && \
 		plugin="$$source_root/plugins/model-gateway" && \
-		npm --prefix "$$plugin" ci --ignore-scripts --no-audit --no-fund >&2 && \
-		node hack/toolschema-goldens.mjs "$$plugin"
+		deps=$$(mktemp -d) && trap 'rm -rf -- "$$deps"' EXIT && \
+		cp "$$plugin/package.json" "$$plugin/package-lock.json" "$$deps/" && \
+		npm --prefix "$$deps" ci --include=dev --ignore-scripts --no-audit --no-fund >&2 && \
+		node hack/toolschema-goldens.mjs "$$plugin" "$$deps"
 
 fuzz-settings:
 	@$(require_test_venue) && go test -run='^$$' -fuzz='^FuzzSettingsNoEdit$$' -parallel=4 -fuzztime=60s -fuzzminimizetime=1s ./internal/jsonx

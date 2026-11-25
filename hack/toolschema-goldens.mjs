@@ -6,14 +6,24 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 execFileSync(fileURLToPath(new URL('venue-check', import.meta.url)), { stdio: 'inherit' });
-const require = createRequire(join(process.argv[2], 'package.json'));
-const { adaptCodexToolSchemas, ToolSchemaCompatibilityError } = require('./lib/tool-schema-compat.js');
-const Ajv2020 = require('./node_modules/ajv/dist/2020.js');
-const ajv = require('./node_modules/ajv/package.json').version;
+assert.equal(process.version, 'v24.11.1');
+const source = createRequire(join(process.argv[2], 'package.json'));
+const deps = createRequire(join(process.argv[3], 'package.json'));
+const { adaptCodexToolSchemas, ToolSchemaCompatibilityError } = source('./lib/tool-schema-compat.js');
+const Ajv2020 = deps('./node_modules/ajv/dist/2020.js');
+const ajv = deps('./node_modules/ajv/package.json').version;
 assert.equal(ajv, '8.20.0');
 
 function verdicts(schema, instances) {
-  const validate = new Ajv2020({ strict: false, unicodeRegExp: true }).compile(schema);
+  const validator = new Ajv2020({ strict: false, unicodeRegExp: true });
+  let validate;
+  try {
+    validate = validator.compile(schema);
+  } catch (error) {
+    // An accepted edit can make the pattern invalid even though the input compiled.
+    if (!(error instanceof SyntaxError)) throw error;
+    return { compiled: false };
+  }
   return instances.map(instance => validate(instance));
 }
 
@@ -34,12 +44,25 @@ function edits(before, after, pointer, result) {
 
 const directory = new URL('../internal/toolschema/testdata/', import.meta.url);
 const inputs = JSON.parse(readFileSync(new URL('node-inputs.json', directory), 'utf8'));
-const cases = {};
-for (const [name, input] of Object.entries(inputs)) {
+assert.ok(Array.isArray(inputs), 'expected an array of cases');
+const cases = Object.create(null);
+for (const input of inputs) {
+  assert.ok(input !== null && typeof input === 'object' && !Array.isArray(input), 'expected a case object');
+  const { name } = input;
+  assert.ok(typeof name === 'string' && name.length > 0, 'expected a nonempty case name');
+  assert.ok(!Object.hasOwn(cases, name), `duplicate case: ${name}`);
+  assert.ok(Object.keys(input).every(key => ['name', 'schema', 'tools', 'selfCycle', 'instances'].includes(key)), `${name}: unknown case field`);
   const single = Object.hasOwn(input, 'schema');
+  assert.notEqual(single, Object.hasOwn(input, 'tools'), `${name}: expected exactly one of schema and tools`);
+  if (Object.hasOwn(input, 'instances')) assert.ok(single && Array.isArray(input.instances), `${name}: expected schema with instances array`);
+  if (Object.hasOwn(input, 'selfCycle')) {
+    assert.ok(input.selfCycle === true && single && !input.instances && input.schema !== null && typeof input.schema === 'object'
+      && !Array.isArray(input.schema) && !Object.hasOwn(input.schema, 'self'), `${name}: expected an object schema without self or instances`);
+  }
   const tools = single ? [{ name: 'artifact_tool', input_schema: input.schema }] : input.tools;
   if (input.selfCycle) input.schema.self = input.schema;
   const snapshot = structuredClone(tools);
+  const inputWire = input.selfCycle ? undefined : JSON.stringify(tools);
   const result = cases[name] = {};
   if (input.instances) result.before = verdicts(input.schema, input.instances);
   try {
@@ -58,7 +81,9 @@ for (const [name, input] of Object.entries(inputs)) {
     result.error = { reasonCode, pointer, toolName };
   }
   assert.deepEqual(tools, snapshot, `${name}: input mutated`);
+  if (!input.selfCycle) assert.equal(JSON.stringify(tools), inputWire, `${name}: serialized input mutated`);
 }
+assert.deepEqual(new Set(Object.keys(cases)), new Set(inputs.map(input => input.name)), 'input and output names differ');
 const bytes = JSON.stringify({ node: process.version, ajv, cases }, null, 2) + '\n';
 writeFileSync(new URL('node-golden.json', directory), bytes);
 // Successful remote runs discard the checkout. Return the same bytes on stdout.
