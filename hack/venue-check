@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# Copyright 2026 The claude-code-model-gateway Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+set -euo pipefail
+
+venue_refuse() {
+    printf 'not a test venue: %s\n' "$1" >&2
+    exit 97
+}
+
+venue_home() {
+    local home
+    case $(uname -s) in
+        Linux) home=$(getent passwd "$EUID" | awk -F: -v u="$EUID" '$3 == u { print $6 }') ;;
+        Darwin) home=$(dscacheutil -q user -a uid "$EUID" | awk '/^dir: / { print substr($0,6) }') ;;
+        *) return 1 ;;
+    esac 2>/dev/null || return 1
+    [[ $home == /* && $home != *$'\n'* && -d $home && -x $home ]] || return 1
+    printf '%s\n' "$home"
+}
+
+venue_file_kind() {
+    # Shell file tests do not distinguish ENOENT from EACCES or ELOOP.
+    perl -MFcntl=:mode -MErrno=ENOENT -e '
+        my @s = lstat($ARGV[0]);
+        if (@s) { print S_ISREG($s[2]) ? "regular" : "other" }
+        elsif ($! == ENOENT) { print "absent" } else { exit 1 }
+    ' "$1" 2>/dev/null
+}
+
+venue_state_clear() {
+    local kind
+    kind=$(venue_file_kind "$1/.claude/model-gateway") || venue_refuse 'cannot inspect gateway state'
+    [[ $kind == absent ]] || venue_refuse 'gateway state present'
+}
+
+venue_ports_clear() {
+    local os sockets port busy
+    os=$(uname -s)
+    for port in 18764 18765; do
+        case $os in
+            Linux)
+                sockets=$(LC_ALL=C ss -ltn "sport = :$port" 2>&1) || venue_refuse "cannot inspect TCP port $port"
+                busy=$(awk -v p="$port" '
+                    NR == 1 && /^State .*Local Address:Port/ { header=1; next }
+                    $1 == "LISTEN" && $4 ~ (":" p "$") { busy=1; next }
+                    { bad=1 } END { if (!header || bad) exit 1; print busy+0 }' <<< "$sockets") || venue_refuse "cannot inspect TCP port $port"
+                ;;
+            Darwin)
+                sockets=$(LC_ALL=C /usr/sbin/netstat -an -p tcp 2>&1) || venue_refuse "cannot inspect TCP port $port"
+                busy=$(awk -v p="$port" '
+                    /^Active Internet connections/ || !NF { next }
+                    /^Proto .*Local Address/ { header=1; next }
+                    /^tcp/ && NF >= 6 { if ($6 == "LISTEN" && $4 ~ ("[.]" p "$")) busy=1; next }
+                    { bad=1 } END { if (!header || bad) exit 1; print busy+0 }' <<< "$sockets") || venue_refuse "cannot inspect TCP port $port"
+                ;;
+            *) venue_refuse "cannot inspect TCP port $port" ;;
+        esac
+        [[ $busy == 0 ]] || venue_refuse "TCP port $port has a listener"
+    done
+}
+
+venue_require() {
+    local home=$1 kind
+    kind=$(venue_file_kind "$home/.model-gateway-test-venue") || venue_refuse 'cannot inspect attestation'
+    case $kind in
+        absent) venue_refuse 'attestation missing' ;;
+        regular) ;;
+        *) venue_refuse 'attestation is not a regular file' ;;
+    esac
+    venue_state_clear "$home"
+    venue_ports_clear
+}
+
+venue_attest() {
+    local file=$1/.model-gateway-test-venue timestamp host
+    if [[ -f $file && ! -L $file ]]; then return; fi
+    [[ ! -e $file && ! -L $file ]] || venue_refuse 'invalid attestation file'
+    timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ') || venue_refuse 'cannot date attestation'
+    host=$(hostname) || venue_refuse 'cannot identify attestation origin'
+    (umask 077; set -C; printf '%s\t%s\t%s\n' "$timestamp" "$host" "$2" > "$file") || venue_refuse 'cannot create attestation file'
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    [[ $# == 0 ]] || venue_refuse 'unexpected arguments'
+    home=$(venue_home) || venue_refuse 'cannot determine account home'
+    venue_require "$home"
+fi

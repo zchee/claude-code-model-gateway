@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+# Copyright 2026 The claude-code-model-gateway Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+set -euo pipefail
+# shellcheck source-path=SCRIPTDIR source=venue-check
+source "$(dirname "$0")/venue-check"
+
+fail() { printf 'remote: %s\n' "$*" >&2; exit 1; }
+
+# Check the OpenSSH expansion as well as the alias; no connection is needed.
+reject_local() {
+    python3 -I - "$@" <<'PY'
+import ipaddress, socket, subprocess, sys
+from sys import platform
+command = ['/sbin/ifconfig', '-a'] if platform == 'darwin' else ['ip', '-o', 'address']
+lines = subprocess.check_output(command, text=True).splitlines()
+def addr(value):
+    ip = ipaddress.ip_address(value.split('/')[0].split('%')[0])
+    return getattr(ip, 'ipv4_mapped', None) or ip
+ours = set()
+for line in lines:
+    fields = line.split()
+    family = 0 if platform == 'darwin' else 2
+    if len(fields) > family + 1 and fields[family] in ('inet', 'inet6'):
+        ours.add(addr(fields[family+1]))
+if not ours:
+    sys.exit('remote: cannot determine local interface addresses')
+names = {socket.gethostname().lower(), socket.getfqdn().lower()}
+names |= {n.split('.')[0] for n in names}
+for name in sys.argv[1:]:
+    name = name.strip('[]').rstrip('.').lower()
+    if name in names or name == 'localhost' or name.endswith('.localhost'):
+        sys.exit('remote: refusing local destination')
+for result in socket.getaddrinfo(sys.argv[-1].strip('[]'), None, type=socket.SOCK_STREAM):
+    ip = addr(result[4][0])
+    if ip.is_loopback or ip.is_unspecified or ip in ours:
+        sys.exit('remote: refusing local destination')
+PY
+}
+
+archive_tree() {
+    local root=$1
+    (cd "$root" && git ls-files --cached --others --exclude-standard -z | perl -0ne '
+        chomp;
+        next if m{(?:^|/)(?:\.cache|\.git|\.omc)(?:/|$)};
+        my $p = ""; my @c = split m{/}; pop @c;
+        for my $c (@c) { $p .= "$c/"; die "symlink ancestor: $p\n" if -l substr($p,0,-1); }
+        next unless -e || -l;
+        die "not a file: $_\n" unless -f || -l;
+        print "$_\0";
+    ' | COPYFILE_DISABLE=1 tar --no-recursion --null -T - -cf -)
+}
+
+fetch() { curl -qfsSL --proto '=https' --proto-redir '=https' --retry 2 "$1" -o "$2"; }
+
+install_tools() {
+    local stage gofile nodefile sum kind archive
+    stage=$(mktemp -d "$base/install.XXXXXXXX")
+    trap 'rm -rf -- "$stage"' EXIT
+    gofile=$gover.linux-amd64.tar.gz
+    nodefile=node-$nodever-linux-x64.tar.xz
+    for kind in go node; do
+        if [[ $kind == go ]]; then archive=$gofile; else archive=$nodefile; fi
+        if [[ -d $base/$archive.toolchain ]]; then continue; fi
+        mkdir "$stage/$kind"
+        if [[ $kind == go ]]; then
+            fetch 'https://go.dev/dl/?mode=json&include=all' "$stage/go.json"
+            sum=$(python3 -I -c 'import json,sys; print(next(f["sha256"] for v in json.load(open(sys.argv[1])) for f in v["files"] if f["filename"] == sys.argv[2]))' "$stage/go.json" "$archive")
+            fetch "https://go.dev/dl/$archive" "$stage/$archive"
+        else
+            fetch "https://nodejs.org/dist/$nodever/SHASUMS256.txt" "$stage/node.sums"
+            sum=$(awk -v f="$archive" '$2 == f {print $1}' "$stage/node.sums")
+            fetch "https://nodejs.org/dist/$nodever/$archive" "$stage/$archive"
+        fi
+        [[ $sum =~ ^[0-9a-f]{64}$ ]] || fail "no published SHA-256 for $archive"
+        (cd "$stage" && printf '%s  %s\n' "$sum" "$archive" | sha256sum -c -)
+        tar --strip-components=1 -xf "$stage/$archive" -C "$stage/$kind"
+        printf '%s  %s\n' "$sum" "$archive" | tee "$stage/$kind/venue.sha256"
+        mv -T "$stage/$kind" "$base/$archive.toolchain"
+    done
+    rm -rf -- "$stage"; trap - EXIT
+}
+
+negative_control() {
+    local fixture=$1 sentinel_var=$2 tag rc target tool
+    local control=$run/control sentinel=$run/control/sentinel
+    [[ ${GITHUB_ACTIONS:-} != true ]] || fail 'negative control requires a non-CI venue'
+    mkdir -p "$control/bin"
+    printf '%-24s %-16s %s\n' SUBJECT ATTESTATION RESULT
+    for tag in default process; do
+        if [[ $tag == default ]]; then
+            go test -c -o "$control/$tag" "$fixture"
+        else
+            go test -c -tags process -o "$control/$tag" "$fixture"
+        fi
+        env "$sentinel_var=$sentinel" "$control/$tag"
+        printf '%s\n' "$tag" >| "$control/expected"
+        [[ -f $sentinel ]] && cmp -s "$control/expected" "$sentinel" || fail "$tag did not write its expected sentinel"
+        rm -- "$sentinel"
+        printf '%-24s %-16s %s\n' "$tag" present PASS
+    done
+    for tool in go node npm; do
+        printf '#!/bin/sh\nprintf "%%s\\n" "%s" >> "%s"\nexit 70\n' "$tool" "$control/dispatched" > "$control/bin/$tool"
+        chmod +x "$control/bin/$tool"
+    done
+    # A leftover backup after an uncatchable signal requires reprovisioning.
+    local saved=$base/attestation.withdrawn
+    [[ ! -e $saved && ! -L $saved ]] || fail 'withdrawn attestation exists; deprovision and provision again'
+    trap 'restore_attestation "$?"' EXIT
+    trap 'exit 1' HUP INT TERM
+    mv -T "$home/.model-gateway-test-venue" "$saved"
+    for tag in default process; do
+        rc=0; env "$sentinel_var=$sentinel" "$control/$tag" > "$control/stdout" 2> "$control/stderr" || rc=$?
+        printf 'not a test venue: attestation missing\n' >| "$control/expected"
+        if [[ $rc != 97 || -e $sentinel || -L $sentinel ]] || ! cmp -s "$control/expected" "$control/stderr"; then
+            fail "$tag did not refuse before running its test"
+        fi
+        printf '%-24s %-16s %s\n' "$tag" withdrawn 'PASS (97)'
+    done
+    for target in test test-process conformance baseline-node bench; do
+        rc=0; PATH="$control/bin:$PATH" make "$target" > "$control/make.log" 2>&1 || rc=$?
+        if [[ $rc == 0 || -e $control/dispatched ]] || ! grep -Fq 'not a test venue' "$control/make.log"; then
+            fail "$target did not refuse before dispatch"
+        fi
+        printf '%-24s %-16s PASS (%s)\n' "$target" withdrawn "$rc"
+    done
+    restore_attestation 0
+}
+
+restore_attestation() {
+    local rc=$1
+    trap - EXIT; trap '' HUP INT TERM
+    if [[ -e $saved ]]; then mv -T "$saved" "$home/.model-gateway-test-venue" || fail 'ATTESTATION RESTORATION FAILED'; fi
+    ./hack/venue-check || fail 'RESTORED VENUE CHECK FAILED; reprovision before continuing'
+    printf '%-24s %-16s %s\n' 'venue-check' restored PASS
+    exit "$rc"
+}
+
+remote_main() {
+    local op=$1 localname=$2 gover=$3 nodever=$4; shift 4
+    local home base=/tmp/model-gateway-venue run
+    [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || fail 'expected a remote Linux/amd64 venue'
+    [[ $(hostname -s) != "$localname" ]] || fail 'refusing same host name as caller'
+    home=$(venue_home) || venue_refuse 'cannot determine account home'
+    local go=$base/$gover.linux-amd64.tar.gz.toolchain node=$base/node-$nodever-linux-x64.tar.xz.toolchain
+    export HOME=$base/home XDG_CONFIG_HOME=$base/config XDG_CACHE_HOME=$base/cache TMPDIR=$base/tmp
+    if [[ $op == status ]]; then
+        printf 'account home: %s\n' "$home"
+        if [[ -f $home/.model-gateway-test-venue && ! -L $home/.model-gateway-test-venue ]]; then
+            printf 'attestation: regular file\n'
+            venue_require "$home"; printf 'gateway state: absent\nTCP listeners on 18764/18765: none\n'
+        else
+            printf 'attestation: absent or invalid; state and ports not checked\n'
+        fi
+        if [[ -d $base && ! -L $base && -O $base && $(stat -c %a "$base") == 700 ]]; then
+            if flock -ns "$base" true; then printf 'lock: free\n'; else printf 'lock: held (%s)\n' "$(<"$base/holder")"; fi
+            if [[ -x $go/bin/go ]]; then printf 'Go: %s\n' "$gover"; else printf 'Go: absent\n'; fi
+            if [[ -x $node/bin/node ]]; then printf 'Node: %s\n' "$nodever"; else printf 'Node: absent\n'; fi
+        else printf 'venue toolchains and lock: unavailable\n'; fi
+        return
+    fi
+    if [[ $op == provision || $op == deprovision ]]; then venue_state_clear "$home"; venue_ports_clear; else venue_require "$home"; fi
+    umask 077
+    if [[ $op == provision && ! -e $base ]]; then mkdir -m 700 "$base"; fi
+    if [[ $op == deprovision && ! -e $base && ! -L $base ]]; then
+        rm -f -- "$home/.model-gateway-test-venue"; return
+    fi
+    [[ -d $base && ! -L $base && -O $base && $(stat -c %a "$base") == 700 ]] || fail 'missing or unsafe private venue directory; provision first'
+    exec 9<"$base"
+    flock -nx 9 || fail 'venue locked by another operation'
+    [[ $base -ef /proc/self/fd/9 ]] || fail 'venue directory replaced'
+    printf 'pid=%s command=%s\n' "$$" "$op" >| "$base/holder"
+    if [[ $op == deprovision ]]; then
+        rm -f -- "$home/.model-gateway-test-venue"
+        chmod -R u+w "$base"; rm -rf -- "$base"; return
+    fi
+    export GOCACHE=$base/cache/go-build GOMODCACHE=$base/cache/go-mod GOPATH=$base/gopath GOBIN=$base/bin
+    export npm_config_cache=$base/cache/npm GOTOOLCHAIN=local
+    export PATH=$go/bin:$node/bin:$GOBIN:/usr/sbin:/usr/bin:/sbin:/bin
+    mkdir -p "$HOME" "$TMPDIR" "$GOBIN" "$base/runs"
+    if command -v claude >/dev/null; then fail 'claude must not resolve on the venue PATH'; fi
+    if [[ $op == provision ]]; then
+        [[ ! -e $base/attestation.withdrawn && ! -L $base/attestation.withdrawn ]] || fail 'interrupted withdrawal; deprovision before provisioning'
+        install_tools
+        go version; node --version
+        venue_state_clear "$home"; venue_ports_clear; venue_attest "$home" provision; return
+    fi
+    venue_require "$home"
+    [[ -x $go/bin/go && -x $node/bin/node ]] || fail 'toolchains absent; provision first'
+    run=$(mktemp -d "$base/runs/run.XXXXXXXX")
+    mkdir "$run/tree"; cd "$run/tree"
+    tar -xf - --no-same-owner
+    ./hack/venue-check
+    if [[ $op == run ]]; then make -- "$@"; else negative_control "$@"; fi
+}
+
+op=${1:-}; [[ $# == 0 ]] || shift
+case $op in
+    provision|deprovision|status|negative-control) [[ $# == 0 ]] || fail "unexpected arguments for $op" ;;
+    run) [[ $# -gt 0 ]] || fail 'run requires at least one make target'
+         for target do [[ $target =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || fail 'invalid make target'; done ;;
+    *) fail 'usage: remote {provision|run TARGET...|negative-control|status|deprovision}' ;;
+esac
+host=${VENUE_HOST:?set VENUE_HOST to the approved SSH destination}
+[[ $host =~ ^[a-zA-Z0-9_:][a-zA-Z0-9_.:@%-]*$ ]] || fail 'invalid SSH destination'
+sshopts=(-T -o BatchMode=yes -o ConnectTimeout=15 -o ClearAllForwardings=yes -o ForwardAgent=no)
+expanded=$(ssh -G "${sshopts[@]}" "$host" | awk '$1 == "hostname" {print $2}')
+[[ -n $expanded ]] || fail 'could not resolve SSH configuration'
+reject_local "${host##*@}" "$expanded"
+root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+gover=go1.27.4
+if [[ $op == negative-control ]]; then set -- ./internal/venue/testdata/control MODEL_GATEWAY_VENUE_SENTINEL; fi
+# Send only the functions and validated arguments; stdin remains the tree archive.
+program=$(declare -f venue_refuse venue_home venue_file_kind venue_state_clear venue_ports_clear venue_attest venue_require fail fetch install_tools negative_control restore_attestation remote_main)
+program=$'set -euo pipefail\n'"$program"$'\nremote_main "$@"'
+# A single-line encoding survives SSH command relays that split multiline arguments.
+encoded=$(printf '%s' "$program" | base64 | tr -d '\n')
+cmd="env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/bash -c \"\$(printf %s $encoded | base64 -d)\" remote"
+for arg in "$op" "$(hostname -s)" "$gover" v24.11.1 "$@"; do
+    [[ $arg =~ ^[a-zA-Z0-9_./-]+$ ]] || fail 'invalid remote argument'
+    cmd+=" $arg"
+done
+input=/dev/null
+if [[ $op == run || $op == negative-control ]]; then
+    input=$(mktemp "${TMPDIR:-/tmp}/venue-tree.XXXXXXXX")
+    trap 'rm -f -- "$input"' EXIT
+    archive_tree "$root" >| "$input"
+fi
+# cmd contains the encoded script and only validated positional arguments.
+# shellcheck disable=SC2029
+ssh "${sshopts[@]}" "$host" "$cmd" < "$input"
