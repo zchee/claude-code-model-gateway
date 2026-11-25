@@ -94,9 +94,10 @@ install_tools() {
 }
 
 negative_control() {
-    local fixture=$1 sentinel_var=$2 tag rc target tool
+    local fixture=${1:-./internal/venue/testdata/control} sentinel_var=${2:-MODEL_GATEWAY_VENUE_SENTINEL} tag rc target tool
     local control=$run/control sentinel=$run/control/sentinel
     [[ ${GITHUB_ACTIONS:-} != true ]] || fail 'negative control requires a non-CI venue'
+    [[ -d $fixture ]] || fail "negative-control fixture package missing from copied tree: $fixture"
     mkdir -p "$control/bin"
     printf '%-24s %-16s %s\n' SUBJECT ATTESTATION RESULT
     for tag in default process; do
@@ -107,7 +108,9 @@ negative_control() {
         fi
         env "$sentinel_var=$sentinel" "$control/$tag"
         printf '%s\n' "$tag" >| "$control/expected"
-        [[ -f $sentinel ]] && cmp -s "$control/expected" "$sentinel" || fail "$tag did not write its expected sentinel"
+        if [[ ! -f $sentinel || -L $sentinel ]] || ! cmp -s "$control/expected" "$sentinel"; then
+            fail "$tag did not write its expected sentinel"
+        fi
         rm -- "$sentinel"
         printf '%-24s %-16s %s\n' "$tag" present PASS
     done
@@ -208,7 +211,12 @@ remote_main() {
 
 op=${1:-}; [[ $# == 0 ]] || shift
 case $op in
-    provision|deprovision|status|negative-control) [[ $# == 0 ]] || fail "unexpected arguments for $op" ;;
+    provision|deprovision|status) [[ $# == 0 ]] || fail "unexpected arguments for $op" ;;
+    negative-control)
+        [[ $# -le 2 ]] || fail 'negative-control accepts [fixture-package [sentinel-variable]]'
+        [[ $# -lt 1 || $1 =~ ^\./internal/venue/testdata/([a-zA-Z0-9_-]+/)*[a-zA-Z0-9_-]+$ ]] || fail 'expected a fixture under ./internal/venue/testdata/'
+        [[ $# -lt 2 || $2 =~ ^MODEL_GATEWAY_[A-Z0-9_]+$ ]] || fail 'invalid sentinel variable'
+        ;;
     run) [[ $# -gt 0 ]] || fail 'run requires at least one make target'
          for target do [[ $target =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || fail 'invalid make target'; done ;;
     *) fail 'usage: remote {provision|run TARGET...|negative-control|status|deprovision}' ;;
@@ -221,13 +229,12 @@ expanded=$(ssh -G "${sshopts[@]}" "$host" | awk '$1 == "hostname" {print $2}')
 reject_local "${host##*@}" "$expanded"
 root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 gover=go1.27.4
-if [[ $op == negative-control ]]; then set -- ./internal/venue/testdata/control MODEL_GATEWAY_VENUE_SENTINEL; fi
 # Send only the functions and validated arguments; stdin remains the tree archive.
 program=$(declare -f venue_refuse venue_home venue_file_kind venue_state_clear venue_ports_clear venue_attest venue_require fail fetch install_tools negative_control restore_attestation remote_main)
 program=$'set -euo pipefail\n'"$program"$'\nremote_main "$@"'
 # A single-line encoding survives SSH command relays that split multiline arguments.
 encoded=$(printf '%s' "$program" | base64 | tr -d '\n')
-cmd="env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /bin/bash -c \"\$(printf %s $encoded | base64 -d)\" remote"
+cmd="env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin GITHUB_ACTIONS=\"\${GITHUB_ACTIONS:-}\" /bin/bash -c \"\$(printf %s $encoded | base64 -d)\" remote"
 for arg in "$op" "$(hostname -s)" "$gover" v24.11.1 "$@"; do
     [[ $arg =~ ^[a-zA-Z0-9_./-]+$ ]] || fail 'invalid remote argument'
     cmd+=" $arg"
