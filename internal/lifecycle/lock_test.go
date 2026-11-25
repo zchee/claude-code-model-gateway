@@ -36,9 +36,11 @@ import (
 
 func TestMain(m *testing.M) { venue.Require(); os.Exit(m.Run()) }
 
-type lookup func(int) (lifecycle.ProcessState, string)
+type lookup func(context.Context, int) (lifecycle.ProcessState, string)
 
-func (f lookup) Lookup(pid int) (lifecycle.ProcessState, string) { return f(pid) }
+func (f lookup) Lookup(ctx context.Context, pid int) (lifecycle.ProcessState, string) {
+	return f(ctx, pid)
+}
 
 const (
 	token    = "00000000-0000-4000-8000-000000000000"
@@ -46,7 +48,9 @@ const (
 )
 
 func lockFor(state string) lifecycle.Lock {
-	return lifecycle.Lock{StateDir: state, PID: 41, Host: "host", Processes: lookup(func(int) (lifecycle.ProcessState, string) { return lifecycle.Alive, "birth" }), NewToken: func() string { return token }}
+	return lifecycle.Lock{StateDir: state, PID: 41, Host: "host", Processes: lookup(func(context.Context, int) (lifecycle.ProcessState, string) {
+		return lifecycle.Alive, "Mon Jan  2 15:04:05 2006"
+	}), NewToken: func() string { return token }}
 }
 
 func equal[T any](t *testing.T, want, got T) {
@@ -99,7 +103,7 @@ func TestLiveOwner(t *testing.T) {
 	oldRelease := acquire(t, older)
 	oldRelease()
 	release := acquire(t, lock)
-	const want = `{"token":"00000000-0000-4000-8000-000000000000","pid":41,"startedAt":"birth","host":"host"}`
+	const want = `{"token":"00000000-0000-4000-8000-000000000000","pid":41,"startedAt":"Mon Jan  2 15:04:05 2006","host":"host"}`
 	path := filepath.Join(dir, token)
 	equal(t, want, bytesAt(t, path))
 	older.Timeout = new(time.Duration(0))
@@ -120,11 +124,13 @@ func TestReusedPID(t *testing.T) {
 		dir := filepath.Join(lock.StateDir, "lifecycle.lock")
 		old := lock
 		old.NewToken = func() string { return previous }
-		old.Processes = lookup(func(int) (lifecycle.ProcessState, string) { return lifecycle.Alive, "earlier" })
+		old.Processes = lookup(func(context.Context, int) (lifecycle.ProcessState, string) {
+			return lifecycle.Alive, "Sun Jan  1 23:59:59 2006"
+		})
 		oldRelease := acquire(t, old)
 		release := acquire(t, lock)
 		mustBeAbsent(t, filepath.Join(dir, previous))
-		const want = `{"token":"00000000-0000-4000-8000-000000000000","pid":41,"startedAt":"birth","host":"host"}`
+		const want = `{"token":"00000000-0000-4000-8000-000000000000","pid":41,"startedAt":"Mon Jan  2 15:04:05 2006","host":"host"}`
 		equal(t, want, bytesAt(t, filepath.Join(dir, token)))
 		oldRelease()
 		equal(t, want, bytesAt(t, filepath.Join(dir, token)))
@@ -136,9 +142,11 @@ func TestUnidentifiableOwner(t *testing.T) {
 	tests := map[string]struct{ files map[string]string }{
 		"error: missing birth":    {map[string]string{"unknown": `{"token":"unknown","pid":41,"host":"host"}`}},
 		"error: nonstring birth":  {map[string]string{"unknown": `{"token":"unknown","pid":41,"host":"host","startedAt":10}`}},
+		"error: negative pid":     {map[string]string{"unknown": `{"token":"unknown","pid":-1,"host":"host","startedAt":"Mon Jan  2 15:04:05 2006"}`}},
+		"error: fractional pid":   {map[string]string{"unknown": `{"token":"unknown","pid":42.5,"host":"host","startedAt":"Mon Jan  2 15:04:05 2006"}`}},
 		"error: corrupt":          {map[string]string{"owner": "bad"}},
-		"error: wrong filename":   {map[string]string{"owner": `{"token":"unknown","pid":42,"host":"host","startedAt":"gone"}`}},
-		"error: multiple entries": {map[string]string{"first": `{"token":"first","pid":42,"host":"host","startedAt":"gone"}`, "second": ""}},
+		"error: wrong filename":   {map[string]string{"owner": `{"token":"unknown","pid":42,"host":"host","startedAt":"Sun Jan  1 23:59:59 2006"}`}},
+		"error: multiple entries": {map[string]string{"first": `{"token":"first","pid":42,"host":"host","startedAt":"Sun Jan  1 23:59:59 2006"}`, "second": ""}},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -149,7 +157,13 @@ func TestUnidentifiableOwner(t *testing.T) {
 				noError(t, atomicfile.WriteFile(filepath.Join(dir, file), []byte(data), 0o600))
 			}
 			lock.Timeout = new(time.Duration(0))
+			var inspected []int
+			lock.Processes = lookup(func(_ context.Context, pid int) (lifecycle.ProcessState, string) {
+				inspected = append(inspected, pid)
+				return lifecycle.Alive, "Mon Jan  2 15:04:05 2006"
+			})
 			_, err := lock.Acquire(t.Context())
+			equal(t, []int{lock.PID}, inspected)
 			if err == nil {
 				t.Fatal("acquired an unidentifiable lock")
 			}
@@ -164,10 +178,53 @@ func TestUnidentifiableOwner(t *testing.T) {
 	}
 }
 
+func TestPreserveUncertainProcess(t *testing.T) {
+	tests := map[string]struct {
+		state lifecycle.ProcessState
+		birth string
+	}{
+		"success: inaccessible identity":                   {lifecycle.Unknown, ""},
+		"success: existing process without readable birth": {lifecycle.Alive, ""},
+		"success: matching legacy owner":                   {lifecycle.Alive, "Mon Jan  2 15:04:05 2006"},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			lock := lockFor(t.TempDir())
+			dir := filepath.Join(lock.StateDir, "lifecycle.lock")
+			noError(t, os.Mkdir(dir, 0o700))
+			path := filepath.Join(dir, previous)
+			const data = `{"token":"00000000-0000-4000-8000-000000000001","pid":42,"startedAt":"Mon Jan  2 15:04:05 2006","host":"host"}`
+			noError(t, atomicfile.WriteFile(path, []byte(data), 0o600))
+			lock.Timeout = new(time.Duration(0))
+			var inspected []int
+			ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+			defer cancel()
+			deadline, _ := ctx.Deadline()
+			lock.Processes = lookup(func(ctx context.Context, pid int) (lifecycle.ProcessState, string) {
+				if d, ok := ctx.Deadline(); !ok || d.After(deadline) {
+					t.Fatal("process probe escaped acquisition context deadline")
+				}
+				inspected = append(inspected, pid)
+				if pid == lock.PID {
+					return lifecycle.Alive, "Tue Jan  3 01:02:03 2006"
+				}
+				return tc.state, tc.birth
+			})
+			_, err := lock.Acquire(ctx)
+			if err == nil {
+				t.Fatal("displaced an owner without evidence")
+			}
+			equal(t, busyMessage(dir), err.Error())
+			equal(t, []int{lock.PID, 42}, inspected)
+			equal(t, data, bytesAt(t, path))
+		})
+	}
+}
+
 func TestMissingOwnIdentity(t *testing.T) {
 	state := filepath.Join(t.TempDir(), "state")
 	lock := lockFor(state)
-	lock.Processes = lookup(func(int) (lifecycle.ProcessState, string) { return lifecycle.Unknown, "" })
+	lock.Processes = lookup(func(context.Context, int) (lifecycle.ProcessState, string) { return lifecycle.Unknown, "" })
 	_, err := lock.Acquire(t.Context())
 	if err == nil {
 		t.Fatal("accepted missing own identity")
@@ -177,29 +234,40 @@ func TestMissingOwnIdentity(t *testing.T) {
 }
 
 func TestStale(t *testing.T) {
-	valid := &lifecycle.Owner{PID: 17, Host: "host", StartedAt: new("birth")}
+	valid := &lifecycle.Owner{PID: 17, Host: "host", StartedAt: new("Mon Jan  2 15:04:05 2006")}
 	tests := map[string]struct {
 		owner *lifecycle.Owner
 		state lifecycle.ProcessState
 		birth string
 		want  bool
 	}{
-		"success: same process":               {valid, lifecycle.Alive, "birth", false},
-		"success: recycled pid":               {valid, lifecycle.Alive, "new", true},
+		"success: same process":               {valid, lifecycle.Alive, "Mon Jan  2 15:04:05 2006", false},
+		"success: recycled pid":               {valid, lifecycle.Alive, "Tue Jan  3 01:02:03 2006", true},
 		"success: confirmed absent":           {valid, lifecycle.Absent, "", true},
 		"success: unknown process":            {valid, lifecycle.Unknown, "", false},
 		"success: unreadable birth":           {valid, lifecycle.Alive, "", false},
 		"success: another host":               {&lifecycle.Owner{PID: 17, Host: "foreign"}, lifecycle.Absent, "", false},
-		"success: foreign identifiable owner": {&lifecycle.Owner{PID: 17, Host: "foreign", StartedAt: new("birth")}, lifecycle.Absent, "", false},
+		"success: foreign identifiable owner": {&lifecycle.Owner{PID: 17, Host: "foreign", StartedAt: new("Mon Jan  2 15:04:05 2006")}, lifecycle.Absent, "", false},
 		"success: invalid pid":                {&lifecycle.Owner{PID: 0, Host: "host"}, lifecycle.Absent, "", false},
-		"success: zero pid with birth":        {&lifecycle.Owner{PID: 0, Host: "host", StartedAt: new("birth")}, lifecycle.Absent, "", false},
+		"success: zero pid with birth":        {&lifecycle.Owner{PID: 0, Host: "host", StartedAt: new("Mon Jan  2 15:04:05 2006")}, lifecycle.Absent, "", false},
 		"success: missing owner":              {nil, lifecycle.Absent, "", false},
 		"success: missing birth":              {&lifecycle.Owner{PID: 17, Host: "host"}, lifecycle.Absent, "", false},
-		"success: empty recorded string":      {&lifecycle.Owner{PID: 17, Host: "host", StartedAt: new("")}, lifecycle.Alive, "birth", true},
+		"success: empty recorded string":      {&lifecycle.Owner{PID: 17, Host: "host", StartedAt: new("")}, lifecycle.Alive, "Mon Jan  2 15:04:05 2006", true},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			equal(t, tc.want, lifecycle.Stale(tc.owner, "host", lookup(func(pid int) (lifecycle.ProcessState, string) { equal(t, 17, pid); return tc.state, tc.birth })))
+			calls := 0
+			observed := lifecycle.Stale(t.Context(), tc.owner, "host", lookup(func(_ context.Context, pid int) (lifecycle.ProcessState, string) {
+				calls++
+				equal(t, 17, pid)
+				return tc.state, tc.birth
+			}))
+			equal(t, tc.want, observed)
+			if tc.owner == nil || tc.owner.PID <= 0 || tc.owner.Host != "host" || tc.owner.StartedAt == nil {
+				equal(t, 0, calls)
+			} else {
+				equal(t, 1, calls)
+			}
 		})
 	}
 }
@@ -209,17 +277,17 @@ func TestPreparedDirectory(t *testing.T) {
 	dir := filepath.Join(lock.StateDir, "lifecycle.lock")
 	noError(t, os.Mkdir(dir, 0o700))
 	old := filepath.Join(dir, "old")
-	noError(t, atomicfile.WriteFile(old, []byte(`{"token":"old","pid":42,"host":"host","startedAt":"old"}`), 0o600))
+	noError(t, atomicfile.WriteFile(old, []byte(`{"token":"old","pid":42,"host":"host","startedAt":"Sun Jan  1 23:59:59 2006"}`), 0o600))
 	var prepared fs.FileInfo
 	var events []string
-	lock.Processes = lookup(func(pid int) (lifecycle.ProcessState, string) {
+	lock.Processes = lookup(func(_ context.Context, pid int) (lifecycle.ProcessState, string) {
 		switch pid {
 		case 41:
 			events = append(events, "self")
 			paths, err := filepath.Glob(dir + ".candidate-*")
 			noError(t, err)
 			equal(t, 0, len(paths))
-			return lifecycle.Alive, "birth"
+			return lifecycle.Alive, "Mon Jan  2 15:04:05 2006"
 		case 42:
 			events = append(events, "contended")
 			paths, err := filepath.Glob(dir + ".candidate-*")
@@ -229,7 +297,7 @@ func TestPreparedDirectory(t *testing.T) {
 			noError(t, err)
 			equal(t, fs.FileMode(0o700), prepared.Mode().Perm())
 			path := filepath.Join(paths[0], token)
-			equal(t, `{"token":"00000000-0000-4000-8000-000000000000","pid":41,"startedAt":"birth","host":"host"}`, bytesAt(t, path))
+			equal(t, `{"token":"00000000-0000-4000-8000-000000000000","pid":41,"startedAt":"Mon Jan  2 15:04:05 2006","host":"host"}`, bytesAt(t, path))
 			info, err := os.Stat(path)
 			noError(t, err)
 			equal(t, fs.FileMode(0o600), info.Mode().Perm())
@@ -305,7 +373,7 @@ func TestReentrantFailure(t *testing.T) {
 	err := lock.With(t.Context(), func(ctx context.Context) error {
 		return lock.With(ctx, func(context.Context) error {
 			nested = true
-			equal(t, `{"token":"00000000-0000-4000-8000-000000000000","pid":41,"startedAt":"birth","host":"host"}`, bytesAt(t, filepath.Join(dir, token)))
+			equal(t, `{"token":"00000000-0000-4000-8000-000000000000","pid":41,"startedAt":"Mon Jan  2 15:04:05 2006","host":"host"}`, bytesAt(t, filepath.Join(dir, token)))
 			return failure
 		})
 	})

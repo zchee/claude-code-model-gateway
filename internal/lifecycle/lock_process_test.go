@@ -28,35 +28,83 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
-	"github.com/shirou/gopsutil/v4/process"
-
 	"github.com/zchee/claude-code-model-gateway/internal/atomicfile"
 	"github.com/zchee/claude-code-model-gateway/internal/gatewaytest"
 	"github.com/zchee/claude-code-model-gateway/internal/lifecycle"
+	"github.com/zchee/claude-code-model-gateway/internal/procinfo"
 )
 
 // Both supported venues provide POSIX signal zero and SIGKILL wait status.
 func nativeIdentity(ctx context.Context, pid int) (lifecycle.ProcessState, string) {
-	if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
-		return lifecycle.Absent, ""
-	} else if err != nil {
+	probe := procinfo.New(nil)
+	alive, err := probe.Alive(ctx, pid)
+	if err != nil {
 		return lifecycle.Unknown, ""
 	}
-	p, err := process.NewProcessWithContext(ctx, int32(pid))
+	if !alive {
+		return lifecycle.Absent, ""
+	}
+	id, err := probe.Identity(ctx, pid)
 	if err != nil {
 		return lifecycle.Alive, ""
 	}
-	born, err := p.CreateTimeWithContext(ctx)
-	if err != nil || born == 0 {
-		return lifecycle.Alive, ""
+	return lifecycle.Alive, procinfo.LegacyStart(id.Birth)
+}
+
+func TestLegacyProcessInterop(t *testing.T) {
+	lock := lockFor(t.TempDir())
+	lock.PID = os.Getpid()
+	host, err := os.Hostname()
+	noError(t, err)
+	lock.Host = host
+	lock.Processes = lookup(nativeIdentity)
+	lock.Timeout = new(time.Duration(0))
+	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Second)
+	defer cancel()
+	raw, err := exec.CommandContext(ctx, "/bin/ps", "-ww", "-p", strconv.Itoa(lock.PID), "-o", "lstart=").Output()
+	noError(t, err)
+	birth := strings.TrimSpace(string(raw))
+	if birth == "" {
+		t.Fatal("ps returned no birth")
 	}
-	return lifecycle.Alive, strconv.FormatInt(born, 10)
+	state, gotBirth := nativeIdentity(ctx, lock.PID)
+	equal(t, lifecycle.Alive, state)
+	equal(t, birth, gotBirth)
+	// The legacy encoder inserts these fields in this order; its birth text is taken from ps, not from our formatter.
+	ownerBytes := func(name string) []byte {
+		data, err := json.Marshal(struct {
+			Token     string `json:"token"`
+			PID       int    `json:"pid"`
+			StartedAt string `json:"startedAt"`
+			Host      string `json:"host"`
+		}{name, lock.PID, birth, host})
+		noError(t, err)
+		return data
+	}
+	dir := filepath.Join(lock.StateDir, "lifecycle.lock")
+	noError(t, os.Mkdir(dir, 0o700))
+	path := filepath.Join(dir, previous)
+	old := ownerBytes(previous)
+	noError(t, atomicfile.WriteFile(path, old, 0o600))
+	_, err = lock.Acquire(ctx)
+	if err == nil {
+		t.Fatal("displaced a live legacy owner")
+	}
+	equal(t, busyMessage(dir), err.Error())
+	equal(t, string(old), bytesAt(t, path))
+	noError(t, os.Remove(path))
+	noError(t, os.Remove(dir))
+	release := acquire(t, lock)
+	defer release()
+	equal(t, string(ownerBytes(token)), bytesAt(t, filepath.Join(dir, token)))
 }
 
 func takeByte() (byte, error) { var b [1]byte; _, err := io.ReadFull(os.Stdin, b[:]); return b[0], err }
@@ -75,29 +123,60 @@ func runLockChild(t testing.TB, args []string) {
 	if len(args) != 0 {
 		t.Fatal("unexpected helper arguments")
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
-	defer cancel()
-	watchdog := time.AfterFunc(4*time.Second, func() { os.Exit(2) })
-	defer watchdog.Stop()
 	status := os.Stdout
+	if _, err := fmt.Fprintln(status, "ready"); err != nil {
+		t.Fatal(err)
+	}
 	role, err := takeByte()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if role != 'H' && role != 'C' {
+	// Both helpers have finished the venue checks before the parent assigns roles.
+	ctx, cancel := context.WithTimeout(t.Context(), 7*time.Second)
+	defer cancel()
+	const phaseLimit = 7 * time.Second
+	watchdog := time.AfterFunc(phaseLimit, func() { os.Exit(2) })
+	defer watchdog.Stop()
+	state := filepath.Join(os.Getenv("HOME"), ".claude", "model-gateway")
+	switch role {
+	case 'A', 'B':
+		files := filesFor(state)
+		for i := range 32 {
+			files.Record("writer-"+string(role), map[string]any{"pid": i})
+		}
+		return
+	case 'M':
+		mask := syscall.Umask(0o027)
+		defer syscall.Umask(mask)
+		files := filesFor(state)
+		if err := files.WriteStartupFailure(os.Getpid(), nil, "failure"); err != nil {
+			t.Fatal(err)
+		}
+		files.Record("mode", nil)
+		return
+	case 'H', 'C':
+	default:
 		t.Fatal("unknown fixture role")
 	}
-	state := filepath.Join(os.Getenv("HOME"), ".claude", "model-gateway")
 	host, err := os.Hostname()
 	if err != nil {
 		t.Fatal(err)
 	}
-	lock := lifecycle.Lock{StateDir: state, Host: host, PID: os.Getpid(), Timeout: new(2 * time.Second), Processes: lookup(func(pid int) (lifecycle.ProcessState, string) { return nativeIdentity(ctx, pid) })}
+	lock := lifecycle.Lock{StateDir: state, Host: host, PID: os.Getpid(), Timeout: new(6 * time.Second), Processes: lookup(func(ctx context.Context, pid int) (lifecycle.ProcessState, string) {
+		state, birth := nativeIdentity(ctx, pid)
+		if role == 'C' && pid != os.Getpid() {
+			if _, err := fmt.Fprintf(status, "observed %d %d %s\n", pid, state, birth); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return state, birth
+	})}
 	if role == 'C' {
-		first := true
+		attempts := 0
 		lock.Wait = func(ctx context.Context, d time.Duration) error {
-			if first {
-				first = false
+			if attempts < 2 {
+				watchdog.Reset(phaseLimit)
+				attempts++
 				if _, err := fmt.Fprintln(status, "busy"); err != nil {
 					return err
 				}
@@ -140,6 +219,7 @@ func runLockChild(t testing.TB, args []string) {
 		if err := appendEntry(state, "enter"); err != nil {
 			return err
 		}
+		watchdog.Reset(phaseLimit)
 		if _, err := fmt.Fprintf(status, "entered %d\n", os.Getpid()); err != nil {
 			return err
 		}
@@ -170,7 +250,7 @@ type child struct {
 	output bytes.Buffer
 }
 
-func startChild(t *testing.T, env gatewaytest.Environment, role string) *child {
+func startChild(t *testing.T, env gatewaytest.Environment) *child {
 	t.Helper()
 	cmd, err := env.HelperCommand(t, "lifecycle-lock")
 	noError(t, err)
@@ -180,14 +260,20 @@ func startChild(t *testing.T, env gatewaytest.Environment, role string) *child {
 	c := &child{cmd: cmd, input: send, status: make(chan string, 2), done: make(chan struct{})}
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = in, out, out
 	runDone := make(chan struct{})
-	go func() { c.err = env.RunFixture(cmd); _ = out.Close(); _ = in.Close(); close(runDone) }()
+	// Allow the guard's ten-second account lookup, the protocol, and teardown.
+	limit := 18 * time.Second
+	if runtime.GOOS == "darwin" {
+		// Darwin also runs a separate ten-second lsof listener check.
+		limit += 10 * time.Second
+	}
+	go func() { c.err = env.RunFixtureWithin(cmd, limit); _ = out.Close(); _ = in.Close(); close(runDone) }()
 	go func() {
 		defer close(c.done)
 		scanner := bufio.NewScanner(recv)
 		for scanner.Scan() {
 			s := scanner.Text()
 			fmt.Fprintln(&c.output, s)
-			if s == "busy" || strings.HasPrefix(s, "entered ") {
+			if s == "ready" || s == "busy" || strings.HasPrefix(s, "observed ") || strings.HasPrefix(s, "entered ") {
 				select {
 				case c.status <- s:
 				default:
@@ -201,7 +287,6 @@ func startChild(t *testing.T, env gatewaytest.Environment, role string) *child {
 		close(c.status)
 	}()
 	t.Cleanup(func() { _ = send.Close(); <-c.done })
-	c.send(t, role)
 	return c
 }
 
@@ -236,18 +321,102 @@ func entered(t *testing.T, c *child) int {
 	return pid
 }
 
+func TestConcurrentJournalAppend(t *testing.T) {
+	home := t.TempDir()
+	env := gatewaytest.NewEnv(home, nil, nil, nil)
+	dir := filepath.Join(home, ".claude", "model-gateway", "logs")
+	noError(t, os.MkdirAll(dir, 0o700))
+	path := filepath.Join(dir, "lifecycle.jsonl")
+	const seed = `{"event":"seed"}`
+	noError(t, atomicfile.WriteFile(path, []byte(seed+"\n"), 0o600))
+	original, err := os.Open(path)
+	noError(t, err)
+	t.Cleanup(func() {
+		if err := original.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	a, b := startChild(t, env), startChild(t, env)
+	equal(t, "ready", a.notice(t))
+	equal(t, "ready", b.notice(t))
+	a.send(t, "A")
+	b.send(t, "B")
+	<-a.done
+	<-b.done
+	noError(t, a.err)
+	noError(t, b.err)
+	data, err := io.ReadAll(original)
+	noError(t, err)
+	equal(t, string(data), bytesAt(t, path))
+	text, terminated := strings.CutSuffix(string(data), "\n")
+	equal(t, true, terminated)
+	got := strings.Split(text, "\n")
+	equal(t, 65, len(got))
+	equal(t, seed, got[0])
+	want := make([]string, 0, 64)
+	for _, writer := range []string{"A", "B"} {
+		for i := range 32 {
+			want = append(want, fmt.Sprintf(`{"at":"1970-01-01T00:00:00.123Z","event":"writer-%s","pid":%d}`, writer, i))
+		}
+	}
+	slices.Sort(want)
+	slices.Sort(got[1:])
+	equal(t, want, got[1:])
+}
+
+func TestStateCreationModes(t *testing.T) {
+	home := t.TempDir()
+	env := gatewaytest.NewEnv(home, nil, nil, nil)
+	state := filepath.Join(home, ".claude", "model-gateway")
+	noError(t, os.MkdirAll(state, 0o700))
+	writer := startChild(t, env)
+	equal(t, "ready", writer.notice(t))
+	writer.send(t, "M")
+	<-writer.done
+	if writer.err != nil {
+		t.Fatalf("mode writer: %v\n%s", writer.err, writer.output.String())
+	}
+	for _, path := range []string{"shim-supervisor-failure.txt", "logs/lifecycle.jsonl"} {
+		info, err := os.Stat(filepath.Join(state, path))
+		noError(t, err)
+		equal(t, fs.FileMode(0o640), info.Mode().Perm())
+	}
+}
+
 func TestProcessContention(t *testing.T) {
 	tests := map[string]struct{ killed bool }{"success: ordered release": {}, "success: killed holder": {true}}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			home := t.TempDir()
 			env := gatewaytest.NewEnv(home, nil, nil, nil)
-			holder := startChild(t, env, "H")
+			holder, contender := startChild(t, env), startChild(t, env)
+			equal(t, "ready", holder.notice(t))
+			equal(t, "ready", contender.notice(t))
+			holder.send(t, "H")
 			first := entered(t, holder)
-			contender := startChild(t, env, "C")
-			equal(t, "busy", contender.notice(t))
 			state := filepath.Join(home, ".claude", "model-gateway")
 			dir := filepath.Join(state, "lifecycle.lock")
+			entries, err := os.ReadDir(dir)
+			noError(t, err)
+			equal(t, 1, len(entries))
+			path := filepath.Join(dir, entries[0].Name())
+			data := bytesAt(t, path)
+			var owner lifecycle.Owner
+			noError(t, json.Unmarshal([]byte(data), &owner))
+			if owner.StartedAt == nil {
+				t.Fatal("missing holder birth")
+			}
+			equal(t, first, owner.PID)
+			contender.send(t, "C")
+			for attempt := range 2 {
+				if attempt != 0 {
+					contender.send(t, "R")
+				}
+				equal(t, fmt.Sprintf("observed %d %d %s", first, lifecycle.Alive, *owner.StartedAt), contender.notice(t))
+				equal(t, "busy", contender.notice(t))
+				equal(t, data, bytesAt(t, path))
+				equal(t, fmt.Sprintf("enter %d\n", first), bytesAt(t, filepath.Join(state, "ledger")))
+			}
 			if tc.killed {
 				// Both the sandbox ledger and pipe must identify our own exec.Cmd child.
 				equal(t, fmt.Sprintf("enter %d\n", first), bytesAt(t, filepath.Join(state, "ledger")))
@@ -268,6 +437,9 @@ func TestProcessContention(t *testing.T) {
 				noError(t, holder.err)
 			}
 			contender.send(t, "R")
+			if tc.killed {
+				equal(t, fmt.Sprintf("observed %d %d ", first, lifecycle.Absent), contender.notice(t))
+			}
 			second := entered(t, contender)
 			if first == second {
 				t.Fatal("both entrants have the same pid")

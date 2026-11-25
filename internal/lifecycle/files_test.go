@@ -77,16 +77,33 @@ func TestStartupFailure(t *testing.T) {
 	}
 }
 
+func TestUnreadableStartupFailure(t *testing.T) {
+	tests := map[string]struct {
+		create bool
+		data   string
+	}{"error: absent file": {}, "error: malformed JSON": {true, `{"supervisorPid":41,"message":"partial"`}}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			f := filesFor(t.TempDir())
+			if tc.create {
+				noError(t, atomicfile.WriteFile(filepath.Join(f.StateDir, "shim-supervisor-failure.txt"), []byte(tc.data), 0o600))
+			}
+			_, ok := f.StartupFailure(41, "")
+			equal(t, false, ok)
+		})
+	}
+}
+
 func TestLifecycleLine(t *testing.T) {
 	tests := map[string]struct {
 		fields map[string]any
 		line   string
 	}{
 		"success: absent fields": {nil, `{"at":"1970-01-01T00:00:00.123Z","event":"worker-exit"}`},
-		"success: allowlisted fields only": {map[string]any{"pid": 41, "component": "supervisor", "startedAt": "birth", "outcome": "<lost>", "errorType": "EOF", "signal": nil, "exitCode": 0, "child": struct {
+		"success: allowlisted fields only": {map[string]any{"pid": 41, "component": "supervisor", "startedAt": "Mon Jan  2 15:04:05 2006", "outcome": "<lost>", "errorType": "EOF", "signal": nil, "exitCode": 0, "child": struct {
 			Component string `json:"component"`
 			PID       int    `json:"pid"`
-		}{"worker", 10}, "supervisorPid": 99, "extra": "omit"}, `{"at":"1970-01-01T00:00:00.123Z","event":"worker-exit","component":"supervisor","pid":41,"startedAt":"birth","outcome":"<lost>","errorType":"EOF","signal":null,"exitCode":0,"child":{"component":"worker","pid":10}}`},
+		}{"worker", 10}, "supervisorPid": 99, "extra": "omit"}, `{"at":"1970-01-01T00:00:00.123Z","event":"worker-exit","component":"supervisor","pid":41,"startedAt":"Mon Jan  2 15:04:05 2006","outcome":"<lost>","errorType":"EOF","signal":null,"exitCode":0,"child":{"component":"worker","pid":10}}`},
 		"success: optional nulls": {map[string]any{"startedAt": nil, "outcome": nil, "errorType": nil, "signal": "SIGTERM", "exitCode": nil, "child": nil}, `{"at":"1970-01-01T00:00:00.123Z","event":"worker-exit","signal":"SIGTERM","exitCode":null}`},
 	}
 	for name, tc := range tests {
@@ -96,6 +113,20 @@ func TestLifecycleLine(t *testing.T) {
 			equal(t, tc.line+"\n", bytesAt(t, filepath.Join(f.StateDir, "logs", "lifecycle.jsonl")))
 		})
 	}
+}
+
+func TestSingleRecordAppend(t *testing.T) {
+	f := filesFor(t.TempDir())
+	calls := 0
+	f.AppendFile = func(path string, data []byte, mode fs.FileMode) error {
+		calls++
+		equal(t, filepath.Join(f.StateDir, "logs", "lifecycle.jsonl"), path)
+		equal(t, fs.FileMode(0o666), mode)
+		equal(t, `{"at":"1970-01-01T00:00:00.123Z","event":"tick"}`+"\n", string(data))
+		return fs.ErrPermission
+	}
+	f.Record("tick", nil)
+	equal(t, 1, calls)
 }
 
 func TestLifecycleBound(t *testing.T) {

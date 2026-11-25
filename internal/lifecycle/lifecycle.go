@@ -13,12 +13,16 @@
 // limitations under the License.
 
 // Package lifecycle coordinates gateway operations and records lifecycle evidence.
+// The caller supplies one explicit StateDir for both Lock and Files. Normally it is
+// the fixed gateway home (no environment override); a shadow instance's root is
+// the caller's decision.
 package lifecycle
 
 import (
 	"context"
 	"encoding/json/jsontext"
 	"errors"
+	"io/fs"
 	"time"
 )
 
@@ -26,14 +30,18 @@ import (
 type ProcessState uint8
 
 const (
+	// Unknown means the lookup failed and cannot authorize removal.
 	Unknown ProcessState = iota
+	// Alive includes a process that exists but cannot be signaled due to permissions.
 	Alive
+	// Absent means the lookup confirmed that no process has this PID.
 	Absent
 )
 
-// ProcessSource reports liveness and a birth identity, empty when unavailable.
+// ProcessSource reports liveness and the legacy process birth text (POSIX ps lstart in
+// local time, including space-padded day), empty when unreadable. Lookup honors ctx.
 type ProcessSource interface {
-	Lookup(pid int) (ProcessState, string)
+	Lookup(ctx context.Context, pid int) (ProcessState, string)
 }
 
 // Owner is the legacy directory owner's record. A nil birth identity was not a string.
@@ -45,7 +53,9 @@ type Owner struct {
 }
 
 // Stale reports whether a local owner's process is absent or its PID was reused.
-func Stale(owner *Owner, host string, processes ProcessSource) bool { return false }
+func Stale(ctx context.Context, owner *Owner, host string, processes ProcessSource) bool {
+	return false
+}
 
 // Lock describes the lifecycle.lock under StateDir. A nil Timeout uses fifteen seconds.
 // Nil Now, Wait and NewToken select wall time, a cancellable timer and a random UUID.
@@ -74,6 +84,8 @@ func (l Lock) With(ctx context.Context, operation func(context.Context) error) e
 type Files struct {
 	StateDir string
 	Now      func() time.Time
+	// AppendFile appends one complete journal record. Nil uses atomicfile.AppendFile.
+	AppendFile func(path string, data []byte, mode fs.FileMode) error
 }
 
 // Stopped reports whether the intentional stop marker exists, without consuming it.
@@ -85,7 +97,9 @@ func (f Files) Stop() error { return errors.New("stop marker not implemented") }
 // Resume removes the marker if present.
 func (f Files) Resume() error { return errors.New("stop marker not implemented") }
 
-// Record appends an allowlisted lifecycle event on a best-effort basis.
+// Record appends an allowlisted lifecycle event on a best-effort basis. Below the
+// trim threshold it passes the entire record, including its newline, to
+// atomicfile.AppendFile(path, data, 0o666) without replacing the journal.
 func (f Files) Record(event string, fields map[string]any) {}
 
 // Records returns parseable lifecycle records in file order.
