@@ -37,6 +37,7 @@ func TestParityCheck(t *testing.T) {
 		alphaCase       = `test/source.test.js:1:1 "Alpha"`
 		betaCase        = `test/source.test.js:1:1 "Beta"`
 		launchCase      = `test/source.test.js:2:1 "Launch"`
+		launchPair      = launchCase + " -> test/source.test.js:31:2"
 		replacementPair = `test/source.test.js:3:1 "Replacement" -> test/source.test.js:35:2`
 		alphaPair       = alphaCase + " -> test/helper.js:20:3"
 		betaPair        = betaCase + " -> test/helper.js:20:3"
@@ -45,6 +46,11 @@ func TestParityCheck(t *testing.T) {
 		fixtureCommit   = "0123456789012345678901234567890123456789"
 	)
 	type change struct{ file, old, new string }
+	deferLaunch := []change{
+		{siteFile, "Launch\ttest/source.test.js\t31\t2\t\t\tphase-2", "Launch\ttest/source.test.js\t31\t2\t\t\tphase-3"},
+		{deferralFile, "", "test/source.test.js\t2\t1\tLaunch\ttest/source.test.js\t31\t2\tphase-3\tApproved deferral.\n"},
+	}
+	reviewLaunch := change{siteFile, "Launch\ttest/source.test.js\t31\t2\t\t\tphase-3", "Launch\ttest/source.test.js\t31\t2\tinternal/gate.TestGate/shared\tReviewed unconditional launch check.\tphase-3"}
 	mapping := []string{"mapping", "phase-2"}
 	results := []string{"results", "phase-2", "--go-json", "go.json", "--census", "conformance.tsv", "--launches", "launches.tsv"}
 	phase4 := []string{"results", "phase-4", "--go-json", "go.json"}
@@ -119,7 +125,7 @@ func TestParityCheck(t *testing.T) {
 			want:    []string{siteFile + `: header: missing column "target"`},
 		},
 		"error: malformed matrix row is not silently ignored": {
-			changes: []change{{matrixFile, " |\n\n## Phase scope ledger", " |\nforgotten | gate | assertion | no-source-test | phase-4 | internal/gate | pinned case |\n\n## Phase scope ledger"}},
+			changes: []change{{matrixFile, " |\n\n## Phase scope ledger", " |\nForgotten | gate | assertion | no-source-test | phase-4 | internal/gate | pinned case |\n\n## Phase scope ledger"}},
 			want:    []string{matrixFile + ": 10: matrix row must begin with a pipe"},
 		},
 		"error: an unreferenced difference row after a gap needs a valid replacement": {
@@ -133,11 +139,42 @@ func TestParityCheck(t *testing.T) {
 			changes: []change{{planFile, "<br>`internal/gate.TestPackagedReplacement` (phase-5)", "<br>`internal/gate.TestPackagedReplacement` (phase-5)<br>unreadable"}},
 			want:    []string{planFile + `: new-form: invalid replacement test entry "unreadable"`},
 		},
-		"error: malformed row counted independently by its slug cell": {
+		"error: phase ledger bullet does not hide a malformed id": {
+			changes: []change{{matrixFile, "- gate: `replacement`", "- gate: `replacement`, `Extra`"}},
+			want:    []string{matrixFile + ": phase-4: invalid ledger row id \"`Extra`\""},
+		},
+		"error: malformed difference row after a gap lacks a leading pipe and has an uppercase slug": {
+			args:    final,
+			changes: []change{{planFile, "", "\n— | Extra | Old | New | Why | Proof | prose | `internal/gate.TestExtra` (phase-5) |\n"}},
+			want: []string{
+				planFile + ": 9: invalid difference table row",
+				planFile + ": difference table: parsed 1 difference rows, found 2 table-shaped rows",
+			},
+		},
+		"error: difference row has no trailing pipe": {
+			changes: []change{{planFile, "", "\n| — | extra | Old | New | Why | Proof | prose | `internal/gate.TestExtra` (phase-5)\n"}},
+			want: []string{
+				planFile + ": 9: invalid difference table row",
+				planFile + ": difference table: parsed 1 difference rows, found 2 table-shaped rows",
+			},
+		},
+		"error: difference row has exactly one cell too few": {
+			changes: []change{{planFile, "", "\n| — | extra | Old | New | Why | Proof | `internal/gate.TestExtra` (phase-5) |\n"}},
+			want: []string{
+				planFile + ": 9: invalid difference table row",
+				planFile + ": difference table: parsed 1 difference rows, found 2 table-shaped rows",
+			},
+		},
+		"error: valid lowercase difference row after a prose gap still requires evidence": {
+			args:    final,
+			changes: []change{{planFile, "", "\nA prose interruption.\n\n| — | extra | Old | New | Why | Proof | prose | `internal/gate.TestExtra` (phase-5) |\n"}},
+			want:    []string{planFile + ": extra: no exact Go test run for example.org/port/internal/gate.TestExtra in --go-json evidence"},
+		},
+		"error: malformed row counted independently by its shape": {
 			changes: []change{{planFile, "", "\n| — | omitted | Old | New |\n"}},
 			want: []string{
 				planFile + ": 9: invalid difference table row",
-				planFile + ": difference table: parsed 1 difference rows, found 2 slug cells",
+				planFile + ": difference table: parsed 1 difference rows, found 2 table-shaped rows",
 			},
 		},
 		"error: duplicate census identity with matching digest": {
@@ -196,7 +233,7 @@ func TestParityCheck(t *testing.T) {
 		},
 		"error: duplicate plan slug": {
 			changes: []change{{planFile, "", "| — | new-form | Old | New | Reason | Evidence | Human summary. | `internal/gate.TestReplacement` (phase-4) |\n"}},
-			want:    []string{planFile + ": new-form: duplicate difference slug", planFile + ": difference table: parsed 1 difference rows, found 2 slug cells"},
+			want:    []string{planFile + ": new-form: duplicate difference slug", planFile + ": difference table: parsed 1 difference rows, found 2 table-shaped rows"},
 		},
 		"error: missing classification expansion": {
 			changes: []change{{classFile, "Alpha\t1\t1\t", ""}, {ownersFile, "gate | gate | 1 | 0", "gate | gate | 0 | 0"}},
@@ -225,7 +262,7 @@ func TestParityCheck(t *testing.T) {
 			want:    []string{siteFile + ": " + betaPair + ": missing expected pair (via helper:check)"},
 		},
 		"error: missing embedded assertion mapping": {
-			changes: []change{{siteFile, "Beta\ttest/source.test.js\t25", ""}},
+			changes: []change{{siteFile, "Beta\ttest/source.test.js\t25", ""}, {deferralFile, "Beta\ttest/source.test.js\t25", ""}},
 			want:    []string{siteFile + ": " + embedded + ": missing expected pair (via embedded:node-e)"},
 		},
 		"error: mapping pair absent from generated evidence": {
@@ -291,11 +328,8 @@ func TestParityCheck(t *testing.T) {
 			want: []string{pairFile + `: test/source.test.js:3:1 "Replacement": due case has no assertion pair`},
 		},
 		"error: reason outside closed list": {
-			changes: []change{{classFile, "unsupported:dormant-code", "unsupported:unreviewed"}},
-			want: []string{
-				approvalFile + `: test/source.test.js:4:1 "Dormant": approved class "unsupported:dormant-code" does not match classification "unsupported:unreviewed"`,
-				classFile + `: test/source.test.js:4:1 "Dormant": invalid class or reason "unsupported:unreviewed"`,
-			},
+			changes: []change{{classFile, "unsupported:dormant-code", "unsupported:unreviewed"}, {approvalFile, "unsupported:dormant-code", "unsupported:unreviewed"}},
+			want:    []string{classFile + `: test/source.test.js:4:1 "Dormant": invalid class or reason "unsupported:unreviewed"`},
 		},
 		"error: unknown whole-case difference": {
 			changes: []change{{classFile, "difference:new-form", "difference:unknown"}},
@@ -379,9 +413,38 @@ func TestParityCheck(t *testing.T) {
 			changes: []change{{"go.json", "TestGate/child", ""}},
 			want:    []string{siteFile + ": " + embedded + ": no exact Go test run for example.org/port/internal/gate.TestGate/child in --go-json evidence"},
 		},
-		"error: later due date has no review": {
-			changes: []change{{siteFile, "Approved for the later gate.\tphase-3", "\tphase-3"}},
-			want:    []string{siteFile + ": " + embedded + ": later due phase phase-3 needs reviewer approval"},
+		"error: changing the due phase alone does not defer reviewed Go pairs": {
+			changes: []change{{siteFile, "Reviewed shared check.\tphase-2", "Reviewed shared check.\tphase-3"}},
+			want: []string{
+				deferralFile + ": " + alphaPair + ": missing deferral approval for phase-3",
+				deferralFile + ": " + betaPair + ": missing deferral approval for phase-3",
+			},
+		},
+		"error: deferral approval does not authorize a different phase": {
+			changes: []change{{deferralFile, "\tphase-3\t", "\tphase-4\t"}},
+			want:    []string{deferralFile + ": " + embedded + ": approved due phase phase-4 does not match mapping due phase phase-3"},
+		},
+		"error: deferral approval for a nondeferred pair is orphaned": {
+			changes: []change{{deferralFile, "", "test/source.test.js\t1\t1\tAlpha\ttest/helper.js\t20\t3\tphase-3\tUnmatched approval.\n"}},
+			want:    []string{deferralFile + ": " + alphaPair + ": approval has no deferred mapping row"},
+		},
+		"error: duplicate deferral approval": {
+			changes: []change{{deferralFile, "", "test/source.test.js\t1\t1\tBeta\ttest/source.test.js\t25\t2\tphase-3\tDuplicate approval.\n"}},
+			want:    []string{deferralFile + ": " + embedded + ": duplicate deferral approval"},
+		},
+		"error: blank deferral approval text": {
+			changes: []change{{deferralFile, "Inventory reviewer: the child fixture needs the later gate.\n", "\n"}},
+			want:    []string{deferralFile + ": " + embedded + ": missing deferral approval text"},
+		},
+		"error: deferred Go pair has no target at its mapping gate": {
+			args:    []string{"mapping", "phase-3"},
+			changes: []change{{siteFile, "internal/gate.TestGate/child\tReviewer verified the child check.", "\tApproved mapping."}},
+			want:    []string{siteFile + ": " + embedded + `: missing or invalid Go test target ""`},
+		},
+		"error: deferral approval cannot substitute for mapping review": {
+			args:    []string{"mapping", "phase-3"},
+			changes: []change{{siteFile, "Reviewer verified the child check.\tphase-3", "\tphase-3"}},
+			want:    []string{siteFile + ": " + embedded + `: Go target "internal/gate.TestGate/child" needs reviewer approval`},
 		},
 		"error: Go pair without review even when no other site shares its target": {
 			args:    []string{"mapping", "phase-2", "internal/gate"},
@@ -409,8 +472,25 @@ func TestParityCheck(t *testing.T) {
 		},
 		"error: deferred conformance pair does not waive its case gate": {
 			args:    []string{"results", "phase-2", "--go-json", "go.json", "--launches", "launches.tsv"},
-			changes: []change{{siteFile, "Launch\ttest/source.test.js\t31\t2\t\t\tphase-2", "Launch\ttest/source.test.js\t31\t2\t\tApproved later pair.\tphase-3"}},
+			changes: deferLaunch,
 			want:    []string{classFile + ": " + launchCase + ": conformance case requires --census evidence"},
+		},
+		"success: structure can accept an approved deferral before its target is mapped": {
+			changes: deferLaunch,
+		},
+		"error: approved conformance deferral still needs a target at the later results gate": {
+			args:    []string{"results", "phase-3", "--go-json", "go.json"},
+			changes: deferLaunch,
+			want:    []string{siteFile + ": " + launchPair + `: missing or invalid Go test target ""`},
+		},
+		"success: reviewed deferred conformance target passes at the later gate": {
+			args:    []string{"results", "phase-3", "--go-json", "go.json"},
+			changes: append(slices.Clone(deferLaunch), reviewLaunch),
+		},
+		"error: deferred conformance target needs evidence in its later phase": {
+			args:    []string{"results", "phase-3", "--go-json", "go.json"},
+			changes: append(slices.Clone(deferLaunch), reviewLaunch, change{"go.json", sharedEvent, ""}),
+			want:    []string{siteFile + ": " + launchPair + ": no exact Go test run for example.org/port/internal/gate.TestGate/shared in --go-json evidence"},
 		},
 		"error: conformance launch evidence input omitted": {
 			args: []string{"results", "phase-2", "--go-json", "go.json", "--census", "conformance.tsv"},

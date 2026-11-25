@@ -24,17 +24,16 @@ import (
 )
 
 var (
-	tsvEscapes         = strings.NewReplacer(`\`, `\\`, "\t", `\t`, "\r", `\r`, "\n", `\n`)
-	slugPattern        = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
-	tableSeparator     = regexp.MustCompile(`^\|(?:\s*:?-{3,}:?\s*\|)+$`)
-	differenceSlugCell = regexp.MustCompile(`(?m)^\s*\|?[^|\r\n]+\|[ \t]*[a-z0-9]+(?:-[a-z0-9]+)*[ \t]*\|`)
-	replacementCell    = regexp.MustCompile("^`([^`]+)` \\((phase-[0-5])\\)$")
-	differenceHeading  = regexp.MustCompile(`(?m)^### [^\n]+$`)
-	citation           = regexp.MustCompile("^`([^`]+)` `(.+)`$")
-	ledgerHeading      = regexp.MustCompile(`^### (phase-[0-5]) — ([0-9]+) rows?$`)
-	ledgerTotal        = regexp.MustCompile(`^\*\*Total: ([0-9]+) rows?\.\*\*$`)
-	markerPrefix       = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]*[=:]`)
-	sourcePosition     = regexp.MustCompile(`^[^\s:]+:[1-9][0-9]*(?::[1-9][0-9]*)?$`)
+	tsvEscapes        = strings.NewReplacer(`\`, `\\`, "\t", `\t`, "\r", `\r`, "\n", `\n`)
+	slugPattern       = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
+	tableSeparator    = regexp.MustCompile(`^\|(?:\s*:?-{3,}:?\s*\|)+$`)
+	replacementCell   = regexp.MustCompile("^`([^`]+)` \\((phase-[0-5])\\)$")
+	differenceHeading = regexp.MustCompile(`(?m)^#{1,3} [^\n]+$`)
+	citation          = regexp.MustCompile("^`([^`]+)` `(.+)`$")
+	ledgerHeading     = regexp.MustCompile(`^### (phase-[0-5]) — ([0-9]+) rows?$`)
+	ledgerTotal       = regexp.MustCompile(`^\*\*Total: ([0-9]+) rows?\.\*\*$`)
+	markerPrefix      = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]*[=:]`)
+	sourcePosition    = regexp.MustCompile(`^[^\s:]+:[1-9][0-9]*(?::[1-9][0-9]*)?$`)
 )
 
 type matrixRow struct {
@@ -42,28 +41,32 @@ type matrixRow struct {
 	noSourceTest                     bool
 }
 
-// tableCells parses the shared Markdown table subset, where a literal pipe
-// in a cell is escaped even inside a code span.
+// tableFields splits on unescaped pipes, retaining empty boundary fields.
+func tableFields(line string) []string {
+	var fields []string
+	start, backslashes := 0, 0
+	for i := 0; i < len(line); i++ {
+		switch line[i] {
+		case '\\':
+			backslashes++
+			continue
+		case '|':
+			if backslashes%2 == 0 {
+				fields = append(fields, strings.TrimSpace(strings.ReplaceAll(line[start:i], `\|`, `|`)))
+				start = i + 1
+			}
+		}
+		backslashes = 0
+	}
+	return append(fields, strings.TrimSpace(strings.ReplaceAll(line[start:], `\|`, `|`)))
+}
+
 func tableCells(line string) []string {
-	if len(line) < 2 || line[0] != '|' || line[len(line)-1] != '|' {
+	fields := tableFields(line)
+	if len(fields) < 3 || fields[0] != "" || fields[len(fields)-1] != "" {
 		return nil
 	}
-	var cells []string
-	start := 1
-	for i := 1; i < len(line); i++ {
-		if line[i] != '|' {
-			continue
-		}
-		backslashes := 0
-		for j := i - 1; j >= start && line[j] == '\\'; j-- {
-			backslashes++
-		}
-		if backslashes%2 == 0 {
-			cells = append(cells, strings.TrimSpace(strings.ReplaceAll(line[start:i], `\|`, `|`)))
-			start = i + 1
-		}
-	}
-	return cells
+	return fields[1 : len(fields)-1]
 }
 
 type replacement struct {
@@ -77,7 +80,7 @@ func (c *checker) readDifferences() {
 		return
 	}
 	c.diffs = make(map[string][]replacement)
-	before, section, found := strings.Cut(strings.ReplaceAll(text, "\r\n", "\n"), "### 3.10 Differences from the source\n")
+	before, section, found := strings.Cut(markdownOutsideFences(text), "### 3.10 Differences from the source\n")
 	if !found {
 		c.problem(planFile, "difference table", "missing section")
 		return
@@ -87,30 +90,23 @@ func (c *checker) readDifferences() {
 	}
 	const phaseColumn = "Replacement tests (phase)"
 	hasHeader := false
-	for line := range strings.SplitSeq(section, "\n") {
-		cells := tableCells(strings.TrimSpace(line))
-		if len(cells) == 8 && cells[0] == "#" && cells[1] == "slug" && cells[6] == "Required Go replacement test" && cells[7] == phaseColumn {
-			hasHeader = true
-			break
-		}
-	}
-	if !hasHeader {
-		c.problem(planFile, "difference table", "missing %q column", phaseColumn)
-		c.diffs = nil
-		return
-	}
-	want := len(differenceSlugCell.FindAllStringIndex(section, -1)) - 1 // The header's slug column is counted too.
+	candidates := 0
 	lineNum := strings.Count(before, "\n") + 1
 	for line := range strings.SplitSeq(section, "\n") {
 		lineNum++
 		line = strings.TrimSpace(line)
-		if (!strings.HasPrefix(line, "|") && !differenceSlugCell.MatchString(line)) || tableSeparator.MatchString(line) {
+		if !hasHeader {
+			cells := tableCells(line)
+			hasHeader = len(cells) == 8 && cells[0] == "#" && cells[1] == "slug" && cells[6] == "Required Go replacement test" && cells[7] == phaseColumn
 			continue
 		}
+		// A gap does not end this table. Count table-shaped lines without
+		// relying on a valid slug or on both boundary pipes.
+		if tableSeparator.MatchString(line) || len(tableFields(line)) < 2 {
+			continue
+		}
+		candidates++
 		cells := tableCells(line)
-		if len(cells) == 8 && cells[1] == "slug" && cells[0] == "#" {
-			continue
-		}
 		if len(cells) != 8 || !slugPattern.MatchString(cells[1]) {
 			c.problem(planFile, strconv.Itoa(lineNum), "invalid difference table row")
 			continue
@@ -134,8 +130,11 @@ func (c *checker) readDifferences() {
 		c.diffs[slug] = targets
 		c.checkDifference(planFile, slug, slug, true)
 	}
-	if len(c.diffs) == 0 || len(c.diffs) != want {
-		c.problem(planFile, "difference table", "parsed %d difference rows, found %d slug cells", len(c.diffs), max(0, want))
+	if !hasHeader {
+		c.problem(planFile, "difference table", "missing %q column", phaseColumn)
+		c.diffs = nil
+	} else if len(c.diffs) == 0 || len(c.diffs) != candidates {
+		c.problem(planFile, "difference table", "parsed %d difference rows, found %d table-shaped rows", len(c.diffs), candidates)
 	}
 }
 
@@ -230,7 +229,7 @@ func (c *checker) checkMatrix() {
 			continue
 		}
 		if !strings.HasPrefix(line, "|") {
-			if id, _, ok := strings.Cut(line, "|"); ok && slugPattern.MatchString(strings.TrimSpace(id)) {
+			if len(tableFields(line)) >= 2 {
 				c.problem(matrixFile, strconv.Itoa(lineNum), "matrix row must begin with a pipe")
 			} else {
 				inTable = false

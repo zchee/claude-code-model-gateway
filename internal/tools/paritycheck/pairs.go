@@ -69,6 +69,7 @@ func (c *checker) checkPairs() {
 	})
 
 	sites := make(map[pairKey]mapping)
+	deferred := make(map[pairKey]string)
 	sitesOK := c.rows(siteFile, pairColumns+" target review due", func(n int, row map[string]string) {
 		key, ok := c.pairKey(siteFile, n, row)
 		if !ok {
@@ -88,11 +89,12 @@ func (c *checker) checkPairs() {
 			c.problem(siteFile, key, "invalid due phase %q", m.due)
 		case classified && m.due < cl.phase:
 			c.problem(siteFile, key, "due phase %s is earlier than case phase %s", m.due, cl.phase)
-		case classified && m.due > cl.phase && strings.TrimSpace(m.review) == "":
-			c.problem(siteFile, key, "later due phase %s needs reviewer approval", m.due)
+		case classified && validPhase(cl.phase) && m.due > cl.phase:
+			deferred[key] = m.due
 		}
 	})
 	c.sites = sites
+	c.checkDeferralApprovals(deferred, sitesOK && c.classes != nil)
 	if !pairsOK || !overridesOK {
 		return
 	}
@@ -117,6 +119,42 @@ func (c *checker) checkPairs() {
 	for key, cl := range c.classes {
 		if _, classified := c.census[key]; classified && !cl.exempt() && !obligations[key] {
 			c.problem(pairFile, key, "due case has no assertion pair")
+		}
+	}
+}
+
+func (c *checker) checkDeferralApprovals(deferred map[pairKey]string, mappingOK bool) {
+	seen := make(map[pairKey]bool)
+	if !c.rows(deferralFile, pairColumns+" due approval", func(n int, row map[string]string) {
+		key, ok := c.pairKey(deferralFile, n, row)
+		if !ok {
+			return
+		}
+		if seen[key] {
+			c.problem(deferralFile, key, "duplicate deferral approval")
+			return
+		}
+		seen[key] = true
+		due := row["due"]
+		if !validPhase(due) {
+			c.problem(deferralFile, key, "invalid approved due phase %q", due)
+		}
+		if strings.TrimSpace(row["approval"]) == "" {
+			c.problem(deferralFile, key, "missing deferral approval text")
+		}
+		if mappingOK {
+			if want, ok := deferred[key]; !ok {
+				c.problem(deferralFile, key, "approval has no deferred mapping row")
+			} else if due != want {
+				c.problem(deferralFile, key, "approved due phase %s does not match mapping due phase %s", due, want)
+			}
+		}
+	}) {
+		return
+	}
+	for key, due := range deferred {
+		if !seen[key] {
+			c.problem(deferralFile, key, "missing deferral approval for %s", due)
 		}
 	}
 }
@@ -190,7 +228,8 @@ func (c *checker) checkMappings(phase, pkg string, cumulative bool) {
 		}
 		inScope++
 		slug, difference := strings.CutPrefix(cl.class, "difference:")
-		if m.target == "" && !difference && cl.class != "go-port" {
+		deferred := validPhase(cl.phase) && m.due > cl.phase
+		if m.target == "" && !deferred && !difference && cl.class != "go-port" {
 			continue
 		}
 		if reason, exempt := strings.CutPrefix(m.target, "not-ported:"); exempt {
@@ -232,7 +271,7 @@ func (c *checker) checkMappings(phase, pkg string, cumulative bool) {
 		if strings.TrimSpace(m.review) == "" {
 			if shared[test].different {
 				c.problem(siteFile, key, "shared target %q needs a reviewed unconditional check for this pair", m.target)
-			} else if cl.class == "go-port" {
+			} else if cl.class == "go-port" || deferred {
 				c.problem(siteFile, key, "Go target %q needs reviewer approval", m.target)
 			}
 		}

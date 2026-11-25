@@ -31,6 +31,7 @@ const (
 	censusFile   = "test/conformance/baseline/census.tsv"
 	classFile    = "test/conformance/classification.tsv"
 	approvalFile = "test/conformance/exemptions-approved.tsv"
+	deferralFile = "test/conformance/deferrals-approved.tsv"
 	launchFile   = "test/conformance/launch-sites.tsv"
 	pairFile     = "test/conformance/assertion-pairs.tsv"
 	overFile     = "test/conformance/assertion-overrides.tsv"

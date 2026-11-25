@@ -30,6 +30,8 @@ The 57 test files have 693 text lines beginning with optional indentation and `t
 
 `exemptions-approved.tsv` records the approval of every case that is exempt from the port (`js-only:` and `unsupported:` classes): `path`, `line`, `column`, `name`, `class`, `approved`. An exemption is valid only while a row with the same key and the identical class exists here. Adding an exemption or changing the class of an exempt case therefore needs a new independent review, which adds or replaces the row; the structure check compares both files in both directions.
 
+`deferrals-approved.tsv` records approval to move an assertion past its case’s phase. It has the same seven pair-key columns as `assertion-sites.tsv`, followed by `due` and `approval`. Every deferred pair must have exactly one approval for the same pair and phase; a mapping review alone cannot move the date. The original case still has its own gate.
+
 ## Assertions per case
 
 `assertion-pairs.tsv` is generated evidence: one row per pair of a case (`path`, `line`, `column`, `name`) and an assertion it can reach (`site_path`, `site_line`, `site_column`), with the callee or handed-off assertion function as written (`call`) and how the case reaches it (`via`: `direct`, `helper:`, `callback:`, `embedded:`). It covers all cases, is produced in a venue by `make assertion-sites` and `hack/assertion-extract`, and is never edited by hand. It records what a case may reach, not what ran.

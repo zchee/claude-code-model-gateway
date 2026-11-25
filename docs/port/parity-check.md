@@ -9,16 +9,23 @@ cases and must reflect the reviewed `add` and `remove` edges. The editable
 `assertion-sites.tsv` must match exactly the generated pairs for non-exempt
 cases. After the seven key fields its columns are `target`, `review`, `due`.
 Structure does not require targets, but each due case must retain a pair even
-when removals are approved. Each pair is due in the case's phase unless its
-`review` records approval for a later phase. The baseline census must match
+when removals are approved. Each pair is due in the case's phase unless
+`test/conformance/deferrals-approved.tsv` has an approval for the same pair
+and later phase. The baseline census must match
 its recorded SHA-256, and the ownership table's package and phase-gate counts
 must match classification. Static launch rows can include `case_path`,
 `case_line`, and `case_column` to name the registration exactly; otherwise,
 the launch path and full case name must identify a unique census case.
 
-Review coordinated edits to the matrix and its lock/ledger, to exemptions and
-approvals, and to the generated pairs and editable mapping. Regenerate the
-pairs independently in the venue to catch edges deleted from both pair files.
+Review coordinated edits to the matrix and its lock/ledger, to exemptions or
+deferrals and their approvals, and to the generated pairs and editable mapping.
+Regenerate the pairs independently in the venue to catch edges deleted from
+both pair files.
+
+The difference table starts at its header and continues to the end of its
+section. Blank lines and prose do not hide later table-shaped rows. Matrix
+rows belong to contiguous tables with the matrix header; an unrelated table
+outside those blocks is not part of the matrix.
 
 `hack/parity-check mapping phase-2 internal/worker` checks pairs due in that
 phase with the specified owning package and `gate=task`. Omit the package to
@@ -26,8 +33,11 @@ include the whole phase, including phase-gated pairs and pending matrix tests.
 A Go target uses the package path below this module (the full import path is
 also accepted), a dot, and the exact test name with any slash-delimited subtests.
 Use the full module path to name a test in the module root.
-Each Go target for a `go-port` pair needs approval in `review`. If a test is
-shared across sites, the review must describe each unconditional check.
+Each Go target for a `go-port` or deferred pair needs mapping approval in
+`review`; that field never approves a deferral. If a test is shared across
+sites, the review must describe each unconditional check. The later phase's
+mapping and results gates require a deferred pair's reviewed Go target or
+approved assertion exemption; its case's original gate does not move.
 A difference case must map at least one pair to an approved replacement test
 at the case's gate. A mapped subtest may match a replacement function, but a
 named replacement subtest must match exactly. Any exempt assertion needs a

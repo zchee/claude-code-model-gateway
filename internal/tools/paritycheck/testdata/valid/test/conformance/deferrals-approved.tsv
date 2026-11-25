@@ -1,0 +1,2 @@
+path	line	column	name	site_path	site_line	site_column	due	approval
+test/source.test.js	1	1	Beta	test/source.test.js	25	2	phase-3	Inventory reviewer: the child fixture needs the later gate.
