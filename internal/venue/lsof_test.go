@@ -15,11 +15,82 @@
 package venue
 
 import (
+	"context"
+	"errors"
 	"io/fs"
+	"net"
+	"strconv"
+	"syscall"
 	"testing"
 
 	gocmp "github.com/google/go-cmp/cmp"
 )
+
+func TestListenCanary(t *testing.T) {
+	tests := map[string]struct {
+		busy    int
+		other   error
+		ports   []int
+		success bool
+	}{
+		"success: first candidate free":              {ports: []int{65535}, success: true},
+		"success: first busy then wrap to free port": {busy: 1, ports: []int{65535, 49152}, success: true},
+		"error: all candidates busy":                 {busy: 8, ports: []int{65535, 49152, 49153, 49154, 49155, 49156, 49157, 49158}},
+		"error: permission failure stops retries":    {other: fs.ErrPermission, ports: []int{65535}},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			var ports []int
+			listener := new(net.TCPListener)
+			listen := func(_ context.Context, network, address string) (net.Listener, error) {
+				host, port, err := net.SplitHostPort(address)
+				if err != nil || network != "tcp4" || host != "127.0.0.1" {
+					t.Fatalf("unexpected listen(%q, %q): %v", network, address, err)
+				}
+				n, err := strconv.Atoi(port)
+				if err != nil {
+					t.Fatal(err)
+				}
+				ports = append(ports, n)
+				if len(ports) <= tc.busy {
+					return nil, &net.OpError{Op: "listen", Err: syscall.EADDRINUSE}
+				}
+				if tc.other != nil {
+					return nil, tc.other
+				}
+				return listener, nil
+			}
+			got, err := listenCanary(t.Context(), 65535, listen)
+			if diff := gocmp.Diff(tc.ports, ports); diff != "" {
+				t.Errorf("attempted ports (-want +got):\n%s", diff)
+			}
+			if (err == nil) != tc.success || (got == listener) != tc.success || (tc.other != nil && !errors.Is(err, tc.other)) {
+				t.Errorf("listener returned=%t, error=%v; want success=%t, other error=%v", got != nil, err, tc.success, tc.other)
+			}
+		})
+	}
+}
+
+func TestCanaryPortRange(t *testing.T) {
+	ctx := t.Context()
+	// Every distinct start, including all retry candidates, must be safe
+	// before the injected listen function sees the address.
+	for seed := range 1 << 16 {
+		calls := 0
+		_, err := listenCanary(ctx, uint16(seed), func(_ context.Context, _, address string) (net.Listener, error) {
+			calls++
+			host, port, splitErr := net.SplitHostPort(address)
+			n, parseErr := strconv.Atoi(port)
+			if splitErr != nil || parseErr != nil || host != "127.0.0.1" || n < 49152 || n > 65535 {
+				t.Fatalf("seed %d attempt %d: invalid bind address %q", seed, calls, address)
+			}
+			return nil, syscall.EADDRINUSE
+		})
+		if err == nil || calls != 8 {
+			t.Fatalf("seed %d: %d attempts, error %v", seed, calls, err)
+		}
+	}
+}
 
 func TestInspectLsof(t *testing.T) {
 	const witness = "p26313\nf4\nn127.0.0.1:5934\n"

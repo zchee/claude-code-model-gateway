@@ -17,19 +17,22 @@ package venue
 import (
 	"context"
 	"errors"
+	rand "math/rand/v2"
 	"net"
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
-// darwinListeners opens a private loopback listener on a kernel-selected port;
-// it never requests a gateway port, accepts a connection, or dials a socket.
-// Without this positive control an empty lsof result could mean that lsof cannot
-// see this user's listeners. It cannot establish absence for other users.
+// darwinListeners opens a private loopback listener in the dynamic port range;
+// it never binds a gateway port, accepts a connection, or dials a socket.
+// A visible canary establishes visibility of this user's listeners, not other
+// users'. The lsof build determines which warnings it emits; query rejects any
+// warning that reaches stderr.
 func darwinListeners() (map[string]bool, error) {
 	var lc net.ListenConfig
-	listener, err := lc.Listen(context.Background(), "tcp4", "127.0.0.1:0")
+	listener, err := listenCanary(context.Background(), uint16(rand.Uint32()), lc.Listen)
 	if err != nil {
 		return nil, err
 	}
@@ -41,10 +44,21 @@ func darwinListeners() (map[string]bool, error) {
 	return busy, err
 }
 
-func inspectLsof(ownPID, canary string, run func(string, ...string) (string, error)) (map[string]bool, error) {
-	if canary == "18764" || canary == "18765" {
-		return nil, errors.New("kernel assigned a reserved canary port")
+// listenCanary tries distinct ports in 49152..65535, starting at a random
+// offset. Unlike binding port zero, this does not depend on the host's
+// configuration of the ephemeral range.
+func listenCanary(ctx context.Context, start uint16, listen func(context.Context, string, string) (net.Listener, error)) (net.Listener, error) {
+	for i := range 8 {
+		port := 49152 + (int(start)+i)%16384
+		l, err := listen(ctx, "tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+		if !errors.Is(err, syscall.EADDRINUSE) {
+			return l, err
+		}
 	}
+	return nil, errors.New("all candidate canary ports are in use")
+}
+
+func inspectLsof(ownPID, canary string, run func(string, ...string) (string, error)) (map[string]bool, error) {
 	out, err := run("/usr/sbin/lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpfn")
 	if err != nil {
 		return nil, err
