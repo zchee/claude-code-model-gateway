@@ -1,0 +1,486 @@
+#!/usr/bin/env bash
+# Copyright 2026 The claude-code-model-gateway Authors.
+# SPDX-License-Identifier: Apache-2.0
+
+set -euo pipefail
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
+"$root/hack/venue-check"
+# This run reads Linux RSS and relies on the kernel's ephemeral port range.
+[[ $(uname -s) == Linux ]] || { printf 'not a test venue: bench requires Linux\n' >&2; exit 97; }
+read -r low high < /proc/sys/net/ipv4/ip_local_port_range
+for port in 80 18764 18765; do
+    (( port < low || port > high )) || { printf 'bench: ephemeral range includes forbidden port %s\n' "$port" >&2; exit 1; }
+done
+if command -v claude >/dev/null; then printf 'bench: claude resolves on venue PATH\n' >&2; exit 1; fi
+
+umask 077
+work=$(mktemp -d "${TMPDIR:-/tmp}/gateway-bench.XXXXXXXX")
+pid=''
+cleanup() {
+    local rc=$?
+    trap '' HUP INT TERM
+    if [[ -n $pid ]] && kill -0 -- "-$pid" 2>/dev/null; then
+        printf 'bench: terminating remaining processes in benchmark job group\n' >&2
+        kill -KILL -- "-$pid" 2>/dev/null || :
+        wait "$pid" 2>/dev/null || :
+        rc=1
+    fi
+    rm -rf -- "$work"
+    exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+mkdir "$work/hack" "$work/home" "$work/tmp"
+cp -- "$root/hack/pinned-source" "$work/hack/"
+clean=(env -i "PATH=$PATH" "HOME=$work/home" "TMPDIR=$work/tmp" LC_ALL=C)
+plugin=$("${clean[@]}" "$work/hack/pinned-source")/plugins/model-gateway
+"${clean[@]}" "$work/hack/pinned-source" --print-pin > "$work/pin"
+"${clean[@]}" "npm_config_cache=$work/npm-cache" \
+    npm --prefix "$plugin" ci --ignore-scripts --no-audit --no-fund >&2
+
+interrupted=0
+trap 'interrupted=1' HUP INT TERM
+set -m
+"${clean[@]}" node --input-type=commonjs - "$plugin" "$work" > "$work/result" <<'JS' &
+'use strict';
+const assert = require('node:assert/strict');
+const { execFileSync, spawn } = require('node:child_process');
+const { createHash } = require('node:crypto');
+const { once } = require('node:events');
+const fs = require('node:fs');
+const http = require('node:http');
+const net = require('node:net');
+const os = require('node:os');
+const path = require('node:path');
+const { setTimeout: sleep } = require('node:timers/promises');
+const { gzipSync } = require('node:zlib');
+
+const [plugin, work] = process.argv.slice(2);
+const cli = path.join(plugin, 'bin/model-gateway.js');
+const { writeCommandLauncher } = require(path.join(plugin, 'hooks/registry-writer.js'));
+const pluginVersion = require(path.join(plugin, '.claude-plugin/plugin.json')).version;
+const [commit, rootTree, pluginTree] = fs.readFileSync(path.join(work, 'pin'), 'utf8').trim().split('\t');
+const node = process.execPath;
+const loopback = '127.0.0.1';
+const commands = {
+  run: 'VENUE_HOST=debian-13-trixie.gaudiy-platform ./hack/remote run bench',
+  status: 'VENUE_HOST=debian-13-trixie.gaudiy-platform ./hack/remote status',
+  make: 'make -- bench → ./hack/venue-check && ./hack/bench',
+  pin: '$WORK/hack/pinned-source',
+  install: 'npm --prefix "$PLUGIN" ci --ignore-scripts --no-audit --no-fund',
+  harness: 'node --input-type=commonjs - "$PLUGIN" "$WORK"',
+  worker: 'node "$PLUGIN/bin/model-gateway.js" serve-worker',
+  supervisor: 'node "$PLUGIN/bin/model-gateway.js" serve-shim',
+  readiness: 'node "$HOME/.claude/model-gateway/model-gateway.js" readiness-gate',
+  date: 'date -u +%Y-%m-%dT%H:%M:%S.%NZ',
+  kernel: 'uname -srvm',
+  CPU: 'lscpu -p=SOCKET,CORE',
+  listeners: 'ss -H -ltn "sport = :$PORT"',
+};
+const settings = {
+  series: 3, warmups: 1, readinessRuns: 50, ttfbRuns: 200,
+  requestBytes: 1024 * 1024, events: 2000, idleMs: 60000,
+  timeoutMs: 15000, headersSettleMs: 100, observationMs: 1500,
+  pressureBytes: 16 * 1024 * 1024, pressureBlockBytes: 64 * 1024,
+};
+const run = { commit, rootTree, pluginTree, pluginVersion, commands, settings };
+const command = (name, ...args) => execFileSync(name, args, { encoding: 'utf8' }).trim();
+const date = () => command('date', '-u', '+%Y-%m-%dT%H:%M:%S.%NZ');
+const load = () => ({ at: date(), averages: os.loadavg() });
+const elapsed = (since) => Number((performance.now() - since).toFixed(6));
+const envForReport = (env) => Object.fromEntries(Object.entries(env).map(([key, value]) => [key, value.replaceAll(work, '$WORK')]));
+const record = (type, data) => ({ type, ...data });
+const records = [];
+const portURL = (port) => `http://${loopback}:${port}`;
+
+const models = { anthropic: 'claude-sonnet-4-6', codex: 'claude-gpt-5.6-sol' };
+const frame = (type, data) => `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`;
+const start = frame('message_start', { message: { id: 'msg_fixture', type: 'message', role: 'assistant', model: models.anthropic, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0 } } });
+const delta = frame('content_block_delta', { index: 0, delta: { type: 'text_delta', text: 'fixture reply ' } });
+const response = start + frame('content_block_start', { index: 0, content_block: { type: 'text', text: '' } }) +
+  delta.repeat(settings.events - 5) + frame('content_block_stop', { index: 0 }) +
+  frame('message_delta', { delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: settings.events - 5 } }) +
+  frame('message_stop', {});
+assert.equal(response.match(/^event: /gm).length, settings.events);
+const responseBytes = Buffer.byteLength(response);
+function payload(model, padding = '') {
+  return JSON.stringify({ model, max_tokens: 4096, stream: true, messages: [{ role: 'user', content: `fixture prompt ${padding}` }] });
+}
+const bigBody = payload(models.anthropic, 'x'.repeat(settings.requestBytes - Buffer.byteLength(payload(models.anthropic))));
+assert.equal(Buffer.byteLength(bigBody), settings.requestBytes);
+
+const checkPort = (port) => assert(port > 0 && ![80, 18764, 18765].includes(port), `unexpected port ${port}`);
+async function fakeUpstream(provider) {
+  const probes = new Map();
+  const sockets = new Set();
+  let usagePosts = 0;
+  const server = http.createServer((req, res) => {
+    if (provider === 'usage') {
+      req.resume();
+      req.once('end', () => {
+        if (req.method !== 'POST' || req.url !== '/v1/logs') return res.writeHead(400).end();
+        usagePosts++;
+        res.setHeader('Content-Type', 'application/json');
+        res.end('{}');
+      });
+      return;
+    }
+    if (req.method === 'GET' && req.url.split('?')[0] === '/v1/models') {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ data: [{ id: provider === 'codex' ? 'gpt-5.6-sol' : models.anthropic }] }));
+      return;
+    }
+    const probe = probes.get(req.headers['x-bench-probe']);
+    let bytes = 0;
+    req.on('data', (chunk) => { bytes += chunk.length; if (probe) probe.providerRequestBytes += chunk.length; });
+    if (probe) {
+      probe.requests++;
+      probe.note('provider-request', { method: req.method, path: req.url });
+      probe.upstream = res;
+      probe.socket = req.socket;
+      req.socket.once('close', () => probe.note('provider-socket-close'));
+      res.once('close', () => probe.note('provider-response-close', { finished: res.writableFinished }));
+      res.once('finish', () => probe.note('provider-response-finish'));
+    }
+    req.once('end', () => {
+      if (!probe && (req.method !== 'POST' || req.url !== '/v1/messages' || bytes !== settings.requestBytes || provider !== 'anthropic')) {
+        res.writeHead(400).end('unexpected benchmark input');
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      if (!probe) return res.end(response);
+      probe.note('provider-upload-end', { bytes });
+      res.flushHeaders();
+      probe.note('provider-headers');
+      if (probe.stage === 'mid-stream') {
+        res.write(start);
+        probe.providerResponseBytes += Buffer.byteLength(start);
+        probe.note('provider-first-event');
+      }
+      probe.signalHeaders();
+    });
+  });
+  server.on('connection', (socket) => {
+    sockets.add(socket);
+    socket.once('close', () => sockets.delete(socket));
+  });
+  await new Promise((resolve, reject) => server.once('error', reject).listen(0, loopback, resolve));
+  const { port } = server.address();
+  checkPort(port);
+  return { port, probes, usagePosts: () => usagePosts, close: () => new Promise((resolve) => {
+    for (const socket of sockets) socket.destroy();
+    server.close(resolve);
+  }) };
+}
+
+function request(port, url, body) {
+  const began = performance.now();
+  return new Promise((resolve, reject) => {
+    let ttfbMs;
+    const options = { host: loopback, port, path: url, agent: false };
+    if (body) Object.assign(options, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) },
+    });
+    const req = http.request(options, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('error', reject);
+      res.once('end', () => resolve({ status: res.statusCode, ttfbMs, body: Buffer.concat(chunks).toString() }));
+    });
+    req.on('error', reject);
+    req.once('socket', (socket) => socket.once('data', () => { ttfbMs = elapsed(began); }));
+    req.setTimeout(settings.timeoutMs, () => req.destroy(new Error(`request timed out: ${url}`)));
+    req.end(body);
+  });
+}
+
+function gateway(commandName, home, upstreams) {
+  fs.mkdirSync(home);
+  const env = {
+    ...process.env, HOME: home,
+    CODEX_GATEWAY_PORT: '0', CODEX_GATEWAY_WORKER_PORT: '0', CODEX_GATEWAY_COMPAT_PORT: '0',
+    CODEX_GATEWAY_PROXY_PORT: String(upstreams.codex.port),
+    CODEX_GATEWAY_ANTHROPIC_UPSTREAM: portURL(upstreams.anthropic.port),
+    CODEX_GATEWAY_USAGE_ENDPOINT: `${portURL(upstreams.usage.port)}/v1/logs`,
+    CODEX_GATEWAY_HOSTS_FILE: path.join(home, 'fixture-hosts'),
+    CODEX_GATEWAY_SOCKET_PATH: path.join(home, 'gateway.sock'),
+    CODEX_GATEWAY_CLAUDE_BIN: path.join(home, 'missing-claude'),
+  };
+  fs.writeFileSync(env.CODEX_GATEWAY_HOSTS_FILE, '');
+  const child = spawn(node, [cli, commandName], { cwd: home, env, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+  let stdout = '', stderr = '';
+  child.stdout.on('data', (chunk) => { stdout += chunk; });
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  const status = once(child, 'exit');
+  const state = path.join(home, '.claude/model-gateway');
+  const topology = { child, env, home, state, port: null, workerPid: null, workerPort: null };
+  const diagnostic = () => `${commandName}: ${stdout}${stderr}`;
+  topology.ready = async () => {
+    const began = performance.now();
+    while (elapsed(began) < settings.timeoutMs && child.exitCode === null && child.signalCode === null) {
+      const report = stdout.match(/listening on 127\.0\.0\.1:(\d+)/);
+      if (report) {
+        topology.port = Number(report[1]);
+        checkPort(topology.port);
+        const result = await request(topology.port, '/healthz');
+        if (result.status === 200) {
+          const health = JSON.parse(result.body);
+          assert.equal(health.ok, true);
+          if (commandName === 'serve-shim') {
+            assert.equal(health.supervisorPid, child.pid);
+            assert.equal(health.supervisorVersion, pluginVersion);
+            assert.equal(health.proxyRecovery, true);
+            const pidFile = path.join(state, 'shim.pid');
+            const logFile = path.join(state, 'logs/shim.log');
+            if (!fs.existsSync(pidFile) || !fs.existsSync(logFile)) { await sleep(25); continue; }
+            topology.workerPid = Number(fs.readFileSync(pidFile, 'utf8').trim());
+            const log = fs.readFileSync(logFile, 'utf8');
+            topology.workerPort = Number(log.match(/listening on 127\.0\.0\.1:(\d+)/)?.[1]);
+            checkPort(topology.workerPort);
+            assert.equal(parentPID(topology.workerPid), child.pid);
+          }
+          return;
+        }
+      }
+      await sleep(25);
+    }
+    throw new Error(`listener not ready: ${diagnostic()}`);
+  };
+  topology.stop = async () => {
+    if (child.exitCode === null && child.signalCode === null) {
+      if (commandName === 'serve-shim') child.send({ type: 'fixture-shutdown' }, (err) => { if (err) child.kill('SIGTERM'); });
+      else if (child.connected) child.disconnect();
+    }
+    const [code, signal] = await bounded(status, `stop ${commandName}`);
+    assert.equal(code, 0, `${diagnostic()} (signal ${signal})`);
+    for (const pid of [child.pid, topology.workerPid].filter(Boolean)) assert(!fs.existsSync(`/proc/${pid}`), `PID ${pid} remains`);
+    for (const port of new Set([topology.port, topology.workerPort].filter(Boolean))) checkClosed(port);
+  };
+  return topology;
+}
+
+function bounded(promise, what) {
+  const timeout = new AbortController();
+  const deadline = sleep(settings.timeoutMs, null, { signal: timeout.signal }).then(() => { throw new Error(`timed out: ${what}`); });
+  return Promise.race([promise, deadline]).finally(() => timeout.abort());
+}
+
+const checkClosed = (port) => assert.equal(command('ss', '-H', '-ltn', `sport = :${port}`), '', `port ${port} still listening`);
+const parentPID = (pid) => Number(fs.readFileSync(`/proc/${pid}/status`, 'utf8').match(/^PPid:\s+(\d+)$/m)?.[1]);
+const rss = (pid) => {
+  const kib = Number(fs.readFileSync(`/proc/${pid}/status`, 'utf8').match(/^VmRSS:\s+(\d+)\s+kB$/m)?.[1]);
+  assert(kib > 0, `missing RSS for ${pid}`);
+  return kib;
+};
+
+function readinessFixture(shim) {
+  const { home, state, port, child, env } = shim;
+  const plugins = path.join(home, '.claude/plugins');
+  fs.mkdirSync(plugins, { recursive: true });
+  fs.writeFileSync(path.join(plugins, 'installed_plugins.json'), JSON.stringify({ plugins: { 'model-gateway@fixture': [{ version: pluginVersion, installPath: plugin }] } }));
+  fs.writeFileSync(path.join(state, 'guardian.pid'), String(child.pid));
+  fs.writeFileSync(path.join(state, 'guardian.pid.json'), JSON.stringify({ pid: child.pid, command: `node "${cli}" serve-shim` }));
+  const { file } = writeCommandLauncher({ home });
+  const hookEnv = { ...env, CODEX_GATEWAY_PORT: String(port), CODEX_GATEWAY_WORKER_PORT: String(port), ANTHROPIC_BASE_URL: portURL(port) };
+  const payload = JSON.stringify({ hook_event_name: 'UserPromptSubmit', cwd: home });
+  return { env: hookEnv, invoke: async () => {
+    const began = performance.now();
+    const hook = spawn(node, [file, 'readiness-gate'], { cwd: home, env: hookEnv, stdio: ['pipe', 'pipe', 'pipe'] });
+    let output = '';
+    hook.stdout.on('data', (c) => { output += c; });
+    hook.stderr.on('data', (c) => { output += c; });
+    hook.stdin.end(payload);
+    const [code, signal] = await bounded(once(hook, 'close'), 'readiness gate');
+    const ms = elapsed(began);
+    assert.equal(code, 0, `readiness gate: ${output} (signal ${signal})`);
+    assert.equal(output, '', 'readiness gate was not quiet');
+    return ms;
+  } };
+}
+
+async function measure(shim, index) {
+  const hook = readinessFixture(shim);
+  const sample = (action, boundary, values) => records.push(record('load', { series: index, action, boundary, ...values }));
+  records.push(record('environment', { series: index, supervisor: envForReport(shim.env), readiness: envForReport(hook.env), workerPort: shim.workerPort }));
+  sample('readiness', 'start', load());
+  for (let i = 0; i < settings.warmups + settings.readinessRuns; i++) {
+    records.push(record('readiness', { series: index, sample: i, warmup: i < settings.warmups, wallMs: await hook.invoke() }));
+  }
+  sample('readiness', 'end', load());
+  sample('ttfb', 'start', load());
+  for (let i = 0; i < settings.warmups + settings.ttfbRuns; i++) {
+    const result = await request(shim.port, '/v1/messages', bigBody);
+    assert.equal(result.status, 200);
+    assert.equal(result.body, response, 'response was not the entire fixture SSE stream');
+    assert(result.ttfbMs > 0);
+    records.push(record('ttfb', { series: index, sample: i, warmup: i < settings.warmups, ttfbMs: result.ttfbMs }));
+  }
+  sample('ttfb', 'end', load());
+  sample('rss', 'start', load());
+  const began = performance.now();
+  await sleep(settings.idleMs);
+  const idleMs = elapsed(began);
+  const { pid } = shim.child;
+  assert.equal(parentPID(shim.workerPid), pid);
+  const supervisorKiB = rss(pid), workerKiB = rss(shim.workerPid);
+  records.push(record('rss', { series: index, idleMs, supervisorKiB, workerKiB, sumKiB: supervisorKiB + workerKiB }));
+  sample('rss', 'end', load());
+}
+
+async function disconnect(topology, provider, fake, stage) {
+  const key = `${topology.name}-${provider}-${stage}`;
+  const timeline = [];
+  const probe = {
+    stage, requests: 0, providerRequestBytes: 0, providerResponseBytes: 0,
+    note: (event, fields = {}) => timeline.push({ event, time: performance.now(), ...fields }),
+  };
+  const headers = new Promise((resolve) => { probe.signalHeaders = resolve; });
+  fake.probes.set(key, probe);
+  const body = payload(models[provider]);
+  const peer = net.createConnection({ host: loopback, port: topology.port });
+  peer.on('error', (err) => probe.note('client-error', { code: err.code }));
+  const closed = new Promise((resolve) => peer.once('close', (hadError) => { probe.note('client-close', { hadError }); resolve(); }));
+  let received = '';
+  let clientWireBytes = 0;
+  const data = new Promise((resolve) => peer.on('data', (chunk) => {
+    clientWireBytes += chunk.length;
+    received += chunk.toString();
+    probe.note('client-data', { bytes: chunk.length });
+    if (received.includes('event: message_start')) resolve();
+  }));
+  try {
+    await bounded(once(peer, 'connect'), key);
+    const upload = stage === 'before-upload-end' ? body.slice(0, Math.floor(body.length / 2)) : body;
+    await new Promise((resolve, reject) => peer.write(
+      `POST /v1/messages HTTP/1.1\r\nHost: ${loopback}:${topology.port}\r\nContent-Type: application/json\r\nContent-Length: ${body.length}\r\nX-Bench-Probe: ${key}\r\n\r\n${upload}`,
+      (error) => error ? reject(error) : resolve(),
+    ));
+    probe.note('client-upload', { bytes: upload.length, declaredBytes: body.length });
+    if (stage !== 'before-upload-end') await bounded(headers, key);
+    if (stage === 'mid-stream') await bounded(data, key);
+    else await sleep(settings.headersSettleMs);
+    const zero = performance.now();
+    timeline.push({ event: 'client-disconnect', time: zero });
+    peer.destroy();
+    await bounded(closed, key);
+    if (probe.upstream) void sendTail(probe);
+    await sleep(settings.observationMs);
+    const observationMs = elapsed(zero);
+    const events = timeline.map(({ time, ...e }) => ({ ...e, offsetMs: Number((time - zero).toFixed(6)) }));
+    // Reuse of an open connection after a completed response is not a stalled stream.
+    const outcome = {
+      requests: probe.requests, requestBytes: probe.providerRequestBytes, responseBytesWritten: probe.providerResponseBytes,
+      responseFinished: events.some((e) => e.event === 'provider-response-finish'),
+      socketClosed: events.some((e) => e.event === 'provider-socket-close'),
+      blockedForMs: probe.blockedSince === undefined ? null : elapsed(probe.blockedSince),
+    };
+    return record('disconnect', { topology: topology.name, model: models[provider], stage, observationMs, provider: outcome,
+      client: { wireBytes: clientWireBytes, status: Number(received.match(/^HTTP\/1\.1 (\d+)/)?.[1]) || null }, events });
+  } finally {
+    peer.destroy();
+    if (probe.socket && !probe.socket.destroyed) {
+      const close = once(probe.socket, 'close');
+      probe.socket.destroy();
+      await bounded(close, `close fake upstream for ${key}`);
+    }
+    fake.probes.delete(key);
+  }
+}
+
+async function sendTail(probe) {
+  const res = probe.upstream;
+  const block = ': ' + 'x'.repeat(settings.pressureBlockBytes - 4) + '\n\n';
+  try {
+    while (!res.destroyed && probe.providerResponseBytes < settings.pressureBytes) {
+      const remaining = settings.pressureBytes - probe.providerResponseBytes;
+      const chunk = remaining >= block.length ? block : block.slice(0, remaining - 2) + '\n\n';
+      const ready = res.write(chunk);
+      probe.providerResponseBytes += Buffer.byteLength(chunk);
+      if (!ready) {
+        const began = performance.now();
+        probe.blockedSince = began;
+        // A false write alone is only Node's writable high-water mark; log
+        // long blocked writes in addition to progress and finish.
+        await new Promise((resolve) => {
+          const done = () => { res.off('drain', done); res.off('close', done); resolve(); };
+          res.once('drain', done);
+          res.once('close', done);
+        });
+        delete probe.blockedSince;
+        const waitMs = elapsed(began);
+        if (waitMs >= settings.headersSettleMs) probe.note('provider-write-unblocked', { waitMs });
+      }
+    }
+    if (!res.destroyed) res.end(frame('message_stop', {}));
+  } catch (error) { probe.note('provider-write-error', { code: error.code ?? error.message }); }
+}
+
+async function upgrade(topology) {
+  const began = performance.now();
+  const peer = net.createConnection({ host: loopback, port: topology.port });
+  const chunks = [];
+  peer.on('data', (chunk) => chunks.push(chunk));
+  try {
+    await bounded(once(peer, 'connect'), 'upgrade connect');
+    const close = once(peer, 'close');
+    peer.write(`GET /healthz HTTP/1.1\r\nHost: ${loopback}:${topology.port}\r\nConnection: Upgrade, close\r\nUpgrade: fixture\r\n\r\n`);
+    await bounded(close, 'upgrade response');
+    const wire = Buffer.concat(chunks).toString();
+    const [head, body] = wire.split('\r\n\r\n', 2);
+    return record('upgrade', { topology: topology.name, elapsedMs: elapsed(began), wireBytes: Buffer.byteLength(wire), head, body });
+  } finally { peer.destroy(); }
+}
+
+async function main() {
+  const [anthropic, codex, usage] = await Promise.all([fakeUpstream('anthropic'), fakeUpstream('codex'), fakeUpstream('usage')]);
+  const providers = { anthropic, codex };
+  const upstreams = { ...providers, usage };
+  const cores = new Set(command('lscpu', '-p=SOCKET,CORE').split('\n').filter((line) => /^\d+,\d+$/.test(line))).size;
+  assert(cores > 0, 'no processor topology from lscpu');
+  records.push(record('run', { ...run, started: date(), machine: { cpu: os.cpus()[0].model, logicalCPUs: os.cpus().length, cores,
+    availableCPUs: os.availableParallelism(), memoryBytes: os.totalmem(), kernel: command('uname', '-srvm'),
+    node: process.version, npm: command('npm', '--version'),
+    ajv: require(path.join(plugin, 'node_modules/ajv/package.json')).version },
+    env: envForReport(process.env), npmCache: '$WORK/npm-cache',
+    providers: Object.fromEntries(Object.entries(upstreams).map(([name, fake]) => [name, fake.port])),
+    responseBytes }));
+  try {
+    for (let i = 1; i <= settings.series; i++) {
+      const shim = gateway('serve-shim', path.join(work, `shim-${i}`), upstreams);
+      try { await shim.ready(); await measure(shim, i); }
+      finally { await shim.stop(); }
+    }
+    for (const [name, startCommand] of [['direct', 'serve-worker'], ['relayed', 'serve-shim']]) {
+      const topology = gateway(startCommand, path.join(work, name), upstreams);
+      topology.name = name;
+      try {
+        await topology.ready();
+        records.push(record('probe-environment', { topology: name, gateway: envForReport(topology.env),
+          clientPort: topology.port, workerPort: topology.workerPort }));
+        for (const [provider, fake] of Object.entries(providers)) {
+          for (const stage of ['before-upload-end', 'headers-only', 'mid-stream']) {
+            records.push(await disconnect(topology, provider, fake, stage));
+          }
+        }
+        records.push(await upgrade(topology));
+      } finally { await topology.stop(); }
+    }
+  } finally {
+    for (const fake of Object.values(upstreams)) { await fake.close(); checkClosed(fake.port); }
+  }
+  assert.equal(usage.usagePosts(), settings.series * (settings.warmups + settings.ttfbRuns), 'expected one usage record per completed stream');
+  records.push(record('end', { ended: date(), ownedProcessesAndListenersGone: true, usagePosts: usage.usagePosts() }));
+  const payload = gzipSync(records.map((r) => JSON.stringify(r)).join('\n') + '\n');
+  process.stdout.write(`NODE-BENCH-V1 ${createHash('sha256').update(payload).digest('hex')} ${payload.toString('base64')}\n`);
+}
+main().catch((error) => { console.error(error); process.exitCode = 1; });
+JS
+pid=$!
+set +m
+trap 'exit 1' HUP INT TERM
+(( interrupted == 0 )) || exit 1
+wait "$pid"
+"$root/hack/venue-check"
+IFS= read -r result < "$work/result"
+[[ $result == NODE-BENCH-V1\ * ]]
+printf '%s\n' "$result"
