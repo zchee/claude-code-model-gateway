@@ -13,12 +13,15 @@
 // limitations under the License.
 
 // Package paths resolves gateway and Claude paths without accessing the filesystem.
+// Windows path forms follow the host's path rules; while Windows is compile-only,
+// parity with the source's Windows path functions is not claimed, including for
+// bare drive prefixes such as C: joined with a name.
 package paths
 
 import (
 	"errors"
 	"fmt"
-	"path"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
@@ -89,7 +92,7 @@ func (r Resolver) UserSettingsPath() (string, error) {
 // GlobalConfigPath returns the Claude global config, which lives directly in the home unless overridden.
 func (r Resolver) GlobalConfigPath() (string, error) {
 	if dir := config.ClaudeConfig.Get(r.env); dir != "" {
-		return r.join(dir, ".claude.json"), nil
+		return filepath.Join(dir, ".claude.json"), nil
 	}
 	return r.childPath("", r.HomeDir, ".claude.json")
 }
@@ -112,7 +115,7 @@ func (r Resolver) PluginRegistryPaths() ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		paths = append(paths, r.join(absolute, "installed_plugins.json"))
+		paths = append(paths, filepath.Join(absolute, "installed_plugins.json"))
 	}
 	conf, err := r.ClaudeConfigDir()
 	if err != nil {
@@ -122,7 +125,7 @@ func (r Resolver) PluginRegistryPaths() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	legacy := r.join(absolute, "plugins", "installed_plugins.json")
+	legacy := filepath.Join(absolute, "plugins", "installed_plugins.json")
 	if !slices.Contains(paths, legacy) {
 		paths = append(paths, legacy)
 	}
@@ -132,7 +135,7 @@ func (r Resolver) PluginRegistryPaths() ([]string, error) {
 // LauncherRegistryPaths also honors the source launcher's whole-config-directory override.
 func (r Resolver) LauncherRegistryPaths() ([]string, error) {
 	if dir := config.RegistryClaudeHome.Get(r.env); dir != "" {
-		return []string{r.join(dir, "plugins", "installed_plugins.json")}, nil
+		return []string{filepath.Join(dir, "plugins", "installed_plugins.json")}, nil
 	}
 	return r.PluginRegistryPaths()
 }
@@ -154,14 +157,14 @@ func (r Resolver) ProxyConfigDir() (string, error) {
 	switch r.platform {
 	case "windows":
 		if dir := config.AppData.Get(r.env); dir != "" {
-			return r.join(dir, name), nil
+			return filepath.Join(dir, name), nil
 		}
 		return r.childPath("", r.HomeDir, "AppData", "Roaming", name)
 	case "darwin":
 		return r.childPath("", r.HomeDir, ".config", name)
 	default:
 		if dir := config.XDGConfigHome.Get(r.env); dir != "" {
-			return r.join(dir, name), nil
+			return filepath.Join(dir, name), nil
 		}
 		return r.childPath("", r.HomeDir, ".config", name)
 	}
@@ -201,7 +204,7 @@ func (r Resolver) HostsFile() string {
 		return file
 	}
 	if r.platform == "windows" {
-		return r.join(config.SystemRoot.Get(r.env), "System32", "drivers", "etc", "hosts")
+		return filepath.Join(config.SystemRoot.Get(r.env), "System32", "drivers", "etc", "hosts")
 	}
 	return "/etc/hosts"
 }
@@ -248,7 +251,7 @@ func (r Resolver) childPath(override string, parent func() (string, error), elem
 	if err != nil || len(elements) == 0 {
 		return dir, err
 	}
-	return r.join(append([]string{dir}, elements...)...), nil
+	return filepath.Join(append([]string{dir}, elements...)...), nil
 }
 
 func (r Resolver) workingDir() (string, error) {
@@ -263,104 +266,15 @@ func (r Resolver) workingDir() (string, error) {
 }
 
 func (r Resolver) resolve(name string) (string, error) {
-	if r.platform == "windows" {
-		return r.resolveWindows(name)
-	}
-	if path.IsAbs(name) {
-		return path.Clean(name), nil
+	if filepath.IsAbs(name) {
+		return filepath.Clean(name), nil
 	}
 	dir, err := r.workingDir()
 	if err != nil {
 		return "", err
 	}
-	if !path.IsAbs(dir) {
+	if !filepath.IsAbs(dir) {
 		return "", errors.New("resolve working directory: not absolute")
 	}
-	return path.Join(dir, name), nil
-}
-
-func (r Resolver) join(elements ...string) string {
-	if r.platform != "windows" {
-		return path.Join(elements...)
-	}
-	var joined, first string
-	for _, element := range elements {
-		if element == "" {
-			continue
-		}
-		element = windowsSlashes(element)
-		if first == "" {
-			joined, first = element, element
-		} else {
-			joined += "/" + element
-		}
-	}
-	// Joining separate leading slashes must not manufacture a UNC server name.
-	if len(first) < 3 || first[2] == '/' {
-		if strings.HasPrefix(joined, "//") {
-			joined = "/" + strings.TrimLeft(joined, "/")
-		}
-	}
-	return cleanWindows(joined, true)
-}
-
-func windowsSlashes(name string) string { return strings.ReplaceAll(name, `\`, "/") }
-
-func windowsVolume(name string) (volume, tail string) {
-	if len(name) >= 2 && name[1] == ':' && (name[0]|0x20) >= 'a' && (name[0]|0x20) <= 'z' {
-		return name[:2], name[2:]
-	}
-	if unc, hasUNC := strings.CutPrefix(name, "//"); hasUNC {
-		server, rest, _ := strings.Cut(unc, "/")
-		share, tail, _ := strings.Cut(strings.TrimLeft(rest, "/"), "/")
-		if server != "" && share != "" {
-			return "//" + server + "/" + share, "/" + tail
-		}
-	}
-	return "", name
-}
-
-func cleanWindows(name string, preserveTrailing bool) string {
-	volume, tail := windowsVolume(name)
-	clean := path.Clean(tail)
-	if preserveTrailing && clean != "/" && strings.HasSuffix(name, "/") {
-		clean += "/"
-	}
-	return strings.ReplaceAll(volume+clean, "/", `\`)
-}
-
-func (r Resolver) resolveWindows(name string) (string, error) {
-	name = windowsSlashes(name)
-	volume, tail := windowsVolume(name)
-	if volume != "" && strings.HasPrefix(tail, "/") {
-		return cleanWindows(name, false), nil
-	}
-	dir, err := r.workingDir()
-	if err != nil {
-		return "", err
-	}
-	dir = windowsSlashes(dir)
-	current, currentTail := windowsVolume(dir)
-	if current == "" || !strings.HasPrefix(currentTail, "/") {
-		return "", errors.New("resolve working directory: not absolute")
-	}
-	if strings.HasPrefix(tail, "/") {
-		return cleanWindows(current+tail, false), nil
-	}
-	if volume != "" && !strings.EqualFold(volume, current) {
-		// Windows stores per-drive working directories as hidden environment entries.
-		dir = volume + "/"
-		if r.env != nil {
-			if saved, set := r.env("=" + volume); set {
-				saved = windowsSlashes(saved)
-				device, savedTail := windowsVolume(saved)
-				if strings.EqualFold(volume, device) && strings.HasPrefix(savedTail, "/") {
-					dir = volume + savedTail
-				}
-			}
-		}
-	} else if volume != "" {
-		dir = volume + currentTail
-	}
-	return cleanWindows(dir+"/"+tail, false), nil
+	return filepath.Join(dir, name), nil
 }

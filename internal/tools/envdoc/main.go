@@ -55,6 +55,7 @@ func render() []byte {
 	var out bytes.Buffer
 	out.WriteString("<!-- Generated from internal/config by make env-doc; do not edit. -->\n\n# Environment variables\n\n")
 	out.WriteString("The readers column identifies the component and line at the pinned source, or the Go reader for a port-only setting. Child processes also inherit environment entries the gateway itself does not interpret.\n\n")
+	out.WriteString("Windows path forms follow the host's path rules; while Windows is compile-only, parity with the source's Windows path functions is not claimed, including for bare drive prefixes such as `C:` joined with a name.\n\n")
 	out.WriteString("| Variable | Default or fallback | Meaning | Parse rule | Readers |\n| --- | --- | --- | --- | --- | --- |\n")
 	for _, row := range config.Variables() {
 		fmt.Fprintf(&out, "| `%s` | %s | %s | %s | %s |\n", row.Name, cell(row.Default), cell(row.Meaning), cell(row.Rule), cell(row.Readers))

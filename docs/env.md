@@ -4,6 +4,8 @@
 
 The readers column identifies the component and line at the pinned source, or the Go reader for a port-only setting. Child processes also inherit environment entries the gateway itself does not interpret.
 
+Windows path forms follow the host's path rules; while Windows is compile-only, parity with the source's Windows path functions is not claimed, including for bare drive prefixes such as `C:` joined with a name.
+
 | Variable | Default or fallback | Meaning | Parse rule | Readers |
 | --- | --- | --- | --- | --- | --- |
 | `ANTHROPIC_API_KEY` | unset | Pin probe strips this inherited key. | Pin probe matches the key case-insensitively; picker probe, where applicable, matches it exactly. The value is never inspected. | lib/pins.js:241–247 |

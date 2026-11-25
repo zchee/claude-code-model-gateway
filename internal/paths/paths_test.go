@@ -90,14 +90,14 @@ func TestDirectories(t *testing.T) {
 				filepath.Join("instance-state", "logs", "request-routes.jsonl"), filepath.Join("instance-state", "dispatch-routes.json"), filepath.Join("instance-state", "gateway.sock"), "hosts",
 			},
 		},
-		"success: Windows profile, AppData and SystemRoot": {
-			platform: "windows", env: map[string]string{"USERPROFILE": `C:\users\sandbox`, "HOME": "ignored", "APPDATA": "D:", "XDG_CONFIG_HOME": "ignored", "SystemRoot": "E:"},
+		"success: Windows selects profile, AppData, SystemRoot and named pipe": {
+			platform: "windows", env: map[string]string{"USERPROFILE": home, "HOME": "ignored", "APPDATA": "roaming", "XDG_CONFIG_HOME": "ignored", "SystemRoot": "system"},
 			want: []string{
-				`C:\users\sandbox`, `C:\users\sandbox\.claude`, `C:\users\sandbox\.claude\model-gateway`, `C:\users\sandbox\.claude\model-gateway`,
-				`C:\users\sandbox\.claude\settings.json`, `C:\users\sandbox\.claude.json`, `C:\users\sandbox\.claude\projects`,
-				`C:\users\sandbox\.claude\cache\gateway-models.json`, `D:\claude-code-proxy`, `C:\users\sandbox\.grok`,
-				`C:\users\sandbox\.claude\model-gateway\request-body`, `C:\users\sandbox\.claude\model-gateway\logs\request-routes.jsonl`, `C:\users\sandbox\.claude\model-gateway\dispatch-routes.json`,
-				`\\.\pipe\model-gateway`, `E:\System32\drivers\etc\hosts`,
+				home, filepath.Join(home, ".claude"), gateway, gateway,
+				filepath.Join(home, ".claude", "settings.json"), filepath.Join(home, ".claude.json"), filepath.Join(home, ".claude", "projects"),
+				filepath.Join(home, ".claude", "cache", "gateway-models.json"), filepath.Join("roaming", "claude-code-proxy"), filepath.Join(home, ".grok"),
+				filepath.Join(gateway, "request-body"), filepath.Join(gateway, "logs", "request-routes.jsonl"), filepath.Join(gateway, "dispatch-routes.json"),
+				`\\.\pipe\model-gateway`, filepath.Join("system", "System32", "drivers", "etc", "hosts"),
 			},
 		},
 		"success: macOS ignores XDG; direct artifact overrides remain raw": {
@@ -297,63 +297,6 @@ func TestWorkingDirectoryLookupFailures(t *testing.T) {
 			got, err := r.PluginRoot("../plugin")
 			if got != "" || err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Errorf("got %q, %v; want no path and a %q error", got, err, tt.want)
-			}
-		})
-	}
-}
-
-func TestWindowsDriveJoins(t *testing.T) {
-	tests := map[string]struct {
-		env                map[string]string
-		home, proxy, hosts string
-	}{
-		"success: bare drives join as absolute": {
-			env:  map[string]string{"USERPROFILE": "C:", "APPDATA": "D:", "SystemRoot": "E:"},
-			home: `C:\.claude\model-gateway`, proxy: `D:\claude-code-proxy`, hosts: `E:\System32\drivers\etc\hosts`,
-		},
-		"success: bare profile drive with default roaming path": {
-			env:  map[string]string{"USERPROFILE": "C:"},
-			home: `C:\.claude\model-gateway`, proxy: `C:\AppData\Roaming\claude-code-proxy`, hosts: `C:\Windows\System32\drivers\etc\hosts`,
-		},
-		"success: Windows slash folding and UNC share": {
-			env:  map[string]string{"USERPROFILE": `\\server\share\sandbox`, "APPDATA": `D:/first/../roaming`, "SystemRoot": `E:/Windows/`},
-			home: `\\server\share\sandbox\.claude\model-gateway`, proxy: `D:\roaming\claude-code-proxy`, hosts: `E:\Windows\System32\drivers\etc\hosts`,
-		},
-	}
-	for label, tt := range tests {
-		t.Run(label, func(t *testing.T) {
-			r := New(func(key string) (string, bool) { value, ok := tt.env[key]; return value, ok }, nil, nil)
-			r.platform = "windows"
-			home, homeErr := r.GatewayHome()
-			proxy, proxyErr := r.ProxyConfigDir()
-			if homeErr != nil || proxyErr != nil {
-				t.Fatalf("gateway home or proxy config resolution: %v, %v", homeErr, proxyErr)
-			}
-			if diff := gocmp.Diff([]string{tt.home, tt.proxy, tt.hosts}, []string{home, proxy, r.HostsFile()}); diff != "" {
-				t.Errorf("resolved Windows paths (-want +got):\n%s", diff)
-			}
-		})
-	}
-}
-
-func TestResolveWindowsFromInjectedDirectory(t *testing.T) {
-	tests := map[string]struct {
-		name string
-		want string
-	}{
-		"success: relative":                                              {`..\plugin`, `C:\physical\plugin`},
-		"success: rooted without a drive":                                {`\plugin`, `C:\plugin`},
-		"success: current drive relative":                                {`c:..\plugin`, `c:\physical\plugin`},
-		"success: alternate drive uses injected drive directory":         {`D:..\plugin`, `D:\saved\plugin`},
-		"success: alternate drive without saved directory uses its root": {`E:plugin`, `E:\plugin`},
-		"success: absolute UNC":                                          {`\\server\share\work\..\plugin`, `\\server\share\plugin`},
-	}
-	for label, tt := range tests {
-		t.Run(label, func(t *testing.T) {
-			r := New(func(key string) (string, bool) { return `D:\saved\work`, key == "=D:" }, nil, func() (string, error) { return `C:\physical\work`, nil })
-			r.platform = "windows"
-			if got, err := r.PluginRoot(tt.name); got != tt.want || err != nil {
-				t.Errorf("Windows path: got %q, %v; want %q", got, err, tt.want)
 			}
 		})
 	}
