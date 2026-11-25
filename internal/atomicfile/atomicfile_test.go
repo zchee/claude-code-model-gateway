@@ -177,10 +177,14 @@ func TestSweepTemporarySiblings(t *testing.T) {
 		age    time.Duration
 		exists bool
 	}{
-		"RemovesStale":          {".4242.abandoned.tmp", 2 * time.Hour, false},
-		"RetainsLive":           {".4243.in-flight.tmp", 0, true},
-		"RemovesAtThreshold":    {".4244.threshold.tmp", time.Hour, false},
-		"RetainsBelowThreshold": {".4245.recent.tmp", time.Hour - time.Second, true},
+		// Only names of the shape a writer generates (pid, twelve hex digits)
+		// are swept; any other sibling may be the user's file.
+		"RemovesStale":             {".4242.0123456789ab.tmp", 2 * time.Hour, false},
+		"RetainsLive":              {".4243.123456789abc.tmp", 0, true},
+		"RemovesAtThreshold":       {".4244.23456789abcd.tmp", time.Hour, false},
+		"RetainsBelowThreshold":    {".4245.3456789abcde.tmp", time.Hour - time.Second, true},
+		"RetainsUnrelatedStale":    {".backup.tmp", 2 * time.Hour, true},
+		"RetainsForeignShapeStale": {".4242.abandoned.tmp", 2 * time.Hour, true},
 	}
 	for _, tt := range tests {
 		sibling := path + tt.suffix
