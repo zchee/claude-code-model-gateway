@@ -11,10 +11,19 @@ override fmt_paths = $(foreach dir,$(fmt_dirs),$(call shell_quote,$(dir)))
 override fmt_packages = $(foreach dir,$(fmt_dirs),$(call shell_quote,$(if $(filter . ./,$(dir)),./...,./$(patsubst ./%,%,$(patsubst %/,%,$(dir)))/...)))
 override imports_flags := -project-name=github.com/zchee/claude-code-model-gateway -use-cache -cache-fast-skip -rm-unused -set-alias -recursive
 
-override validate_fmt_paths = for dir in $(fmt_paths); do \
+# Preserve trailing newlines in directory names when capturing pwd output.
+override validate_fmt_paths = root=$$(pwd -P && printf .) || exit 1; root=$${root%??}; \
+	for dir in $(fmt_paths); do \
 		case "/$$dir/" in \
-			/-*|//*|*/../*) \
-				printf 'invalid FMT_PATHS entry: %s (must not start with - or / or contain a .. component)\n' "$$dir" >&2; exit 1 ;; \
+			/-*|//*|*/../*|*...*) \
+				printf 'invalid FMT_PATHS entry: %s (must not start with - or / or contain a .. component or ...)\n' "$$dir" >&2; exit 1 ;; \
+		esac; \
+		if ! resolved=$$(cd -P "./$$dir" 2>/dev/null && pwd -P && printf .); then \
+			printf 'invalid FMT_PATHS entry: %s (not an accessible directory)\n' "$$dir" >&2; exit 1; \
+		fi; \
+		case "$${resolved%??}" in \
+			"$$root"|"$${root%/}"/*) ;; \
+			*) printf 'invalid FMT_PATHS entry: %s (resolves outside the checkout)\n' "$$dir" >&2; exit 1 ;; \
 		esac; \
 	done
 
@@ -44,18 +53,23 @@ vet:
 build-windows:
 	GOOS=windows GOARCH=amd64 go build ./...
 
+# A nonempty GOFLAGS overrides Go's saved defaults. Keep module metadata unchanged.
+override fmt_environment := GOFLAGS=-mod=readonly GOWORK=off
 # modernize's -tags flag is a no-op; GOFLAGS passes tags to go list.
+override fmt_process_flags := GOFLAGS='-mod=readonly -tags=process'
+
 fmt:
-	@$(validate_fmt_paths) && \
+	@$(validate_fmt_paths); \
+	export $(fmt_environment); \
 	gofmt -s -w -- $(fmt_paths) && \
 	gofumpt -w -extra -- $(fmt_paths) && \
 	modernize -fix -test -- $(fmt_packages) && \
-	GOFLAGS="$${GOFLAGS:+$$GOFLAGS }-tags=process" modernize -fix -test -- $(fmt_packages) && \
+	$(fmt_process_flags) modernize -fix -test -- $(fmt_packages) && \
 	goimports-rereviser $(imports_flags) -- $(fmt_paths)
 
 fmt-check:
 	@$(validate_fmt_paths); \
-	export GOFLAGS=-mod=readonly GOWORK=off; \
+	export $(fmt_environment); \
 	status=0; \
 	check() { \
 		output=$$("$$@") || status=1; \
@@ -64,7 +78,7 @@ fmt-check:
 	check gofmt -s -l -- $(fmt_paths); \
 	check gofumpt -l -extra -- $(fmt_paths); \
 	check modernize -fix -diff -test -- $(fmt_packages); \
-	check env GOFLAGS='-mod=readonly -tags=process' modernize -fix -diff -test -- $(fmt_packages); \
+	check env $(fmt_process_flags) modernize -fix -diff -test -- $(fmt_packages); \
 	check goimports-rereviser $(imports_flags) -list-diff -- $(fmt_paths); \
 	exit "$$status"
 
