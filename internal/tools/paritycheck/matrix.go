@@ -16,19 +16,25 @@ package main
 
 import (
 	"fmt"
+	"io/fs"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 )
 
 var (
-	tsvEscapes     = strings.NewReplacer(`\`, `\\`, "\t", `\t`, "\r", `\r`, "\n", `\n`)
-	slugPattern    = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
-	tableSeparator = regexp.MustCompile(`^\|(?:\s*:?-{3,}:?\s*\|)+$`)
-	codeSpan       = regexp.MustCompile("`([^`]+)`")
-	citation       = regexp.MustCompile("^`([^`]+)` `(.+)`$")
-	ledgerHeading  = regexp.MustCompile(`^### (phase-[0-5]) — ([0-9]+) rows?$`)
-	ledgerTotal    = regexp.MustCompile(`^\*\*Total: ([0-9]+) rows?\.\*\*$`)
+	tsvEscapes         = strings.NewReplacer(`\`, `\\`, "\t", `\t`, "\r", `\r`, "\n", `\n`)
+	slugPattern        = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
+	tableSeparator     = regexp.MustCompile(`^\|(?:\s*:?-{3,}:?\s*\|)+$`)
+	differenceSlugCell = regexp.MustCompile(`(?m)^\s*\|?[^|\r\n]+\|[ \t]*[a-z0-9]+(?:-[a-z0-9]+)*[ \t]*\|`)
+	replacementCell    = regexp.MustCompile("^`([^`]+)` \\((phase-[0-5])\\)$")
+	differenceHeading  = regexp.MustCompile(`(?m)^### [^\n]+$`)
+	citation           = regexp.MustCompile("^`([^`]+)` `(.+)`$")
+	ledgerHeading      = regexp.MustCompile(`^### (phase-[0-5]) — ([0-9]+) rows?$`)
+	ledgerTotal        = regexp.MustCompile(`^\*\*Total: ([0-9]+) rows?\.\*\*$`)
+	markerPrefix       = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]*[=:]`)
+	sourcePosition     = regexp.MustCompile(`^[^\s:]+:[1-9][0-9]*(?::[1-9][0-9]*)?$`)
 )
 
 type matrixRow struct {
@@ -60,32 +66,52 @@ func tableCells(line string) []string {
 	return cells
 }
 
+type replacement struct {
+	test  goTest
+	phase string
+}
+
 func (c *checker) readDifferences() {
 	text, ok := c.read(planFile)
 	if !ok {
 		return
 	}
-	c.diffs = make(map[string][]goTest)
-	inTable := false
-	lineNum := 0
-	for line := range strings.SplitSeq(text, "\n") {
-		lineNum++
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "| # | slug |") {
-			inTable = true
-			continue
-		}
-		if !inTable {
-			continue
-		}
-		if !strings.HasPrefix(line, "|") {
+	c.diffs = make(map[string][]replacement)
+	before, section, found := strings.Cut(strings.ReplaceAll(text, "\r\n", "\n"), "### 3.10 Differences from the source\n")
+	if !found {
+		c.problem(planFile, "difference table", "missing section")
+		return
+	}
+	if next := differenceHeading.FindStringIndex(section); next != nil {
+		section = section[:next[0]]
+	}
+	const phaseColumn = "Replacement tests (phase)"
+	hasHeader := false
+	for line := range strings.SplitSeq(section, "\n") {
+		cells := tableCells(strings.TrimSpace(line))
+		if len(cells) == 8 && cells[0] == "#" && cells[1] == "slug" && cells[6] == "Required Go replacement test" && cells[7] == phaseColumn {
+			hasHeader = true
 			break
 		}
-		if tableSeparator.MatchString(line) {
+	}
+	if !hasHeader {
+		c.problem(planFile, "difference table", "missing %q column", phaseColumn)
+		c.diffs = nil
+		return
+	}
+	want := len(differenceSlugCell.FindAllStringIndex(section, -1)) - 1 // The header's slug column is counted too.
+	lineNum := strings.Count(before, "\n") + 1
+	for line := range strings.SplitSeq(section, "\n") {
+		lineNum++
+		line = strings.TrimSpace(line)
+		if (!strings.HasPrefix(line, "|") && !differenceSlugCell.MatchString(line)) || tableSeparator.MatchString(line) {
 			continue
 		}
 		cells := tableCells(line)
-		if len(cells) != 7 || !slugPattern.MatchString(cells[1]) {
+		if len(cells) == 8 && cells[1] == "slug" && cells[0] == "#" {
+			continue
+		}
+		if len(cells) != 8 || !slugPattern.MatchString(cells[1]) {
 			c.problem(planFile, strconv.Itoa(lineNum), "invalid difference table row")
 			continue
 		}
@@ -94,16 +120,22 @@ func (c *checker) readDifferences() {
 			c.problem(planFile, slug, "duplicate difference slug")
 			continue
 		}
-		var targets []goTest
-		for _, span := range codeSpan.FindAllStringSubmatch(cells[6], -1) {
-			if t, ok := c.goTarget(span[1]); ok {
-				targets = append(targets, t)
+		var targets []replacement
+		for entry := range strings.SplitSeq(cells[7], "<br>") {
+			parts := replacementCell.FindStringSubmatch(entry)
+			if parts != nil {
+				if t, ok := c.goTarget(parts[1]); ok {
+					targets = append(targets, replacement{test: t, phase: parts[2]})
+					continue
+				}
 			}
+			c.problem(planFile, slug, "invalid replacement test entry %q", entry)
 		}
 		c.diffs[slug] = targets
+		c.checkDifference(planFile, slug, slug, true)
 	}
-	if len(c.diffs) == 0 {
-		c.problem(planFile, "difference table", "no difference rows found")
+	if len(c.diffs) == 0 || len(c.diffs) != want {
+		c.problem(planFile, "difference table", "parsed %d difference rows, found %d slug cells", len(c.diffs), max(0, want))
 	}
 }
 
@@ -117,6 +149,32 @@ func (c *checker) checkDifference(file string, key any, slug string, replacement
 	} else if replacement && len(targets) == 0 {
 		c.problem(planFile, slug, "no valid Go replacement test named")
 	}
+}
+
+// markdownOutsideFences keeps line numbers while excluding fenced examples.
+func markdownOutsideFences(text string) string {
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	var fence byte
+	var width int
+	for i, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if len(line) != 0 && (line[0] == '`' || line[0] == '~') {
+			n := 0
+			for n < len(line) && line[n] == line[0] {
+				n++
+			}
+			if fence == 0 && n >= 3 {
+				fence, width = line[0], n
+			} else if line[0] == fence && n >= width && line[n:] == "" {
+				fence = 0
+				lines[i] = ""
+			}
+		}
+		if fence != 0 {
+			lines[i] = ""
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (c *checker) checkMatrix() {
@@ -153,26 +211,40 @@ func (c *checker) checkMatrix() {
 
 	c.matrix = make(map[string]matrixRow)
 	covered := make(map[caseKey]bool)
-	before, ledger, found := strings.Cut(text, "\n## Phase scope ledger\n")
+	before, ledger, found := strings.Cut(markdownOutsideFences(text), "\n## Phase scope ledger\n")
 	if !found {
 		c.problem(matrixFile, "phase scope ledger", "missing heading")
 	}
+	header := []string{"Row id", "Area", "Assertion", "Source tests", "Due", "Go package", "Source of the row"}
 	lineNum := 0
+	inTable := false
 	for line := range strings.SplitSeq(before, "\n") {
 		lineNum++
 		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "|") || tableSeparator.MatchString(line) {
+		cells := tableCells(line)
+		if slices.Equal(cells, header) {
+			inTable = true
 			continue
 		}
-		cells := tableCells(line)
+		if !inTable {
+			continue
+		}
+		if !strings.HasPrefix(line, "|") {
+			if id, _, ok := strings.Cut(line, "|"); ok && slugPattern.MatchString(strings.TrimSpace(id)) {
+				c.problem(matrixFile, strconv.Itoa(lineNum), "matrix row must begin with a pipe")
+			} else {
+				inTable = false
+			}
+			continue
+		}
+		if tableSeparator.MatchString(line) {
+			continue
+		}
 		if len(cells) != 7 {
 			c.problem(matrixFile, strconv.Itoa(lineNum), "got %d table cells, want seven", len(cells))
 			continue
 		}
 		id := cells[0]
-		if id == "Row id" {
-			continue
-		}
 		if !slugPattern.MatchString(id) {
 			c.problem(matrixFile, strconv.Itoa(lineNum), "invalid row id %q", id)
 			continue
@@ -186,12 +258,34 @@ func (c *checker) checkMatrix() {
 			c.problem(matrixFile, id, "invalid area, assertion, phase, package or provenance")
 		}
 		superseded := make(map[caseKey]bool)
-		supersedes, phaseGate := false, false
+		crossLinks := make(map[string]string)
+		supersedes, phaseGate, shipped := false, false, false
 		for marker := range strings.SplitSeq(cells[6], ";") {
 			marker = strings.TrimSpace(marker)
 			switch k, value, _ := strings.Cut(marker, "="); k {
-			case "supersedes":
-				supersedes = value != ""
+			case "supersedes", "assertion-site":
+				if !sourcePosition.MatchString(value) {
+					c.problem(matrixFile, id, "invalid %s location %q", k, value)
+				}
+				if k == "supersedes" {
+					supersedes = true
+				}
+			case "shipped-source":
+				shipped = true
+				if value == "." || !fs.ValidPath(value) || strings.ContainsAny(value, "\\\t\x00") {
+					c.problem(matrixFile, id, "invalid shipped-source path %q", value)
+				}
+			case "integration-from", "narrower-from":
+				origin, note, _ := strings.Cut(value, " ")
+				phase, pkg, ok := strings.Cut(origin, "@")
+				if !ok || !validPhase(phase) || !validPackage(pkg) || (note != "" && (!strings.HasPrefix(note, "(") || !strings.HasSuffix(note, ")"))) {
+					c.problem(matrixFile, id, "invalid %s marker %q", k, value)
+					continue
+				}
+				if k == "integration-from" && phase >= row.phase {
+					c.problem(matrixFile, id, "integration-from must name a phase earlier than %s", row.phase)
+				}
+				crossLinks[origin] = k
 			case "superseded-case":
 				if key, ok := resolve(id, value); ok {
 					superseded[key] = true
@@ -202,8 +296,16 @@ func (c *checker) checkMatrix() {
 				}
 				phaseGate = value == "phase-gate"
 			case "pending":
-				if _, ok := c.goTarget(value); !ok || row.pending != "" {
+				test, ok := c.goTarget(value)
+				if !ok || row.pending != "" {
 					c.problem(matrixFile, id, "invalid or duplicate pending target %q", value)
+				}
+				for _, replacements := range c.diffs {
+					for _, replacement := range replacements {
+						if replacement.test == test && replacement.phase < row.phase {
+							c.problem(matrixFile, id, "pending test %s is scheduled in %s by the plan, earlier than row phase %s", test, replacement.phase, row.phase)
+						}
+					}
 				}
 				row.pending = value
 			case "mixed-with":
@@ -215,33 +317,53 @@ func (c *checker) checkMatrix() {
 						c.problem(matrixFile, id, "multiple differences listed")
 					}
 					row.difference = slug
+				} else if markerPrefix.MatchString(marker) {
+					c.problem(matrixFile, id, "unknown matrix marker %q", marker)
 				}
 			}
+		}
+		if shipped && !phaseGate {
+			c.problem(matrixFile, id, "shipped-source needs due-at=phase-gate")
 		}
 		if supersedes != (len(superseded) != 0) && c.census != nil {
 			c.problem(matrixFile, id, "supersedes and superseded-case must be paired")
 		}
 		c.matrix[id] = row
-		if row.noSourceTest {
-			continue
+		origins := make(map[string]bool)
+		for key := range superseded {
+			if cl, ok := c.classes[key]; ok {
+				origins[cl.phase+"@"+cl.pkg] = true
+			}
 		}
-		for ref := range strings.SplitSeq(cells[3], "<br>") {
-			key, ok := resolve(id, strings.TrimSpace(ref))
-			if !ok || superseded[key] {
-				continue
+		if !row.noSourceTest {
+			for ref := range strings.SplitSeq(cells[3], "<br>") {
+				key, ok := resolve(id, strings.TrimSpace(ref))
+				if !ok {
+					continue
+				}
+				if superseded[key] {
+					c.problem(matrixFile, id, "cites superseded case %s as proof", key)
+					continue
+				}
+				cl, ok := c.classes[key]
+				if !ok {
+					continue
+				}
+				origins[cl.phase+"@"+cl.pkg] = true
+				if cl.class != "conformance" && cl.class != "go-port" {
+					c.problem(matrixFile, id, "cites %s as proof despite class %q", key, cl.class)
+					continue
+				}
+				if cl.gate == "phase" && !phaseGate {
+					c.problem(matrixFile, id, "phase-gated citation %s needs due-at=phase-gate", key)
+				}
+				covered[key] = true
 			}
-			cl, ok := c.classes[key]
-			if !ok {
-				continue
+		}
+		for origin, kind := range crossLinks {
+			if c.classes != nil && !origins[origin] {
+				c.problem(matrixFile, id, "%s=%s does not identify a cited case's phase and package", kind, origin)
 			}
-			if cl.class != "conformance" && cl.class != "go-port" {
-				c.problem(matrixFile, id, "cites %s as proof despite class %q", key, cl.class)
-				continue
-			}
-			if cl.gate == "phase" && !phaseGate {
-				c.problem(matrixFile, id, "phase-gated citation %s needs due-at=phase-gate", key)
-			}
-			covered[key] = true
 		}
 	}
 	for key, cl := range c.classes {
@@ -263,7 +385,7 @@ func (c *checker) checkMatrixLock() {
 		return
 	}
 	locked := make(map[string]bool)
-	for id := range strings.SplitSeq(strings.TrimSuffix(text, "\n"), "\n") {
+	for id := range strings.SplitSeq(strings.TrimSuffix(strings.ReplaceAll(text, "\r\n", "\n"), "\n"), "\n") {
 		if !slugPattern.MatchString(id) || locked[id] {
 			c.problem(lockFile, id, "invalid or duplicate row id")
 		}

@@ -3,4 +3,7 @@ set -eu
 
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
 caller=$(pwd -P)
-exec go -C "$root" run ./internal/tools/paritycheck "$root" "$caller" "$@"
+build=$(mktemp -d "${TMPDIR:-/tmp}/parity-check.XXXXXXXX")
+trap 'rm -rf -- "$build"' EXIT
+go -C "$root" build -o "$build/parity-check" ./internal/tools/paritycheck
+"$build/parity-check" "$root" "$caller" "$@"

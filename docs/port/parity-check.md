@@ -7,39 +7,55 @@ checkout. An exempt case must have one entry of the same class in
 `test/conformance/exemptions-approved.tsv`. `assertion-pairs.tsv` records all
 cases and must reflect the reviewed `add` and `remove` edges. The editable
 `assertion-sites.tsv` must match exactly the generated pairs for non-exempt
-cases. After the seven key fields its columns are `target`, `review`, `due`;
-`due` is never empty, but structure mode does not require targets. A due case
-has at least one pair unless a reviewed removal explains its absence.
-Regenerate pairs independently in the venue before reviewing updates; comparing
-the files alone cannot detect a deleted edge when another pair covers its case.
+cases. After the seven key fields its columns are `target`, `review`, `due`.
+Structure does not require targets, but each due case must retain a pair even
+when removals are approved. Each pair is due in the case's phase unless its
+`review` records approval for a later phase. The baseline census must match
+its recorded SHA-256, and the ownership table's package and phase-gate counts
+must match classification. Static launch rows can include `case_path`,
+`case_line`, and `case_column` to name the registration exactly; otherwise,
+the launch path and full case name must identify a unique census case.
+
+Review coordinated edits to the matrix and its lock/ledger, to exemptions and
+approvals, and to the generated pairs and editable mapping. Regenerate the
+pairs independently in the venue to catch edges deleted from both pair files.
 
 `hack/parity-check mapping phase-2 internal/worker` checks pairs due in that
 phase with the specified owning package and `gate=task`. Omit the package to
 include the whole phase, including phase-gated pairs and pending matrix tests.
 A Go target uses the package path below this module (the full import path is
 also accepted), a dot, and the exact test name with any slash-delimited subtests.
-A difference case maps each pair to the applicable replacement test function
-named for its slug in the plan; it may name a subtest of that function. An
-exempt assertion needs a permitted `not-ported:` reason and a reviewer named
-in `review`. When one Go target covers different sites, record the reviewed,
-unconditional check
-in each pair's `review` field. The tool checks presence, not whether a reviewer
-approved a claim or the test body actually exercises each predicate.
+Use the full module path to name a test in the module root.
+Each Go target for a `go-port` pair needs approval in `review`. If a test is
+shared across sites, the review must describe each unconditional check.
+A difference case must map at least one pair to an approved replacement test
+at the case's gate. A mapped subtest may match a replacement function, but a
+named replacement subtest must match exactly. Any exempt assertion needs a
+permitted `not-ported:` reason and a reviewer named in `review`. The tool
+checks for review text, not the reviewer or the test body's behavior.
 
-`hack/parity-check results <phase>` also checks evidence. Pass paths to the
-following files as needed; relative paths resolve from the caller's directory:
+`hack/parity-check results <phase>` also checks evidence. Pass `--commit SHA`
+with the full commit ID of the gated checkout. Every supplied evidence file
+starts with a JSON metadata line `{"run_id":"...","commit":"..."}`; all files
+must have the same run identifier and match the expected commit. Relative
+paths resolve from the caller's directory. Supply each file its gate requires:
 
 | Option | Evidence |
 |---|---|
-| `--go-json PATH` | Unfiltered `go test -json -count=1` output from the venue. Repeat for separate suites. The exact package and test must have `run` then `pass`, and the package must pass without cached output. |
-| `--census PATH` | The source suite run against Go, with the baseline census columns: `path`, `line`, `column`, `depth`, `name`, `status`, `detail`. A due case must have `status=pass`. |
-| `--launches PATH` | TSV with `path`, `line`, `column`, `name`, `binary`. Each row attributes one launch of the built Go binary (its absolute path) to the exact case key. Multiple launches per case are allowed. |
+| `--go-json PATH` | Unfiltered `go test -json -count=1` output from the venue. Repeat for separate suites. The exact package and test must have ordered start/run/pass events and a successful uncached package summary. |
+| `--census PATH` | The source suite run against Go; TSV columns `path`, `line`, `column`, `depth`, `name`, `status`, `detail`. Each conformance case assigned to the phase must pass, even if its individual pairs are due later. |
+| `--launches PATH` | TSV with `path`, `line`, `column`, `name`, `binary`, `binary_sha256`. Each row attributes one launch to the exact case key. The absolute binary path and lowercase SHA-256 must be identical throughout the run. |
 
-TSVs use a header and literal tabs with the same field escaping as the baseline.
-Each gate checks its pending matrix targets and mapped replacements. The final
-phase also checks all earlier ledgers and every replacement test named in the
-plan, including unreferenced tests. The fixtures exercise the evidence formats;
-the conformance census and attributed launch producers are not yet implemented.
-The tool checks the records, not their provenance: use evidence from the gated
-checkout and trusted venue, not a hand-authored record or an earlier run. An
-uncached result alone cannot prove when the evidence was collected.
+After the metadata line, TSVs use a header and literal tabs with the same
+field escaping as the baseline. Each results gate requires its pending matrix
+and mapped tests plus every replacement scheduled for that phase in the plan's
+`Replacement tests (phase)` column. Entries are separated by `<br>`; each is a
+backquoted Go test target followed by its phase in parentheses. The preceding
+prose column is not evidence. The final phase includes the earlier ledgers and
+all plan replacements.
+
+Future producers must assign a fresh identifier to each run, derive its commit
+from the gated checkout, collect unfiltered Go events without caching, and
+record the executable path and measured digest from the actual Go launch.
+The checker matches those claims but cannot authenticate the producers, prove
+when a run occurred, or inspect an executable in another venue.

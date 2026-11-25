@@ -1,3 +1,4 @@
+{"run_id":"venue-fixture","commit":"0123456789012345678901234567890123456789"}
 {"Action":"start","Package":"example.org/port/internal/gate"}
 {"Action":"run","Package":"example.org/port/internal/gate","Test":"TestGate"}
 {"Action":"run","Package":"example.org/port/internal/gate","Test":"TestGate/shared"}
@@ -8,6 +9,8 @@
 {"Action":"run","Package":"example.org/port/internal/gate","Test":"TestReplacement"}
 {"Action":"run","Package":"example.org/port/internal/gate","Test":"TestReplacement/subtest"}
 {"Action":"pass","Package":"example.org/port/internal/gate","Test":"TestReplacement/subtest"}
+{"Action":"run","Package":"example.org/port/internal/gate","Test":"TestReplacement/other"}
+{"Action":"pass","Package":"example.org/port/internal/gate","Test":"TestReplacement/other"}
 {"Action":"pass","Package":"example.org/port/internal/gate","Test":"TestReplacement"}
 {"Action":"run","Package":"example.org/port/internal/gate","Test":"TestPackagedReplacement"}
 {"Action":"pass","Package":"example.org/port/internal/gate","Test":"TestPackagedReplacement"}

@@ -1,6 +1,7 @@
 path	line	column	name	site_path	site_line	site_column	target	review	due
-test/source.test.js	1	1	Alpha	test/helper.js	20	3	internal/gate.TestGate/shared		phase-2
-test/source.test.js	1	1	Beta	test/helper.js	20	3	internal/gate.TestGate/shared		phase-2
-test/source.test.js	1	1	Beta	test/source.test.js	25	2	internal/gate.TestGate/child		phase-3
+test/source.test.js	1	1	Alpha	test/helper.js	20	3	internal/gate.TestGate/shared	Reviewed shared check.	phase-2
+test/source.test.js	1	1	Beta	test/helper.js	20	3	internal/gate.TestGate/shared	Reviewed shared check.	phase-2
+test/source.test.js	1	1	Beta	test/source.test.js	25	2	internal/gate.TestGate/child	Approved for the later gate.	phase-3
 test/source.test.js	2	1	Launch	test/source.test.js	31	2			phase-2
 test/source.test.js	3	1	Replacement	test/source.test.js	35	2	internal/gate.TestReplacement/subtest		phase-4
+test/source.test.js	3	1	Replacement	test/source.test.js	36	2	internal/gate.TestReplacement/other		phase-4

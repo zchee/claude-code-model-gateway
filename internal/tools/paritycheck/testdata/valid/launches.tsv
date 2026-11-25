@@ -1,2 +1,3 @@
-path	line	column	name	binary
-test/source.test.js	2	1	Launch	/venue/bin/gateway
+{"run_id":"venue-fixture","commit":"0123456789012345678901234567890123456789"}
+path	line	column	name	binary	binary_sha256
+test/source.test.js	2	1	Launch	/venue/bin/gateway	0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef

@@ -1,2 +1,3 @@
+{"run_id":"venue-fixture","commit":"0123456789012345678901234567890123456789"}
 path	line	column	depth	name	status	detail
 test/source.test.js	2	1	0	Launch	pass	-

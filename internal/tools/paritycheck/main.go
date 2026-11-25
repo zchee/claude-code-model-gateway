@@ -21,6 +21,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 )
 
@@ -30,11 +31,13 @@ const usage = `usage:
   hack/parity-check [--root DIR] results <phase> [options]
 
 Results options (provide each file needed by the selected gate):
-  --go-json PATH       go test -json -count=1 output; repeat for separate suites
-  --census PATH        conformance TSV: path, line, column, depth, name, status, detail
-  --launches PATH      Go launch TSV: path, line, column, name, binary (absolute path)
+  --commit SHA         required full commit of the gated checkout
+  --go-json PATH       metadata line, then go test -json -count=1; repeatable
+  --census PATH        metadata line, then conformance census TSV
+  --launches PATH      metadata line, then launch TSV including binary and binary_sha256
 
-Evidence paths are relative to the caller. See docs/port/parity-check.md.`
+Each metadata line is a JSON object with run_id and commit. Evidence paths are
+relative to the caller. See docs/port/parity-check.md.`
 
 func main() {
 	if len(os.Args) < 3 {
@@ -113,9 +116,11 @@ func run(root, caller string, args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+var commitPattern = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
+
 type evidenceFiles struct {
-	goJSON           []string
-	census, launches string
+	goJSON                   []string
+	census, launches, commit string
 }
 
 func (ev *evidenceFiles) parse(caller string, args []string, w io.Writer) bool {
@@ -128,6 +133,7 @@ func (ev *evidenceFiles) parse(caller string, args []string, w io.Writer) bool {
 	flags := flag.NewFlagSet("results", flag.ContinueOnError)
 	flags.SetOutput(w)
 	flags.Usage = func() { _, _ = fmt.Fprintln(w, usage) }
+	flags.StringVar(&ev.commit, "commit", "", "full commit of the gated checkout")
 	flags.Func("go-json", "path to Go test events (repeatable)", func(path string) error {
 		if path == "" {
 			return fmt.Errorf("empty path")
@@ -149,6 +155,10 @@ func (ev *evidenceFiles) parse(caller string, args []string, w io.Writer) bool {
 	}
 	if flags.NArg() != 0 {
 		flags.Usage()
+		return false
+	}
+	if !commitPattern.MatchString(ev.commit) {
+		_, _ = fmt.Fprintln(w, "results: --commit requires a full lowercase Git commit ID")
 		return false
 	}
 	return true

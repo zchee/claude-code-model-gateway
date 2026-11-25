@@ -15,6 +15,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	json "encoding/json/v2"
 	"fmt"
 	"io/fs"
 	"os"
@@ -84,7 +86,7 @@ type checker struct {
 	census   map[caseKey]string
 	classes  map[caseKey]classification
 	matrix   map[string]matrixRow
-	diffs    map[string][]goTest
+	diffs    map[string][]replacement
 	sites    map[pairKey]mapping
 }
 
@@ -116,13 +118,21 @@ func (c *checker) rows(file, required string, visit func(int, map[string]string)
 	if !ok {
 		return false
 	}
+	return c.parseRows(file, text, required, 0, visit)
+}
+
+func (c *checker) parseRows(file, text, required string, prefixLines int, visit func(int, map[string]string)) bool {
 	header, rest, _ := strings.Cut(text, "\n")
 	columns := strings.Split(strings.TrimSuffix(header, "\r"), "\t")
 	row := make(map[string]string, len(columns))
 	bad := false
 	for _, name := range columns {
-		if _, duplicate := row[name]; duplicate || name == "" {
-			c.problem(file, "header", "empty or duplicate column %q", name)
+		if _, duplicate := row[name]; duplicate {
+			c.problem(file, "header", "duplicate column %q", name)
+			bad = true
+		}
+		if !headerColumn.MatchString(name) {
+			c.problem(file, "header", "invalid column %q", name)
 			bad = true
 		}
 		row[name] = ""
@@ -136,7 +146,7 @@ func (c *checker) rows(file, required string, visit func(int, map[string]string)
 	if bad {
 		return false
 	}
-	n := 1
+	n := 1 + prefixLines
 	for line := range strings.SplitSeq(strings.TrimSuffix(rest, "\n"), "\n") {
 		if rest == "" {
 			break
@@ -159,7 +169,11 @@ func validPhase(s string) bool {
 	return len(s) == len("phase-0") && strings.HasPrefix(s, "phase-") && s[6] >= '0' && s[6] <= '5'
 }
 
-var packagePattern = regexp.MustCompile(`^[A-Za-z0-9_~.+-]+(?:/[A-Za-z0-9_~.+-]+)*$`)
+var (
+	headerColumn   = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+	digestPattern  = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	packagePattern = regexp.MustCompile(`^[A-Za-z0-9_~.+-]+(?:/[A-Za-z0-9_~.+-]+)*$`)
+)
 
 func validPackage(s string) bool {
 	return s != "." && fs.ValidPath(s) && packagePattern.MatchString(s)
@@ -212,7 +226,10 @@ func (c *checker) structure() {
 			c.problem("go.mod", "module", "missing or invalid module path")
 		}
 	}
-	c.census = c.readCensus(censusFile)
+	if text, ok := c.read(censusFile); ok {
+		c.checkCensusDigest(text)
+		c.census = c.readCensus(censusFile, text, 0)
+	}
 	c.readDifferences()
 	c.readClasses()
 	c.checkExemptionApprovals()
@@ -222,9 +239,31 @@ func (c *checker) structure() {
 	c.checkMarkers()
 }
 
-func (c *checker) readCensus(file string) map[caseKey]string {
+func (c *checker) checkCensusDigest(text string) {
+	const runFile = "test/conformance/baseline/run.json"
+	metadata, ok := c.read(runFile)
+	if !ok {
+		return
+	}
+	var run struct {
+		CensusDigest string `json:"census_sha256"`
+	}
+	if err := json.Unmarshal([]byte(metadata), &run); err != nil {
+		c.problem(runFile, "census_sha256", "invalid baseline metadata: %v", err)
+		return
+	}
+	if !digestPattern.MatchString(run.CensusDigest) {
+		c.problem(runFile, "census_sha256", "missing or invalid SHA-256 digest")
+		return
+	}
+	if fmt.Sprintf("%x", sha256.Sum256([]byte(text))) != run.CensusDigest {
+		c.problem(censusFile, "census_sha256", "digest does not match %s", runFile)
+	}
+}
+
+func (c *checker) readCensus(file, text string, prefixLines int) map[caseKey]string {
 	statuses := make(map[caseKey]string)
-	if !c.rows(file, caseColumns+" depth status detail", func(n int, row map[string]string) {
+	if !c.parseRows(file, text, caseColumns+" depth status detail", prefixLines, func(n int, row map[string]string) {
 		key, ok := c.caseKey(file, n, row)
 		if !ok {
 			return
@@ -254,13 +293,32 @@ func (c *checker) readCensus(file string) map[caseKey]string {
 
 func (c *checker) readClasses() {
 	type owner struct{ phase, pkg string }
-	owners := make(map[owner]bool)
-	if text, ok := c.read(ownersFile); ok {
-		for line := range strings.SplitSeq(text, "\n") {
-			cells := tableCells(line)
-			if len(cells) == 6 && validPhase(cells[0]) {
-				owners[owner{cells[0], strings.Trim(cells[1], "`")}] = true
+	type counts struct{ due, conformance int }
+	const phaseGate = "**phase gate**"
+	owners := make(map[owner]counts)
+	actual := make(map[owner]counts)
+	ownership, ownersOK := c.read(ownersFile)
+	if ownersOK {
+		for line := range strings.SplitSeq(ownership, "\n") {
+			cells := tableCells(strings.TrimSpace(line))
+			if len(cells) == 0 || !strings.HasPrefix(cells[0], "phase-") {
+				continue
 			}
+			if len(cells) != 6 || !validPhase(cells[0]) {
+				c.problem(ownersFile, "ownership table", "invalid ownership row %q", line)
+				continue
+			}
+			key := owner{cells[0], strings.Trim(cells[1], "`")}
+			if _, duplicate := owners[key]; duplicate {
+				c.problem(ownersFile, key.phase+" "+key.pkg, "duplicate ownership row")
+				continue
+			}
+			due, dueOK := positive(cells[4])
+			conf, confOK := positive(cells[5])
+			if (!dueOK && cells[4] != "0") || (!confOK && cells[5] != "0") || conf > due {
+				c.problem(ownersFile, key.phase+" "+key.pkg, "invalid ownership counts %q, %q", cells[4], cells[5])
+			}
+			owners[key] = counts{due, conf}
 		}
 	}
 	classes := make(map[caseKey]classification)
@@ -292,14 +350,32 @@ func (c *checker) readClasses() {
 		} else {
 			if !validPhase(cl.phase) || !validPackage(cl.pkg) || (cl.gate != "task" && cl.gate != "phase") {
 				c.problem(classFile, key, "invalid phase, package or gate: %q, %q, %q", cl.phase, cl.pkg, cl.gate)
-			} else if !owners[owner{cl.phase, cl.pkg}] || cl.gate == "phase" && !owners[owner{cl.phase, "**phase gate**"}] {
-				c.problem(classFile, key, "phase/package/gate not listed in %s", ownersFile)
+			} else if ownersOK {
+				ownerKey := owner{cl.phase, cl.pkg}
+				_, hasPackage := owners[ownerKey]
+				if cl.gate == "phase" {
+					ownerKey.pkg = phaseGate
+				}
+				if _, ok := owners[ownerKey]; !ok || !hasPackage {
+					c.problem(classFile, key, "phase/package/gate not listed in %s", ownersFile)
+				}
+				n := actual[ownerKey]
+				n.due++
+				if cl.class == "conformance" {
+					n.conformance++
+				}
+				actual[ownerKey] = n
 			}
 		}
 	}) {
 		return
 	}
 	c.classes = classes
+	for key, declared := range owners {
+		if got := actual[key]; got != declared {
+			c.problem(ownersFile, key.phase+" "+key.pkg, "counts due=%d conformance=%d disagree with classification due=%d conformance=%d", declared.due, declared.conformance, got.due, got.conformance)
+		}
+	}
 	if c.census == nil {
 		return
 	}
@@ -354,7 +430,18 @@ func (c *checker) checkExemptionApprovals() {
 
 func (c *checker) checkLaunchSites() {
 	type launchOwner struct{ path, name string }
-	launched := make(map[launchOwner]bool)
+	type launchKey struct {
+		site            location
+		owner           caseKey
+		kind, via, argv string
+	}
+	byOwner := make(map[launchOwner][]caseKey)
+	for key := range c.census {
+		short := launchOwner{key.loc.path, key.name}
+		byOwner[short] = append(byOwner[short], key)
+	}
+	seen := make(map[launchKey]bool)
+	launched := make(map[caseKey]bool)
 	if !c.rows(launchFile, "path line column kind via case argv", func(n int, row map[string]string) {
 		loc, ok := parseLocation(row["path"], row["line"], row["column"])
 		if !ok {
@@ -367,14 +454,37 @@ func (c *checker) checkLaunchSites() {
 			c.problem(launchFile, loc, "invalid launch kind %q", row["kind"])
 			return
 		}
-		if row["case"] != "-" {
-			launched[launchOwner{loc.path, row["case"]}] = true
+		owner := caseKey{name: row["case"]}
+		if owner.name != "-" && c.census != nil {
+			_, withPath := row["case_path"]
+			_, withLine := row["case_line"]
+			_, withCol := row["case_column"]
+			if withPath || withLine || withCol {
+				owner.loc, ok = parseLocation(row["case_path"], row["case_line"], row["case_column"])
+				if _, exists := c.census[owner]; !ok || !exists {
+					c.problem(launchFile, loc, "launch does not name an exact census case: %s", owner)
+					return
+				}
+			} else {
+				matches := byOwner[launchOwner{loc.path, owner.name}]
+				if len(matches) != 1 {
+					c.problem(launchFile, loc, "launch name %q identifies %d census cases; need one", owner.name, len(matches))
+					return
+				}
+				owner = matches[0]
+			}
+			launched[owner] = true
 		}
+		key := launchKey{loc, owner, row["kind"], row["via"], row["argv"]}
+		if seen[key] {
+			c.problem(launchFile, loc, "duplicate launch row for %q", owner.name)
+		}
+		seen[key] = true
 	}) {
 		return
 	}
 	for key, cl := range c.classes {
-		if cl.class == "conformance" && !launched[launchOwner{key.loc.path, key.name}] {
+		if cl.class == "conformance" && c.census != nil && !launched[key] {
 			c.problem(launchFile, key, "no launch site names conformance case")
 		}
 	}

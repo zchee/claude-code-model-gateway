@@ -36,7 +36,6 @@ func (c *checker) checkPairs() {
 		}
 		expected[key] = row["via"]
 	})
-	removed := make(map[caseKey]bool)
 	added := make(map[pairKey]bool)
 	seen := make(map[pairKey]bool)
 	overridesOK := c.rows(overFile, pairColumns+" action reason", func(n int, row map[string]string) {
@@ -64,7 +63,6 @@ func (c *checker) checkPairs() {
 			if exists {
 				c.problem(overFile, key, "removed pair still appears in generated evidence")
 			}
-			removed[key.caseKey] = true
 		default:
 			c.problem(overFile, key, "invalid override action %q", row["action"])
 		}
@@ -90,6 +88,8 @@ func (c *checker) checkPairs() {
 			c.problem(siteFile, key, "invalid due phase %q", m.due)
 		case classified && m.due < cl.phase:
 			c.problem(siteFile, key, "due phase %s is earlier than case phase %s", m.due, cl.phase)
+		case classified && m.due > cl.phase && strings.TrimSpace(m.review) == "":
+			c.problem(siteFile, key, "later due phase %s needs reviewer approval", m.due)
 		}
 	})
 	c.sites = sites
@@ -115,8 +115,8 @@ func (c *checker) checkPairs() {
 		}
 	}
 	for key, cl := range c.classes {
-		if _, classified := c.census[key]; classified && !cl.exempt() && !obligations[key] && !removed[key] {
-			c.problem(pairFile, key, "due case has no assertion pair or removal override")
+		if _, classified := c.census[key]; classified && !cl.exempt() && !obligations[key] {
+			c.problem(pairFile, key, "due case has no assertion pair")
 		}
 	}
 }
@@ -145,6 +145,9 @@ func (c *checker) goTarget(target string) (goTest, bool) {
 		}
 		pkg, name := target[:offset], target[offset+1:]
 		offset += len(".Test")
+		if pkg == c.module && testName.MatchString(name) {
+			return goTest{pkg: c.module, name: name}, true
+		}
 		if rel, full := strings.CutPrefix(pkg, c.module+"/"); full {
 			pkg = rel
 		} else if first, _, _ := strings.Cut(pkg, "/"); strings.Contains(first, ".") {
@@ -179,6 +182,7 @@ func (c *checker) checkMappings(phase, pkg string, cumulative bool) {
 		}
 	}
 	inScope := 0
+	replaced := make(map[caseKey]bool)
 	for key, m := range c.sites {
 		cl := c.classes[key.caseKey]
 		if !phaseMatches(m.due, phase, cumulative) || (pkg != "" && (cl.pkg != pkg || cl.gate != "task")) {
@@ -209,15 +213,34 @@ func (c *checker) checkMappings(phase, pkg string, cumulative bool) {
 			c.problem(siteFile, key, "missing or invalid Go test target %q", m.target)
 			continue
 		}
-		if replacements := c.diffs[slug]; difference && len(replacements) != 0 && !slices.ContainsFunc(replacements, func(r goTest) bool {
+		if difference && slices.ContainsFunc(c.diffs[slug], func(r replacement) bool {
+			if r.test.pkg != test.pkg {
+				return false
+			}
+			if strings.Contains(r.test.name, "/") {
+				return test.name == r.test.name
+			}
 			name, _, _ := strings.Cut(test.name, "/")
-			want, _, _ := strings.Cut(r.name, "/")
-			return test.pkg == r.pkg && name == want
+			return name == r.test.name
 		}) {
+			if m.due == cl.phase {
+				replaced[key.caseKey] = true
+			}
+		} else if difference && len(c.diffs[slug]) != 0 {
 			c.problem(siteFile, key, "target %q is not a replacement test for difference %q", m.target, slug)
 		}
-		if shared[test].different && strings.TrimSpace(m.review) == "" {
-			c.problem(siteFile, key, "shared target %q needs a reviewed unconditional check for this pair", m.target)
+		if strings.TrimSpace(m.review) == "" {
+			if shared[test].different {
+				c.problem(siteFile, key, "shared target %q needs a reviewed unconditional check for this pair", m.target)
+			} else if cl.class == "go-port" {
+				c.problem(siteFile, key, "Go target %q needs reviewer approval", m.target)
+			}
+		}
+	}
+	for key, cl := range c.classes {
+		if slug, ok := strings.CutPrefix(cl.class, "difference:"); ok && len(c.diffs[slug]) != 0 && phaseMatches(cl.phase, phase, cumulative) &&
+			(pkg == "" || (cl.pkg == pkg && cl.gate == "task")) && !replaced[key] {
+			c.problem(siteFile, key, "difference case needs a mapped replacement test due in %s", cl.phase)
 		}
 	}
 	if pkg == "" {
