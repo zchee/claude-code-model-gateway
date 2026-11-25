@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
+case $# in
+    0) dir=$root ;;
+    1) dir=$(CDPATH='' cd -- "$1" && pwd -P) ;;
+    *) printf '%s\n' 'usage: lint-venue [directory]' >&2; exit 2 ;;
+esac
+exec go -C "$root" run ./internal/tools/lintvenue "$dir"
