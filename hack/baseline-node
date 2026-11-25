@@ -75,8 +75,8 @@ script_path=$("${clean[@]}" npm --prefix "$plugin" --silent run env | perl -ne '
 if PATH="$script_path" command -v claude >/dev/null; then fail 'claude resolves on npm script PATH'; fi
 [[ $(PATH="$script_path" command -v node) == "$work/bin/node" ]] || fail 'npm script PATH shadows reporter dispatcher'
 
-# Process identity survives renames and reparenting. Read only stat and cgroup,
-# never process arguments, open files or environments.
+# Process identity survives renames and reparenting. Check the executable only
+# for a potential session bus, never process arguments or environments.
 snapshot() {
     python3 -I - "$1" "$work/before" <<'PY'
 from pathlib import Path
@@ -109,13 +109,15 @@ for p in sorted(Path('/proc').glob('[0-9]*')):
     current.append(item[:2])
     if mode == 'before' or item[:2] in old: continue
     pid, start, name = item
-    try: group = cgroup(p)
+    try:
+        group = cgroup(p)
+        bus = (name == 'dbus-daemon' and group.startswith(f'{user_slice}user@{uid}.service/')
+               and group.endswith('/dbus.service') and Path(os.readlink(p / 'exe')).name == 'dbus-daemon')
     except (OSError, ValueError) as err:
         if (identity(p) or ())[:2] != item[:2]: continue
         raise SystemExit(f'cannot attribute live PID {pid} (start tick {start}): {err}')
     if (identity(p) or ())[:2] != item[:2]: continue
-    # Socket-activated services run under the user manager, not the SSH scope.
-    dest = excluded if group.startswith(f'{user_slice}user@{uid}.service/') else leftovers
+    dest = excluded if bus else leftovers
     dest.append(dict(pid=pid, start_tick=start, name=name, cgroup=group))
 print(json.dumps(current if mode == 'before' else dict(excluded=excluded, leftovers=leftovers)))
 PY
@@ -126,15 +128,35 @@ PY
 printf '%s\n' "$ajv" > "$work/ajv-version"
 "${clean[@]}" "$node" -p 'require(process.argv[1]).scripts.test' "$plugin/package.json" > "$work/command"
 snapshot before > "$work/before"
+suite_pid=''
+# Called by the signal trap, not on the ordinary completion path.
+# shellcheck disable=SC2329
+on_interrupt() {
+    trap '' HUP INT TERM
+    printf 'baseline-node: interrupted; no publishable evidence; post-run process check:\n' >&2
+    if [[ -n $suite_pid && $(jobs -pr) == "$suite_pid" ]]; then
+        kill -TERM -- "-$suite_pid" 2>/dev/null || :
+    fi
+    snapshot after >&2 || printf 'baseline-node: interrupted process check failed\n' >&2
+    exit 1
+}
+trap on_interrupt HUP INT TERM
 date -u '+%Y-%m-%dT%H:%M:%SZ' > "$work/start"
-rc=0
-"${clean[@]}" npm --prefix "$plugin" test || rc=$?
+# A separate job group lets a signal interrupt wait immediately, and lets us
+# terminate that group without signalling other processes in the login session.
+set -m
+"${clean[@]}" npm --prefix "$plugin" test &
+suite_pid=$!
+set +m
+rc=0; wait "$suite_pid" || rc=$?
+suite_pid=''
 printf '%d\n' "$rc" > "$work/exit"
 date -u '+%Y-%m-%dT%H:%M:%SZ' > "$work/end"
 # The command, dates, exit and raw events are durable before these checks.
 process_rc=0; snapshot after > "$work/processes" 2> "$work/process-error" || process_rc=$?
 venue_rc=0; "$root/hack/venue-check" > "$work/venue-check" 2>&1 || venue_rc=$?
-python3 -I - "$work" "$plugin" "$process_rc" "$venue_rc" <<'PY'
+frame_rc=0
+python3 -I - "$work" "$plugin" "$process_rc" "$venue_rc" > "$work/frame" <<'PY' || frame_rc=$?
 import base64, gzip, hashlib, json, sys
 from collections import Counter
 from pathlib import Path
@@ -170,4 +192,7 @@ payload = gzip.compress(json.dumps(dict(run=run, events=events)).encode(), mtime
 print('BASELINE-NODE-V1', hashlib.sha256(payload).hexdigest(), base64.b64encode(payload).decode(), flush=True)
 if errors: sys.exit('baseline-node: ' + '; '.join(errors))
 PY
+# Do not send bytes from a still-running (and possibly interrupted) collector.
+if IFS= read -r frame < "$work/frame"; then printf '%s\n' "$frame"; fi
+(( frame_rc == 0 )) || exit "$frame_rc"
 exit "$rc"

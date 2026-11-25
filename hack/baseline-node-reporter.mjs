@@ -13,7 +13,7 @@ export default async function* census(source) {
     const file = data.file && relative(process.cwd(), data.file);
     if (type === 'test:summary') {
       yield JSON.stringify({ type, file, success: data.success, counts: data.counts }) + '\n';
-    } else if (['test:start', 'test:pass', 'test:fail'].includes(type)) {
+    } else if (['test:start', 'test:pass', 'test:fail', 'test:abort', 'test:aborted', 'test:cancelled'].includes(type)) {
       const { name, line, column, nesting, skip, todo } = data;
       const error = data.details?.error;
       yield JSON.stringify({ type, file, name, line, column, nesting, skip, todo,

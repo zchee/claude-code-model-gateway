@@ -16,15 +16,25 @@
 set -euo pipefail
 dump=''
 if [[ $# == 3 && $1 == --dump && -n $2 ]]; then dump=$2; shift 2; fi
-[[ $# == 1 ]] || { printf 'usage: baseline-extract [--dump <new scratch file>] <venue log>\n' >&2; exit 1; }
+[[ $# == 1 ]] || { printf 'usage: baseline-extract --verify | [--dump <new scratch file>] <venue log>\n' >&2; exit 1; }
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
-plugin=$("$root/hack/pinned-source")/plugins/model-gateway
-pin=$("$root/hack/pinned-source" --print-pin)
+plugin='' pin=''
+if [[ $1 != --verify ]]; then
+    plugin=$("$root/hack/pinned-source")/plugins/model-gateway
+    pin=$("$root/hack/pinned-source" --print-pin)
+fi
 python3 -I - "$1" "$plugin" "$pin" "$root" "$dump" <<'PY'
 import base64, gzip, hashlib, json, re, sys
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
+
+def verify_pair(directory):
+    digest = hashlib.sha256((directory / 'census.tsv').read_bytes()).hexdigest()
+    record = json.loads((directory / 'run.json').read_bytes())
+    require(record.get('census_sha256') == digest, 'census.tsv digest differs from run.json')
+    print('Verified census SHA-256:', digest)
 
 def require(ok, reason):
     if not ok: sys.exit('baseline-extract: ' + reason)
@@ -35,6 +45,10 @@ def escape(value):
 log, plugin, pin, root, dump = sys.argv[1:]
 plugin, root = Path(plugin), Path(root)
 out = root / 'test/conformance/baseline'
+if log == '--verify':
+    require(not dump, '--verify takes no dump path')
+    verify_pair(out)
+    sys.exit(0)
 frames = [s.split() for s in Path(log).read_bytes().splitlines() if s.startswith(b'BASELINE-NODE-V1 ')]
 require(len(frames) == 1 and len(frames[0]) == 3, 'expected exactly one complete evidence frame')
 _, checksum, encoded = frames[0]
@@ -53,6 +67,14 @@ require(not verdicts['errors'], '; '.join(verdicts['errors']))
 for check in ('files_complete', 'processes_clean', 'venue_clean'):
     require(verdicts[check] is True, f'failed verdict: {check}')
 require(verdicts['suite_exit'] == run['exit'], 'conflicting suite exit evidence')
+require(run.get('ajv') == '8.20.0', 'missing or incorrect installed ajv version')
+processes = run.get('processes', {})
+require(processes.get('leftovers') == [] and isinstance(processes.get('excluded'), list),
+        'process evidence contradicts clean verdict')
+for proc in processes['excluded']:
+    require(proc.get('name') == 'dbus-daemon' and re.fullmatch(
+        r'/user\.slice/user-(\d+)\.slice/user@\1\.service/(?:[^/]+/)*dbus\.service', proc.get('cgroup', '')),
+        'unrecognized process exclusion')
 tools = run.get('tools', {})
 for name in ('lsof', 'ps', 'tar', 'gzip', 'which', 'sh', 'env', 'touch', 'git', 'node', 'npm'):
     info = tools.get(name, {})
@@ -80,7 +102,11 @@ observed = defaultdict(Counter)
 status_keys = {'pass': 'passed', 'fail': 'failed', 'skip': 'skipped', 'todo': 'todo', 'cancelled': 'cancelled'}
 for ev in bundle['events']:
     kind, path = ev['type'], ev.get('file')
+    require(kind not in ('test:abort', 'test:aborted', 'test:cancelled') and
+            ev.get('failureType') not in ('cancelledByParent', 'testAborted', 'testTimeoutFailure'),
+            f'aborted or cancelled test: {path}:{ev.get("line")} {ev.get("name")}')
     if kind == 'test:summary':
+        require(ev['counts']['cancelled'] == 0, f'runner reported cancelled tests: {path}')
         require(path is None or path in files, f'unknown summary: {path}')
         require(path not in ends, f'duplicate summary: {path}')
         ends[path] = ev
@@ -88,6 +114,7 @@ for ev in bundle['events']:
     require(path in files and path not in ends, f'unknown or finished file: {path}')
     line, col, depth, name = (ev[k] for k in ('line', 'column', 'nesting', 'name'))
     require((path, line) in registered and isinstance(col, int) and col > 0 and name, f'unknown registration: {ev}')
+    require(isinstance(name, str) and ' > ' not in name, f'ambiguous test name segment: {name!r}')
     require(files[path][line-1][col-1:].startswith('test('), f'column does not identify test call: {ev}')
     stack = stacks[path]
     if kind == 'test:start':
@@ -109,7 +136,7 @@ for ev in bundle['events']:
             require(predicate, f'no declaration reason for boolean {status}: {key}')
             detail = f'{status} predicate: {predicate[1].strip()}'
     elif kind == 'test:fail':
-        status = 'cancelled' if ev.get('failureType') in ('cancelledByParent', 'testAborted', 'testTimeoutFailure') else 'fail'
+        status = 'fail'
         detail = ev.get('error') or ev.get('failureType')
     else:
         status = 'pass'
@@ -133,11 +160,18 @@ run['totals'] = {s: totals[s] for s in status_keys}
 run['duration_seconds'] = int((datetime.fromisoformat(run['ended'].replace('Z', '+00:00')) - datetime.fromisoformat(run['started'].replace('Z', '+00:00'))).total_seconds())
 rows.sort(key=lambda r: (r[0], r[1], r[2], r[4]))
 text = 'path\tline\tcolumn\tdepth\tname\tstatus\tdetail\n' + ''.join('\t'.join(map(escape, r)) + '\n' for r in rows)
-# Publish only after every check. A bad or truncated log leaves existing evidence alone.
+# Both writes must finish before either old file is replaced. Install the run
+# record last; interruption between renames is detectable with --verify.
 if not dump:
     out.mkdir(parents=True, exist_ok=True)
-    (out / 'census.tsv').write_text(text)
-    (out / 'run.json').write_text(json.dumps(run, ensure_ascii=False, indent=2) + '\n')
+    content = text.encode('utf-8')
+    run['census_sha256'] = hashlib.sha256(content).hexdigest()
+    with TemporaryDirectory(prefix='.baseline-', dir=out) as tmp:
+        staging = Path(tmp)
+        (staging / 'census.tsv').write_bytes(content)
+        (staging / 'run.json').write_text(json.dumps(run, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+        for name in ('census.tsv', 'run.json'): (staging / name).replace(out / name)
+    verify_pair(out)
 print(f'{len(files)} file summaries, {len(sites)} static text matches, {len(site_counts)} outer registrations, {len(rows)} terminal cases')
 print(f'Nested child-program declaration: {embedded}; outer owner: {owner}')
 print('Rows per outer site:', dict(sorted(Counter(site_counts.values()).items())))
