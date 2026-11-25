@@ -190,10 +190,13 @@ func TestListenerBudget(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		started := time.Now()
 		entered := make(chan struct{}, 1)
+		// The fake clock stops when this function returns, so the query is released by the test and not by a timer.
+		release := make(chan struct{})
+		defer close(release)
 		p := Probe{sockets: func(context.Context) ([]socketEvidence, error) {
 			entered <- struct{}{}
 			// Some kernel reads do not observe context cancellation.
-			time.Sleep(time.Second)
+			<-release
 			return []socketEvidence{{port: 27123, listening: true, owners: []int{702}}}, nil
 		}}
 		got := p.Listener(t.Context(), 27123)
