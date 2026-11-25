@@ -74,11 +74,20 @@ func TestCeilingLifetime(t *testing.T) {
 	}
 	observe(&s, "reader", m, 55, false)
 	check(t, &s, "reader", m, first, sentry.Crossing{Usage: 55, Trigger: 50})
+	// The learned low watermark is 37.5, not the original 75.
+	observe(&s, "reader", m, 45, false)
+	observe(&s, "reader", m, 80, false)
+	check(t, &s, "reader", m, first, sentry.Crossing{})
+	// A completed turn at 80 crosses the learned 50 but not the original 100.
+	observe(&s, "reader", m, 80, true)
+	check(t, &s, "reader", m, first, sentry.Crossing{Usage: 80, Trigger: 50})
 	other := m
 	other.Key = "another"
 	observe(&s, "reader", other, 55, false)
 	check(t, &s, "reader", other, first, sentry.Crossing{})
 	m.Policy = &policy.Sentry{BackendWindow: 210, CompactTrigger: 200, Source: "derived"}
+	observe(&s, "reader", m, 201, false)
+	check(t, &s, "reader", m, first, sentry.Crossing{})
 	observe(&s, "later", m, 120, false)
 	check(t, &s, "later", m, first, sentry.Crossing{})
 	observe(&s, "later", m, 201, false)

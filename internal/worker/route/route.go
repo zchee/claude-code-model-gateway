@@ -17,6 +17,7 @@ package route
 
 import (
 	"encoding/json/jsontext"
+	"sync/atomic"
 
 	"github.com/zchee/claude-code-model-gateway/internal/policy"
 	"github.com/zchee/claude-code-model-gateway/internal/proxymodels"
@@ -37,13 +38,18 @@ func (Snapshot) Resolver() policy.Resolver { return policy.Resolver{} }
 func (Snapshot) Catalog() (string, jsontext.Value) { return "", nil }
 
 // Store publishes complete model generations. Its zero value has no snapshot.
-type Store struct{}
+type Store struct{ current atomic.Pointer[Snapshot] }
 
 // Publish replaces the visible generation only after its snapshot has been built.
 func (*Store) Publish(snapshot Snapshot) {}
 
-// Load returns one generation for the full lifetime of a request, or nil before publication.
-func (*Store) Load() *Snapshot { return nil }
+// Load returns a snapshot value for the lifetime of a request, or false before publication.
+func (s *Store) Load() (Snapshot, bool) {
+	if current := s.current.Load(); current != nil {
+		return *current, true
+	}
+	return Snapshot{}, false
+}
 
 // ProxyID returns the upstream route for a proxy-served picker ID.
 func (Snapshot) ProxyID(id string) (proxymodels.Route, bool) { return proxymodels.Route{}, false }

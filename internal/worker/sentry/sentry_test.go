@@ -223,6 +223,36 @@ func TestCompletedJSON(t *testing.T) {
 	}
 }
 
+func TestCompactionUsage(t *testing.T) {
+	var s sentry.State
+	m := model()
+	observe(&s, "s", m, 101, false)
+	check(t, &s, "s", m, first, sentry.Crossing{Usage: 101, Trigger: 100})
+	s.ObserveJSON("s", m, []byte(compact), []byte(`{"type":"message","stop_reason":"end_turn","usage":{"input_tokens":109}}`))
+	if got := s.Overflow("s", m, false); got != 109 {
+		t.Errorf("compaction usage=%v, want 109", got)
+	}
+}
+
+func TestFalsyJSONError(t *testing.T) {
+	tests := map[string]struct{ value string }{
+		"success: null":         {`null`},
+		"success: false":        {`false`},
+		"success: zero":         {`0`},
+		"success: empty string": {`""`},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			var s sentry.State
+			m := model()
+			observe(&s, "s", m, 101, false)
+			check(t, &s, "s", m, first, sentry.Crossing{Usage: 101, Trigger: 100})
+			s.ObserveJSON("s", m, []byte(first), []byte(`{"type":"message","error":`+tt.value+`,"stop_reason":"end_turn","usage":{"input_tokens":109}}`))
+			check(t, &s, "s", m, first, sentry.Crossing{Usage: 109, Trigger: 100})
+		})
+	}
+}
+
 func TestIgnoredJSON(t *testing.T) {
 	tests := map[string]struct{ response string }{
 		"success: malformed":          {`{"type":"message"`},

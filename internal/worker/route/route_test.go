@@ -34,7 +34,7 @@ func TestMain(m *testing.M) {
 }
 
 func resolverFor(routes []proxymodels.Route, windows policy.Windows, local int64, lmStudio map[string]int64) policy.Resolver {
-	return policy.Resolver{Routes: proxymodels.NewTable(routes), Windows: windows, LocalWindow: local, LocalPort: 8080, LMStudioWindows: lmStudio, LMStudioURL: "http://127.0.0.1:1234"}
+	return policy.NewResolver(policy.ResolverInputs{Routes: proxymodels.NewTable(routes), Windows: windows, LocalWindow: local, LocalPort: 8080, LMStudioWindows: lmStudio, LMStudioURL: "http://127.0.0.1:1234"})
 }
 
 func listedSnapshot() route.Snapshot {
@@ -202,6 +202,7 @@ func TestClassifyRequest(t *testing.T) {
 		"success: prefix not segment":                  {"PATCH", "/v1/messages-anything", good, proxy},
 		"success: foreign path":                        {"DELETE", "/other?path=/v1/messages", good, anthropic},
 		"success: arbitrary method without body":       {"OPTIONS", "/v1/messages", "", anthropic},
+		"success: replacement inside JSON string":      {"POST", "/v1/messages", "{\"text\":\"\xff\",\"model\":\"claude-gpt-9\"}", proxy},
 		"success: byte-exact arbitrary payload":        {"PUT", "/v1/messages", " \n\xffgzip", anthropic},
 		"success: repeated model last wins":            {"POST", "/v1/messages", `{"model":"claude-opus","model":"claude-gpt-9"}`, proxy},
 		"success: last model null":                     {"POST", "/v1/messages", `{"model":"claude-gpt-9","model":null}`, anthropic},
