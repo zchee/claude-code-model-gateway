@@ -1,0 +1,38 @@
+Stopped supervisor before sending fixture shutdown
+Command: VENUE_HOST=debian-13-trixie.gaudiy-platform ./hack/remote run bench
+started 2026-11-25T20:22:39Z
+control: stopped supervisor PID 312451 before fixture shutdown
+bench: SIGTERM PID 312451 after stop serve-shim failed
+bench: SIGKILL PID 312451 after stop serve-shim failed
+    Error: timed out: stop serve-shim
+bench: no marked processes remain
+bench: removed private scratch /tmp/model-gateway-venue/tmp/gateway-bench.ZY5ZaiLI
+failed run retained: /tmp/model-gateway-venue/runs/run.dSL80G8j
+bench control rc=2 elapsed=21 s
+attestation: regular file
+gateway state: absent
+TCP listeners on 18764/18765: none
+lock: free
+status rc=0
+
+Interrupted benchmark wrapper after supervisor readiness
+
+Command: VENUE_HOST=debian-13-trixie.gaudiy-platform ./hack/remote run bench
+started 2026-11-25T20:23:28Z
+control: supervisor PID 312837 ready; stopped detached helper PID/PGID 312853; interrupting bench wrapper
+bench: interrupted
+bench: SIGTERM marked PID 312740
+bench: SIGTERM marked PID 312741
+bench: SIGTERM marked PID 312837
+bench: SIGTERM marked PID 312844
+bench: SIGTERM marked PID 312853
+bench: SIGKILL marked PID 312853
+bench: no marked processes remain
+bench: removed private scratch /tmp/model-gateway-venue/tmp/gateway-bench.PPL3Q55T
+failed run retained: /tmp/model-gateway-venue/runs/run.rjPJbXWZ
+bench control rc=2 elapsed=7 s
+attestation: regular file
+gateway state: absent
+TCP listeners on 18764/18765: none
+lock: free
+status rc=0

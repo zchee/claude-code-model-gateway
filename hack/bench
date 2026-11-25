@@ -13,35 +13,132 @@ for port in 80 18764 18765; do
 done
 if command -v claude >/dev/null; then printf 'bench: claude resolves on venue PATH\n' >&2; exit 1; fi
 
-umask 077
-work=$(mktemp -d "${TMPDIR:-/tmp}/gateway-bench.XXXXXXXX")
-pid=''
-cleanup() {
-    local rc=$?
-    trap '' HUP INT TERM
-    if [[ -n $pid ]] && kill -0 -- "-$pid" 2>/dev/null; then
-        printf 'bench: terminating remaining processes in benchmark job group\n' >&2
-        kill -KILL -- "-$pid" 2>/dev/null || :
-        wait "$pid" 2>/dev/null || :
-        rc=1
-    fi
-    rm -rf -- "$work"
-    exit "$rc"
-}
-trap cleanup EXIT
-trap 'exit 1' HUP INT TERM
-mkdir "$work/hack" "$work/home" "$work/tmp"
-cp -- "$root/hack/pinned-source" "$work/hack/"
-clean=(env -i "PATH=$PATH" "HOME=$work/home" "TMPDIR=$work/tmp" LC_ALL=C)
-plugin=$("${clean[@]}" "$work/hack/pinned-source")/plugins/model-gateway
-"${clean[@]}" "$work/hack/pinned-source" --print-pin > "$work/pin"
-"${clean[@]}" "npm_config_cache=$work/npm-cache" \
-    npm --prefix "$plugin" ci --ignore-scripts --no-audit --no-fund >&2
+# /proc reports the initial environment. Mark at exec, not by exporting inside
+# the running shell, so even a detached descendant can be found.
+# Read and signal by pinned process identity; an exiting PID can be reused.
+# shellcheck disable=SC2329
+sweep_marked() {
+    python3 -I - "$1" "$2" <<'PY'
+import errno
+import os
+import select
+import signal
+import sys
+import time
 
-interrupted=0
-trap 'interrupted=1' HUP INT TERM
-set -m
-"${clean[@]}" node --input-type=commonjs - "$plugin" "$work" > "$work/result" <<'JS' &
+work, phase = sys.argv[1:]
+marker = b'MODEL_GATEWAY_BENCH_RUN=' + os.fsencode(work)
+uid = os.getuid()
+vanished = {errno.ENOENT, errno.ESRCH}
+
+
+def processes():
+    for name in os.listdir('/proc'):
+        if not name.isdecimal():
+            continue
+        try:
+            directory = os.open('/proc/' + name, os.O_PATH | os.O_DIRECTORY)
+        except OSError as exc:
+            if exc.errno in vanished:
+                continue
+            raise
+        try:
+            if os.fstat(directory).st_uid == uid:
+                yield int(name), directory
+        finally:
+            os.close(directory)
+
+
+def identity(pid, directory):
+    data = os.open('stat', os.O_RDONLY, dir_fd=directory)
+    with os.fdopen(data, 'rb') as stat:
+        fields = stat.read().rsplit(b')', 1)[1].split()
+    return (pid, int(fields[19]))
+
+
+snapshot = work + '/processes-before'
+if phase == 'snapshot':
+    # Older processes cannot have inherited the new marker. Compare start
+    # ticks so a reused PID cannot exempt a benchmark child.
+    with open(snapshot, 'x') as file:
+        for pid, directory in processes():
+            try:
+                print(*identity(pid, directory), file=file)
+            except OSError as exc:
+                if exc.errno not in vanished:
+                    raise
+    sys.exit(0)
+with open(snapshot) as file:
+    previous = {tuple(map(int, line.split())) for line in file}
+
+
+def scan(sig=None):
+    found, unknown = [], []
+    for pid, directory in processes():
+        try:
+            if identity(pid, directory) in previous:
+                continue
+            pidfd = os.pidfd_open(pid)
+            try:
+                data = os.open('environ', os.O_RDONLY, dir_fd=directory)
+                with os.fdopen(data, 'rb') as env:
+                    if marker not in env.read().split(b'\0'):
+                        continue
+                found.append(pid)
+                if sig is not None:
+                    print(f'bench: {sig.name} marked PID {pid}', file=sys.stderr)
+                    signal.pidfd_send_signal(pidfd, sig)
+            except PermissionError:
+                poll = select.poll()
+                poll.register(pidfd, select.POLLIN)
+                if not poll.poll(0):
+                    raise
+            finally:
+                os.close(pidfd)
+        except OSError as exc:
+            if exc.errno not in vanished:
+                unknown.append(f'PID {pid}: {exc}')
+    return found, unknown
+
+
+terminated, _ = scan(signal.SIGTERM)
+for sig in (None, signal.SIGKILL):
+    deadline = time.monotonic() + 3
+    while True:
+        pending, unknown = scan(sig)
+        if not (pending or unknown) or time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+    if not (pending or unknown):
+        break
+else:
+    sys.exit(f'bench: marked processes remain: {pending}; inspection failures: {unknown}')
+print('bench: no marked processes remain', file=sys.stderr)
+if terminated and phase == '0':
+    sys.exit('bench: unexpectedly needed to terminate marked processes after success')
+PY
+}
+
+# Called by the timed child shell, not by this wrapper.
+# shellcheck disable=SC2329
+run_job() {
+    local root=$1 work=$2 plugin
+    local -a clean=(env -i "PATH=$PATH" "HOME=$work/home" "TMPDIR=$work/tmp" LC_ALL=C "MODEL_GATEWAY_BENCH_RUN=$work")
+    mkdir "$work/hack" "$work/home" "$work/tmp" "$work/bin"
+    cp -- "$root/hack/pinned-source" "$work/hack/"
+    # The source exporter clears its environment for Git. Restore only our
+    # marker across that boundary with an env shim private to the export.
+    # shellcheck disable=SC2016
+    printf '%s\n' '#!/bin/bash' 'if [[ ${1:-} == -i ]]; then' '    shift' \
+        '    set -- -i "MODEL_GATEWAY_BENCH_RUN=$MODEL_GATEWAY_BENCH_RUN" "$@"' 'fi' \
+        'exec /usr/bin/env "$@"' > "$work/bin/env"
+    chmod +x "$work/bin/env"
+    plugin=$("${clean[@]}" "PATH=$work/bin:$PATH" "$work/hack/pinned-source")/plugins/model-gateway
+    "${clean[@]}" "$work/hack/pinned-source" --print-pin > "$work/pin"
+    "${clean[@]}" "npm_config_cache=$work/npm-cache" \
+        npm --prefix "$plugin" ci --ignore-scripts --no-audit --no-fund >&2
+
+    exec "${clean[@]}" node --input-type=commonjs - "$plugin" "$work" > "$work/result" <<'JS'
 'use strict';
 const assert = require('node:assert/strict');
 const { execFileSync, spawn } = require('node:child_process');
@@ -110,10 +207,10 @@ const bigBody = payload(models.anthropic, 'x'.repeat(settings.requestBytes - Buf
 assert.equal(Buffer.byteLength(bigBody), settings.requestBytes);
 
 const checkPort = (port) => assert(port > 0 && ![80, 18764, 18765].includes(port), `unexpected port ${port}`);
-async function fakeUpstream(provider) {
+async function fakeUpstream(provider, cleanup) {
   const probes = new Map();
   const sockets = new Set();
-  let usagePosts = 0;
+  let port, usagePosts = 0;
   const server = http.createServer((req, res) => {
     if (provider === 'usage') {
       req.resume();
@@ -147,30 +244,38 @@ async function fakeUpstream(provider) {
         res.writeHead(400).end('unexpected benchmark input');
         return;
       }
-      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
-      if (!probe) return res.end(response);
+      if (!probe) return res.writeHead(200, { 'Content-Type': 'text/event-stream' }).end(response);
       probe.note('provider-upload-end', { bytes });
-      res.flushHeaders();
-      probe.note('provider-headers');
+      probe.releaseHeaders = () => {
+        if (res.destroyed) { probe.note('provider-headers-skipped'); return; }
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.flushHeaders();
+        probe.note('provider-headers');
+      };
+      if (probe.stage !== 'awaiting-headers') probe.releaseHeaders();
       if (probe.stage === 'mid-stream') {
         res.write(start);
         probe.providerResponseBytes += Buffer.byteLength(start);
         probe.note('provider-first-event');
       }
-      probe.signalHeaders();
+      probe.signalUpload();
     });
   });
   server.on('connection', (socket) => {
     sockets.add(socket);
     socket.once('close', () => sockets.delete(socket));
   });
-  await new Promise((resolve, reject) => server.once('error', reject).listen(0, loopback, resolve));
-  const { port } = server.address();
-  checkPort(port);
-  return { port, probes, usagePosts: () => usagePosts, close: () => new Promise((resolve) => {
+  cleanup.push(async () => {
     for (const socket of sockets) socket.destroy();
-    server.close(resolve);
-  }) };
+    if (server.listening) {
+      await bounded(new Promise((resolve, reject) => server.close((err) => err ? reject(err) : resolve())), `close ${provider}`);
+    }
+    if (port !== undefined) checkClosed(port);
+  });
+  await bounded(new Promise((resolve, reject) => server.once('error', reject).listen(0, loopback, resolve)), `listen ${provider}`);
+  port = server.address().port;
+  checkPort(port);
+  return { port, probes, usagePosts: () => usagePosts };
 }
 
 function request(port, url, body) {
@@ -211,7 +316,11 @@ function gateway(commandName, home, upstreams) {
   let stdout = '', stderr = '';
   child.stdout.on('data', (chunk) => { stdout += chunk; });
   child.stderr.on('data', (chunk) => { stderr += chunk; });
+  // In the direct case we close IPC ourselves. Reap on 'exit' whether or not
+  // Node's combined stdio/IPC 'close' event follows that disconnect.
   const status = once(child, 'exit');
+  // A spawn error can arrive before the readiness poll enters its stop path.
+  void status.catch(() => {});
   const state = path.join(home, '.claude/model-gateway');
   const topology = { child, env, home, state, port: null, workerPid: null, workerPort: null };
   const diagnostic = () => `${commandName}: ${stdout}${stderr}`;
@@ -247,11 +356,18 @@ function gateway(commandName, home, upstreams) {
     throw new Error(`listener not ready: ${diagnostic()}`);
   };
   topology.stop = async () => {
-    if (child.exitCode === null && child.signalCode === null) {
+    if (child.exitCode === null && child.signalCode === null && child.connected) {
       if (commandName === 'serve-shim') child.send({ type: 'fixture-shutdown' }, (err) => { if (err) child.kill('SIGTERM'); });
-      else if (child.connected) child.disconnect();
+      else child.disconnect();
     }
-    const [code, signal] = await bounded(status, `stop ${commandName}`);
+    let outcome;
+    try { outcome = await reapChild(child, status, `stop ${commandName}`); }
+    finally {
+      child.stdout.destroy();
+      child.stderr.destroy();
+      if (child.connected) child.disconnect();
+    }
+    const [code, signal] = outcome;
     assert.equal(code, 0, `${diagnostic()} (signal ${signal})`);
     for (const pid of [child.pid, topology.workerPid].filter(Boolean)) assert(!fs.existsSync(`/proc/${pid}`), `PID ${pid} remains`);
     for (const port of new Set([topology.port, topology.workerPort].filter(Boolean))) checkClosed(port);
@@ -259,9 +375,24 @@ function gateway(commandName, home, upstreams) {
   return topology;
 }
 
-function bounded(promise, what) {
+async function reapChild(child, status, what) {
+  try { return await bounded(status, what); }
+  catch (error) {
+    for (const signal of ['SIGTERM', 'SIGKILL']) {
+      if (child.exitCode === null && child.signalCode === null && child.pid) {
+        console.error(`bench: ${signal} PID ${child.pid} after ${what} failed`);
+        child.kill(signal);
+      }
+      try { await bounded(status, `reap PID ${child.pid}`, 2000); break; }
+      catch { /* The outer marker sweep handles a child that cannot be reaped here. */ }
+    }
+    throw error;
+  }
+}
+
+function bounded(promise, what, milliseconds = settings.timeoutMs) {
   const timeout = new AbortController();
-  const deadline = sleep(settings.timeoutMs, null, { signal: timeout.signal }).then(() => { throw new Error(`timed out: ${what}`); });
+  const deadline = sleep(milliseconds, null, { signal: timeout.signal }).then(() => { throw new Error(`timed out: ${what}`); });
   return Promise.race([promise, deadline]).finally(() => timeout.abort());
 }
 
@@ -289,8 +420,9 @@ function readinessFixture(shim) {
     let output = '';
     hook.stdout.on('data', (c) => { output += c; });
     hook.stderr.on('data', (c) => { output += c; });
+    hook.stdin.on('error', (error) => { output += error.message; });
     hook.stdin.end(payload);
-    const [code, signal] = await bounded(once(hook, 'close'), 'readiness gate');
+    const [code, signal] = await reapChild(hook, once(hook, 'close'), 'readiness gate');
     const ms = elapsed(began);
     assert.equal(code, 0, `readiness gate: ${output} (signal ${signal})`);
     assert.equal(output, '', 'readiness gate was not quiet');
@@ -318,7 +450,10 @@ async function measure(shim, index) {
   sample('ttfb', 'end', load());
   sample('rss', 'start', load());
   const began = performance.now();
-  await sleep(settings.idleMs);
+  // Node timers can fire slightly early relative to the monotonic clock.
+  for (let remaining = settings.idleMs; remaining > 0; remaining = settings.idleMs - elapsed(began)) {
+    await sleep(Math.ceil(remaining));
+  }
   const idleMs = elapsed(began);
   const { pid } = shim.child;
   assert.equal(parentPID(shim.workerPid), pid);
@@ -334,7 +469,7 @@ async function disconnect(topology, provider, fake, stage) {
     stage, requests: 0, providerRequestBytes: 0, providerResponseBytes: 0,
     note: (event, fields = {}) => timeline.push({ event, time: performance.now(), ...fields }),
   };
-  const headers = new Promise((resolve) => { probe.signalHeaders = resolve; });
+  const uploaded = new Promise((resolve) => { probe.signalUpload = resolve; });
   fake.probes.set(key, probe);
   const body = payload(models[provider]);
   const peer = net.createConnection({ host: loopback, port: topology.port });
@@ -356,15 +491,19 @@ async function disconnect(topology, provider, fake, stage) {
       (error) => error ? reject(error) : resolve(),
     ));
     probe.note('client-upload', { bytes: upload.length, declaredBytes: body.length });
-    if (stage !== 'before-upload-end') await bounded(headers, key);
+    if (stage !== 'before-upload-end') await bounded(uploaded, key);
     if (stage === 'mid-stream') await bounded(data, key);
     else await sleep(settings.headersSettleMs);
     const zero = performance.now();
     timeline.push({ event: 'client-disconnect', time: zero });
     peer.destroy();
     await bounded(closed, key);
+    if (stage === 'awaiting-headers') {
+      await sleep(settings.headersSettleMs);
+      probe.releaseHeaders();
+    }
     if (probe.upstream) void sendTail(probe);
-    await sleep(settings.observationMs);
+    await sleep(Math.max(0, settings.observationMs - elapsed(zero)));
     const observationMs = elapsed(zero);
     const events = timeline.map(({ time, ...e }) => ({ ...e, offsetMs: Number((time - zero).toFixed(6)) }));
     // Reuse of an open connection after a completed response is not a stalled stream.
@@ -425,26 +564,32 @@ async function upgrade(topology) {
     const close = once(peer, 'close');
     peer.write(`GET /healthz HTTP/1.1\r\nHost: ${loopback}:${topology.port}\r\nConnection: Upgrade, close\r\nUpgrade: fixture\r\n\r\n`);
     await bounded(close, 'upgrade response');
-    const wire = Buffer.concat(chunks).toString();
-    const [head, body] = wire.split('\r\n\r\n', 2);
-    return record('upgrade', { topology: topology.name, elapsedMs: elapsed(began), wireBytes: Buffer.byteLength(wire), head, body });
+    const wire = Buffer.concat(chunks);
+    const split = wire.indexOf('\r\n\r\n');
+    const head = (split === -1 ? wire : wire.subarray(0, split)).toString('latin1');
+    return record('upgrade', { topology: topology.name, elapsedMs: elapsed(began), wireBytes: wire.length, head,
+      wireBase64: wire.toString('base64') });
   } finally { peer.destroy(); }
 }
 
 async function main() {
-  const [anthropic, codex, usage] = await Promise.all([fakeUpstream('anthropic'), fakeUpstream('codex'), fakeUpstream('usage')]);
-  const providers = { anthropic, codex };
-  const upstreams = { ...providers, usage };
-  const cores = new Set(command('lscpu', '-p=SOCKET,CORE').split('\n').filter((line) => /^\d+,\d+$/.test(line))).size;
-  assert(cores > 0, 'no processor topology from lscpu');
-  records.push(record('run', { ...run, started: date(), machine: { cpu: os.cpus()[0].model, logicalCPUs: os.cpus().length, cores,
-    availableCPUs: os.availableParallelism(), memoryBytes: os.totalmem(), kernel: command('uname', '-srvm'),
-    node: process.version, npm: command('npm', '--version'),
-    ajv: require(path.join(plugin, 'node_modules/ajv/package.json')).version },
-    env: envForReport(process.env), npmCache: '$WORK/npm-cache',
-    providers: Object.fromEntries(Object.entries(upstreams).map(([name, fake]) => [name, fake.port])),
-    responseBytes }));
+  const cleanup = [], errors = [];
+  let usage;
   try {
+    const anthropic = await fakeUpstream('anthropic', cleanup);
+    const codex = await fakeUpstream('codex', cleanup);
+    usage = await fakeUpstream('usage', cleanup);
+    const providers = { anthropic, codex };
+    const upstreams = { ...providers, usage };
+    const cores = new Set(command('lscpu', '-p=SOCKET,CORE').split('\n').filter((line) => /^\d+,\d+$/.test(line))).size;
+    assert(cores > 0, 'no processor topology from lscpu');
+    records.push(record('run', { ...run, started: date(), machine: { cpu: os.cpus()[0].model, logicalCPUs: os.cpus().length, cores,
+      availableCPUs: os.availableParallelism(), memoryBytes: os.totalmem(), kernel: command('uname', '-srvm'),
+      node: process.version, npm: command('npm', '--version'),
+      ajv: require(path.join(plugin, 'node_modules/ajv/package.json')).version },
+      env: envForReport(process.env), npmCache: '$WORK/npm-cache',
+      providers: Object.fromEntries(Object.entries(upstreams).map(([name, fake]) => [name, fake.port])),
+      responseBytes }));
     for (let i = 1; i <= settings.series; i++) {
       const shim = gateway('serve-shim', path.join(work, `shim-${i}`), upstreams);
       try { await shim.ready(); await measure(shim, i); }
@@ -458,16 +603,21 @@ async function main() {
         records.push(record('probe-environment', { topology: name, gateway: envForReport(topology.env),
           clientPort: topology.port, workerPort: topology.workerPort }));
         for (const [provider, fake] of Object.entries(providers)) {
-          for (const stage of ['before-upload-end', 'headers-only', 'mid-stream']) {
+          for (const stage of ['before-upload-end', 'awaiting-headers', 'headers-only', 'mid-stream']) {
             records.push(await disconnect(topology, provider, fake, stage));
           }
         }
         records.push(await upgrade(topology));
       } finally { await topology.stop(); }
     }
+  } catch (error) {
+    errors.push(error);
   } finally {
-    for (const fake of Object.values(upstreams)) { await fake.close(); checkClosed(fake.port); }
+    for (const result of await Promise.allSettled(cleanup.map((close) => close()))) {
+      if (result.status === 'rejected') errors.push(result.reason);
+    }
   }
+  if (errors.length) throw new AggregateError(errors, 'benchmark job failed');
   assert.equal(usage.usagePosts(), settings.series * (settings.warmups + settings.ttfbRuns), 'expected one usage record per completed stream');
   records.push(record('end', { ended: date(), ownedProcessesAndListenersGone: true, usagePosts: usage.usagePosts() }));
   const payload = gzipSync(records.map((r) => JSON.stringify(r)).join('\n') + '\n');
@@ -475,12 +625,56 @@ async function main() {
 }
 main().catch((error) => { console.error(error); process.exitCode = 1; });
 JS
-pid=$!
-set +m
-trap 'exit 1' HUP INT TERM
+}
+
+# Invoked by the EXIT trap.
+# shellcheck disable=SC2329
+cleanup() {
+    local rc=$? result=''
+    trap '' HUP INT TERM
+    if [[ -n $pid ]]; then
+        if sweep_marked "$work" "$rc"; then
+            # After interruption, reap the shell's child after the sweep.
+            wait "$pid" 2>/dev/null || :
+        else
+            rc=1
+        fi
+    fi
+    if (( rc == 0 )); then
+        if ! "$root/hack/venue-check" || ! IFS= read -r result < "$work/result" || [[ $result != NODE-BENCH-V1\ * ]]; then
+            printf 'bench: missing valid evidence or venue check failed\n' >&2
+            rc=1
+        fi
+    fi
+    # Only the benchmark's private scratch belongs to this script. The
+    # remote runner retains its separate staging tree on failure for diagnosis.
+    if rm -rf -- "$work" && [[ ! -e $work && ! -L $work ]]; then
+        printf 'bench: removed private scratch %s\n' "$work" >&2
+    else
+        printf 'bench: private scratch remains: %s\n' "$work" >&2
+        rc=1
+    fi
+    if (( rc == 0 )); then printf '%s\n' "$result"; fi
+    exit "$rc"
+}
+
+umask 077
+work=$(mktemp -d "${TMPDIR:-/tmp}/gateway-bench.XXXXXXXX")
+pid=''
+interrupted=0
+trap cleanup EXIT
+trap 'interrupted=1' HUP INT TERM
+sweep_marked "$work" snapshot
 (( interrupted == 0 )) || exit 1
-wait "$pid"
-"$root/hack/venue-check"
-IFS= read -r result < "$work/result"
-[[ $result == NODE-BENCH-V1\ * ]]
-printf '%s\n' "$result"
+job=$(declare -f run_job)
+# The watchdog covers pin export, dependency installation and every Node phase.
+# The cleanup sweep also reaches children that escaped the job's process group.
+MODEL_GATEWAY_BENCH_RUN="$work" timeout --foreground --kill-after=5s 360s \
+    bash -euo pipefail -c "$job"$'\nrun_job "$@"' bench "$root" "$work" 9<&- &
+pid=$!
+trap 'printf "bench: interrupted\n" >&2; exit 1' HUP INT TERM
+(( interrupted == 0 )) || exit 1
+rc=0
+wait "$pid" || rc=$?
+if (( rc == 124 || rc == 137 )); then printf 'bench: job exceeded outer deadline (status %s)\n' "$rc" >&2; fi
+exit "$rc"
