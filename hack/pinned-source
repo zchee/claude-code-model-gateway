@@ -25,10 +25,13 @@ fail() {
     exit 1
 }
 
-if [[ $# == 2 && $1 == --from && -n $2 ]]; then
+if [[ $# == 1 && $1 == --print-pin ]]; then
+    printf '%s\t%s\t%s\n' "$commit" "$root_tree" "$plugin_tree"
+    exit 0
+elif [[ $# == 2 && $1 == --from && -n $2 ]]; then
     source_repo=$2
 elif [[ $# != 0 ]]; then
-    fail 'usage: pinned-source [--from <local checkout or URL>]'
+    fail 'usage: pinned-source [--print-pin | --from <local checkout or URL>]'
 fi
 
 root=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)

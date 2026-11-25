@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# Copyright 2026 The claude-code-model-gateway Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+set -euo pipefail
+dump=''
+if [[ $# == 3 && $1 == --dump && -n $2 ]]; then dump=$2; shift 2; fi
+[[ $# == 1 ]] || { printf 'usage: baseline-extract [--dump <new scratch file>] <venue log>\n' >&2; exit 1; }
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
+plugin=$("$root/hack/pinned-source")/plugins/model-gateway
+pin=$("$root/hack/pinned-source" --print-pin)
+python3 -I - "$1" "$plugin" "$pin" "$root" "$dump" <<'PY'
+import base64, gzip, hashlib, json, re, sys
+from collections import Counter, defaultdict
+from datetime import datetime
+from pathlib import Path
+
+def require(ok, reason):
+    if not ok: sys.exit('baseline-extract: ' + reason)
+
+def escape(value):
+    return str(value).replace('\\', '\\\\').replace('\t', '\\t').replace('\r', '\\r').replace('\n', '\\n')
+
+log, plugin, pin, root, dump = sys.argv[1:]
+plugin, root = Path(plugin), Path(root)
+out = root / 'test/conformance/baseline'
+frames = [s.split() for s in Path(log).read_bytes().splitlines() if s.startswith(b'BASELINE-NODE-V1 ')]
+require(len(frames) == 1 and len(frames[0]) == 3, 'expected exactly one complete evidence frame')
+_, checksum, encoded = frames[0]
+payload = base64.b64decode(encoded, validate=True)
+require(hashlib.sha256(payload).hexdigest().encode() == checksum, 'damaged evidence frame')
+raw = gzip.decompress(payload)
+bundle = json.loads(raw)
+if dump:
+    target = Path(dump).resolve()
+    require(target != root and root not in target.parents, 'diagnostic dump must be outside the repository')
+    with target.open('xb') as stream: stream.write(raw + b'\n')
+    print('Saved diagnostic frame:', target)
+run = bundle['run']
+verdicts = run['verdicts']
+require(not verdicts['errors'], '; '.join(verdicts['errors']))
+for check in ('files_complete', 'processes_clean', 'venue_clean'):
+    require(verdicts[check] is True, f'failed verdict: {check}')
+require(verdicts['suite_exit'] == run['exit'], 'conflicting suite exit evidence')
+tools = run.get('tools', {})
+for name in ('lsof', 'ps', 'tar', 'gzip', 'which', 'sh', 'env', 'touch', 'git', 'node', 'npm'):
+    info = tools.get(name, {})
+    require(info.get('path', '').startswith('/') and info.get('version'), f'missing tool provenance: {name}')
+for name in ('node', 'npm'):
+    require(tools[name]['version'] == run[name], f'conflicting {name} versions')
+require(run['bus_environment_present'] == {'XDG_RUNTIME_DIR': False, 'DBUS_SESSION_BUS_ADDRESS': False}, 'unexpected session bus environment')
+require(pin.split('\t') == [run[k] for k in ('commit', 'root_tree', 'plugin_tree')], 'unexpected source pin')
+require(run['command'] == json.loads((plugin / 'package.json').read_bytes())['scripts']['test'], 'unexpected package command')
+files = {p.relative_to(plugin).as_posix(): p.read_text().splitlines() for p in sorted((plugin / 'test').glob('*.test.js'))}
+require(len(files) == 57, 'expected 57 pinned test files')
+sites = {(p, i) for p, lines in files.items() for i, line in enumerate(lines, 1)
+         if re.match(r'^\s*test\(', line) or re.search(r'\bt\.test\(', line)}
+# This declaration is source text written into a temporary child program, not a
+# registration in the outer process. Its owner checks the child's failing TAP.
+embedded = ('test/gateway-process-isolation.test.js', 1150)
+owner = (embedded[0], 1143)
+require(embedded in sites and owner in sites, 'child-program source or owner missing')
+registered = sites - {embedded}
+rows = []
+seen = set()
+stacks = defaultdict(list)
+ends = {}
+observed = defaultdict(Counter)
+status_keys = {'pass': 'passed', 'fail': 'failed', 'skip': 'skipped', 'todo': 'todo', 'cancelled': 'cancelled'}
+for ev in bundle['events']:
+    kind, path = ev['type'], ev.get('file')
+    if kind == 'test:summary':
+        require(path is None or path in files, f'unknown summary: {path}')
+        require(path not in ends, f'duplicate summary: {path}')
+        ends[path] = ev
+        continue
+    require(path in files and path not in ends, f'unknown or finished file: {path}')
+    line, col, depth, name = (ev[k] for k in ('line', 'column', 'nesting', 'name'))
+    require((path, line) in registered and isinstance(col, int) and col > 0 and name, f'unknown registration: {ev}')
+    require(files[path][line-1][col-1:].startswith('test('), f'column does not identify test call: {ev}')
+    stack = stacks[path]
+    if kind == 'test:start':
+        require(depth == len(stack), f'broken parent chain: {ev}')
+        stack.append((line, col, name))
+        continue
+    require(kind in ('test:pass', 'test:fail') and len(stack) == depth + 1 and stack[-1] == (line, col, name), f'unmatched terminal event: {ev}')
+    full = ' > '.join(n for _, _, n in stack)
+    stack.pop()
+    key = path, line, col, full
+    require(key not in seen, f'duplicate test identity: {key}')
+    seen.add(key)
+    detail = '-'
+    if 'skip' in ev or 'todo' in ev:
+        status = 'skip' if 'skip' in ev else 'todo'
+        detail = ev[status]
+        if detail is True:
+            predicate = re.search(r'\b' + status + r':\s*([^,}]+)', files[path][line-1])
+            require(predicate, f'no declaration reason for boolean {status}: {key}')
+            detail = f'{status} predicate: {predicate[1].strip()}'
+    elif kind == 'test:fail':
+        status = 'cancelled' if ev.get('failureType') in ('cancelledByParent', 'testAborted', 'testTimeoutFailure') else 'fail'
+        detail = ev.get('error') or ev.get('failureType')
+    else:
+        status = 'pass'
+    require(status == 'pass' or isinstance(detail, str) and detail, f'missing {status} reason: {key}')
+    observed[path][status] += 1
+    rows.append((path, line, col, depth, full, status, detail))
+
+require(set(ends) == set(files) | {None}, f'missing summaries: {(set(files) | {None}) - set(ends)}')
+require(not any(stacks.values()), 'file ended with unfinished tests')
+site_counts = Counter((p, line) for p, line, *_ in rows)
+require(registered == set(site_counts), f'unreported registration sites: {sorted(registered - set(site_counts))}')
+totals = sum(observed.values(), Counter())
+for path, ev in ends.items():
+    counts = totals if path is None else observed[path]
+    require(ev['counts']['tests'] == sum(counts.values()), f'runner test count differs: {path}')
+    require(all(ev['counts'][k] == counts[s] for s, k in status_keys.items()), f'runner outcomes differ: {path}')
+    require(ev['success'] == (counts['fail'] + counts['cancelled'] == 0), f'unexplained file or suite failure: {path}')
+require((run['exit'] == 0) == ends[None]['success'], 'suite exit and runner summary disagree')
+run['files'] = {p: {'success': ends[p]['success'], 'tests': ends[p]['counts']['tests']} for p in files}
+run['totals'] = {s: totals[s] for s in status_keys}
+run['duration_seconds'] = int((datetime.fromisoformat(run['ended'].replace('Z', '+00:00')) - datetime.fromisoformat(run['started'].replace('Z', '+00:00'))).total_seconds())
+rows.sort(key=lambda r: (r[0], r[1], r[2], r[4]))
+text = 'path\tline\tcolumn\tdepth\tname\tstatus\tdetail\n' + ''.join('\t'.join(map(escape, r)) + '\n' for r in rows)
+# Publish only after every check. A bad or truncated log leaves existing evidence alone.
+if not dump:
+    out.mkdir(parents=True, exist_ok=True)
+    (out / 'census.tsv').write_text(text)
+    (out / 'run.json').write_text(json.dumps(run, ensure_ascii=False, indent=2) + '\n')
+print(f'{len(files)} file summaries, {len(sites)} static text matches, {len(site_counts)} outer registrations, {len(rows)} terminal cases')
+print(f'Nested child-program declaration: {embedded}; outer owner: {owner}')
+print('Rows per outer site:', dict(sorted(Counter(site_counts.values()).items())))
+PY
