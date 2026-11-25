@@ -39,6 +39,3 @@ func RemoveBlock(text string) (string, bool, error) { return "", false, errors.N
 
 // Conflicts returns the non-loopback mappings for the compatibility hostname in file order.
 func Conflicts(text string) []string { return nil }
-
-// UnsafeProcessOverride returns the original process base URL when it is unsafe for compatibility, or nil.
-func UnsafeProcessOverride(baseURL string) *string { return nil }

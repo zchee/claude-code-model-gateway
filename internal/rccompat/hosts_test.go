@@ -112,6 +112,8 @@ func TestTransformBlock(t *testing.T) {
 		"already removed":                    {rccompat.RemoveBlock, original, original, false, ""},
 		"add partial":                        {transform: rccompat.AddBlock, input: start + "\n", problem: "partial"},
 		"remove partial":                     {transform: rccompat.RemoveBlock, input: end + "\n", problem: "partial"},
+		"add reversed":                       {transform: rccompat.AddBlock, input: end + "\n" + start, problem: "partial"},
+		"remove reversed":                    {transform: rccompat.RemoveBlock, input: end + "\n" + start, problem: "partial"},
 		"add invalid":                        {transform: rccompat.AddBlock, input: start + "\n" + end, problem: "invalid"},
 		"remove invalid":                     {transform: rccompat.RemoveBlock, input: start + "\n" + end, problem: "invalid"},
 		"append to unterminated line":        {rccompat.AddBlock, "# first\r\n# second", "# first\r\n# second\r\n" + crlfBlock, true, ""},
@@ -122,8 +124,9 @@ func TestTransformBlock(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			got, changed, err := tc.transform(tc.input)
 			if tc.problem != "" {
-				if err == nil || !strings.Contains(err.Error(), tc.problem) {
-					t.Errorf("error = %v, want error containing %q", err, tc.problem)
+				want := "plugin-marked hosts block is " + tc.problem + "; run remote-control doctor and repair it manually"
+				if err == nil || err.Error() != want {
+					t.Errorf("error = %v, want %q", err, want)
 				}
 				return
 			}
