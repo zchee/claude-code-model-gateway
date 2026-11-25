@@ -26,6 +26,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -42,7 +43,8 @@ func TestGatewayFixtureHelper(t *testing.T) {
 		if len(args) != 1 || (args[0] != "a" && args[0] != "b") {
 			t.Fatalf("invalid writer identifier: %q", args)
 		}
-		if _, err := fmt.Fprint(os.Stdout, args[0]); err != nil {
+		// The launcher reserves fd 3 for the working directory. Keep readiness separate from test output.
+		if _, err := unix.Write(4, []byte(args[0])); err != nil {
 			t.Fatal(err)
 		}
 		var start [1]byte
@@ -75,7 +77,7 @@ func TestAppendFileIndependentWriters(t *testing.T) {
 		t.Fatal(err)
 	}
 	var dir string
-	done := make(chan error, 2)
+	commands := make(map[string]*exec.Cmd)
 	want := map[string]int{}
 	for _, id := range []string{"a", "b"} {
 		cmd, err := env.HelperCommand(t, "append", id)
@@ -85,22 +87,57 @@ func TestAppendFileIndependentWriters(t *testing.T) {
 		if dir == "" {
 			dir = cmd.Dir
 		}
-		cmd.Dir, cmd.Stdin, cmd.Stdout, cmd.Stderr = dir, input, output, os.Stderr
-		go func() { done <- env.RunFixtureWithin(cmd, limit) }()
+		cmd.Dir, cmd.Stdin = dir, input
+		cmd.ExtraFiles = []*os.File{output}
+		commands[id] = cmd
 		for i := range processRecords {
 			want[fmt.Sprintf("%s:%d\n", id, i)]++
 		}
 	}
+	var workers sync.WaitGroup
+	// Test cleanup cancels the helpers' t.Context before this join. Register it
+	// after preparing both commands so their fixture directories are removed last.
+	t.Cleanup(func() { _ = ready.Close(); workers.Wait() })
+	done := make(chan error, len(commands))
+	for id, cmd := range commands {
+		workers.Go(func() {
+			var log strings.Builder
+			cmd.Stdout, cmd.Stderr = &log, &log
+			err := env.RunFixtureWithin(cmd, limit)
+			if err != nil {
+				err = fmt.Errorf("writer %s: %w: %s", id, err, log.String())
+			}
+			done <- err
+		})
+	}
 	// Both children must have entered the shared fixture directory before either writes.
-	var ids [2]byte
-	if _, err := io.ReadFull(ready, ids[:]); err != nil || (string(ids[:]) != "ab" && string(ids[:]) != "ba") {
-		t.Fatalf("writers did not reach the barrier: %q, %v", ids, err)
+	barrier := make(chan error, 1)
+	workers.Go(func() {
+		var ids [2]byte
+		_, err := io.ReadFull(ready, ids[:])
+		if err == nil && string(ids[:]) != "ab" && string(ids[:]) != "ba" {
+			err = fmt.Errorf("unexpected writer IDs: %q", ids)
+		}
+		barrier <- err
+	})
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Fatal("writer exited successfully before barrier release")
+	case err := <-barrier:
+		if err != nil {
+			t.Fatalf("writers did not reach the barrier: %v", err)
+		}
 	}
 	if _, err := start.Write([]byte("++")); err != nil {
 		t.Fatal(err)
 	}
-	if err := errors.Join(<-done, <-done); err != nil {
-		t.Fatal(err)
+	for range commands {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "journal"))
 	if err != nil {

@@ -67,6 +67,8 @@ func (d *directory) appendFile(name string, data []byte, mode fs.FileMode) error
 	return d.openAndAppend(name, data, mode, unix.Write)
 }
 
+// openAndAppend requires an append-valid basename and a preliminary type check.
+// Production callers must use appendFile rather than calling this step directly.
 func (d *directory) openAndAppend(name string, data []byte, mode fs.FileMode, write func(int, []byte) (int, error)) (err error) {
 	f, err := d.OpenFile(name, unix.O_APPEND|unix.O_WRONLY|unix.O_CREAT|unix.O_NONBLOCK|unix.O_NOCTTY, mode)
 	if errors.Is(err, unix.ELOOP) || errors.Is(err, unix.EISDIR) || errors.Is(err, unix.ENXIO) {
