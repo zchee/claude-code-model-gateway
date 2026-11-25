@@ -50,16 +50,12 @@ func TestProbeTimeout(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			const key = "CODEX_GATEWAY_PROBE_TIMEOUT_MS"
+			env := map[string]string{}
 			if tt.override != nil {
-				t.Setenv(key, *tt.override)
-			} else {
-				t.Setenv(key, "") // Register cleanup for the original environment before unsetting it.
-				if err := os.Unsetenv(key); err != nil {
-					t.Fatal(err)
-				}
+				env["CODEX_GATEWAY_PROBE_TIMEOUT_MS"] = *tt.override
 			}
-			if got := ProbeTimeout(tt.goos); got != tt.want {
+			p := New(func(key string) (string, bool) { value, ok := env[key]; return value, ok })
+			if got := p.timeout(tt.goos); got != tt.want {
 				t.Errorf("ProbeTimeout(%q) = %s, want %s", tt.goos, got, tt.want)
 			}
 		})
@@ -186,14 +182,15 @@ func TestListenerEvidence(t *testing.T) {
 }
 
 func TestListenerBudget(t *testing.T) {
-	t.Setenv("CODEX_GATEWAY_PROBE_TIMEOUT_MS", "50")
+	env := map[string]string{"CODEX_GATEWAY_PROBE_TIMEOUT_MS": "50"}
+	lookup := func(key string) (string, bool) { value, ok := env[key]; return value, ok }
 	synctest.Test(t, func(t *testing.T) {
 		started := time.Now()
 		entered := make(chan struct{}, 1)
 		// The fake clock stops when this function returns, so the query is released by the test and not by a timer.
 		release := make(chan struct{})
 		defer close(release)
-		p := Probe{sockets: func(context.Context) ([]socketEvidence, error) {
+		p := Probe{lookup: lookup, sockets: func(context.Context) ([]socketEvidence, error) {
 			entered <- struct{}{}
 			// Some kernel reads do not observe context cancellation.
 			<-release
