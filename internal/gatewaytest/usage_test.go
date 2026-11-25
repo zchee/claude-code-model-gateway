@@ -15,6 +15,7 @@
 package gatewaytest_test
 
 import (
+	"maps"
 	"testing"
 
 	gocmp "github.com/google/go-cmp/cmp"
@@ -25,22 +26,32 @@ import (
 const fixtureUsageKey = "CODEX_GATEWAY_USAGE_ENDPOINT"
 
 func TestUsageEnvironment(t *testing.T) {
-	tests := map[string]struct{ key string }{
-		"success: generic OTLP endpoint removed": {"OTEL_EXPORTER_OTLP_ENDPOINT"},
-		"success: logs endpoint removed":         {"OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"},
-		"success: traces endpoint removed":       {"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"},
-		"success: lower-case endpoint removed":   {"otel_exporter_otlp_endpoint"},
-		"success: mixed-case setting removed":    {"Otel_Exporter_OTLP_Logs_Timeout"},
+	tests := map[string]struct {
+		parent, normal, isolated map[string]string
+	}{
+		"success: remove inherited generic endpoint": {parent: map[string]string{"OTEL_EXPORTER_OTLP_ENDPOINT": "inherited"}},
+		"success: remove different ordinary override": {
+			parent: map[string]string{"OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "inherited"},
+			normal: map[string]string{"OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "override"},
+		},
+		"success: remove mixed-case isolated override": {isolated: map[string]string{"Otel_Exporter_OTLP_Logs_Timeout": "override"}},
+		"success: remove inherited value copied into isolated override": {
+			parent:   map[string]string{"otel_exporter_otlp_traces_endpoint": "inherited"},
+			isolated: map[string]string{"otel_exporter_otlp_traces_endpoint": "inherited"},
+		},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			parent := map[string]string{tt.key: "inherited", fixtureUsageKey: "inherited"}
-			env := gatewaytest.NewEnv(t.TempDir(), parent, parent, nil)
-			if diff := gocmp.Diff("0", env[fixtureUsageKey]); diff != "" {
-				t.Errorf("usage endpoint (-want +got):\n%s", diff)
+			parent := map[string]string{fixtureUsageKey: "inherited"}
+			maps.Copy(parent, tt.parent)
+			home := t.TempDir()
+			want := gatewaytest.NewEnv(home, nil, nil, nil)
+			env := gatewaytest.NewEnv(home, parent, tt.normal, tt.isolated)
+			if diff := gocmp.Diff(want, env); diff != "" {
+				t.Errorf("fixture environment (-want +got):\n%s", diff)
 			}
-			if _, ok := env[tt.key]; ok {
-				t.Errorf("inherited setting %q survived", tt.key)
+			if env[fixtureUsageKey] != "0" {
+				t.Errorf("usage endpoint=%q, want 0", env[fixtureUsageKey])
 			}
 		})
 	}

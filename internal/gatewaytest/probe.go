@@ -62,6 +62,9 @@ func (env Environment) ProbeAlias(ctx context.Context, alias, endpoint string) (
 		ctx, cancel := context.WithTimeout(ctx, time.Duration(config.PinProbeTimeout.Get(env.lookup))*time.Millisecond)
 		defer cancel()
 		child := Environment(config.PinProbeEnvironment(env))
+		if _, set := child[usageEndpointKey]; !set {
+			child[usageEndpointKey] = "0"
+		}
 		maps.DeleteFunc(child, func(key, _ string) bool {
 			switch strings.ToUpper(key) {
 			case "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "ANTHROPIC_UNIX_SOCKET", "CODEX_GATEWAY_SOCKET_PATH":
@@ -83,6 +86,9 @@ func (env Environment) ProbeAlias(ctx context.Context, alias, endpoint string) (
 	})
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
+	}
+	if errors.Is(err, ErrUsageEndpoint) {
+		return nil, err
 	}
 	if err != nil || output.model == "" {
 		return nil, nil

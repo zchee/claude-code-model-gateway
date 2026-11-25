@@ -42,10 +42,11 @@ func (env Environment) StartUpstream(t testing.TB, handler http.Handler) string 
 	if handler == nil {
 		handler = http.NotFoundHandler()
 	}
-	return env.serve(t, &http.Server{Handler: handler})
+	base, _ := env.serve(t, &http.Server{Handler: handler})
+	return base
 }
 
-func (env Environment) serve(t testing.TB, server *http.Server) string {
+func (env Environment) serve(t testing.TB, server *http.Server) (string, <-chan struct{}) {
 	t.Helper()
 	var cfg net.ListenConfig
 	ln, err := env.Listen(t.Context(), "tcp4", "127.0.0.1:0", cfg.Listen)
@@ -55,7 +56,12 @@ func (env Environment) serve(t testing.TB, server *http.Server) string {
 	ctx := t.Context()
 	server.BaseContext = func(net.Listener) context.Context { return ctx }
 	done := make(chan error, 1)
-	go func() { done <- server.Serve(ln) }()
+	stopped := make(chan struct{})
+	go func() {
+		err := server.Serve(ln)
+		close(stopped)
+		done <- err
+	}()
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
 		defer cancel()
@@ -66,7 +72,7 @@ func (env Environment) serve(t testing.TB, server *http.Server) string {
 			t.Error(err)
 		}
 	})
-	return "http://" + ln.Addr().String()
+	return "http://" + ln.Addr().String(), stopped
 }
 
 // StartModelProxy serves a model catalog and sends message requests to the supplied JSON or SSE handler.
@@ -135,7 +141,7 @@ func (env Environment) StartCountingProxy(t testing.TB) *CountingProxy {
 		w.Header().Set("Connection", "close")
 		w.WriteHeader(http.StatusBadGateway)
 	})}
-	p.URL = env.serve(t, server)
+	p.URL, _ = env.serve(t, server)
 	return p
 }
 
@@ -147,8 +153,15 @@ type UsageRequest struct {
 // UsageCollector records requests sent to its private loopback URL without forwarding them.
 type UsageCollector struct {
 	URL      string
+	lease    *usageCollectorLease
 	mu       sync.Mutex
 	requests []UsageRequest
+}
+
+// RunFixture authorizes a fixture to send usage to this collector while it is running.
+// The caller must set the collector URL in env and give cmd a bounded lifetime.
+func (c *UsageCollector) RunFixture(env Environment, cmd *exec.Cmd) error {
+	return env.runFixture(cmd, c.lease)
 }
 
 // Requests returns a snapshot of the requests recorded by the collector.
@@ -162,7 +175,7 @@ func (c *UsageCollector) Requests() []UsageRequest {
 func (env Environment) StartUsageCollector(t testing.TB) *UsageCollector {
 	t.Helper()
 	collector := new(UsageCollector)
-	collector.URL = env.StartUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	base, stopped := env.serve(t, &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
 		if err != nil {
 			t.Errorf("read usage request: %v", err)
@@ -173,7 +186,16 @@ func (env Environment) StartUsageCollector(t testing.TB) *UsageCollector {
 		collector.requests = append(collector.requests, UsageRequest{r.Method, r.RequestURI, r.Header.Get("Content-Type"), string(body)})
 		collector.mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
-	})) + "/v1/logs"
+	})})
+	collector.URL = base + "/v1/logs"
+	lease := &usageCollectorLease{endpoint: collector.URL, stopped: stopped}
+	collector.lease = lease
+	// Cleanup runs before server shutdown and after any already authorized child exits.
+	t.Cleanup(func() {
+		lease.mu.Lock()
+		lease.revoked = true
+		lease.mu.Unlock()
+	})
 	return collector
 }
 
@@ -185,6 +207,9 @@ func (env Environment) HelperCommand(t testing.TB, helper string, args ...string
 	dispatch := append([]string{helperSelector, "--", "--gatewaytest-helper=" + helper}, args...)
 	if !registeredDispatch(dispatch) {
 		return nil, errors.New("unregistered gateway fixture helper")
+	}
+	if dispatch[2] == usageHelperDispatch && !validUsageEndpoint(dispatch[3]) {
+		return nil, ErrUsageEndpoint
 	}
 	exe, err := os.Executable()
 	if err != nil {
@@ -225,6 +250,9 @@ func DispatchHelper(t testing.TB) string {
 			t.Fatal(err)
 		}
 		if os.Args[3] == usageHelperDispatch {
+			if !validUsageEndpoint(os.Args[4]) {
+				t.Fatal(ErrUsageEndpoint)
+			}
 			return os.Args[4]
 		}
 		if err := FakeClaude(os.Args[4:], os.Stdout); err != nil {

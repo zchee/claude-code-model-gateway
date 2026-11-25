@@ -31,6 +31,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/zchee/claude-code-model-gateway/internal/config"
 	"github.com/zchee/claude-code-model-gateway/internal/paths"
@@ -45,15 +46,15 @@ var (
 	ErrOutsideSandbox = errors.New("refusing to touch settings outside the sandbox")
 	// ErrInvalidEnvironment identifies a child environment entry os/exec cannot represent exactly.
 	ErrInvalidEnvironment = errors.New("invalid fixture environment entry")
-	// ErrUsageEndpoint identifies a usage override that is neither disabled nor a safe loopback HTTP endpoint.
-	ErrUsageEndpoint = errors.New("fixture usage requires 0 or an HTTP loopback IP with an explicit non-reserved port")
+	// ErrUsageEndpoint identifies a missing, unowned, or conflicting fixture usage endpoint.
+	ErrUsageEndpoint = errors.New("fixture usage requires 0 or an authorized live collector URL, without OTLP exporter overrides")
 )
 
 // Environment is the environment of a gateway process, not its parent's live environment.
 type Environment map[string]string
 
 // NewEnv builds an isolated environment in the caller's temporary home. Overrides cannot move the sandbox root.
-// Usage reporting is off unless an override directs it to a test-owned collector.
+// Usage reporting is off unless an override names a collector and the caller launches through it.
 func NewEnv(home string, parent, overrides, isolatedOverrides map[string]string) Environment {
 	socket := filepath.Join(home, "gateway.sock")
 	if runtime.GOOS == "windows" {
@@ -91,7 +92,6 @@ func NewEnv(home string, parent, overrides, isolatedOverrides map[string]string)
 	isolated := func(key string) bool {
 		_, forced := env[key]
 		return forced || strings.HasPrefix(key, "CODEX_GATEWAY_") || strings.HasPrefix(key, "MODEL_GATEWAY_") ||
-			strings.HasPrefix(strings.ToUpper(key), "OTEL_EXPORTER_OTLP") ||
 			key == "ANTHROPIC_BASE_URL" || key == "ANTHROPIC_UNIX_SOCKET" || key == "CLAUDE_CODE_PLUGIN_CACHE_DIR"
 	}
 	for key, value := range parent {
@@ -106,8 +106,13 @@ func NewEnv(home string, parent, overrides, isolatedOverrides map[string]string)
 		env[key] = value
 	}
 	maps.Copy(env, isolatedOverrides)
+	maps.DeleteFunc(env, func(key, _ string) bool { return otlpExporterKey(key) })
 	env[sandboxKey] = home
 	return env
+}
+
+func otlpExporterKey(key string) bool {
+	return strings.HasPrefix(strings.ToUpper(key), "OTEL_EXPORTER_OTLP")
 }
 
 const (
@@ -204,9 +209,19 @@ func (env Environment) openSandboxDir(path string, allowRoot bool) (*os.Root, er
 }
 
 const (
-	helperSelector      = "-test.run=^TestGatewayFixtureHelper$"
-	usageHelperDispatch = "--gatewaytest-helper=usage"
+	helperSelector       = "-test.run=^TestGatewayFixtureHelper$"
+	usageHelperDispatch  = "--gatewaytest-helper=usage"
+	legacyHelperSelector = "-test.run=^TestEmptyEnvironmentHelper$"
+	emptyLegacyDispatch  = "--gatewaytest-helper=empty"
 )
+
+// A lease holds the collector open until an authorized child exits.
+type usageCollectorLease struct {
+	endpoint string
+	stopped  <-chan struct{}
+	mu       sync.RWMutex
+	revoked  bool
+}
 
 func validUsageEndpoint(endpoint string) bool {
 	if endpoint == "0" {
@@ -223,8 +238,8 @@ func registeredDispatch(args []string) bool {
 	switch args[0] {
 	case helperSelector:
 		return args[2] == "--gatewaytest-helper=claude" ||
-			(args[2] == usageHelperDispatch && len(args) == 4 && validUsageEndpoint(args[3]))
-	case "-test.run=^TestEmptyEnvironmentHelper$":
+			(args[2] == usageHelperDispatch && len(args) == 4)
+	case legacyHelperSelector:
 		mode, ok := strings.CutPrefix(args[2], "--gatewaytest-helper=")
 		return ok && len(args) == 3 && slices.Contains([]string{"empty", "fixture", "alias", "pins", "named-alias", "named-pins"}, mode)
 	default:
@@ -233,14 +248,17 @@ func registeredDispatch(args []string) bool {
 }
 
 // RunFixture runs a sandbox executable or a registered helper dispatch with exactly env.
-// Only the legacy isolation check may run without a sandbox. Invalid usage overrides are refused before launch.
-func (env Environment) RunFixture(cmd *exec.Cmd) error {
-	if endpoint, set := env[usageEndpointKey]; set && !validUsageEndpoint(endpoint) {
-		return ErrUsageEndpoint
-	}
+// Usage reporting must be disabled; only the zero-entry legacy helper may omit the setting.
+func (env Environment) RunFixture(cmd *exec.Cmd) error { return env.runFixture(cmd, nil) }
+
+func (env Environment) runFixture(cmd *exec.Cmd, lease *usageCollectorLease) error {
 	entries := make([]string, 0, len(env)) // A nil slice inherits the ambient environment.
 	for name, value := range env {
-		if name == "" || strings.ContainsAny(name, "=\x00") || strings.IndexByte(value, 0) >= 0 {
+		hasNUL := strings.IndexByte(value, 0) >= 0
+		if otlpExporterKey(name) || (name == usageEndpointKey && hasNUL) {
+			return ErrUsageEndpoint
+		}
+		if name == "" || strings.ContainsAny(name, "=\x00") || hasNUL {
 			return ErrInvalidEnvironment
 		}
 		entries = append(entries, name+"="+value)
@@ -257,28 +275,52 @@ func (env Environment) RunFixture(cmd *exec.Cmd) error {
 		return err
 	}
 	program, err := os.Stat(cmd.Path)
+	var dispatch []string
 	if cmd.Path == self || (err == nil && os.SameFile(program, selfInfo)) {
-		if !registeredDispatch(cmd.Args[1:]) || (cmd.Args[1] != helperSelector && !filepath.IsAbs(cmd.Dir)) {
+		dispatch = cmd.Args[1:]
+		if !registeredDispatch(dispatch) || (dispatch[0] == legacyHelperSelector && !filepath.IsAbs(cmd.Dir)) {
 			return ErrRealClaude
-		}
-		if cmd.Args[1] == helperSelector {
-			root, err := env.openSandboxDir(cmd.Dir, false)
-			if err != nil {
-				return err
-			}
-			dir, err := root.Open(".")
-			if err != nil {
-				return errors.Join(err, root.Close())
-			}
-			// Bootstrap in the trusted sandbox root, not a second lookup of the requested
-			// directory. DispatchHelper enters the checked handle before doing fixture work.
-			cmd.Dir = env.sandboxRoot()
-			cmd.ExtraFiles = append([]*os.File{dir}, cmd.ExtraFiles...)
-			cmd.Env = entries
-			return errors.Join(cmd.Run(), dir.Close(), root.Close())
 		}
 	} else if !env.guarded() || !env.contains(cmd.Path) {
 		return ErrRealClaude
+	}
+
+	endpoint := env[usageEndpointKey]
+	if len(dispatch) > 0 && dispatch[2] == usageHelperDispatch && endpoint != dispatch[3] {
+		return ErrUsageEndpoint
+	}
+	legacyEmpty := len(env) == 0 && slices.Equal(dispatch, []string{legacyHelperSelector, "--", emptyLegacyDispatch})
+	if endpoint != "0" && !legacyEmpty {
+		if lease == nil || endpoint != lease.endpoint || !validUsageEndpoint(endpoint) {
+			return ErrUsageEndpoint
+		}
+		lease.mu.RLock()
+		defer lease.mu.RUnlock()
+		if lease.revoked {
+			return ErrUsageEndpoint
+		}
+		select {
+		case <-lease.stopped:
+			return ErrUsageEndpoint
+		default:
+		}
+	}
+
+	if len(dispatch) > 0 && dispatch[0] == helperSelector {
+		root, err := env.openSandboxDir(cmd.Dir, false)
+		if err != nil {
+			return err
+		}
+		dir, err := root.Open(".")
+		if err != nil {
+			return errors.Join(err, root.Close())
+		}
+		// Bootstrap in the trusted sandbox root, not a second lookup of the requested
+		// directory. DispatchHelper enters the checked handle before doing fixture work.
+		cmd.Dir = env.sandboxRoot()
+		cmd.ExtraFiles = append([]*os.File{dir}, cmd.ExtraFiles...)
+		cmd.Env = entries
+		return errors.Join(cmd.Run(), dir.Close(), root.Close())
 	}
 	cmd.Env = entries
 	return cmd.Run()

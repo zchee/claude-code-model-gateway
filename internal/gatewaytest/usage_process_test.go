@@ -72,12 +72,11 @@ func postFixtureUsage(t *testing.T, expected string) {
 
 func TestUsageFixtureProcess(t *testing.T) {
 	tests := map[string]struct {
-		override, isolated, wrongCollector bool
+		override, isolated bool
 	}{
 		"success: default disables reporting":  {},
 		"success: explicit collector":          {override: true},
 		"success: isolated collector override": {isolated: true},
-		"error: unexpected loopback collector": {override: true, wrongCollector: true},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -103,15 +102,6 @@ func TestUsageFixtureProcess(t *testing.T) {
 				normal = map[string]string{fixtureUsageKey: "0"}
 				isolated = map[string]string{fixtureUsageKey: collector.URL}
 			}
-			if tt.wrongCollector {
-				other := env.StartUsageCollector(t)
-				normal[fixtureUsageKey] = other.URL
-				defer func() {
-					if got := other.Requests(); len(got) != 0 {
-						t.Errorf("unexpected collector received %v", got)
-					}
-				}()
-			}
 			env = gatewaytest.NewEnv(home, parent, normal, isolated)
 			cmd, err := env.HelperCommand(t, "usage", expected)
 			if err != nil {
@@ -119,19 +109,177 @@ func TestUsageFixtureProcess(t *testing.T) {
 			}
 			var output bytes.Buffer
 			cmd.Stdout, cmd.Stderr = &output, &output
-			err = env.RunFixture(cmd)
 			var want []gatewaytest.UsageRequest
-			if tt.wrongCollector {
-				if _, ok := errors.AsType[*exec.ExitError](err); !ok || !strings.Contains(output.String(), "usage endpoint is not the expected fixture destination") {
-					t.Fatalf("expected child to refuse the endpoint: %v\n%s", err, &output)
-				}
-			} else if err != nil {
-				t.Fatalf("usage helper: %v\n%s", err, &output)
-			} else if tt.override || tt.isolated {
+			if tt.override || tt.isolated {
+				err = collector.RunFixture(env, cmd)
 				want = []gatewaytest.UsageRequest{{Method: "POST", RequestURI: "/v1/logs", ContentType: "application/json", Body: fixtureUsageBody}}
+			} else {
+				err = env.RunFixture(cmd)
+			}
+			if err != nil {
+				t.Fatalf("usage helper: %v\n%s", err, &output)
 			}
 			if diff := gocmp.Diff(want, collector.Requests()); diff != "" {
 				t.Errorf("collector requests (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestUsageCollectorAuthorization(t *testing.T) {
+	home := t.TempDir()
+	base := gatewaytest.NewEnv(home, nil, nil, nil)
+	first, second := base.StartUsageCollector(t), base.StartUsageCollector(t)
+	var stopped *gatewaytest.UsageCollector
+	t.Run("start then clean up collector", func(t *testing.T) { stopped = base.StartUsageCollector(t) })
+	bin := filepath.Join(home, "fixture-launch-canary")
+	if err := os.WriteFile(bin, []byte(launchCanary), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tests := map[string]struct {
+		url, helperURL string
+		authorize      *gatewaytest.UsageCollector
+	}{
+		"error: arbitrary loopback URL":                 {url: "http://127.0.0.1:9000/v1/logs"},
+		"error: existing URL without collector":         {url: first.URL},
+		"error: constructed collector without lease":    {url: first.URL, authorize: &gatewaytest.UsageCollector{URL: first.URL}},
+		"error: changed collector path":                 {url: first.URL + "/other", authorize: first},
+		"error: previously cleaned up collector":        {url: stopped.URL, authorize: stopped},
+		"error: helper aimed at another live collector": {url: second.URL, helperURL: first.URL, authorize: second},
+		"error: helper strings alone are not authority": {url: first.URL, helperURL: first.URL},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			env := gatewaytest.NewEnv(home, nil, map[string]string{fixtureUsageKey: tt.url}, nil)
+			var cmd *exec.Cmd
+			if tt.helperURL != "" {
+				var err error
+				cmd, err = env.HelperCommand(t, "usage", tt.helperURL)
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				cmd = exec.CommandContext(t.Context(), bin)
+			}
+			launch := env.RunFixture
+			if tt.authorize != nil {
+				launch = func(cmd *exec.Cmd) error { return tt.authorize.RunFixture(env, cmd) }
+			}
+			if err := launch(cmd); !errors.Is(err, gatewaytest.ErrUsageEndpoint) || cmd.Process != nil {
+				t.Fatalf("RunFixture: process=%v err=%v; want ErrUsageEndpoint before launch", cmd.Process, err)
+			}
+			wantAbsent(t, filepath.Join(home, "launched"))
+			if got := len(first.Requests()) + len(second.Requests()) + len(stopped.Requests()); got != 0 {
+				t.Errorf("collectors received %d requests, want zero", got)
+			}
+		})
+	}
+}
+
+func TestUsagePolicyRequiredAtLaunch(t *testing.T) {
+	tests := map[string]struct {
+		raw, helper, empty  bool
+		legacy, exporterKey string
+	}{
+		"error: missing on a sandbox executable":            {},
+		"error: raw map missing on a sandbox executable":    {raw: true},
+		"error: missing on a usage helper":                  {helper: true},
+		"error: nonempty legacy environment missing policy": {legacy: "empty"},
+		"error: legacy fixture mode cannot use empty map":   {legacy: "fixture", empty: true},
+		"error: exporter in raw map":                        {raw: true, exporterKey: "OTel_Exporter_OTLP_Logs_Endpoint"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			env := gatewaytest.NewEnv(home, nil, nil, nil)
+			var cmd *exec.Cmd
+			switch {
+			case tt.helper:
+				var err error
+				cmd, err = env.HelperCommand(t, "usage", "0")
+				if err != nil {
+					t.Fatal(err)
+				}
+			case tt.legacy != "":
+				cmd = helperCommand(t, privateWorkdir(t), tt.legacy)
+			default:
+				bin := filepath.Join(home, "fixture-launch-canary")
+				if err := os.WriteFile(bin, []byte(launchCanary), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				cmd = exec.CommandContext(t.Context(), bin)
+			}
+			if tt.empty {
+				clear(env)
+			}
+			if tt.raw {
+				env = gatewaytest.Environment{sandbox: home}
+			}
+			if tt.exporterKey != "" {
+				env[fixtureUsageKey] = "0"
+				env[tt.exporterKey] = "http://127.0.0.1:9000/v1/logs"
+			} else {
+				delete(env, fixtureUsageKey)
+			}
+			if err := env.RunFixture(cmd); !errors.Is(err, gatewaytest.ErrUsageEndpoint) || cmd.Process != nil {
+				t.Fatalf("RunFixture: process=%v err=%v; want ErrUsageEndpoint before launch", cmd.Process, err)
+			}
+			wantAbsent(t, filepath.Join(home, "launched"))
+		})
+	}
+}
+
+func TestUsageHelperPolicyError(t *testing.T) {
+	tests := map[string]struct{ endpoint string }{
+		"error: empty endpoint argument":  {""},
+		"error: named host argument":      {"http://localhost:9000/v1/logs"},
+		"error: NUL in endpoint argument": {"http://127.0.0.1:9000/v1/logs\x00"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			env := gatewaytest.NewEnv(t.TempDir(), nil, nil, nil)
+			if cmd, err := env.HelperCommand(t, "usage", tt.endpoint); cmd != nil || !errors.Is(err, gatewaytest.ErrUsageEndpoint) {
+				t.Fatalf("HelperCommand: cmd=%v err=%v; want ErrUsageEndpoint", cmd, err)
+			}
+			cmd, err := env.HelperCommand(t, "usage", "0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmd.Args[len(cmd.Args)-1] = tt.endpoint
+			env[fixtureUsageKey] = tt.endpoint
+			if err := env.RunFixture(cmd); !errors.Is(err, gatewaytest.ErrUsageEndpoint) || cmd.Process != nil {
+				t.Fatalf("direct dispatch: process=%v err=%v; want ErrUsageEndpoint before launch", cmd.Process, err)
+			}
+		})
+	}
+}
+
+func TestProbeUsagePolicyError(t *testing.T) {
+	tests := map[string]struct {
+		key, value string
+		wantErr    error
+	}{
+		"error: unowned usage endpoint": {fixtureUsageKey, "http://127.0.0.1:9000/v1/logs", gatewaytest.ErrUsageEndpoint},
+		"error: raw exporter setting":   {"OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:9000", gatewaytest.ErrUsageEndpoint},
+		"success: ordinary probe miss":  {fixtureUsageKey, "0", nil},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			bin := filepath.Join(home, "fixture-launch-canary")
+			if err := os.WriteFile(bin, []byte(launchCanary), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			env := gatewaytest.NewEnv(home, nil, map[string]string{"CODEX_GATEWAY_CLAUDE_BIN": bin}, nil)
+			env[tt.key] = tt.value
+			model, err := env.ProbeAlias(t.Context(), "sonnet", "http://127.0.0.1:9")
+			if model != nil || !errors.Is(err, tt.wantErr) {
+				t.Fatalf("ProbeAlias: model=%v err=%v, want nil and %v", model, err, tt.wantErr)
+			}
+			if tt.wantErr != nil {
+				wantAbsent(t, filepath.Join(home, "launched"))
+			} else if _, err := os.Stat(filepath.Join(home, "launched")); err != nil {
+				t.Fatalf("ordinary miss did not run the canary: %v", err)
 			}
 		})
 	}
