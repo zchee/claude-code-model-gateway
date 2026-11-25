@@ -1,0 +1,6 @@
+﻿{
+    "z" : [1.00, -0, 1e+03, 9007199254740993],
+	"2": { "ANTHROPIC_BASE_URL": "before" }, "1" : "a\/b",
+ "env" : {"CUSTOM": "before", "ANTHROPIC_BASE_URL" : "before"},
+    "tail" : "😀"
+}

@@ -1,0 +1,5 @@
+{
+  "spelling": [{"Path": ["env", "ANTHROPIC_BASE_URL"], "Value": "after"}],
+  "removal": [{"Path": ["env", "ANTHROPIC_BASE_URL"]}],
+  "insertion": [{"Path": ["env", "ANTHROPIC_BASE_URL"], "Value": "after"}]
+}
