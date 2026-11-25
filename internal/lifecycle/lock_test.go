@@ -53,21 +53,21 @@ func lockFor(state string) lifecycle.Lock {
 	}), NewToken: func() string { return token }}
 }
 
-func equal[T any](t *testing.T, want, got T) {
+func equal[T any](t testing.TB, want, got T) {
 	t.Helper()
 	if diff := gocmp.Diff(want, got); diff != "" {
 		t.Fatalf("(-want +got):\n%s", diff)
 	}
 }
 
-func noError(t *testing.T, err error) {
+func noError(t testing.TB, err error) {
 	t.Helper()
 	if err != nil {
 		t.Fatal(err)
 	}
 }
 
-func bytesAt(t *testing.T, path string) string {
+func bytesAt(t testing.TB, path string) string {
 	t.Helper()
 	data, err := os.ReadFile(path)
 	noError(t, err)
@@ -81,7 +81,7 @@ func mustBeAbsent(t *testing.T, path string) {
 	}
 }
 
-func acquire(t *testing.T, lock lifecycle.Lock) func() {
+func acquire(t testing.TB, lock lifecycle.Lock) func() {
 	t.Helper()
 	release, err := lock.Acquire(t.Context())
 	noError(t, err)
@@ -183,6 +183,7 @@ func TestPreserveUncertainProcess(t *testing.T) {
 		state lifecycle.ProcessState
 		birth string
 	}{
+		"success: unknown with a different birth":          {lifecycle.Unknown, "Tue Jan  3 01:02:03 2006"},
 		"success: inaccessible identity":                   {lifecycle.Unknown, ""},
 		"success: existing process without readable birth": {lifecycle.Alive, ""},
 		"success: matching legacy owner":                   {lifecycle.Alive, "Mon Jan  2 15:04:05 2006"},
@@ -195,7 +196,20 @@ func TestPreserveUncertainProcess(t *testing.T) {
 			path := filepath.Join(dir, previous)
 			const data = `{"token":"00000000-0000-4000-8000-000000000001","pid":42,"startedAt":"Mon Jan  2 15:04:05 2006","host":"host"}`
 			noError(t, atomicfile.WriteFile(path, []byte(data), 0o600))
-			lock.Timeout = new(time.Duration(0))
+			const timeout = 200 * time.Millisecond
+			lock.Timeout = new(timeout)
+			start := time.Unix(0, 0)
+			now := start
+			lock.Now = func() time.Time { return now }
+			lock.Wait = func(_ context.Context, d time.Duration) error {
+				equal(t, 50*time.Millisecond, d)
+				equal(t, data, bytesAt(t, path))
+				now = now.Add(d)
+				if now.Sub(start) > timeout {
+					t.Fatal("continued polling after deadline")
+				}
+				return nil
+			}
 			var inspected []int
 			ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 			defer cancel()
@@ -215,22 +229,32 @@ func TestPreserveUncertainProcess(t *testing.T) {
 				t.Fatal("displaced an owner without evidence")
 			}
 			equal(t, busyMessage(dir), err.Error())
-			equal(t, []int{lock.PID, 42}, inspected)
+			equal(t, timeout, now.Sub(start))
+			equal(t, []int{lock.PID, 42, 42, 42, 42, 42}, inspected)
 			equal(t, data, bytesAt(t, path))
 		})
 	}
 }
 
 func TestMissingOwnIdentity(t *testing.T) {
-	state := filepath.Join(t.TempDir(), "state")
-	lock := lockFor(state)
-	lock.Processes = lookup(func(context.Context, int) (lifecycle.ProcessState, string) { return lifecycle.Unknown, "" })
-	_, err := lock.Acquire(t.Context())
-	if err == nil {
-		t.Fatal("accepted missing own identity")
+	tests := map[string]struct{ state lifecycle.ProcessState }{"error: unknown existence": {lifecycle.Unknown}, "error: live without birth": {lifecycle.Alive}}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			state := filepath.Join(t.TempDir(), "state")
+			lock := lockFor(state)
+			lock.Processes = lookup(func(_ context.Context, pid int) (lifecycle.ProcessState, string) {
+				equal(t, lock.PID, pid)
+				return tc.state, ""
+			})
+			_, err := lock.Acquire(t.Context())
+			if err == nil {
+				t.Fatal("accepted missing own birth")
+			}
+			equal(t, "could not establish lifecycle lock process identity; run doctor", err.Error())
+			mustBeAbsent(t, filepath.Join(state, "lifecycle.lock"))
+			mustBeAbsent(t, state)
+		})
 	}
-	equal(t, "could not establish lifecycle lock process identity; run doctor", err.Error())
-	mustBeAbsent(t, state)
 }
 
 func TestStale(t *testing.T) {
@@ -241,18 +265,19 @@ func TestStale(t *testing.T) {
 		birth string
 		want  bool
 	}{
-		"success: same process":               {valid, lifecycle.Alive, "Mon Jan  2 15:04:05 2006", false},
-		"success: recycled pid":               {valid, lifecycle.Alive, "Tue Jan  3 01:02:03 2006", true},
-		"success: confirmed absent":           {valid, lifecycle.Absent, "", true},
-		"success: unknown process":            {valid, lifecycle.Unknown, "", false},
-		"success: unreadable birth":           {valid, lifecycle.Alive, "", false},
-		"success: another host":               {&lifecycle.Owner{PID: 17, Host: "foreign"}, lifecycle.Absent, "", false},
-		"success: foreign identifiable owner": {&lifecycle.Owner{PID: 17, Host: "foreign", StartedAt: new("Mon Jan  2 15:04:05 2006")}, lifecycle.Absent, "", false},
-		"success: invalid pid":                {&lifecycle.Owner{PID: 0, Host: "host"}, lifecycle.Absent, "", false},
-		"success: zero pid with birth":        {&lifecycle.Owner{PID: 0, Host: "host", StartedAt: new("Mon Jan  2 15:04:05 2006")}, lifecycle.Absent, "", false},
-		"success: missing owner":              {nil, lifecycle.Absent, "", false},
-		"success: missing birth":              {&lifecycle.Owner{PID: 17, Host: "host"}, lifecycle.Absent, "", false},
-		"success: empty recorded string":      {&lifecycle.Owner{PID: 17, Host: "host", StartedAt: new("")}, lifecycle.Alive, "Mon Jan  2 15:04:05 2006", true},
+		"success: same process":                         {valid, lifecycle.Alive, "Mon Jan  2 15:04:05 2006", false},
+		"success: recycled pid":                         {valid, lifecycle.Alive, "Tue Jan  3 01:02:03 2006", true},
+		"success: confirmed absent":                     {valid, lifecycle.Absent, "", true},
+		"success: unknown process with different birth": {valid, lifecycle.Unknown, "Tue Jan  3 01:02:03 2006", false},
+		"success: unknown process":                      {valid, lifecycle.Unknown, "", false},
+		"success: unreadable birth":                     {valid, lifecycle.Alive, "", false},
+		"success: another host":                         {&lifecycle.Owner{PID: 17, Host: "foreign"}, lifecycle.Absent, "", false},
+		"success: foreign identifiable owner":           {&lifecycle.Owner{PID: 17, Host: "foreign", StartedAt: new("Mon Jan  2 15:04:05 2006")}, lifecycle.Absent, "", false},
+		"success: invalid pid":                          {&lifecycle.Owner{PID: 0, Host: "host"}, lifecycle.Absent, "", false},
+		"success: zero pid with birth":                  {&lifecycle.Owner{PID: 0, Host: "host", StartedAt: new("Mon Jan  2 15:04:05 2006")}, lifecycle.Absent, "", false},
+		"success: missing owner":                        {nil, lifecycle.Absent, "", false},
+		"success: missing birth":                        {&lifecycle.Owner{PID: 17, Host: "host"}, lifecycle.Absent, "", false},
+		"success: empty recorded string":                {&lifecycle.Owner{PID: 17, Host: "host", StartedAt: new("")}, lifecycle.Alive, "Mon Jan  2 15:04:05 2006", true},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {

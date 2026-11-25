@@ -28,7 +28,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -44,15 +43,19 @@ import (
 
 // Both supported venues provide POSIX signal zero and SIGKILL wait status.
 func nativeIdentity(ctx context.Context, pid int) (lifecycle.ProcessState, string) {
+	probeCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
 	probe := procinfo.New(nil)
-	alive, err := probe.Alive(ctx, pid)
+	alive, err := probe.Alive(probeCtx, pid)
 	if err != nil {
 		return lifecycle.Unknown, ""
 	}
 	if !alive {
 		return lifecycle.Absent, ""
 	}
-	id, err := probe.Identity(ctx, pid)
+	birthCtx, cancelBirth := context.WithTimeout(ctx, 4*time.Second)
+	defer cancelBirth()
+	id, err := probe.Identity(birthCtx, pid)
 	if err != nil {
 		return lifecycle.Alive, ""
 	}
@@ -60,7 +63,24 @@ func nativeIdentity(ctx context.Context, pid int) (lifecycle.ProcessState, strin
 }
 
 func TestLegacyProcessInterop(t *testing.T) {
-	lock := lockFor(t.TempDir())
+	env := gatewaytest.NewEnv(t.TempDir(), nil, map[string]string{"LC_ALL": "C", "TZ": "Asia/Tokyo"}, nil)
+	oracle := startChild(t, env)
+	equal(t, "ready", oracle.notice(t))
+	oracle.send(t, "L")
+	<-oracle.done
+	if oracle.err != nil {
+		t.Fatalf("legacy oracle: %v\n%s", oracle.err, oracle.output.String())
+	}
+}
+
+func legacyOracle(t testing.TB) {
+	t.Helper()
+	equal(t, "C", os.Getenv("LC_ALL"))
+	equal(t, "Asia/Tokyo", os.Getenv("TZ"))
+	// DispatchHelper already entered this process's private directory in the sandbox.
+	directory, err := os.Getwd()
+	noError(t, err)
+	lock := lockFor(directory)
 	lock.PID = os.Getpid()
 	host, err := os.Hostname()
 	noError(t, err)
@@ -75,7 +95,8 @@ func TestLegacyProcessInterop(t *testing.T) {
 	if birth == "" {
 		t.Fatal("ps returned no birth")
 	}
-	state, gotBirth := nativeIdentity(ctx, lock.PID)
+	cancel()
+	state, gotBirth := nativeIdentity(t.Context(), lock.PID)
 	equal(t, lifecycle.Alive, state)
 	equal(t, birth, gotBirth)
 	// The legacy encoder inserts these fields in this order; its birth text is taken from ps, not from our formatter.
@@ -94,7 +115,7 @@ func TestLegacyProcessInterop(t *testing.T) {
 	path := filepath.Join(dir, previous)
 	old := ownerBytes(previous)
 	noError(t, atomicfile.WriteFile(path, old, 0o600))
-	_, err = lock.Acquire(ctx)
+	_, err = lock.Acquire(t.Context())
 	if err == nil {
 		t.Fatal("displaced a live legacy owner")
 	}
@@ -130,6 +151,10 @@ func runLockChild(t testing.TB, args []string) {
 	role, err := takeByte()
 	if err != nil {
 		t.Fatal(err)
+	}
+	if role == 'L' {
+		legacyOracle(t)
+		return
 	}
 	// Both helpers have finished the venue checks before the parent assigns roles.
 	ctx, cancel := context.WithTimeout(t.Context(), 7*time.Second)
@@ -260,12 +285,10 @@ func startChild(t *testing.T, env gatewaytest.Environment) *child {
 	c := &child{cmd: cmd, input: send, status: make(chan string, 2), done: make(chan struct{})}
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = in, out, out
 	runDone := make(chan struct{})
-	// Allow the guard's ten-second account lookup, the protocol, and teardown.
-	limit := 18 * time.Second
-	if runtime.GOOS == "darwin" {
-		// Darwin also runs a separate ten-second lsof listener check.
-		limit += 10 * time.Second
-	}
+	// Budget twenty seconds collectively for account and listener checks (two ss
+	// calls on Linux, one lsof on Darwin), seven for the protocol and one for
+	// teardown. Slower guards fail the test rather than extend this bound.
+	const limit = 28 * time.Second
 	go func() { c.err = env.RunFixtureWithin(cmd, limit); _ = out.Close(); _ = in.Close(); close(runDone) }()
 	go func() {
 		defer close(c.done)
@@ -403,7 +426,7 @@ func TestProcessContention(t *testing.T) {
 			data := bytesAt(t, path)
 			var owner lifecycle.Owner
 			noError(t, json.Unmarshal([]byte(data), &owner))
-			if owner.StartedAt == nil {
+			if owner.StartedAt == nil || *owner.StartedAt == "" {
 				t.Fatal("missing holder birth")
 			}
 			equal(t, first, owner.PID)
