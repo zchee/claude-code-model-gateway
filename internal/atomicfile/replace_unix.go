@@ -104,7 +104,11 @@ func creationMode(root *directory, base string, mode fs.FileMode, stage fs.FileI
 		return 0, err
 	}
 	info, statErr := probe.Stat()
-	if err := errors.Join(root.removeIfPresent(name), probe.Close(), statErr); err != nil {
+	cleanupErr := root.removeIfPresent(name)
+	if cleanupErr != nil {
+		cleanupErr = &StageCleanupError{Staged: root.path(name), Err: cleanupErr}
+	}
+	if err := errors.Join(cleanupErr, probe.Close(), statErr); err != nil {
 		return 0, err
 	}
 	return info.Mode().Perm(), nil
@@ -204,7 +208,7 @@ func (w writer) replace(root *directory, base string, data []byte, mode fs.FileM
 }
 
 func (w writer) writeFile(path string, data []byte, mode fs.FileMode) error {
-	root, base, err := openParent(nil, path, false)
+	root, base, err := openWriteParent(path)
 	if err != nil {
 		return err
 	}

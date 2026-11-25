@@ -184,6 +184,69 @@ func TestWriterDestinationNames(t *testing.T) {
 	}
 }
 
+func TestSettingsResolvedDestinationName(t *testing.T) {
+	long := strings.Repeat("x", 240)
+	const reserved = "settings.1234.0123456789ab.tmp"
+	tests := map[string]struct {
+		chain  []string
+		refuse bool
+	}{
+		"success: restricted intermediate links": {[]string{"settings", long, reserved, "target"}, false},
+		"success: restricted caller link":        {[]string{reserved, long, "target"}, false},
+		"error: reserved final leaf":             {[]string{"settings", reserved}, true},
+		"error: long final leaf":                 {[]string{"settings", long}, true},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			last := len(tt.chain) - 1
+			target := filepath.Join(dir, tt.chain[last])
+			writeFixture(t, target, oldState)
+			links := make([]fs.FileInfo, last)
+			for i := range last {
+				link := filepath.Join(dir, tt.chain[i])
+				if err := os.Symlink(tt.chain[i+1], link); err != nil {
+					t.Fatal(err)
+				}
+				info, err := os.Lstat(link)
+				if err != nil {
+					t.Fatal(err)
+				}
+				links[i] = info
+			}
+			err := ReplaceSettings(filepath.Join(dir, tt.chain[0]), func(current []byte) ([]byte, error) {
+				if tt.refuse {
+					t.Fatal("edited a refused destination")
+				}
+				if diff := gocmp.Diff(oldState, string(current)); diff != "" {
+					t.Fatal(diff)
+				}
+				return []byte(newState), nil
+			})
+			if tt.refuse {
+				if _, ok := errors.AsType[*DestinationError](err); !ok {
+					t.Fatalf("want DestinationError, got %v", err)
+				}
+				checkContents(t, target, oldState)
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				checkContents(t, target, newState)
+			}
+			for i, original := range links {
+				path := filepath.Join(dir, tt.chain[i])
+				if info, err := os.Lstat(path); err != nil || !os.SameFile(info, original) {
+					t.Fatalf("link replaced: %s: %v", path, err)
+				}
+				if got, err := os.Readlink(path); err != nil || got != tt.chain[i+1] {
+					t.Fatalf("link %s: got %q, %v; want %q", path, got, err, tt.chain[i+1])
+				}
+			}
+		})
+	}
+}
+
 func TestCreateExclusiveDestination(t *testing.T) {
 	dir := t.TempDir()
 	tests := map[string]struct {

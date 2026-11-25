@@ -41,7 +41,7 @@ func CreateExclusive(path string, data []byte, mode fs.FileMode) error {
 }
 
 func (w writer) createExclusive(path string, data []byte, mode fs.FileMode) error {
-	root, base, err := openParent(nil, path, false)
+	root, base, err := openWriteParent(path)
 	if err != nil {
 		return err
 	}

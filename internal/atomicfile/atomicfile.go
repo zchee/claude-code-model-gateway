@@ -16,9 +16,10 @@
 // Writers accept destination names of at most 227 bytes, leaving room for the
 // staging suffix within a 255-byte directory entry. Names of the form
 // <destination>.<positive decimal pid>.<12 lowercase hex digits>.tmp are
-// reserved and must not be used as destinations: a successful write to the
-// same base name may sweep stale staged siblings. Stale-file cleanup checks
-// the entry with lstat before a separate file-only unlink.
+// reserved by exact spelling and must not be used as destinations: a successful
+// write to the same base name may sweep stale staged siblings. For settings
+// these rules apply to the resolved destination, not intervening symlinks.
+// Stale-file cleanup checks the entry with lstat before a separate file-only unlink.
 // The package does not protect directories writable by other users.
 package atomicfile
 
@@ -37,7 +38,10 @@ func (e *DestinationError) Error() string {
 
 // StageCleanupError reports that unlinking a staged sibling failed. If Published
 // is true, Staged is a second name for the published inode. Otherwise publication
-// did not succeed and Staged is an orphan. Err is the unlink error.
+// did not succeed and Staged is an orphan. Err is the unlink error. Staged
+// records the sibling name using the spelling of the opened directory at the
+// time of failure. It may no longer resolve if the directory was moved or the
+// sibling was removed.
 type StageCleanupError struct {
 	Staged    string
 	Published bool

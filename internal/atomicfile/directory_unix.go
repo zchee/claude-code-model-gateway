@@ -179,7 +179,7 @@ func validWriteBase(base string) bool {
 
 func splitDestination(path string) (string, string, error) {
 	parent, base := filepath.Split(path)
-	if !validWriteBase(base) {
+	if !validBase(base) {
 		return "", "", &DestinationError{path}
 	}
 	if parent == "" {
@@ -246,17 +246,36 @@ func openParent(parent *directory, path string, create bool) (*directory, string
 	return &directory{os.NewFile(uintptr(fd), display)}, base, nil
 }
 
+func openWriteParent(path string) (*directory, string, error) {
+	if _, base := filepath.Split(path); !validWriteBase(base) {
+		return nil, "", &DestinationError{path}
+	}
+	return openParent(nil, path, false)
+}
+
 func openSettingsParent(path string, create bool) (*directory, string, error) {
-	d, base, err := openParent(nil, path, create)
+	// A restricted name may be an existing symlink to a valid destination,
+	// but a missing parent can never contain such a link. Do not create it.
+	_, leaf := filepath.Split(path)
+	canStage := validWriteBase(leaf)
+	d, base, err := openParent(nil, path, create && canStage)
 	if err != nil {
+		if !canStage && errors.Is(err, fs.ErrNotExist) {
+			return nil, "", &DestinationError{path}
+		}
 		return nil, "", err
 	}
 	for hops := 0; ; hops++ {
 		info, err := d.Lstat(base)
-		if errors.Is(err, fs.ErrNotExist) && hops == 0 {
-			return d, base, nil
-		}
-		if err == nil && info.Mode&unix.S_IFMT != unix.S_IFLNK {
+		if (errors.Is(err, fs.ErrNotExist) && hops == 0) || (err == nil && info.Mode&unix.S_IFMT != unix.S_IFLNK) {
+			if !validWriteBase(base) {
+				invalid := &DestinationError{d.path(base)}
+				if hops == 0 {
+					invalid.Path = path
+				}
+				_ = d.Close()
+				return nil, "", invalid
+			}
 			return d, base, nil
 		}
 		if err != nil {
