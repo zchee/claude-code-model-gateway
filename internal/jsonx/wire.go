@@ -70,10 +70,22 @@ func DecodeWire(input []byte) (WireValue, error) {
 	return v, nil
 }
 
+const maxWireDepth = 10000 // jsontext's maximum number of open containers.
+
+// WireDepthError reports that the wire document exceeds the tokenizer's nesting limit.
+type WireDepthError struct{}
+
+func (*WireDepthError) Error() string {
+	return fmt.Sprintf("wire JSON exceeds %d nested containers", maxWireDepth)
+}
+
 func readWire(d *jsontext.Decoder) (WireValue, error) {
 	v := WireValue{Kind: d.PeekKind()}
 	switch v.Kind {
 	case '{', '[':
+		if d.StackDepth() >= maxWireDepth {
+			return WireValue{}, &WireDepthError{}
+		}
 		if _, err := d.ReadToken(); err != nil {
 			return WireValue{}, err
 		}
@@ -247,8 +259,8 @@ func (v WireValue) MarshalJSON() ([]byte, error) { return EncodeWire(v) }
 func EncodeWire(value WireValue) ([]byte, error) { return appendWire(nil, value, 0) }
 
 func appendWire(dst []byte, v WireValue, depth int) ([]byte, error) {
-	if depth > 10000 {
-		return nil, errors.New("JSON nesting exceeds maximum depth")
+	if depth >= maxWireDepth && (v.Kind == '[' || v.Kind == '{') {
+		return nil, &WireDepthError{}
 	}
 	switch v.Kind {
 	case 'n':

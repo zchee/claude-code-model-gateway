@@ -17,13 +17,111 @@
 package atomicfile
 
 import (
+	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
+	"time"
 
 	gocmp "github.com/google/go-cmp/cmp"
 )
+
+func TestSweepRetainsSymlink(t *testing.T) {
+	path := stateFile(t)
+	dest := filepath.Join(filepath.Dir(path), "authored")
+	writeFixture(t, dest, "authored")
+	link := path + ".4242.abc012def345.tmp"
+	if err := os.Symlink(dest, link); err != nil {
+		t.Fatal(err)
+	}
+	w := newWriter()
+	w.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+	if err := w.writeFile(path, []byte(newState), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.Readlink(link); err != nil || got != dest {
+		t.Fatalf("swept or changed link: %q %v", got, err)
+	}
+	checkContents(t, dest, "authored")
+}
+
+func TestSettingsParentIdentity(t *testing.T) {
+	dir := t.TempDir()
+	parent := filepath.Join(dir, "config")
+	moved := filepath.Join(dir, "archived")
+	path := filepath.Join(parent, "settings.json")
+	w := newWriter()
+	err := w.replaceSettings(path, func([]byte) ([]byte, error) { return []byte(newState), nil }, func(f preparedFile, _ string) {
+		if !generatedName(filepath.Base(f.Name()), filepath.Base(path)) {
+			t.Fatalf("unexpected stage name %s", f.Name())
+		}
+		if err := os.Rename(parent, moved); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(parent, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if err == nil {
+		t.Fatal("accepted a different directory")
+	}
+	for _, p := range []string{parent, moved} {
+		contents, err := os.ReadDir(p)
+		if err != nil || len(contents) != 0 {
+			t.Fatalf("unexpected contents of %s: %v %v", p, contents, err)
+		}
+	}
+}
+
+func TestOwnershipRefusal(t *testing.T) {
+	groups, err := os.Getgroups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gid := 1
+	for gid == os.Getegid() || slices.Contains(groups, gid) {
+		gid++
+	}
+	tests := map[string]struct{ otherUser bool }{"error: another owner": {true}, "error: cannot keep group": {false}}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			f, err := os.CreateTemp(t.TempDir(), "stage")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = f.Close() })
+			info, err := f.Stat()
+			if err != nil {
+				t.Fatal(err)
+			}
+			owner := ownerOf(info)
+			want := owner
+			if tt.otherUser {
+				want.uid++
+			} else {
+				want.gid = uint32(gid)
+				if os.Geteuid() == 0 {
+					if err := f.Close(); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			err = preserveOwner(f, f.Name(), owner, want)
+			if _, ok := errors.AsType[*OwnershipError](err); !ok {
+				t.Fatalf("want ownership refusal, got %v", err)
+			}
+			after, err := os.Stat(f.Name())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ownerOf(after) != owner {
+				t.Fatal("ownership changed despite refusal")
+			}
+		})
+	}
+}
 
 func TestSettingsCreateAndPreserve(t *testing.T) {
 	tests := map[string]struct {

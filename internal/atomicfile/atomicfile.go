@@ -16,12 +16,24 @@
 package atomicfile
 
 import (
+	"fmt"
 	"io/fs"
 	"time"
 )
 
-// preparedFile is the commit surface of a renameio.PendingFile on POSIX.
-// The interface keeps the error-only Windows build independent of renameio.
+// OwnershipError reports that replacement would change the file's owner or group.
+type OwnershipError struct {
+	Path string
+	Err  error
+}
+
+func (e *OwnershipError) Error() string {
+	return fmt.Sprintf("cannot preserve ownership of %s: %v", e.Path, e.Err)
+}
+
+func (e *OwnershipError) Unwrap() error { return e.Err }
+
+// preparedFile names a synced, closed sibling ready for publication.
 type preparedFile interface {
 	Name() string
 	CloseAtomicallyReplace() error

@@ -107,7 +107,7 @@ json-goldens:
 	@$(require_test_venue) && node hack/json-goldens.mjs
 
 fuzz-settings:
-	@$(require_test_venue) && go test -run='^$$' -fuzz='^FuzzSettingsNoEdit$$' -parallel=4 -fuzztime=60s ./internal/jsonx
+	@$(require_test_venue) && go test -run='^$$' -fuzz='^FuzzSettingsNoEdit$$' -parallel=4 -fuzztime=60s -fuzzminimizetime=1s ./internal/jsonx
 
 conformance baseline-node assertion-sites bench:
 	@$(require_test_venue) && $(run_script)

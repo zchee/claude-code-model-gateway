@@ -52,7 +52,7 @@ func EncodeState(value any) ([]byte, error) {
 	return append(pretty, '\n'), nil
 }
 
-// WriteState atomically replaces path with the encoded state using mode on creation.
+// WriteState atomically replaces path; mode, filtered by creation permissions, applies to the replacement inode.
 func WriteState(path string, value any, mode fs.FileMode) error {
 	data, err := EncodeState(value)
 	if err != nil {

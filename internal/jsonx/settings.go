@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf16"
+	"unicode/utf8"
 )
 
 // Edit addresses an object member or array element by JSON Pointer. A nil value
@@ -52,6 +53,14 @@ func EditSettings(input []byte, edits ...Edit) ([]byte, error) {
 	if _, err = d.ReadToken(); !errors.Is(err, io.EOF) {
 		return nil, errors.New("trailing data after settings object")
 	}
+	if len(edits) == 0 {
+		return input, nil
+	}
+	lineEnd := "\n"
+	crlf := bytes.Count(doc, []byte("\r\n"))
+	if crlf > 0 && bytes.Count(doc, []byte("\r")) == crlf && bytes.Count(doc, []byte("\n")) == crlf {
+		lineEnd = "\r\n"
+	}
 	for _, edit := range edits {
 		if edit.Path == "" || !edit.Path.IsValid() {
 			return nil, fmt.Errorf("invalid settings member pointer %q", edit.Path)
@@ -59,6 +68,9 @@ func EditSettings(input []byte, edits ...Edit) ([]byte, error) {
 		from, to, replacement, err := locateEdit(input[start:end], slices.Collect(edit.Path.Tokens()), edit.Value)
 		if err != nil {
 			return nil, fmt.Errorf("settings %s: %w", edit.Path, err)
+		}
+		if lineEnd == "\r\n" {
+			replacement = bytes.ReplaceAll(replacement, []byte("\n"), []byte(lineEnd))
 		}
 		if from == to && len(replacement) == 0 {
 			continue
@@ -74,6 +86,13 @@ func EditSettings(input []byte, edits ...Edit) ([]byte, error) {
 
 func settingsDecoder(data []byte) *jsontext.Decoder {
 	return jsontext.NewDecoder(bytes.NewReader(data), jsontext.AllowInvalidUTF8(true), jsontext.AllowDuplicateNames(true))
+}
+
+// InvalidMemberNameError identifies a traversed object with an ill-formed UTF-8 property name.
+type InvalidMemberNameError struct{}
+
+func (*InvalidMemberNameError) Error() string {
+	return "settings object contains a member name with invalid UTF-8"
 }
 
 type span struct{ start, value, end int }
@@ -110,6 +129,9 @@ func locateEdit(root []byte, tokens []string, value jsontext.Value) (int, int, [
 				key, err := d.ReadValue()
 				if err != nil {
 					return 0, 0, nil, err
+				}
+				if !utf8.Valid(key) {
+					return 0, 0, nil, &InvalidMemberNameError{}
 				}
 				item.start = int(d.InputOffset()) - len(key)
 				match = slices.Equal(readUnits(key), units)
@@ -148,6 +170,9 @@ func locateEdit(root []byte, tokens []string, value jsontext.Value) (int, int, [
 				return 0, 0, nil, nil
 			}
 			p := items[found]
+			if len(items) == 1 {
+				return offset + 1, offset + len(raw) - 1, nil, nil
+			}
 			from, to := p.start, p.end
 			if found+1 < len(items) {
 				to = items[found+1].start

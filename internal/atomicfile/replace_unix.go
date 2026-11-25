@@ -18,154 +18,295 @@ package atomicfile
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
-	renameio "github.com/google/renameio/v2"
 	"golang.org/x/sys/unix"
 )
 
-func (w writer) writeFile(path string, data []byte, mode fs.FileMode) error {
-	return w.replace(path, data, renameio.WithPermissions(mode), nil)
+type stagedFile struct {
+	root         *os.Root
+	name, target string
 }
 
-func (w writer) replace(path string, data []byte, permission renameio.Option, check func(*renameio.PendingFile) error) error {
+func (s stagedFile) Name() string                  { return filepath.Join(s.root.Name(), s.name) }
+func (s stagedFile) CloseAtomicallyReplace() error { return s.root.Rename(s.name, s.target) }
+
+func createSibling(root *os.Root, base string, mode fs.FileMode) (*os.File, string, error) {
+	for {
+		var random [6]byte
+		_, _ = rand.Read(random[:])
+		name := base + "." + strconv.Itoa(os.Getpid()) + "." + hex.EncodeToString(random[:]) + ".tmp"
+		f, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+		if !errors.Is(err, fs.ErrExist) {
+			return f, name, err
+		}
+	}
+}
+
+func generatedName(name, base string) bool {
+	rest, ok := strings.CutPrefix(name, base+".")
+	if !ok {
+		return false
+	}
+	rest, ok = strings.CutSuffix(rest, ".tmp")
+	if !ok {
+		return false
+	}
+	pid, nonce, ok := strings.Cut(rest, ".")
+	if !ok || len(pid) == 0 || pid[0] == '0' || len(nonce) != 12 {
+		return false
+	}
+	for _, c := range pid {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	for _, c := range nonce {
+		if !strings.ContainsRune("0123456789abcdef", c) {
+			return false
+		}
+	}
+	return true
+}
+
+func sweep(root *os.Root, base, staged string, now time.Time) {
+	entries, _ := fs.ReadDir(root.FS(), ".")
+	for _, e := range entries {
+		name := e.Name()
+		if name == staged || !generatedName(name, base) {
+			continue
+		}
+		info, err := root.Lstat(name)
+		if err == nil && info.Mode().IsRegular() && now.Sub(info.ModTime()) >= time.Hour {
+			_ = root.Remove(name)
+		}
+	}
+}
+
+// creationMode observes the directory's actual creation policy without changing
+// the process-wide umask or exposing data in an initially permissive file.
+func creationMode(root *os.Root, base string, mode fs.FileMode, stage fs.FileInfo) (fs.FileMode, error) {
+	if mode.Perm()&^0o600 == 0 {
+		return stage.Mode().Perm() & mode.Perm(), nil
+	}
+	probe, name, err := createSibling(root, base, mode.Perm())
+	if err != nil {
+		return 0, err
+	}
+	info, statErr := probe.Stat()
+	if err := errors.Join(root.Remove(name), probe.Close(), statErr); err != nil {
+		return 0, err
+	}
+	return info.Mode().Perm(), nil
+}
+
+type ownership struct{ uid, gid uint32 }
+
+func ownerOf(info fs.FileInfo) ownership {
+	stat := info.Sys().(*syscall.Stat_t)
+	return ownership{stat.Uid, stat.Gid}
+}
+
+func preserveOwner(f *os.File, path string, from, to ownership) error {
+	if to.uid != uint32(os.Geteuid()) || from.uid != to.uid {
+		return &OwnershipError{path, fmt.Errorf("file belongs to uid %d", to.uid)}
+	}
+	if from.gid != to.gid {
+		if err := f.Chown(-1, int(to.gid)); err != nil {
+			return &OwnershipError{path, err}
+		}
+	}
+	return nil
+}
+
+func (w writer) replace(root *os.Root, base string, data []byte, mode fs.FileMode, existing fs.FileInfo, retainMode bool, check func(preparedFile) error) (err error) {
+	file, name, err := createSibling(root, base, 0o600)
+	if err != nil {
+		return err
+	}
+	stage := stagedFile{root, name, base}
+	published := false
+	defer func() {
+		if !published {
+			err = errors.Join(err, root.Remove(name))
+		}
+	}()
+	info, err := file.Stat()
+	if err == nil && existing != nil {
+		err = preserveOwner(file, filepath.Join(root.Name(), base), ownerOf(info), ownerOf(existing))
+	}
+	if err == nil && !retainMode {
+		mode, err = creationMode(root, base, mode, info)
+	}
+	if err == nil {
+		_, err = file.Write(data)
+	}
+	if err == nil {
+		err = file.Chmod(mode)
+	}
+	if err == nil {
+		err = file.Sync()
+	}
+	if err = errors.Join(err, file.Close()); err != nil {
+		return err
+	}
 	delays := [...]time.Duration{20 * time.Millisecond, 60 * time.Millisecond, 140 * time.Millisecond, 300 * time.Millisecond}
 	for attempt := 0; ; attempt++ {
-		// A failed rename leaves a closed PendingFile; stage a fresh one for each retry.
-		f, err := renameio.NewPendingFile(path, renameio.WithTempDir(filepath.Dir(path)), permission)
-		if err != nil {
-			return err
+		if check != nil {
+			if err := check(stage); err != nil {
+				return err
+			}
 		}
-		_, err = f.Write(data)
-		if err == nil && check != nil {
-			err = check(f)
-		}
-		if err != nil {
-			return errors.Join(err, f.Cleanup())
-		}
-		err = w.commit(f, path)
-		if cleanup := f.Cleanup(); cleanup != nil {
-			return errors.Join(err, cleanup)
-		}
+		// A competing editor can still write between this final read and the rename.
+		err = w.commit(stage, filepath.Join(root.Name(), base))
 		if err == nil {
-			sweep(path, w.now())
+			published = true
+			sweep(root, base, name, w.now())
 			return nil
 		}
 		retry := errors.Is(err, unix.EBUSY) || errors.Is(err, unix.EACCES) || errors.Is(err, unix.EPERM)
-		if attempt == len(delays) || !retry {
+		if !retry || attempt == len(delays) {
 			return err
 		}
 		time.Sleep(delays[attempt])
 	}
 }
 
-func sweep(path string, now time.Time) {
-	dir, base := filepath.Split(path)
-	if dir == "" {
-		dir = "."
+func (w writer) writeFile(path string, data []byte, mode fs.FileMode) error {
+	root, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		return err
 	}
-	entries, _ := os.ReadDir(dir)
-	for _, entry := range entries {
-		if !strings.HasPrefix(entry.Name(), base+".") || !strings.HasSuffix(entry.Name(), ".tmp") {
-			continue
-		}
-		sibling := filepath.Join(dir, entry.Name())
-		info, err := os.Stat(sibling)
-		if err == nil && now.Sub(info.ModTime()) >= time.Hour {
-			_ = unix.Unlink(sibling)
-		}
+	defer func() { _ = root.Close() }()
+	base := filepath.Base(path)
+	info, err := root.Lstat(base)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
 	}
+	return w.replace(root, base, data, mode, info, false, nil)
+}
+
+func settingsTarget(path string) (string, error) {
+	target, err := filepath.EvalSymlinks(path)
+	if !errors.Is(err, fs.ErrNotExist) {
+		return target, err
+	}
+	if _, e := os.Lstat(path); !errors.Is(e, fs.ErrNotExist) {
+		return "", err
+	}
+	dir, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, filepath.Base(path)), nil
 }
 
 type snapshot struct {
-	path string
-	mode fs.FileMode
 	info fs.FileInfo
 	data []byte
 }
 
-func readSettings(path string) (snapshot, error) {
-	target, err := filepath.EvalSymlinks(path)
+func readSettings(root *os.Root, base string) (snapshot, error) {
+	info, err := root.Lstat(base)
 	if errors.Is(err, fs.ErrNotExist) {
-		// A dangling symlink is not a new file: replacing it would destroy the link.
-		if _, e := os.Lstat(path); errors.Is(e, fs.ErrNotExist) {
-			return snapshot{path: path, mode: 0o666, data: []byte("{}")}, nil
-		}
+		return snapshot{data: []byte("{}")}, nil
 	}
-	if err != nil {
-		return snapshot{}, err
-	}
-	info, err := os.Lstat(target)
 	if err != nil {
 		return snapshot{}, err
 	}
 	if !info.Mode().IsRegular() {
-		return snapshot{}, fmt.Errorf("%s is not a regular file", path)
+		return snapshot{}, fmt.Errorf("%s is not a regular file", base)
 	}
-	// A FIFO or symlink substituted after Lstat must not block or redirect this open.
-	f, err := os.OpenFile(target, os.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW, 0)
+	file, err := root.OpenFile(base, os.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return snapshot{}, err
 	}
-	defer func() { _ = f.Close() }()
-	info, err = f.Stat()
+	defer func() { _ = file.Close() }()
+	opened, err := file.Stat()
 	if err != nil {
 		return snapshot{}, err
 	}
-	if !info.Mode().IsRegular() {
-		return snapshot{}, fmt.Errorf("%s is not a regular file", path)
+	if !os.SameFile(info, opened) || !opened.Mode().IsRegular() {
+		return snapshot{}, fmt.Errorf("%s changed during open", base)
 	}
-	data, err := io.ReadAll(f)
-	return snapshot{target, info.Mode(), info, data}, err
+	data, err := io.ReadAll(file)
+	return snapshot{opened, data}, err
 }
 
 func (w writer) replaceSettings(path string, edit func([]byte) ([]byte, error), afterStage func(preparedFile, string)) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o777); err != nil {
+		return err
+	}
+	target, err := settingsTarget(path)
+	if err != nil {
+		return err
+	}
+	root, err := os.OpenRoot(filepath.Dir(target))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	parent, err := root.Stat(".")
+	if err != nil {
+		return err
+	}
+	base := filepath.Base(target)
 	conflict := fmt.Errorf("%s: settings changed before replacement", path)
 	for range 3 {
-		before, err := readSettings(path)
+		before, err := readSettings(root, base)
 		if err != nil {
 			return err
+		}
+		if before.info != nil && ownerOf(before.info).uid != uint32(os.Geteuid()) {
+			return &OwnershipError{path, fmt.Errorf("file belongs to uid %d", ownerOf(before.info).uid)}
 		}
 		data, err := edit(bytes.Clone(before.data))
 		if err != nil {
 			return err
 		}
-		check := func(f *renameio.PendingFile) error {
-			// renameio preserves permission bits; special mode bits must be set after writing.
-			if f != nil && before.mode&(fs.ModeSetuid|fs.ModeSetgid|fs.ModeSticky) != 0 {
-				if err := f.Chmod(before.mode); err != nil {
-					return err
-				}
-			}
+		check := func(f preparedFile) error {
 			if f != nil && afterStage != nil {
-				afterStage(f, before.path)
+				afterStage(f, target)
 			}
-			after, err := readSettings(path)
+			current, err := settingsTarget(path)
 			if err != nil {
 				return err
 			}
-			if before.path != after.path || before.mode != after.mode || (before.info == nil) != (after.info == nil) || before.info != nil && !os.SameFile(before.info, after.info) || !bytes.Equal(before.data, after.data) {
+			dir, err := os.Stat(filepath.Dir(current))
+			if err != nil {
+				return err
+			}
+			if base != filepath.Base(current) || !os.SameFile(dir, parent) {
+				return fmt.Errorf("%s: settings target directory or name changed", path)
+			}
+			after, err := readSettings(root, base)
+			if err != nil {
+				return err
+			}
+			if (before.info == nil) != (after.info == nil) || before.info != nil && (!os.SameFile(before.info, after.info) || before.info.Mode() != after.info.Mode() || ownerOf(before.info) != ownerOf(after.info)) || !bytes.Equal(before.data, after.data) {
 				return conflict
 			}
 			return nil
 		}
-		if before.info != nil && bytes.Equal(data, before.data) {
+		if before.info != nil && bytes.Equal(before.data, data) {
 			err = check(nil)
 		} else {
-			permission := renameio.WithPermissions(before.mode)
+			mode := fs.FileMode(0o666)
 			if before.info != nil {
-				permission = renameio.WithStaticPermissions(before.mode)
-			} else if err := os.MkdirAll(filepath.Dir(before.path), 0o777); err != nil {
-				return err
+				mode = before.info.Mode()
 			}
-			err = w.replace(before.path, data, permission, check)
+			err = w.replace(root, base, data, mode, before.info, before.info != nil, check)
 		}
 		if !errors.Is(err, conflict) {
 			return err

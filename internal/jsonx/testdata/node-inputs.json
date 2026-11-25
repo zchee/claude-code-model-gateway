@@ -7,7 +7,8 @@
   "invalid UTF-8 and incomplete sequences": {"hex":"5b22e180222c22e08080222c22c2c2222c22f09f92222c22eda080222c22ff80225d"},
   "empty containers and whitespace": {"json":" \t {\"emptyObject\":{},\"emptyArray\":[],\"null\":null,\"nested\":[true,false,[],{}]}\r\n"},
   "discovery cache": {"json":"{\"baseUrl\":\"http://localhost\",\"fetchedAt\":9007199254740993,\"models\":[]}"},
-  "request body high water": {"json":"{\"value\":120,\"observed_at\":\"2000-01-01T00:00:00.000Z\"}"},
-  "dispatch cache": {"json":"{\"version\":1,\"routes\":[[\"identity\",{\"model\":\"example\",\"lastUsedAt\":1}]]}"},
+  "pin aliases": {"json":"{\"opus\":\"first\",\"sonnet\":\"second\",\"fable\":\"third\"}"},
+  "request body high water": {"framing":"compact","json":"{\"value\":120,\"observed_at\":\"2000-01-01T00:00:00.000Z\"}"},
+  "dispatch cache": {"framing":"line","json":"{\"version\":1,\"routes\":[[\"identity\",{\"model\":\"example\",\"effort\":\"high\",\"ticket\":null,\"lastUsedAt\":1}]]}"},
   "root scalar": {"json":"\"no final newline\""}
 }

@@ -19,29 +19,77 @@ import (
 	"encoding/hex"
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
+	"errors"
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	gocmp "github.com/google/go-cmp/cmp"
 
+	"github.com/zchee/claude-code-model-gateway/internal/atomicfile"
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
 )
 
-func TestNodeCorpus(t *testing.T) {
-	var tests map[string]struct {
-		JSON string `json:"json"`
-		Hex  string `json:"hex"`
-	}
-	var golden map[string]struct {
+type nodeGolden struct {
+	Cases map[string]struct {
 		Wire  string `json:"wire"`
 		State string `json:"state"`
-	}
-	if err := json.Unmarshal(fixture(t, "node-inputs.json"), &tests); err != nil {
+		File  string `json:"file"`
+	} `json:"cases"`
+	Depth struct {
+		Shared int    `json:"shared"`
+		Wire   string `json:"wire"`
+	} `json:"depth"`
+}
+
+func readGolden(t *testing.T) nodeGolden {
+	t.Helper()
+	var data nodeGolden
+	if err := json.Unmarshal(fixture(t, "node-golden.json"), &data); err != nil {
 		t.Fatal(err)
 	}
-	if err := json.Unmarshal(fixture(t, "node-golden.json"), &golden); err != nil {
+	return data
+}
+
+func TestWireDepth(t *testing.T) {
+	depth := readGolden(t).Depth
+	if depth.Shared == 0 || len(depth.Wire) != 2*depth.Shared+1 {
+		t.Fatal("missing Node depth fixture")
+	}
+	v, err := jsonx.DecodeWire([]byte(depth.Wire))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, err := jsonx.EncodeWire(v)
+	if err != nil || !bytes.Equal(wire, []byte(depth.Wire)) {
+		t.Fatalf("depth %d round trip: %v", depth.Shared, err)
+	}
+	for _, n := range []int{10000, 10001} {
+		input := strings.Repeat("[", n) + "0" + strings.Repeat("]", n)
+		v, err := jsonx.DecodeWire([]byte(input))
+		if n == 10000 {
+			if err != nil {
+				t.Fatal(err)
+			}
+			v = jsonx.WireValue{Kind: '[', Elements: []jsonx.WireValue{v}}
+			_, err = jsonx.EncodeWire(v)
+		}
+		if _, ok := errors.AsType[*jsonx.WireDepthError](err); !ok {
+			t.Fatalf("at %d: want depth refusal, got %v", n, err)
+		}
+	}
+}
+
+func TestNodeCorpus(t *testing.T) {
+	var tests map[string]struct {
+		JSON    string `json:"json"`
+		Hex     string `json:"hex"`
+		Framing string `json:"framing"`
+	}
+	golden := readGolden(t).Cases
+	if err := json.Unmarshal(fixture(t, "node-inputs.json"), &tests); err != nil {
 		t.Fatal(err)
 	}
 	if len(tests) == 0 || len(tests) != len(golden) {
@@ -71,6 +119,15 @@ func TestNodeCorpus(t *testing.T) {
 			}
 			if diff := gocmp.Diff(want.Wire, string(wire)); diff != "" {
 				t.Errorf("wire (-Node +Go):\n%s", diff)
+			}
+			if tt.Framing != "" {
+				framed := wire
+				if tt.Framing == "line" {
+					framed = append(framed, '\n')
+				}
+				if diff := gocmp.Diff(want.File, string(framed)); diff != "" {
+					t.Errorf("framed file (-Node +Go):\n%s", diff)
+				}
 			}
 			state, err := jsonx.EncodeState(v)
 			if err != nil {
@@ -107,12 +164,7 @@ func TestWriteTypedState(t *testing.T) {
 		Models    []jsonx.WireValue `json:"models"`
 		Missing   bool              `json:"missing,omitzero"`
 	}
-	var golden map[string]struct {
-		State string `json:"state"`
-	}
-	if err := json.Unmarshal(fixture(t, "node-golden.json"), &golden); err != nil {
-		t.Fatal(err)
-	}
+	golden := readGolden(t).Cases
 	tests := map[string]struct {
 		value any
 		want  string
@@ -139,10 +191,56 @@ func TestWriteTypedState(t *testing.T) {
 	}
 }
 
+func TestSettingsEdgeFiles(t *testing.T) {
+	var tests map[string]struct {
+		Before string     `json:"before"`
+		After  string     `json:"after"`
+		Hex    string     `json:"hex"`
+		Edit   jsonx.Edit `json:"edit"`
+	}
+	if err := json.Unmarshal(fixture(t, "settings-edges.json"), &tests, json.RejectUnknownMembers(true)); err != nil {
+		t.Fatal(err)
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			input := []byte(tt.Before)
+			want := []byte(tt.After)
+			if tt.Hex != "" {
+				var err error
+				input, err = hex.DecodeString(tt.Hex)
+				if err != nil {
+					t.Fatal(err)
+				}
+				want = input
+			}
+			path := filepath.Join(t.TempDir(), "settings.json")
+			if err := os.WriteFile(path, input, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			err := atomicfile.ReplaceSettings(path, func(b []byte) ([]byte, error) { return jsonx.EditSettings(b, tt.Edit) })
+			if tt.Hex != "" {
+				if _, ok := errors.AsType[*jsonx.InvalidMemberNameError](err); !ok {
+					t.Fatalf("want invalid member name, got %v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if diff := gocmp.Diff(want, got); diff != "" {
+				t.Fatalf("settings (-want +disk):\n%s", diff)
+			}
+		})
+	}
+}
+
 func FuzzSettingsNoEdit(f *testing.F) {
 	for _, seed := range []string{"{}", " \t{\"a\":1.00,\"a\":-0}\r\n", "\ufeff{\"text\":\"\\ud800\",\"1\":[{},[]]}", "{\"badUTF8\":\"\xff\"}", "[1]", "{} {}", "{"} {
 		f.Add([]byte(seed))
 	}
+	path := filepath.Join(f.TempDir(), "settings.json")
 	f.Fuzz(func(t *testing.T, input []byte) {
 		doc := jsontext.Value(bytes.TrimPrefix(input, []byte("\ufeff")))
 		valid := doc.Kind() == '{' && doc.IsValid(jsontext.AllowDuplicateNames(true), jsontext.AllowInvalidUTF8(true))
@@ -150,8 +248,18 @@ func FuzzSettingsNoEdit(f *testing.F) {
 		if (err == nil) != valid {
 			t.Fatalf("valid=%t: %v", valid, err)
 		}
-		if valid && !bytes.Equal(input, out) {
-			t.Fatalf("no-edit bytes (-input +output):\n%s", gocmp.Diff(input, out))
+		if !valid {
+			return
+		}
+		if err := atomicfile.WriteFile(path, out, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		onDisk, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(input, onDisk) {
+			t.Fatalf("no-edit file bytes (-input +disk):\n%s", gocmp.Diff(input, onDisk))
 		}
 	})
 }
