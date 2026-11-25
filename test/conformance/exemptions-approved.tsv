@@ -1,0 +1,128 @@
+path	line	column	name	class	approved
+test/context-window.test.js	1457	1	the local Fable probe keeps proxy observation active for the installed Claude CLI	js-only:developer-probe	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	678	1	owned fixture teardown yields and retries transient EBUSY (simulated Windows lock)	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	727	3	owned fixture removal retries transient EBUSY with one application budget	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	727	3	owned fixture removal retries transient EMFILE with one application budget	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	727	3	owned fixture removal retries transient ENFILE with one application budget	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	727	3	owned fixture removal retries transient ENOTEMPTY with one application budget	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	727	3	owned fixture removal retries transient EPERM with one application budget	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	746	1	owned fixture removal reports persistent EBUSY without a post-deadline attempt	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	766	1	owned fixture removal does not retry a nontransient failure	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	777	1	owned fixture removal accepts an already absent root without submitting IO	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	783	1	owned fixture removal accepts ENOENT from an in-flight removal	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	792	1	owned fixture removal awaits IO that crosses the retry deadline	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	813	1	owned fixture removal preserves a late IO failure without starting another attempt	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	828	1	owned fixture removal revalidates the root before retrying	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	848	1	owned fixture removal refuses a caller-supplied unowned root	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	869	1	direct worker classification precedes readiness and never parent-disconnects a failed start	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	948	3	direct worker drain records bounded malformed failure even after a later real close	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	948	3	direct worker drain records bounded malformed-token failure even after a later real close	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	948	3	direct worker drain records bounded missing-token failure even after a later real close	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	948	3	direct worker drain records bounded not-draining failure even after a later real close	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	948	3	direct worker drain records bounded null-response failure even after a later real close	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	948	3	direct worker drain records bounded oversize failure even after a later real close	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	948	3	direct worker drain records bounded oversize-token failure even after a later real close	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	948	3	direct worker drain records bounded redirect failure even after a later real close	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	948	3	direct worker drain records bounded stall failure even after a later real close	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	948	3	direct worker drain records bounded wrong-token failure even after a later real close	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	967	1	direct worker drain uses only its registered loopback endpoint and settled local control	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	981	1	direct worker natural close with a reset does not manufacture a control failure	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	990	1	direct worker drain clamps its subdeadline to the remaining shutdown budget	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	997	1	direct worker drain refuses unregistered children without looking up any default control	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	1002	1	direct worker drain revalidates its registered root before reading control credentials	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	1012	1	direct worker refused control never counts as observed close	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	1029	1	fixture close observation waits beyond exit and remembers an already-fired close	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	1041	3	fixture close timeout never escalates an exited child (0, null)	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	1041	3	fixture close timeout never escalates an exited child (null, SIGTERM)	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	1073	1	fixture close timeout is reported and never authorizes root removal	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	1094	1	owned fixture removal preserves known-live PID leak checks	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	1102	1	owned fixture removal does not submit IO when root validation spends the deadline	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	1115	1	owned fixture removal bounds diagnostic fields and preserves the underlying cause	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	1126	1	fixture close timeout stays a failure even if close arrives before removal	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	1143	1	fixture teardown preserves primary and cleanup failure evidence	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	1168	1	gateway fixture home teardown stops a supervisor even after later commands reused its home	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	1304	1	stale-worker fixture cleanup fails closed for absent and reused birth identities	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-process-isolation.test.js	1314	1	stale-worker fixture cleanup requests one TERM only after exact identity verification	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/gateway-ps-locale.test.js	130	1	Windows process probes inherit their existing environment	unsupported:windows-only	independent review of the classification, 2026-11-26
+test/gateway-ps-locale.test.js	175	1	Windows port owners are read from numeric netstat columns in German and French UI languages (#296)	unsupported:windows-only	independent review of the classification, 2026-11-26
+test/gateway-usage.test.js	194	1	usage reader ignores a truncated final spool record	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/hook-ensure-delegation.test.js	59	1	a checkout loaded from a directory marketplace runs the registered install instead of itself	unsupported:dormant-code	independent review of the classification, 2026-11-26
+test/hook-ensure-delegation.test.js	84	1	delegation does not depend on the generated stable launcher existing yet	unsupported:dormant-code	independent review of the classification, 2026-11-26
+test/hook-ensure-delegation.test.js	106	1	the config-dir registry is used when no plugin cache dir is configured	unsupported:dormant-code	independent review of the classification, 2026-11-26
+test/hook-ensure-delegation.test.js	129	1	the newest recorded install wins across a migrated host's two registries	unsupported:dormant-code	independent review of the classification, 2026-11-26
+test/hook-ensure-delegation.test.js	155	1	a recorded install whose CLI is gone does not hide one that is still on disk	unsupported:dormant-code	independent review of the classification, 2026-11-26
+test/hook-ensure-delegation.test.js	182	1	a checkout the registry does not list runs its own CLI	unsupported:dormant-code	independent review of the classification, 2026-11-26
+test/hook-ensure-delegation.test.js	200	1	a missing registry file leaves the loaded copy running itself	unsupported:dormant-code	independent review of the classification, 2026-11-26
+test/hook-ensure-delegation.test.js	217	1	no CLI anywhere names the registries it searched, and keeps the hook contract on exit codes	unsupported:dormant-code	independent review of the classification, 2026-11-26
+test/hook-ensure-delegation.test.js	244	1	the exit status of the delegated CLI is the hook's exit status	unsupported:dormant-code	independent review of the classification, 2026-11-26
+test/native-budget-probe.test.js	49	1	synthetic client exercises case reporting, project-only cap and owned cleanup without native proof	js-only:developer-probe	independent review of the classification, 2026-11-26
+test/native-budget-probe.test.js	67	1	absence, error and timeout never become native compatibility receipts	js-only:developer-probe	independent review of the classification, 2026-11-26
+test/native-budget-probe.test.js	77	1	budget overrides block preflight; native markers stay intact until a synthetic child actually refuses	js-only:developer-probe	independent review of the classification, 2026-11-26
+test/native-budget-probe.test.js	105	1	a synthetic native tool refusal stops the owned process and later cases without a marker precheck	js-only:developer-probe	independent review of the classification, 2026-11-26
+test/native-budget-probe.test.js	124	1	output and debug bounds stop synthetic children and remove oversized fixture logs	js-only:developer-probe	independent review of the classification, 2026-11-26
+test/native-budget-probe.test.js	131	1	launch failure remains UNVERIFIED and removes only its owned fixture	js-only:developer-probe	independent review of the classification, 2026-11-26
+test/native-budget-probe.test.js	145	1	numeric telemetry ignores unrelated text, malformed events and missing resolver fields	js-only:developer-probe	independent review of the classification, 2026-11-26
+test/native-budget-probe.test.js	161	1	fixture protocol supports streamed replies and bounds model metadata	js-only:developer-probe	independent review of the classification, 2026-11-26
+test/native-budget-probe.test.js	173	1	auxiliary traffic preserves the main pressure sequence and stripped Opus IDs still need native window proof	js-only:developer-probe	independent review of the classification, 2026-11-26
+test/native-budget-probe.test.js	189	1	an exact /context diagnostic uses separate count_tokens traffic and only structured native metadata	js-only:developer-probe	independent review of the classification, 2026-11-26
+test/native-budget-probe.test.js	220	1	an emitted context-diagnostic refusal stops the next model case and cleans both owned launches	js-only:developer-probe	independent review of the classification, 2026-11-26
+test/native-budget-probe.test.js	236	1	structured telemetry is numeric, allowlisted and bounded while unavailable agents and errors stay distinguishable	js-only:developer-probe	independent review of the classification, 2026-11-26
+test/native-budget-probe.test.js	265	1	synthetic Messages usage has explicit nullable fields and cumulative SSE totals	js-only:developer-probe	independent review of the classification, 2026-11-26
+test/native-budget-probe.test.js	279	1	Agent availability observes the documented legacy Task init alias without inventing missing metadata	js-only:developer-probe	independent review of the classification, 2026-11-26
+test/native-budget-probe.test.js	291	1	fixture emits only the Agent or Task schema advertised by the current request	js-only:developer-probe	independent review of the classification, 2026-11-26
+test/native-budget-probe.test.js	308	1	tool error classification retains only allowlisted counters and guard refusal takes precedence	js-only:developer-probe	independent review of the classification, 2026-11-26
+test/native-budget-probe.test.js	323	1	CLI validation and inherited-budget refusal use only synthetic processes	js-only:developer-probe	independent review of the classification, 2026-11-26
+test/native-budget-probe.test.js	338	1	structural denials stop pressure or context and every following case, with owned cleanup	js-only:developer-probe	independent review of the classification, 2026-11-26
+test/native-budget-probe.test.js	354	1	missing or unsafe own result session uses only a labeled fresh-window diagnostic	js-only:developer-probe	independent review of the classification, 2026-11-26
+test/native-budget-probe.test.js	367	1	HTTP method and path counts include unparseable and non-message traffic before JSON parsing	js-only:developer-probe	independent review of the classification, 2026-11-26
+test/native-budget-probe.test.js	379	1	own task starts, worker model, result metadata and compaction trigger stay structural and allowlisted	js-only:developer-probe	independent review of the classification, 2026-11-26
+test/native-budget-probe.test.js	403	1	boundary occurrence has no exact-threshold authority and context over-limit fields reject arbitrary values	js-only:developer-probe	independent review of the classification, 2026-11-26
+test/owned-worker-cleanup.test.js	301	3	process table malformed Windows JSON remains unknown without inventing ancestry	unsupported:windows-only	independent review of the classification, 2026-11-26
+test/owned-worker-cleanup.test.js	306	1	Windows table output accepts explicit root zero and a single CIM object	unsupported:windows-only	independent review of the classification, 2026-11-26
+test/owned-worker-cleanup.test.js	333	1	an empty Windows process table is not malformed or a made-up root	unsupported:windows-only	independent review of the classification, 2026-11-26
+test/owned-worker-cleanup.test.js	344	3	native Windows parent data  does not become a proven root	unsupported:windows-only	independent review of the classification, 2026-11-26
+test/owned-worker-cleanup.test.js	344	3	native Windows parent data -1 does not become a proven root	unsupported:windows-only	independent review of the classification, 2026-11-26
+test/owned-worker-cleanup.test.js	344	3	native Windows parent data 1.5 does not become a proven root	unsupported:windows-only	independent review of the classification, 2026-11-26
+test/owned-worker-cleanup.test.js	344	3	native Windows parent data invalid does not become a proven root	unsupported:windows-only	independent review of the classification, 2026-11-26
+test/owned-worker-cleanup.test.js	344	3	native Windows parent data null does not become a proven root	unsupported:windows-only	independent review of the classification, 2026-11-26
+test/owned-worker-cleanup.test.js	344	3	native Windows parent data undefined does not become a proven root	unsupported:windows-only	independent review of the classification, 2026-11-26
+test/picker-guard.test.js	115	1	real claude: the wired picker offers the native Fable, Opus and Sonnet plus gateway rows	js-only:developer-probe	independent review of the classification, 2026-11-26
+test/readiness-gate.test.js	338	3	intentional stop launch handoff: setup launch failure	unsupported:windows-only	independent review of the classification, 2026-11-26
+test/readiness-gate.test.js	338	3	intentional stop launch handoff: start launch failure	unsupported:windows-only	independent review of the classification, 2026-11-26
+test/shim-upload-abort.test.js	111	1	upload abort fixture rejects a refused connection before 100 Continue	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/shim-upload-abort.test.js	118	3	upload abort fixture accepts a reset after 100 Continue	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/shim-upload-abort.test.js	118	3	upload abort fixture rejects a reset before 100 Continue	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/start-gateway-timeout.test.js	36	1	fixture proxy readiness waits past five seconds for a live recorded proxy	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/start-gateway-timeout.test.js	52	1	fixture proxy readiness shares its launch deadline with every bounded probe	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/start-gateway-timeout.test.js	68	3	fixture proxy readiness rejects a dead PID without probing HTTP	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/start-gateway-timeout.test.js	68	3	fixture proxy readiness rejects a missing PID without probing HTTP	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/start-gateway-timeout.test.js	80	3	fixture proxy readiness fast-fails on supervisor exit (7, null)	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/start-gateway-timeout.test.js	80	3	fixture proxy readiness fast-fails on supervisor exit (null, SIGTERM)	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/start-gateway-timeout.test.js	99	1	fixture proxy readiness notices an already exited supervisor	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/start-gateway-timeout.test.js	107	1	fixture proxy readiness reports a spawn error and detaches its observers	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/start-gateway-timeout.test.js	129	3	fixture proxy readiness bounds aborted body HTTP probes	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/start-gateway-timeout.test.js	129	3	fixture proxy readiness bounds non-200 HTTP probes	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/start-gateway-timeout.test.js	129	3	fixture proxy readiness bounds stalled body HTTP probes	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/start-gateway-timeout.test.js	129	3	fixture proxy readiness bounds stalled headers HTTP probes	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/start-gateway-timeout.test.js	140	1	fixture proxy readiness bounds a refused connection	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/start-gateway-timeout.test.js	148	1	fixture proxy readiness accepts a live PID only after the local model response completes	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/start-gateway-timeout.test.js	158	1	fixture proxy readiness caps individual probes even with launch time remaining	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/start-gateway-timeout.test.js	170	1	fixture proxy readiness retains bounded actual diagnostics before fixture removal	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/start-gateway-timeout.test.js	229	1	startGateway reports the startup phase that timed out	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/support.test.js	16	1	fixture shutdown trusts observed close without probing a reused pid	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/support.test.js	31	1	fixture shutdown accepts ESRCH for a pid without observed close	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/support.test.js	38	1	fixture shutdown rejects a running pid without observed close	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/support.test.js	51	1	fixture process probe treats Windows EPERM as a foreign pid	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/support.test.js	55	1	fixture process probe preserves non-Windows EPERM liveness	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/support.test.js	59	1	fixture process probe treats ESRCH as exited on every platform	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/support.test.js	64	1	fixture process probe preserves unexpected errors as possibly running	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/support.test.js	69	1	fixture process probe ignores missing pids	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/tool-schema-compat.test.js	89	1	uses Ajv 8.20.0 as the conforming Draft 2020-12 oracle	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/tool-schema-compat.test.js	95	1	uses the shared suite resolver package-script convention for cold gateway setup	js-only:out-of-root-dependency	independent review of the classification, 2026-11-26
+test/tool-schema-compat.test.js	254	1	executes immutable prior adapter snapshots against real SQ-2551 and SQ-2561 Ajv counterexamples	js-only:node-harness-self-test	independent review of the classification, 2026-11-26
+test/usage-observability.test.js	368	1	uses the on-disk Windows repository casing for a transcript cwd	unsupported:windows-only	independent review of the classification, 2026-11-26
+test/windows-detached.test.js	18	1	Windows detached service survives KILL_ON_JOB_CLOSE on the caller job; ordinary detached child does not	unsupported:windows-only	independent review of the classification, 2026-11-26
+test/windows-detached.test.js	95	1	Windows detached launch reports invalid executables without a success PID	unsupported:windows-only	independent review of the classification, 2026-11-26
+test/windows-hide.test.js	10	1	production child processes hide Windows command windows	js-only:js-source-lint	independent review of the classification, 2026-11-26
+test/windows-hide.test.js	16	1	window visibility lint catches an unhidden child process fixture	js-only:js-source-lint	independent review of the classification, 2026-11-26
+test/wiring-mode.test.js	619	1	effectiveBaseUrl is re-exported through commands	js-only:js-source-lint	independent review of the classification, 2026-11-26
