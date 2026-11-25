@@ -1,17 +1,19 @@
-# Go port of the model-gateway Claude Code plugin: work plan (v6)
+# Go port of the model-gateway Claude Code plugin: work plan (v7)
 
-- **Status: pending approval.** No implementation has started; nothing in this plan may be executed before explicit approval.
+- **Status: approved through phase 5 and the phase 6 rehearsal (T6.0); phase 0 is in progress.** Stop before T6.1.
 - Mode: `/plan --direct --deliberate` (direct plan with deliberate-mode content: options, pre-mortem, expanded test plan, ADR).
-- Written: v6 on 2026-11-25 (from `date`). v1 to v5 are kept in `.omc/drafts/`. v1 and v2 were each reviewed by an
-  architect lane and a critic lane (`claude-gpt-6.2-astra-fast[1m]`); verdicts were "sound with changes" and "revise" both
-  times. v3, v4 and v5 each had a targeted critic check of phases 0 and 1; all three said "revise", with a shorter list
-  each time, and the last one states that T0.0 and T0.1 can start after approval. v6 applies that last list and was not
-  reviewed again: five review rounds are the limit of the planning workflow. Appendix C lists the changes and Appendix D
-  what the reviews leave open.
+- Written: v6 on 2026-11-25; v7 on 2026-11-26 (from `date`). v1 and v2 were each reviewed by an architect lane and a
+  critic lane (`claude-gpt-6.2-astra-fast[1m]`); verdicts were "sound with changes" and "revise" both times. v3, v4 and v5
+  each had a targeted critic check of phases 0 and 1; all three said "revise", with a shorter list each time, and the
+  last one states that T0.0 and T0.1 can start after approval. v6 applied that list. The sixth check said "revise" for
+  T0.4, T0.7 and T0.7b, all three "can start after the listed changes"; the user chose to apply those changes in v7
+  and proceed without another review round. Appendix C lists the changes and Appendix D what the reviews leave open.
 - Source: `zchee/eigenwise-toolshed`, branch `dev`, **pinned commit `a8501f251755`** (the head of `dev` on 2026-11-25
   22:51), `plugins/model-gateway` v0.56.3, tree `aaf4f26b527c2ff08dbc47707a5f69e6ec2cf40a`: 13,060 lines of JavaScript in
-  `lib/`, `bin/`, `hooks/` (33 files); 57 test files with 21,680 lines and 693 static `test()` sites (65 files and 23,542
-  lines in `test/` in total). Counted from the Git objects of the pinned commit.
+  `lib/`, `bin/`, `hooks/` (33 files); 57 test files with 21,680 lines (65 files and 23,542 lines in `test/` in total).
+  The 57 test files contain 693 `test(` call sites at line start after optional indentation (662 unindented, 31 indented)
+  plus five nested `t.test(` sites (`test/lmstudio.test.js:552,589`, `test/local-llama.test.js:276`,
+  `test/proxy-providers.test.js:605,664`). Counted from the Git objects of the pinned commit.
   The pin was moved once, on the user's decision, before any implementation: v1 to v4 and the inventories were written
   against `4ffb2f672f0c`. In the plugin the two commits differ by `6ffbf58d3` alone: `lib/runtime.js` gains a second
   evidence group (`models.dev google-vertex 2026-11-25`) with four policy rows, `gemini-4-hydrogen` and `gemini-4-neon`
@@ -20,13 +22,13 @@
   cases, the new counts and a per-row measurement date (no new `test()` site); `README.md` and
   `skills/model-gateway/SKILL.md` say 49 and name the second catalog date. The inventories and this plan were moved to
   the new pin (INV-07: citations into the two changed files shifted and checked line by line, the policy table
-  extended); the review records REV-* still cite the old pin. Every lane reads the source from an export of the pinned
+  extended); the reviews of v1 through v4 still cite the old pin. Every lane reads the source from an export of the pinned
   commit (T0.0), never from the moving checkout.
 - Target: module `github.com/zchee/claude-code-model-gateway` (`go.mod:1`), `go 1.27` (toolchain go1.27.4), Apache-2.0,
-  remote `git@github.com:zchee/claude-code-model-gateway.git`. The repository holds the user's untracked `main.go`
-  (`package main`, no `main` function yet), `README.md` and `.claude/`; the plan builds on `main.go` and deletes none of them.
-- Porting spec: research inventories in `.omc/research/model-gateway-port/`. Every claim in them cites the source as
-  `path:line` at the pinned commit.
+  remote `git@github.com:zchee/claude-code-model-gateway.git`. The first commit of `port/phase-0` tracks the user's
+  `main.go` (`package main`, no `main` function yet) and `README.md` unchanged; the plan builds on `main.go`.
+- Porting spec: `docs/port/` is authoritative for the committed inventories, review records and this plan; copies under
+  `.omc/` are not maintained. Every claim in the inventories cites the source as `path:line` at the pinned commit.
 
 | id | file | lines | covers |
 |---|---|---:|---|
@@ -43,6 +45,7 @@
 | REV-C3 | `review-critic-3.md` | 41 | targeted critic check of v3 (phases 0 and 1) |
 | REV-C4 | `review-critic-4.md` | 49 | delta check of v4 (phases 0 and 1) |
 | REV-C5 | `review-critic-5.md` | 35 | last delta check, of v5 (phases 0 and 1) |
+| REV-C6 | `review-critic-6.md` | 166 | sixth critic check of v6 (venue tooling and test inventory), with the lead's spot check |
 | VER-R | `verify-repin.md` | 35 | verification of the move to the new pin by a separate lane, with the corrections |
 
 Task ids (`T2.3`), decision ids (`D4`, `OD-2`) and inventory ids (`INV-02`) are plan markers. They must never appear in
@@ -287,8 +290,8 @@ other tasks use it only through its exported API, which the owning task publishe
 
 ### 3.3 Third-party dependencies
 
-Versions are the latest on 2026-11-25 (`go list -m <module>@latest` in a scratch module). T0.1 pins them once; lanes do
-not run `go get`.
+Except for the lead's Brotli and `x/text` pins, versions are the latest on 2026-11-25 (`go list -m <module>@latest` in a
+scratch module). T0.1 pins them once; lanes do not run `go get`.
 
 | Module | Version | Used for | Why not hand-written or stdlib |
 |---|---|---|---|
@@ -297,11 +300,10 @@ not run `go get`.
 | `github.com/google/renameio/v2` | v2.0.2 | temp file in the same directory, fsync, rename | the source helper has no fsync (INV-04 §4.1). POSIX only: on Windows `renameio/v2/maybe` falls back to `os.WriteFile` (`maybe/maybe_windows.go:7-20`), so the Windows stub of `atomicfile` returns an error instead |
 | `github.com/dlclark/regexp2` | v1.12.0 | run-time ECMAScript-mode validity check of rewritten tool-schema patterns | Go's RE2 rejects valid ECMAScript patterns and accepts some invalid ones |
 | `github.com/miekg/dns` | v1.1.73 | A/AAAA queries to the system name servers for the RC-compatibility bypass (errors closed, no fallback) | `net.Resolver` may consult `/etc/hosts`, which would loop back into the gateway (INV-02 §10.2) |
-| `github.com/andybalholm/brotli` | pin at T0.1 | side-branch decoding of `br` bodies for usage observation; `gzip` and `deflate` use `compress/gzip` and `compress/zlib` | no brotli in the standard library |
-| `github.com/google/uuid` | pin at T0.1 | lock token, startup and worker generation | no UUID in the standard library |
+| `github.com/andybalholm/brotli` | v1.3.0 | side-branch decoding of `br` bodies for usage observation; `gzip` and `deflate` use `compress/gzip` and `compress/zlib` | no brotli in the standard library |
 | `golang.org/x/sync` | v0.25.0 | `singleflight` (readiness check, catalog refresh, Grok token refresh, proxy recovery), `errgroup` | |
 | `golang.org/x/sys` | v0.50.0 | `Setsid`, process-group kill, `kill(pid, 0)` | |
-| `golang.org/x/text` | pin at T0.1 | root collation for the two `localeCompare` tie-breaks (INV-04 §12) | byte order sorts `_` after digits, ICU does not |
+| `golang.org/x/text` | v0.44.0 | root collation for the two `localeCompare` tie-breaks (INV-04 §12) | byte order sorts `_` after digits, ICU does not |
 | `github.com/google/go-cmp` | v0.7.0 | test diffs | required by the Go rules |
 | `github.com/rogpeppe/go-internal` | v1.16.0 | `testscript`: txtar-driven CLI scenarios | replaces spawn-and-assert test code such as `test/wiring-mode.test.js` (1,096 lines) |
 | `go.uber.org/goleak` | v1.3.0 | goroutine-leak check in relay and stream tests | the "stream left open" bug class (INV-05 §6.2) |
@@ -310,6 +312,7 @@ Considered and not adopted:
 
 | Module | Reason |
 |---|---|
+| `github.com/google/uuid` | go1.27.4 provides the standard package `uuid` (`New`, `NewV4`, `NewV7`, `Parse`); use it instead |
 | `tmaxmax/go-sse` (v0.12.0) | default event limit 64 KiB, joins `data:` lines, drops comments and an unterminated final frame (`event.go:23-109`); the relay must forward an untouched frame byte for byte, rewrite only the first data line of a frame it changes (joining that frame's lines with LF and re-emitting the frame's own delimiter as matched) and emit the unterminated tail (`lib/request-worker.js:1668-1761`). One in-house frame scanner serves relay, peek, observation and Grok translation |
 | `tidwall/gjson`, `tidwall/sjson` | first duplicate wins and invalid JSON is tolerated; the source's routing depends on `JSON.parse` (last wins, invalid rejected) |
 | `santhosh-tekuri/jsonschema`, any Go schema validator as oracle | not V8; the oracle is the pinned source plus Ajv 8.20.0 run under Node in the venue (T1.5a) |
@@ -445,27 +448,28 @@ satisfy and violate each check.
 The boundary is the venue: no test of this module runs on a machine that has a gateway. Guards and digests are further
 layers; they detect, they do not contain.
 
-**Venue.** A test venue is a machine that has no gateway of its own: the Linux host `debian-13-trixie.gaudiy-platform`,
-CI runners, and for macOS the `xcode-27` CI runner (needs permission to push phase branches) or a disposable macOS
-virtual machine (OD-8). The user's Mac is never a venue. A machine is a venue only when all of these hold: the
-attestation file `.model-gateway-test-venue` exists in the account's home (written by `hack/remote provision`, which
-refuses a local address) or the process runs in GitHub Actions; the account's home, as the password database gives it
-and not as `$HOME` says, has no `.claude/model-gateway` directory; nothing listens on 18764 or 18765. An environment
-variable alone never makes a machine a venue. If the Linux host fails the second condition, T0.4 stops and reports, and
-the venue needs a dedicated account there.
+**Venue.** Provision only the approved current account on `debian-13-trixie.gaudiy-platform` or an identified hosted CI
+runner (`ubuntu-26.04` or `xcode-27`). `hack/remote provision` rejects the developer machine and local destinations before
+provisioning. On the destination, check the account's home as given by the password database, not `$HOME`, for a
+`.claude/model-gateway` directory, and both ports (18764 and 18765) for listeners without contacting a gateway. If state or
+any listener is present, or a check is unknown, stop and report without writing anything or running tests. Tests require
+`.model-gateway-test-venue` in that home, except on verified hosted CI; an environment variable alone is insufficient.
 
 The rule is enforced in two places, so that neither a make target nor a direct `go test` runs tests elsewhere:
 
 | Where | Enforcement |
 |---|---|
-| the make targets `test` (Tier 1: every package, without the `process` tag), `test-process` (Tier 2: tests that start a process, signal, bind a fixed port or exercise migration, `//go:build process`), `conformance`, `bench`, and every Node run | each target runs `hack/venue-check` first and exits non-zero with "not a test venue"; in a venue they run through `hack/remote` (copies the tree to `/tmp` on the Linux host, installs Go and Node there, runs the target, returns its log) or through the CI workflow |
-| every test binary | each package's `TestMain` calls `venue.Require()` as its first statement; it applies the same three conditions and exits non-zero before any test function runs. `hack/lint-venue` checks this for the default and for the `process` build tag and fails when a package with test files lacks it. Package initialization runs before `TestMain`, so `gochecknoinits` is enabled and package-level variables are initialized from literals or pure functions (a review rule) |
+| the make targets `test` (Tier 1: every package, without the `process` tag), `test-process` (Tier 2: tests that start a process, signal, bind a fixed port or exercise migration, `//go:build process`), `conformance`, `baseline-node`, `bench`, and every Node run | each target runs `hack/venue-check` first and exits non-zero with "not a test venue"; in a venue they run through `hack/remote` (copies the tree to `/tmp` on the Linux host, installs Go and Node there, runs the target, returns its log) or through the CI workflow |
+| every test binary | each package's `TestMain` calls `venue.Require()` as its first statement; it applies the same venue predicate and exits non-zero before any test function runs. `hack/lint-venue` checks this for the default and for the `process` build tag and fails when a package with test files lacks it. Package initialization runs before `TestMain`, so `gochecknoinits` is enabled and package-level variables are initialized from literals or pure functions (a review rule) |
 
-The binary guard is proven where a failure costs nothing: `hack/remote negative-control` removes the attestation on the
-Linux host, which still has no gateway, runs a fixture package whose only test writes a sentinel file, under the default
-and under the `process` tag, and requires a non-zero exit, the message "not a test venue" and no sentinel file; then it
-restores the attestation. On the developer machine only the shell preflight is exercised: `make test` stops in
-`hack/venue-check` before anything is built. No test binary is started there, not even the guard's own.
+`hack/remote negative-control` uses a gateway-free, non-CI Linux account reserved exclusively for the control. While
+attested, build a fresh fixture for each tag set (default and `process`). Invoke each binary directly through the remote
+control harness, not the make preflight; require exit zero and creation of its per-run sentinel. Remove the sentinel,
+withdraw attestation, and require the same binary to exit with the guard's expected status and exact diagnostic
+("not a test venue") and leave no sentinel. Restore the prior attestation on exit, recheck the venue before normal tests,
+and require reprovisioning after interrupted cleanup. Exercise each protected make target's refusal separately on this
+disposable host and verify that no build, test or Node command ran. On the developer Mac run only the standalone shell
+preflight; do not dispatch a test target, even to prove it is safe.
 
 There is no local test target. Local test execution may be added later only behind an operating-system sandbox
 (`sandbox-exec`) that has passed a proof with positive cases (allowed write, bind, dial and child signal succeed) and
@@ -475,19 +479,21 @@ outside process of the same user and to its process group). No gate depends on i
 Further layers: `gatewaytest.NewEnv` reproduces the source's forced environment block (INV-05 §1.4) and clears the new
 `MODEL_GATEWAY_*` variables; the binary refuses out-of-sandbox settings writes, a real `claude` and the three default ports
 whenever `MODEL_GATEWAY_TEST_SANDBOX` or `NODE_TEST_CONTEXT` is set (as `lib/settings-wiring.js:88-105`,
-`lib/pins.js:212-214`); `hack/tripwire` records SHA-256 digests (no copies) of the real settings files and pid records of
-the developer machine at the start of a phase and compares them at its gate.
+`lib/pins.js:212-214`). Before the first task of each phase the lead captures a read-only digest manifest of the approved
+settings files and pid records on the developer machine (path, absent/present, SHA-256, size; no contents, token or
+credential files). Compare the same paths by the same rules at the gate; use the committed `hack/tripwire` from phase 1.
+For phase 0 the lead captured `.omc/artifacts/tripwire/phase-0-baseline.tsv` by hand on 2026-11-26 00:22:52 JST, after
+T0.0 and T0.1 had started. Gate reports must mark the interval before capture unverified, never backdate a baseline.
 
-`go build`, `go vet`, `golangci-lint` and the formatters execute no product code and run anywhere. Lanes never call
-`go test` or Node directly; they use the make targets.
+`go build`, `go vet`, `golangci-lint` and the formatters execute no product code and run anywhere. The built binary is
+not executed on the developer machine. Lanes never call `go test` or Node directly; they use the make targets.
 
 A design rule keeps most tests free of processes: packages take process identity, clock and network access through
 interfaces that `procinfo` and the commands implement (the lifecycle lock decides staleness with a pure function over an
 injected identity source), so their tests need no `process` tag.
 
-Until OD-8 names a macOS venue, the Darwin halves of T0.5 and T0.6 wait; phases 0 to 2 proceed on Linux venue evidence
-plus the Darwin build, vet and lint results of the developer machine, and the phase 3 gate cannot pass without the
-macOS venue.
+The Darwin halves of T0.5 and T0.6 run on the `xcode-27` CI runner through pushed phase branches (OD-8). A build on the
+developer machine is not evidence for a Darwin process test; the phase 3 gate requires the macOS venue results.
 
 ### 3.9 Windows
 
@@ -538,9 +544,10 @@ response is aborted (`http.ErrAbortHandler`), never ended cleanly.
 
 ### 3.11 Hooks, launchers and distribution
 
-- **Version.** `0.57.0` is the first Go version (above the plugin's `0.56.3`). It comes from `-ldflags -X` in release
-  builds and from `debug.ReadBuildInfo().Main.Version` in `go install` builds; a build with neither reports
-  `0.0.0-dev+<revision>` and `setup` refuses to self-install it over a released version.
+- **Version.** `0.57.0` is the first Go version (above the plugin's `0.56.3`). Print the `-ldflags -X` value verbatim
+  when set; otherwise print the released `debug.ReadBuildInfo().Main.Version` without its leading `v`. A `+dirty` release
+  counts as a development build. For development builds print `0.0.0-dev+<full revision>`, or `0.0.0-dev` without a
+  revision; `setup` refuses to self-install a development build over a released version.
 - **Stable binary.** `~/.claude/model-gateway/bin/model-gateway`, installed by `setup` from the running executable (T4.0).
   Skills, settings hooks and launchers use this absolute path; nothing relies on `PATH`.
 - **Compatibility launchers.** `~/.claude/model-gateway/model-gateway.js` becomes a trampoline that runs the stable binary
@@ -575,7 +582,7 @@ the conformance run.
 
 | Phase | Content | Exit gate | Status |
 |---|---|---|---|
-| 0 | Foundations, isolation, identity seam, test inventory | AC-1, AC-2; T0.7 reviewed | 🔜 not started |
+| 0 | Foundations, isolation, identity seam, test inventory | AC-1, AC-2; T0.7 reviewed | 🔶 in progress |
 | 1 | Pure logic packages | AC-3 (tables), AC-8 for phase 1 rows | 🔜 not started |
 | 2 | Walking skeleton, launch adapter, worker | AC-3 (HTTP), AC-4, AC-5 (worker paths), AC-11 for tests assigned to phase 2 | 🔜 not started |
 | 3 | Supervisor and process layer | AC-5 (supervisor paths), AC-6 (start/stop/recover), AC-14, security review 1 (AC-13) | 🔜 not started |
@@ -583,7 +590,9 @@ the conformance run.
 | 5 | Packaging, migration, shadow mode | AC-7, AC-15a, AC-16, security review 2 (AC-13) | 🔜 not started |
 | 6 | Rehearsal, shadow soak and cutover | AC-10, AC-15b; phase 6 after the rehearsal is run by the user | 🔜 not started |
 
-Current stop point: before phase 0, waiting for approval.
+Current stop point: phase 0 is in progress. The lead reports this table at every gate and starts the next phase when
+its predecessor's gate passes, through T6.0. Stop before T6.1: the shadow soak, cutover and removal of the old plugin
+belong to the user.
 
 ### Phase 0: foundations
 
@@ -591,24 +600,24 @@ Phase 0 works on branch `port/phase-0` in the main checkout until T0.0 is commit
 
 | Task | Work | Size / lane | Needs | Done when |
 |---|---|---|---|---|
-| T0.0 | Inputs every worktree and venue needs. Commit the user's `main.go` and `README.md` unchanged as the first commit of the branch (with the approval of this plan). Commit the seven inventory documents, the review records and this plan under `docs/port/`. Add `hack/pinned-source`: it materializes the whole repository tree of commit `a8501f251755` (1,005 files, 21.5 MiB) into the ignored directory `.cache/model-gateway-js/`, from a local checkout or from `https://github.com/zchee/eigenwise-toolshed` (public, MIT), and fails unless the root tree hash is `22be5dae8859c7307906f938fa364b7ffadf006c` and the tree hash of `plugins/model-gateway` is `aaf4f26b527c2ff08dbc47707a5f69e6ec2cf40a`. The whole tree is exported because the source tests read three files outside the plugin: `plugins/sidequest/lib/suite-resolver.js` (`test/tool-schema-compat.test.js:8`, which also resolves the repository root at `:96`), `plugins/test-support/windows-hide.js` (`test/windows-hide.test.js:6`) and `docs/src/content/docs/getting-started/model-gateway.md` (`test/gateway-readiness.test.js:219`, `test/rc-compat-mode.test.js:280`). Every source citation of this plan and of the inventories resolves under `.cache/model-gateway-js/plugins/model-gateway/`. Add the source's root `LICENSE` text to `THIRD_PARTY_NOTICES.md`. Start `docs/port/upstream-sync.md`, the ledger of source commits after the pin (empty on 2026-11-25); they are applied only in T5.8 | S / sol | approval | `hack/pinned-source` succeeds in a fresh worktree; the materialized plugin has 33 production JavaScript files with 13,060 lines; `sed -n '2951,2953p'` of its `lib/commands.js`, run from that worktree, prints the stop command's marker write; the three outside files exist in the export |
-| T0.1 | Bootstrap on `main.go`; no source behavior. `func main` calling `internal/cli`; cobra root with the 17 source commands registered as stubs that exit 1 with "not implemented", each with cobra's flag parsing switched off; real `version` (from `-ldflags -X`, else `debug.ReadBuildInfo`, else `0.0.0-dev+<revision>`) and `completions`; dependencies of section 3.3 pinned; license header from `main.go:1-13` on every Go file; `Makefile` targets `fmt` (path-scoped), `fmt-check`, `lint`, `test`, `test-process`, `conformance`, `bench`, `tripwire`; `.golangci.yaml` with `gochecknoinits`; `.github/workflows/test.yaml` on `ubuntu-26.04` and `xcode-27` with `actions/checkout@v7`, `actions/setup-go@v7`, `golangci/golangci-lint-action@v9`, a Windows compile-only step | M / sol | T0.0 | `go build ./... && go vet ./... && make fmt-check lint` exit 0; `GOOS=windows go build ./...` exit 0; the `version` tests are written and compile (they run for the first time in T0.4) |
-| T0.4 | Venue tooling (section 3.8): `hack/remote` with `provision` and `negative-control`, `hack/venue-check`, the package `internal/venue` with `Require` (it imports nothing of the product), `hack/lint-venue` with its reject fixture, build tag `process`, `hack/tripwire`, and the make targets wired to them | M / astra | T0.1 | on the developer machine `make test` exits non-zero with "not a test venue" before anything is built, and no test binary is started there; on the Linux host the tests of T0.1 and of `internal/venue` pass, `hack/remote negative-control` passes under both build tags, and `hack/lint-venue` rejects a fixture package whose `TestMain` does not start with the guard |
-| T0.7 | Test inventory (data). `test/conformance/classification.tsv`: one row per source test case, keyed by file, static site and full expanded name, with one class and the task that must make it pass. Classes: `conformance`, `go-port`, `difference:<id>`, `js-only:<reason>` (reasons: `node-harness-self-test`, `js-source-lint`, `out-of-root-dependency`, `developer-probe`), `unsupported:<reason>` (reasons: `windows-only`, `dormant-code`). A behavioral assertion that the source checks through an in-process `require` is `go-port`, not `js-only`. The expanded names come from one full run of the pinned suite in the venue (Node ≥ 22.5; `npm ci` in the exported plugin for `ajv@8.20.0`); the same run records which source tests pass on that machine, and a test that fails for a missing input file fails this task. `docs/port/parity-matrix.md`: the invariant rows of INV-05 §4 split into single assertions, each naming its tests, with a ledger of the rows in each phase's scope; `docs/port/parity-matrix.lock`: its row ids as approved in review, changed afterwards only with the lead's recorded approval. The difference table of section 3.10 completed. A separate lane reviews the result and approves every `js-only` and `unsupported` row | L / astra | T0.0, T0.4 | every one of the 693 static sites and every case of the venue run is classified (three sites of `relay-stream-abort` expand to six cases, INV-05 §2); the review is recorded |
-| T0.7b | Test inventory (tools). `hack/assertion-sites` (static analysis of the pinned tests with a JavaScript parser, run in the venue; independent of the matrix) writes `test/conformance/assertion-sites.tsv`: one row per pair of a test case and a static `assert` call site it can reach, directly or through a helper defined in the test files (the `refusal` helper of `test/tool-schema-compat.test.js:45-52` is reached by the cases at `:199`, `:311`, `:321` and `:344`); a site that the script can attribute to no case is listed as unattributed and is attributed by hand in review. Each pair has a target column. For a `go-port` case the target is a Go subtest, or `not-ported:<reason>` with a reason from a closed list (`js-runtime-artifact`, `harness-internal`, `source-doc-wording`, `changed-by-difference:<id>`) and the reviewer's approval for that pair; a subtest may be the target of several pairs only when the handoff's reviewer has confirmed each of them in the review column. `hack/parity-check` has three modes, each with negative fixtures. `structure`: every static test site and every case of the venue run has a classification row; every `conformance` and `go-port` case is named by a matrix row; the matrix's row ids equal the lock; every assertion site has at least one case or a reviewed attribution; every reason is in its list. `mapping <phase>`: every pair of a `go-port` case in that phase's ledger has a target, and the ledger is not empty. `results <phase>`: every target subtest was executed, passed and was not skipped in the gate's `go test -json`, and every `conformance` case passed with a Go launch attributed to it | M / sol | T0.1, T0.7 | `structure` passes on T0.7's data; each mode rejects its fixtures: a missing expansion, an omitted matrix row, a matrix row deleted while its case stays named by another row (the five `assert.match` calls of `test/gateway-readiness.test.js:221-225` are the model), one pair of a shared helper deleted, a reason outside its list (`structure`); an unmapped pair (`mapping`); a target subtest that is absent or skipped (`results`) |
+| T0.0 | Inputs every worktree and venue needs. Commit the user's `main.go` and `README.md` unchanged as the first commit of the branch. Commit the seven inventory documents, the review records and this plan under `docs/port/`. Do not commit the `gpt62-*.md` agent definitions; lanes use `~/.claude/agents/` from any checkout. Add `hack/pinned-source`: it materializes the whole repository tree of commit `a8501f251755` (1,005 files, 21.5 MiB) into the ignored directory `.cache/model-gateway-js/`, from a local checkout or from `https://github.com/zchee/eigenwise-toolshed` (public, MIT), and fails unless the root tree hash is `22be5dae8859c7307906f938fa364b7ffadf006c` and the tree hash of `plugins/model-gateway` is `aaf4f26b527c2ff08dbc47707a5f69e6ec2cf40a`. The whole tree is exported because the source tests read three files outside the plugin: `plugins/sidequest/lib/suite-resolver.js` (`test/tool-schema-compat.test.js:8`, which also resolves the repository root at `:96`), `plugins/test-support/windows-hide.js` (`test/windows-hide.test.js:6`) and `docs/src/content/docs/getting-started/model-gateway.md` (`test/gateway-readiness.test.js:219`, `test/rc-compat-mode.test.js:280`). Every source citation of this plan and of the inventories resolves under `.cache/model-gateway-js/plugins/model-gateway/`. Add the source's root `LICENSE` text to `THIRD_PARTY_NOTICES.md`. Start `docs/port/upstream-sync.md`, the ledger of source commits after the pin (empty on 2026-11-25); they are applied only in T5.8 | S / sol | approval | `hack/pinned-source` succeeds in a fresh worktree; the materialized plugin has 33 production JavaScript files with 13,060 lines; `sed -n '2951,2953p'` of its `lib/commands.js`, run from that worktree, prints the stop command's marker write; the three outside files exist in the export |
+| T0.1 | Bootstrap on `main.go`; no source behavior. `func main` calling `internal/cli`; cobra root with the 17 source commands registered as stubs that exit 1 with "not implemented", each with cobra's flag parsing switched off; real `version` (section 3.11: linker value verbatim, else released module version without `v`, else `0.0.0-dev+<full revision>` or bare `0.0.0-dev` without a revision; `+dirty` is development) and `completions`; dependencies of section 3.3 pinned; license header from `main.go:1-13` on every Go file; `Makefile` pins `gofumpt` v0.12.0, `modernize` from `golang.org/x/tools` v0.53.0, `goimports-rereviser` v4.2.0 and `golangci-lint` v2.14.0; targets `fmt` (path-scoped), `fmt-check`, `lint`, `test`, `test-process`, `conformance`, `bench`, `tripwire`; `.golangci.yaml` with `gochecknoinits`; `.github/workflows/test.yaml` on `ubuntu-26.04` and `xcode-27` with `actions/checkout@v7`, `actions/setup-go@v7`, `golangci/golangci-lint-action@v9`, a Windows compile-only step and no test step | M / sol | T0.0 | `go build ./... && go vet ./... && make fmt-check lint` exit 0; `GOOS=windows go build ./...` exit 0; the `version` tests are written and compile (they run for the first time in T0.4) |
+| T0.4 | Venue tooling (section 3.8): `hack/remote` with `provision` and `negative-control`, `hack/venue-check`, the package `internal/venue` with `Require` (it imports nothing of the product), `hack/lint-venue` with its reject fixture, build tag `process`, `hack/tripwire`, and the make targets wired to them; add the test steps to `.github/workflows/test.yaml` with `hack/venue-check` | M / astra | T0.1 | the user approved the venue; provisioning and the checks of section 3.8 succeeded on it. The Linux version and `internal/venue` tests pass, both negative-control fixtures pass, and `hack/lint-venue` rejects missing and non-first guards for both tag sets. The standalone developer-host shell preflight returns the expected refusal. No local build or process execution is used as evidence for a test |
+| T0.7 | Test inventory (data). `test/conformance/classification.tsv`: one row per source test case, keyed by file, static site and full expanded name, with one class and the task that must make it pass. Classes: `conformance`, `go-port`, `difference:<id>`, `js-only:<reason>` (reasons: `node-harness-self-test`, `js-source-lint`, `out-of-root-dependency`, `developer-probe`), `unsupported:<reason>` (reasons: `windows-only`, `dormant-code`). A behavioral assertion that the source checks through an in-process `require` is `go-port`, not `js-only`. Use a venue-gated `make baseline-node` via `hack/remote`. Materialize and verify T0.0's whole pinned tree in that venue; run locked `npm ci` in the exported plugin (`ajv@8.20.0`), then its unmodified package test script with the isolation preload (Node ≥ 22.5). Use an allowlisted environment and a PATH on which no real `claude` resolves (`test/picker-guard.test.js:110-130` uses `which`). Record the pin, tool versions, suite exit and terminal runner events keyed by source path, registration line/column and full parent/child name, with status. Return this machine-readable census to the inventory lane and store it independently of the classification rows. Record direct gateway launch sites and their owning cases for T2.0b. `docs/port/parity-matrix.md`: the invariant rows of INV-05 §4 split into single assertions, each naming its tests, with a ledger of the rows in each phase's scope; `docs/port/parity-matrix.lock`: its row ids as approved in review, changed afterwards only with the lead's recorded approval. The difference table of section 3.10 completed. A separate lane reviews the result and approves every `js-only` and `unsupported` row | L / astra | T0.0, T0.4 | all 57 files finished discovery. Reconcile the 693 `test(` sites at line start after optional indentation (662 unindented, 31 indented) and the five nested `t.test(` sites listed under Source with every reported expansion, including skips; classify every case (three sites of `relay-stream-abort` expand to six cases, INV-05 §2). Record reasons for skipped or individually failed baseline cases; an abort, incomplete registration, missing input, unknown identity or unexplained discrepancy blocks completion. The independent classification and exception review is recorded |
+| T0.7b | Test inventory (tools). In the venue `hack/assertion-sites` uses a pinned JavaScript parser and the preserved expanded-case census to produce the expected relation independently of the matrix, keyed by case and assertion source path/line/column. Include nested tests, helper and callback edges, and JavaScript passed to child interpreters or preloads. Review explicit case/site additions for generated or unresolved code without evaluating it; store reviewed attribution overrides independently of the editable target mapping. `hack/assertion-sites` writes `test/conformance/assertion-sites.tsv` with one row per case/site pair and a target column for the handoff. In `test/tool-schema-compat.test.js`, calls at `:199`, `:311`, `:321` and `:344` reach the five `refusal` assertions at `:46-50` from three registrations (`:184`, `:285`, `:331`): 15 distinct case/site pairs. For a `go-port` case use a reviewed package-qualified full Go subtest name or `not-ported:<reason>` from the closed list (`js-runtime-artifact`, `harness-internal`, `source-doc-wording`, `changed-by-difference:<id>`) with the reviewer's approval for that pair. `hack/parity-check` has three modes, each with negative fixtures. `structure`: compare expected and submitted pair sets in both directions; require unique keys, classification of every static site and expanded case, matrix coverage of every `conformance` and `go-port` case, exact matrix row ids against the lock, closed reasons and valid difference references. Do not require future targets. `mapping <phase> [package]`: require a nonempty phase ledger; check all due `go-port` pairs in the selected scope for the reviewed target or individually approved exemption. For a shared subtest record the reviewed unconditional check for each obligation in the review column; a conditional check needs a distinct observable subtest or recorded assertion event. A negative assertion maps to an observable check that the forbidden effect did not occur. `results <phase>`: require fresh, uncached, non-skipped passing `go test -json` evidence for each due Go target, a passing replacement test for each due difference, and a passing result with an attributed Go launch for each due `conformance` case. Require approval for each due `unsupported` row | M / sol | T0.1, T0.7 | `structure` passes on T0.7's data; each mode rejects its fixtures: a missing expansion, an omitted matrix row, a matrix row deleted while its case stays named by another row (the five `assert.match` calls of `test/gateway-readiness.test.js:221-225` are the model), one pair of a shared helper deleted while another case still covers its site, a missing embedded assertion, a reason outside its list (`structure`); an unmapped pair or unapproved exemption (`mapping`); an absent, skipped, wrong-package or unobserved target (`results`) |
 | T0.9 | Test handoff for phase 0: the `go-port` tests that T0.7 assigned to T0.8, T0.2, T0.3, T0.4b (the guard) and T0.5, written from the pinned tests and the inventories by test lanes that implement none of those tasks. The tests fix the package API they call and fail until the behavior exists; each lane fills the target column of `assertion-sites.tsv` for its pairs, and a reviewer other than the author confirms them | M / astra | T0.7, T0.7b | merged on the phase branch; `hack/parity-check mapping phase-0` passes |
 | T0.8 | `cli/argscan`: the source's argument scan, usage text, unknown-command behavior and the `--json` log routing (INV-01 §0-§2), used by every command | S / sol | T0.1, T0.9 | the source's argument and usage cases pass as table tests |
 | T0.2 | `paths`, `config`: one table of every environment variable with name, default, parse rule and reader, derived from the pinned source including `bin/` and `hooks/` (INV-04 §1.1 gives rules for its slice, §1.2 names only); `jsNumber` (INV-04 §12); home, config and state resolution incl. `MODEL_GATEWAY_STATE_DIR`; `docs/env.md` generated from the table | M / sol | T0.1, T0.9 | a table test covers every variable; `docs/env.md` regenerates without diff |
 | T0.3 | `jsonx` (the wire encoder and decoder, the settings file policy, the state-file writer of section 3.5) and `atomicfile` (D1). The Node-generated corpora are produced in the venue by a committed generator script that runs plain Node on JSON inputs (no plugin code), and are committed | L / astra | T0.1, T0.4, T0.9 | wire and state-file goldens match byte for byte; the authored settings pairs pass; a 60 s fuzz run of "settings parse, no edit, write" changes no byte |
 | T0.4b | `gatewaytest` environment and fakes as real HTTP servers and helper processes; the product guard of section 3.8 | L / astra | T0.2, T0.4, T0.9 | in the venue: with the guard set, binding 18764, 18765 or 80, running a real `claude` and writing a settings file outside the sandbox each fail with a named error; a helper process started with an empty environment finds no gateway home and no listener; one sample process test runs |
-| T0.5 | `procinfo` (argv, birth time, parent, table, liveness, port owner with the probe budget `CODEX_GATEWAY_PROBE_TIMEOUT_MS`, default 2 s) and the pid-record schema of section 3.4 with its atomic writer and reader. Venue tests: renamed, replaced and unlinked running binary; record crash points (after spawn, between the JSON and the decimal file); a non-UTC time zone; an injected start date with a single-digit day | M / astra | T0.3, T0.4b | tests pass on Linux; the Darwin run is recorded when OD-8 provides the venue |
+| T0.5 | `procinfo` (argv, birth time, parent, table, liveness, port owner with the probe budget `CODEX_GATEWAY_PROBE_TIMEOUT_MS`, default 2 s) and the pid-record schema of section 3.4 with its atomic writer and reader. Venue tests: renamed, replaced and unlinked running binary; record crash points (after spawn, between the JSON and the decimal file); a non-UTC time zone; an injected start date with a single-digit day | M / astra | T0.3, T0.4b | tests pass on Linux; the Darwin run on `xcode-27` is recorded |
 | T0.6 | Measurements of the pinned Node gateway in the venue, with machine, commands and raw samples in `docs/port/baseline-node.md`; `hack/bench`. (a) the three baselines of AC-9; (b) behavior probes: what happens to the provider request on a client disconnect at each stage, direct and relayed (section 3.10); how a client `Upgrade:` request is answered (INV-02 §14 item 21). What the real `claude -p` returns during the pin probe (INV-04 §13 item 4) is not measured: a fake CLI returns only the status it was programmed with, so `pin` is ported from the source's branches, both statuses are unit-tested, and the question stays open (appendix B) | M / sol | T0.4b | every probe has a recorded observation that later tasks cite |
 
 ### Phase 1: pure logic (packages are disjoint; two venue-only jobs are named)
 
 | Task | Work | Size / lane | Needs |
 |---|---|---|---|
-| T1.0 | Test handoffs for phase 1, one per package and one test lane each: the `go-port` tests that T0.7 assigned to T1.1 through T1.13, with the target column of `assertion-sites.tsv` filled and reviewed; a package's handoff is done when `hack/parity-check mapping phase-1` passes for its pairs | at most M per package / astra | T0.7, T0.7b, T0.9 |
+| T1.0 | Test handoffs for phase 1, one per package and one test lane each: the `go-port` tests that T0.7 assigned to T1.1 through T1.13, with the target column of `assertion-sites.tsv` filled and reviewed; a package's handoff passes `hack/parity-check mapping phase-1 <package>` for its assigned pairs; after all package handoffs merge, `hack/parity-check mapping phase-1` must pass for the entire phase | at most M per package / astra | T0.7, T0.7b, T0.9 |
 | T1.1 | `policy`: the model window table as ordered data (every row of INV-04 §3.2, exactly as pinned), policy functions (§3.3), context-window settings and CLI flag parsing (§3.4), sentry policy and trigger arithmetic; tests from INV-04 §3.5 | L / astra | T0.2, T1.2, T1.0 |
 | T1.2 | `proxymodels`: listing parse, route table, advertised ids and the Fable respelling (INV-04 §7) | M / sol | T0.2, T1.0 |
 | T1.3 | `localprov` response parsers, `proxyconfig`, `install` (installed-plugin registry read, version compare with the collation tie-break) (INV-04 §8, §11) | M / sol | T0.2, T1.0 |
@@ -702,14 +711,14 @@ something passed is not evidence. A test counts only when it was executed, passe
 
 | # | Criterion | Check |
 |---|---|---|
-| AC-1 | `go build ./...`, `go vet ./...`, `golangci-lint run`, `make fmt-check` (formatters change no file of a clean checkout) and `GOOS=windows GOARCH=amd64 go build ./...` exit 0 | on the developer machine (darwin/arm64; these commands execute no product code) and in the Linux venue at every gate; in the CI workflow on `ubuntu-26.04` and `xcode-27` from the first gate after OD-8 allows pushing, at the latest the phase 3 gate. Until then a gate report says "CI: not run" |
-| AC-2 | Isolation. (a) `hack/venue-check` fails without the attestation, with a `.claude/model-gateway` directory in the account's home, or with a listener on 18764 or 18765; `make test`, `make test-process`, `make conformance` and `make bench` run it first and exit non-zero with "not a test venue" before anything is built. (b) Every package with tests has a `TestMain` whose first statement is `venue.Require()`, under the default and the `process` tag (`hack/lint-venue`, with a reject fixture); the negative control on the Linux host without the attestation ends with a non-zero exit, the message and no sentinel file. No test binary is started on the developer machine, and there is no local test target. (c) In the venue, with the guard variable set, binding 18764, 18765 or 80, running a real `claude`, and writing a settings file outside the sandbox each fail with a named error; a helper process started with an empty environment finds no gateway home and no listener. (d) The tripwire digests of the developer machine are equal at the start of each phase and at its gate; this detects, it does not contain | T0.4 and T0.4b tests; `make tripwire` |
+| AC-1 | `go build ./...`, `go vet ./...`, `golangci-lint run`, `make fmt-check` (formatters change no file of a clean checkout) and `GOOS=windows GOARCH=amd64 go build ./...` exit 0 | on the developer machine (darwin/arm64; these commands execute no product code) and in the Linux venue at every gate; in the CI workflow on `ubuntu-26.04` and `xcode-27` at every gate, from the pushed `port/phase-N` branch |
+| AC-2 | Isolation. (a) `hack/venue-check` applies the predicate in section 3.8; only verified hosted CI is exempt from the attestation. Record isolated refusals for each missing prerequisite, then separately for each protected make target: non-zero with "not a test venue", no build, test or Node command dispatched. On the developer Mac exercise only the standalone shell check. (b) Every package with tests has a `TestMain` whose first statement is `venue.Require()`, under the default and the `process` tag (`hack/lint-venue` rejects missing and non-first guards). Record the positive and negative binary controls for both tag sets in section 3.8. No test binary starts on the developer machine, and there is no local test target. (c) In the venue, with the guard variable set, binding 18764, 18765 or 80, running a real `claude`, and writing a settings file outside the sandbox each fail with a named error; a helper process started with an empty environment finds no gateway home and no listener. (d) Compare the same developer-machine paths by the same digest rules as the baseline in section 3.8; the manifests must match. Phase 0 uses the manual manifest and reports the interval before capture as unverified. Later phases use the committed tripwire before their first task and at their gate; report any interval without a baseline as unverified. This detects, it does not contain | T0.4 and T0.4b tests; `make tripwire` |
 | AC-3 | The 15 classification rows of INV-02 §2.2 and the 10 policy examples of INV-04 §3.5 hold as table tests (phase 1). One HTTP test per branch shows which fake (Anthropic, proxy, Grok) received the request (phase 2) | `worker/route`, `policy`; `worker` |
 | AC-4 | Passthrough fidelity for 12 named bodies: 4 MiB valid JSON; two top-level `model` members whose last value selects Anthropic; nested duplicate keys; ill-formed UTF-8 in a string; not JSON; empty; an integer above 2^53; `1e400`; an escaped lone surrogate; CRLF-heavy formatting; a leading byte-order mark; JSON sent to a path outside `/v1/messages`. The SHA-256 of what the fake Anthropic upstream receives equals that of what was sent. Sentinel values placed in `authorization`, `proxy-authorization`, `x-api-key`, `cookie` and the control-token header appear in no header or body received by the fake proxy or the fake Grok endpoint; the control-token sentinel reaches no fake at all | `worker/upstream` integration tests |
 | AC-5 | Streams. For the worker path with Anthropic and proxy upstreams and for the supervisor path: when the fake upstream closes mid-stream, the client has status 200 and the earlier data, and its HTTP response is incomplete (transport error, not a clean end) within 1 s (`test/relay-stream-abort.test.js:84-87,119-122,172-175`). For Grok the translated stream ends as the source ends it (`lib/grok-backend.js:384-389`). An uninterrupted stream delivers its terminal event. `goleak` reports nothing. 20 concurrent compaction streams each deliver a complete terminal event (`test/compact-stream.test.js:670`) | `worker/sse`, `supervisor/relay`; source tests at their assigned gates |
 | AC-6 | Ownership matrix below. Each decoy is checked for survival and unchanged birth time after the command (a count of delivered signals is kept in addition) | Tier 2: T3.7 (start, stop, recover), T4.7 (ensure, setup), Linux and macOS |
 | AC-7 | Migration in an isolated home that holds the pinned Node plugin (Tier 2). Refusals that change no file: Node supervisor still listening; old plugin not disabled; a journal in progress for the other end state. After the Node CLI's `stop`: `migrate --start` ends with the Go supervisor answering `/healthz`, no stop marker, exec-form hooks, both launchers as trampolines; `migrate --keep-stopped` ends with the marker present and nothing listening. In both, every settings file differs from its pre-image only in readiness-hook entries. A legacy `node <launcher> readiness-gate` then exits 0 on a healthy gateway. `migrate --rollback` restores every untouched file, the stop marker and the previous stable binary byte for byte, keeps an edit made after migration and reports it, starts nothing, and prints the commands that re-enable the old plugin and start the Node gateway. A process kill injected before and after each journaled effect leaves a home from which rerunning the same command completes. The hook commands of both plugins, invoked as the host invokes them, behave as documented before migration, after it and after rollback | T5.3, T6.0 |
-| AC-8 | `hack/parity-check results <phase>` passes at the phase gate, after `structure` and `mapping <phase>`. That means: `docs/port/parity-matrix.md` (T0.7) holds every row of INV-05 §4 split into single assertions, and its row ids equal `parity-matrix.lock`; every `conformance` and `go-port` case of `classification.tsv` is named by at least one row; each row is `passed` (every test it names was executed, passed and was not skipped), `difference:<id>` (that difference's replacement test passed), or `unsupported:<reason>` with a reason from T0.7's list and the reviewer's approval; and, independently of the matrix, every pair of `assertion-sites.tsv` that belongs to a `go-port` case has a target subtest that was executed, passed and was not skipped, or an approved `not-ported` reason from T0.7b's list. A phase's ledger is not empty, its rows must not be open at that phase's gate, and no row is open at the phase 5 gate | every phase gate |
+| AC-8 | `hack/parity-check structure` passes globally at every gate: `docs/port/parity-matrix.md` (T0.7) holds every row of INV-05 §4 split into single assertions, its row ids equal `parity-matrix.lock`, and every `conformance` and `go-port` case of `classification.tsv` is named by at least one row. Run `mapping <phase>` and `results <phase>` over the nonempty due ledger only. Each due row is `passed` (every named test ran, passed and was not skipped), `difference:<id>` (the replacement test passed), or `unsupported:<reason>` with a listed reason and reviewer approval. Independently of the matrix, every due `go-port` pair in `assertion-sites.tsv` has passing evidence for its reviewed target or an individually approved `not-ported` reason under T0.7b. Do not assign Go-launch conformance evidence before the adapter decision at T2.0b. Later rows may remain open until their assigned gate. At phase 5 also check every earlier ledger and require no open row | every phase gate |
 | AC-9 | Not slower than Node, both runtimes measured in the same job on the same runner with `hack/bench` (T0.6), after one warm-up run: (a) healthy `readiness-gate` p95 wall time over 50 runs; (b) p99 time to first response byte over 200 runs at the client, through supervisor and worker, for a 1 MiB request answered by a 2,000-event SSE stream; (c) summed resident memory of supervisor and worker after 60 s idle. Each Go value ≤ the Node value; raw samples are kept | phase 4 gate |
 | AC-10 | Shadow soak, at least 20 sessions or 3 days. `shadow report` exits 0, which requires, from `soak.jsonl` alone: request records for at least one Anthropic model, one Codex model and one compaction; no `gateway-fault`; every upstream submission after a request's first carries a cause from the closed list of section 3.7, and a `relay-resend` only when the request's delivery list names two worker generations with a `worker-exit` record of the first between them; replaying the state table of INV-02 §5.3 over the request records of each session and model key reproduces every recorded sentry state and refusal: a request is refused exactly when it is a non-compaction request on a path the sentry covers and the state before it was armed-high (the last usage observation exceeded the recorded trigger and nothing had fired since), and a compaction request is forwarded in every state (`lib/request-worker.js:1360-1364`); every `worker-exit` and `supervisor-exit` record is preceded, within the same supervisor generation, by a `stop-request` or `restart-request` record | the user, T6.1 |
 | AC-11 | Every source test case, identified by file, static site and full expanded name, has exactly one class in `classification.tsv`. `conformance`: it passed at its assigned gate and the launch log attributes at least one Go launch to that test name. `go-port`: its named Go test passed and was authored before the implementing task by a lane other than the implementer, and every assertion site of the case is mapped (AC-8). `difference:<id>`: the replacement test passed. `js-only` and `unsupported`: the reason is in T0.7's lists and the T0.7 reviewer approved the row. A test leaves `conformance` only through the decision of T2.0b or with the lead's recorded reason that names the missing seam | `make conformance`; `hack/parity-check` |
@@ -743,7 +752,7 @@ marker, and the fake proxy binary is installed. (With the plugin disabled, `reco
    not write the code (`gpt62-sol-fast-code-reviewer` for S and M, `gpt62-astra-fast-code-reviewer` for L) reads the diff
    against the cited inventory sections and source ranges. The author never approves its own work.
 2. **Per phase.** A verifier lane (`gpt62-astra-fast-verifier`) runs the phase gate from a clean checkout of the phase
-   branch: every tier in the Linux venue, and in the macOS venue of OD-8 once it exists (required from the phase 3 gate). It stores each command, exit code
+   branch: every tier in the Linux venue and on the `xcode-27` CI runner (OD-8). It stores each command, exit code
    and raw output under `.omc/artifacts/verify/<phase>/` and runs `hack/parity-check`.
 3. **Lead check per phase.** For each difference D1-D13 in scope and for the relay, sentry and ownership code of that phase,
    the lead compares the Go code with the pinned source lines directly, not with the inventory.
@@ -817,9 +826,11 @@ a run is complete only when every lane has acknowledged shutdown.
 with its own branch per lane (`git worktree add`). A lane formats and tests only its own package paths. When a lane
 reports, the lead rebases its branch onto the phase branch with `git r port/phase-N` **before** review; review and
 verification refer to those commit hashes; after approval the lead fast-forwards the phase branch (`git merge --ff-only`)
-and removes the worktree. Merging a phase branch into `main` and any push need the user's word (see OD-8 for CI).
+and removes the worktree. Push the phase branch to `origin` for each completed small task. Merging into `main`, pushing
+`main` and opening a pull request still need the user's word.
 
-**Commits.** Signed, message from a file (`git commit --gpg-sign -F <file>`), subject and body lines at most 72 columns,
+**Commits.** Commit each small task separately on its phase branch and push it to `origin/port/phase-N`. Signed, message
+from a file (`git commit --gpg-sign -F <file>`), subject and body lines at most 72 columns,
 the subject says why the change exists; no task, decision or inventory id anywhere; code written by a GPT lane carries
 `Co-Authored-By: Codex <noreply@openai.com>` beside the Claude trailer.
 
@@ -842,7 +853,7 @@ connected to port 18764, read the real pid records and stopped the live supervis
 - Why plausible: it happened to the source once (`test/isolate-home.js:4-7`); an environment variable is the only thing
   between a helper and the real home.
 - Prevention: no test runs outside a venue, a machine with no gateway of its own: the make targets and every test
-  binary check three conditions and accept no environment variable as proof; there is no local test target (T0.4, AC-2);
+  binary apply the venue predicate and accept no environment variable alone as proof; there is no local test target (T0.4, AC-2);
   ownership needs a record in the instance's own state root (D10), so a test binary can never own the live supervisor.
 - Early signal: tripwire digest mismatch; a record in the real `lifecycle.jsonl` with a test pid.
 - Response: stop all lanes; restore the settings from the user's own backup and restart the gateway with its CLI; the missing boundary becomes a failing
@@ -921,7 +932,7 @@ Further failure cases, each with a fixture and an owner:
 
 ## 12. Open decisions and follow-ups
 
-The defaults are what the plan assumes; each can be changed at approval.
+The defaults are what the plan assumes unless a row records the user's decision.
 
 | # | Decision | Default | If decided otherwise |
 |---|---|---|---|
@@ -932,9 +943,9 @@ The defaults are what the plan assumes; each can be changed at approval.
 | OD-5 | Release archives and `self update` | no; `go install` plus `setup` | adds T5.5 and `go-selfupdate` |
 | OD-6 | Plugin identity | marketplace `claude-code-model-gateway` in this repository, plugin id `model-gateway@claude-code-model-gateway` | another marketplace changes one constant and the skill text |
 | OD-7 | First version | `0.57.0` | any value above `0.56.3` |
-| OD-8 | Where macOS process tests run | the `xcode-27` CI runner, which needs permission to push phase branches to `origin` (no pull request, no merge); until then gate reports carry Linux venue evidence and say that CI and the Darwin process tests were not run | a disposable macOS virtual machine; until one of the two exists the Darwin halves of T0.5 and T0.6 wait and the phase 3 gate cannot pass |
-| OD-9 | Agent definitions `.claude/agents/gpt62-*.md` | committed in T0.0 so every checkout has them | kept untracked; lanes are then spawned only from the main checkout |
-| OD-10 | Inventories, reviews and this plan under `docs/port/` | committed in T0.0 (they are the porting specification) | kept under `.omc/`; every worktree and venue then needs them copied by hand |
+| OD-8 | Where macOS process tests run | decided: `xcode-27` hosted CI runner through pushed phase branches | — |
+| OD-9 | Agent definitions `gpt62-*.md` | decided: not committed; `~/.claude/agents/` makes the definitions available from any checkout | — |
+| OD-10 | Inventories, reviews and this plan under `docs/port/` | done: committed there as the authoritative porting specification; copies under `.omc/` are not maintained | — |
 | OD-11 | Tests written first by a separate lane (section 9) | yes, for every `go-port` test | implementers port their own tests; AC-11 then loses its independence clause |
 
 Follow-ups, not part of this plan: F1 decide whether the relay should never resend after delivery (availability cost: a
@@ -987,7 +998,7 @@ The port follows the code. These are corrected in the rewritten skills and READM
 | line and file counts of the pinned source | `git show a8501f251755:<path> \| wc -l` |
 | module path, remote and files of the target repository | `go.mod`, `git remote -v`, `git status` at 22:06 |
 | `encoding/json/v2` and `jsontext` without an experiment flag | `go doc` on go1.27.4 |
-| module versions of section 3.3 | `go list -m <module>@latest` on 2026-11-25 |
+| module versions of section 3.3 other than the lead's Brotli and `x/text` pins | `go list -m <module>@latest` on 2026-11-25 |
 | `gopsutil` v4.26.10 process API; `net.Connections` runs `lsof` on macOS | module source |
 | hook exec form (`args`) and `GET /v1/models?limit=1000` in Claude Code 2.1.332 | `claude-code-reverse-new/cli.unpack.js` |
 | relay semantics, the `RegExp` validity check, the gate's behavior for a newer supervisor, the context-window load rules, the recovery policy | the pinned `lib/commands.js:2332-2454`, `lib/tool-schema-compat.js:228-238`, `test/readiness-fast-path.test.js:70-88`, `lib/runtime.js:281-316`, `lib/recovery-policy.js` |
@@ -1064,7 +1075,7 @@ Changes from v4 (delta check `review-critic-4.md`; the user's decision to move t
 | `migrate` resume accepts the Go supervisor that its own journal started | critic-4, earlier disposition 1 |
 | AC-10 replays the sentry state table instead of requiring a completed turn before a refusal; the soak record carries the sentry's inputs and states | critic-4, earlier disposition 7 |
 
-Changes from v5 (last delta check `review-critic-5.md`); these were not reviewed again:
+Changes from v5 (delta check `review-critic-5.md`):
 
 | Change | Review item |
 |---|---|
@@ -1076,24 +1087,33 @@ Changes from v5 (last delta check `review-critic-5.md`); these were not reviewed
 | AC-10 limits the refusal rule to non-compaction requests on covered paths | critic-5, earlier 7 |
 | The move to the new pin was verified by a separate lane; seven missed citations and six imprecise inventory statements corrected; the pinned source named as the authority over the inventories (K12) | VER-R |
 
+Changes from v6 (sixth check `review-critic-6.md` and execution decisions):
+
+| Change | Review item or decision |
+|---|---|
+| T0.4 and AC-2 require fail-closed venue checks with a verified hosted-CI exception, separate make refusals, direct positive and negative fixture controls for both tag sets on disposable Linux, and only the standalone shell preflight on the Mac | critic-6 major 1 |
+| Phase gates compare digest manifests; phase 0 uses the manual manifest captured after T0.0 and T0.1 started and reports the earlier interval unverified | critic-6 major 2; lead's baseline |
+| T0.7 runs the pinned suite through `baseline-node` with no real `claude` on PATH, retains independent terminal events, and reconciles all 57 files, including the five nested sites, expansions and skips; incomplete evidence blocks completion | critic-6 major 3; lead's spot check |
+| T0.7 records direct gateway launch sites and their owning cases for the adapter decision | critic-6 minor 7 |
+| T0.7b derives the expected case/site pairs independently, including embedded JavaScript and reviewed attribution overrides; exact set comparison and negative fixtures catch a missing embedded assertion or shared pair. Five helper sites serve three cases, giving 15 pairs | critic-6 major 4, minor 6 |
+| Mapping checks reviewed per-obligation targets or approved exemptions; T1.0 gates packages before the phase. Results require fresh evidence for due targets, differences, Go launches and unsupported approvals. AC-8 checks structure globally, results when due after the appropriate handoff, and all earlier ledgers at phase 5 | critic-6 major 5 |
+| Phase 0 is in progress; the user adopted the sixth check without another round and authorized execution through T6.0, with a phase table at each gate and a stop before the user's soak, cutover and plugin removal | user's decision |
+| Push each completed small task to its phase branch; a pull request, main-branch merge or push to `main` still needs permission. CI runs on pushed branches from the first gate; macOS uses `xcode-27`, Linux the approved current account with the no-write stop rule | user's decisions |
+| The user's `main.go` and `README.md` landed unchanged first. Agent definitions stay at user level; `docs/port/` is authoritative for the inventories, reviews (including the sixth check) and plan, not the `.omc/` copies | user's decisions |
+| Use standard `uuid`; pin Brotli and `x/text`. T0.1 specifies version precedence, development fallbacks and Makefile tool versions; T0.4 adds the first CI test steps. Do not execute the built binary on the developer machine | lead's rulings |
+
 ## Appendix D: what the reviews leave open
 
-No reviewer has approved a version of this plan. The two full rounds were conditional. The three targeted checks of
-phases 0 and 1 (v3, v4, v5) each said "revise" with a shorter list; the last one states that T0.0 and T0.1 can start
-after approval and that T0.4 and the test inventory needed the changes that v6 now contains (appendix C). v6 itself was
-not reviewed. Open at approval:
-
-- The changes of v6 are unreviewed. A reviewer lane checks T0.4, T0.7 and T0.7b against this plan before each of them
-  starts; that check is part of their Needs in practice.
+- v7 itself is unreviewed; the user chose to proceed without another plan review.
 - The inventories are a porting aid, not a verified specification: a sample check found imprecise statements (K12),
   and the corrections made after that check were not verified by another lane.
 - Whether the source's tests can drive the Go binary is decided by T2.0b, not by this plan.
-- A macOS venue for process tests (OD-8) is required before the phase 3 gate; until it exists no Darwin process test and
-  no CI run is claimed.
-- The Linux host must pass the venue check (no gateway state in the account's home); otherwise it needs a dedicated
-  account before T0.4 can finish.
+- Venue eligibility still needs evidence: on the approved current Linux account, gateway state in the password-database
+  home or a listener on 18764 or 18765 means stop and report without writing. The macOS venue is decided, but Darwin
+  results require an actual `xcode-27` run on the pushed phase branch.
 - What the real `claude -p` returns during the pin probe is not measured (appendix B).
 - The detailed design of `migrate`, shadow mode and the relay's disconnect handling is fixed here at the level of rules and
   criteria; each gets a design note that an architect lane and a critic lane review before its implementing task starts
   (T5.3, T5.4, T3.3).
-- Approval of this plan covers phases 0 and 1. Each later phase starts after its predecessor's gate and the user's go-ahead.
+- The shadow soak (T6.1), cutover and removal of the old plugin remain the user's. Approval covers execution through
+  T6.0; report each phase gate and proceed when it passes, without further approval.
