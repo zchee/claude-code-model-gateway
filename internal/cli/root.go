@@ -19,21 +19,49 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/spf13/cobra"
 
+	"github.com/zchee/claude-code-model-gateway/internal/cli/argscan"
 	"github.com/zchee/claude-code-model-gateway/internal/cli/completions"
 	"github.com/zchee/claude-code-model-gateway/internal/cli/version"
 )
 
 // Run dispatches argv, including the executable name, and returns an exit status.
-func Run(argv []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	root := newRoot(commandName(argv))
-	// Cobra treats nil as a request to read process arguments.
-	args := []string{}
-	if len(argv) > 0 {
+// It uses lookup and home to resolve paths without reading the process environment.
+func Run(argv []string, stdin io.Reader, stdout, stderr io.Writer, lookup func(string) (string, bool), home func() (string, error)) int {
+	name := commandName(argv)
+	root := newRoot(name)
+	var args []string
+	var command string
+	if len(argv) > 1 {
 		args = argv[1:]
+		command = args[0]
+	}
+	// The first token is the command even when it looks like a flag. Cobra's
+	// command finder can skip flags, so check the exact token before delegating.
+	if command != cobra.ShellCompRequestCmd && command != cobra.ShellCompNoDescRequestCmd &&
+		!slices.ContainsFunc(root.Commands(), func(cmd *cobra.Command) bool { return cmd.Name() == command }) {
+		state, ok := lookup("MODEL_GATEWAY_STATE_DIR")
+		if !ok || state == "" {
+			dir, err := home()
+			if err != nil {
+				_, _ = fmt.Fprintf(stderr, "model-gateway: cannot determine the home directory: %v\n", err)
+				return 1
+			}
+			state = filepath.Join(dir, ".claude", installedName)
+		}
+		requestLog, ok := lookup("CODEX_GATEWAY_REQUEST_LOG_PATH")
+		if !ok {
+			requestLog = ""
+		}
+		_, _ = fmt.Fprintln(stdout, argscan.Usage(name, state, requestLog))
+		if command != "" {
+			return 1
+		}
+		return 0
 	}
 	root.SetArgs(args)
 	root.SetIn(stdin)
@@ -93,12 +121,20 @@ func newRoot(name string) *cobra.Command {
 			Hidden:             stub.hidden,
 			DisableFlagParsing: true,
 			SilenceUsage:       true,
-			RunE: func(cmd *cobra.Command, _ []string) error {
-				return fmt.Errorf("%s: not implemented", cmd.Name())
+			RunE: func(cmd *cobra.Command, args []string) error {
+				// The readiness gate is dispatched before the source reads its argument tokens.
+				if cmd.Name() == "readiness-gate" {
+					return stubRun(cmd.Name(), argscan.Args{})
+				}
+				return stubRun(cmd.Name(), argscan.Scan(args))
 			},
 		}
 		root.AddCommand(cmd)
 	}
 	root.AddCommand(version.NewCommand(), completions.NewCommand())
 	return root
+}
+
+func stubRun(name string, _ argscan.Args) error {
+	return fmt.Errorf("%s: not implemented", name)
 }

@@ -16,6 +16,8 @@ package cli_test
 
 import (
 	"bytes"
+	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -23,6 +25,19 @@ import (
 
 	"github.com/zchee/claude-code-model-gateway/internal/cli"
 )
+
+const sandboxHome = "sandbox-home"
+
+type testEnv map[string]string
+
+func (e testEnv) lookup(key string) (string, bool) {
+	value, ok := e[key]
+	return value, ok
+}
+
+func testHome() (string, error) {
+	return sandboxHome, nil
+}
 
 func TestRunStubs(t *testing.T) {
 	tests := map[string]struct{ command string }{
@@ -48,7 +63,7 @@ func TestRunStubs(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			var stdin, stdout, stderr bytes.Buffer
 			args := []string{"claude-code-model-gateway", tt.command, "--help", "--unknown", "value"}
-			got := cli.Run(args, &stdin, &stdout, &stderr)
+			got := cli.Run(args, &stdin, &stdout, &stderr, testEnv(nil).lookup, testHome)
 			if diff := gocmp.Diff(1, got); diff != "" {
 				t.Errorf("exit status mismatch (-want +got):\n%s", diff)
 			}
@@ -115,7 +130,7 @@ func TestRunCompletions(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			var stdin, stdout, stderr bytes.Buffer
-			got := cli.Run(tt.args, &stdin, &stdout, &stderr)
+			got := cli.Run(tt.args, &stdin, &stdout, &stderr, testEnv(nil).lookup, testHome)
 			if diff := gocmp.Diff(tt.wantStatus, got); diff != "" {
 				t.Errorf("exit status mismatch (-want +got):\n%s", diff)
 			}
@@ -153,7 +168,7 @@ func TestRunVersion(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			var stdin, stdout, stderr bytes.Buffer
-			if diff := gocmp.Diff(1, cli.Run([]string{tt.program, "version", "extra"}, &stdin, &stdout, &stderr)); diff != "" {
+			if diff := gocmp.Diff(1, cli.Run([]string{tt.program, "version", "extra"}, &stdin, &stdout, &stderr, testEnv(nil).lookup, testHome)); diff != "" {
 				t.Errorf("exit status mismatch (-want +got):\n%s", diff)
 			}
 			if diff := gocmp.Diff("", stdout.String()); diff != "" {
@@ -166,44 +181,175 @@ func TestRunVersion(t *testing.T) {
 	}
 }
 
-func TestRunHelp(t *testing.T) {
-	tests := map[string]struct {
-		args []string
-		name string
-	}{
-		"success: explicit help for go install name": {
-			args: []string{"claude-code-model-gateway", "--help"},
-			name: "claude-code-model-gateway",
-		},
-		"success: executable with no command": {
-			args: []string{"model-gateway"},
-			name: "model-gateway",
-		},
-		"success: empty argument vector": {name: "model-gateway"},
+func TestInheritedObjectNamesAreUnknownCommands(t *testing.T) {
+	type result struct {
+		Status         int
+		Stdout, Stderr string
+	}
+	run := func(command string) result {
+		var stdin, stdout, stderr bytes.Buffer
+		status := cli.Run([]string{"model-gateway", command}, &stdin, &stdout, &stderr, testEnv(nil).lookup, testHome)
+		return result{Status: status, Stdout: stdout.String(), Stderr: stderr.String()}
+	}
+	// bin/model-gateway.js:4-10,13-16 and lib/commands.js:2935-3041:
+	// the JavaScript object inherits these names; Go recognizes only registered commands.
+	want := run("not-a-command")
+	if want.Status != 1 || want.Stderr != "" || !strings.HasPrefix(want.Stdout, "usage: model-gateway <command>\n") {
+		t.Fatalf("unknown command returned status %d, stdout %q, stderr %q", want.Status, want.Stdout, want.Stderr)
+	}
+	tests := map[string]struct{ command string }{
+		"error: inherited toString method":       {command: "toString"},
+		"error: inherited prototype object":      {command: "__proto__"},
+		"error: inherited constructor":           {command: "constructor"},
+		"error: inherited hasOwnProperty method": {command: "hasOwnProperty"},
+		"error: inherited valueOf method":        {command: "valueOf"},
+		"error: inherited getter helper":         {command: "__defineGetter__"},
+		"error: inherited setter helper":         {command: "__defineSetter__"},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			var stdin, stdout, stderr bytes.Buffer
-			if diff := gocmp.Diff(0, cli.Run(tt.args, &stdin, &stdout, &stderr)); diff != "" {
-				t.Errorf("exit status mismatch (-want +got):\n%s", diff)
-			}
-			if diff := gocmp.Diff("", stderr.String()); diff != "" {
-				t.Errorf("stderr mismatch (-want +got):\n%s", diff)
-			}
-			help := stdout.String()
-			if !strings.Contains(help, "\n  "+tt.name+" [command]\n") {
-				t.Errorf("help does not show the invoked name %q", tt.name)
-			}
-			for _, command := range []string{"completions", "serve-shim"} {
-				if !strings.Contains(help, "\n  "+command+" ") {
-					t.Errorf("help does not list %q", command)
-				}
-			}
-			for _, command := range []string{"completion", "readiness-gate", "serve-worker"} {
-				if strings.Contains(help, "\n  "+command+" ") {
-					t.Errorf("help lists %q, which should not be visible", command)
-				}
+			if diff := gocmp.Diff(want, run(tt.command)); diff != "" {
+				t.Errorf("unknown command mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}
 }
+
+func TestRunUsage(t *testing.T) {
+	tests := map[string]struct {
+		args       []string
+		name       string
+		env        testEnv
+		homeErr    error
+		wantStatus int
+		wantStderr string
+	}{
+		// bin/model-gateway.js:4-10 and lib/runtime.js:16-18: no command, default state paths.
+		"success: empty argument vector": {name: "model-gateway"},
+		// lib/commands.js:127,153-197 and lib/runtime.js:16-18: unset paths use defaults.
+		"success: executable with unset path overrides": {args: []string{"model-gateway"}, name: "model-gateway"},
+		// lib/commands.js:127,153-197 and lib/runtime.js:16-18: empty paths also use defaults.
+		"success: executable with empty path overrides": {
+			args: []string{"model-gateway"}, name: "model-gateway",
+			env: testEnv{"MODEL_GATEWAY_STATE_DIR": "", "CODEX_GATEWAY_REQUEST_LOG_PATH": "", "CLAUDE_CONFIG_DIR": "separate-config"},
+		},
+		"success: empty command before known command": {
+			args: []string{"model-gateway", "", "version"}, name: "model-gateway",
+		},
+		// bin/model-gateway.js:4-10 and lib/commands.js:2935-3041: help spellings are not commands.
+		"error: help word": {
+			args: []string{"model-gateway", "help", "setup"}, name: "model-gateway", wantStatus: 1,
+		},
+		"error: long help switch with go install name": {
+			args: []string{"claude-code-model-gateway", "--help"}, name: "claude-code-model-gateway", wantStatus: 1,
+		},
+		"error: short help switch": {
+			args: []string{"model-gateway", "-h"}, name: "model-gateway", wantStatus: 1,
+		},
+		// bin/model-gateway.js:4-10 and lib/commands.js:199-201: a leading flag or -- is not skipped.
+		"error: flag before command": {
+			args: []string{"model-gateway", "--unknown=value", "version"}, name: "model-gateway", wantStatus: 1,
+		},
+		"error: separator before command": {
+			args: []string{"model-gateway", "--", "version"}, name: "model-gateway", wantStatus: 1,
+		},
+		// bin/model-gateway.js:4-10 and lib/commands.js:127,153-197,215-218: usage bypasses the log writer.
+		"error: unknown command with json and path override": {
+			args: []string{"model-gateway", "statu", "--json"}, name: "model-gateway", wantStatus: 1,
+			env: testEnv{"CODEX_GATEWAY_REQUEST_LOG_PATH": "relative request log.jsonl"},
+		},
+		// lib/commands.js:127,153-197: paths in usage follow the active state directory.
+		"success: overridden state does not need home": {
+			args: []string{"model-gateway"}, name: "model-gateway", env: testEnv{"MODEL_GATEWAY_STATE_DIR": "other-state"},
+			homeErr: errors.New("lookup unavailable"),
+		},
+		// lib/runtime.js:16 and bin/model-gateway.js:13-16: usage cannot resolve default paths on a home lookup failure.
+		"error: home lookup failure": {
+			args: []string{"model-gateway"}, name: "model-gateway", homeErr: errors.New("lookup unavailable"), wantStatus: 1,
+			wantStderr: "model-gateway: cannot determine the home directory: lookup unavailable\n",
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			stateDir := tt.env["MODEL_GATEWAY_STATE_DIR"]
+			if stateDir == "" {
+				stateDir = filepath.Join(sandboxHome, ".claude", "model-gateway")
+			}
+			requestLog := tt.env["CODEX_GATEWAY_REQUEST_LOG_PATH"]
+			if requestLog == "" {
+				requestLog = filepath.Join(stateDir, "logs", "request-routes.jsonl")
+			}
+			wantStdout := strings.NewReplacer(
+				"<program>", tt.name,
+				"<bin>", filepath.Join(stateDir, "bin"),
+				"<logs>", filepath.Join(stateDir, "logs"),
+				"<catalog>", filepath.Join(stateDir, "catalog.json"),
+				"<pins>", filepath.Join(stateDir, "pins.json"),
+				"<context>", filepath.Join(stateDir, "context-window.json"),
+				"<request-log>", requestLog,
+			).Replace(sourceUsage)
+			if tt.wantStderr != "" {
+				wantStdout = ""
+			}
+			home := func() (string, error) { return sandboxHome, tt.homeErr }
+			var stdin, stdout, stderr bytes.Buffer
+			if diff := gocmp.Diff(tt.wantStatus, cli.Run(tt.args, &stdin, &stdout, &stderr, tt.env.lookup, home)); diff != "" {
+				t.Errorf("exit status mismatch (-want +got):\n%s", diff)
+			}
+			if diff := gocmp.Diff(wantStdout, stdout.String()); diff != "" {
+				t.Errorf("stdout mismatch (-want +got):\n%s", diff)
+			}
+			if diff := gocmp.Diff(tt.wantStderr, stderr.String()); diff != "" {
+				t.Errorf("stderr mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// lib/commands.js:153-197, with substitutions for the name and paths, and the newline from bin/model-gateway.js:8.
+const sourceUsage = `usage: <program> <command>
+
+  setup            download the claude-code-proxy binary (v-latest) into <bin>
+  login [--device] run the ChatGPT OAuth flow (--device for headless device-code)
+  start | stop     start/stop the proxy + shim (detached, logs in <logs>)
+  ensure [--quiet] maintain installed wiring and start unless intentionally stopped
+  recover          restore readiness without settings, pin or cache maintenance
+  status           show what's running
+  models           show the model list the shim advertises to Claude Code
+  catalog [--json] [--refresh] print the sidequest-readable model catalog (<catalog>);
+                   --refresh exits non-zero and says why on stderr when it could not write a
+                   fresh one, and prints the retained catalog unchanged
+  pin [--opus|--sonnet|--fable <model|default>]
+                   show pin sources and newest catalog ids, or persist an override (<pins>);
+                   default removes the override and follows detected/catalog defaults, never backwards
+  context-window [--claude <tokens|full>] [--codex <tokens|full>] [--grok <tokens|full>]
+                   show or persist the context window per backend (<context>); the
+                   orchestrator and every executor share it. Defaults: claude full, codex 272000,
+                   grok full. Without compact-at, a gateway cap compacts 85000 below the cap.
+                   --codex-compact-at <tokens|cap> and --grok-compact-at <tokens|cap> set a direct
+                   maximum before compaction (positive whole tokens); cap removes the override.
+                   The cap and backend window minus 40000 still limit the effective maximum.
+                   A saved compact-at ignores CODEX_GATEWAY_COMPACT_TRIGGER, reported unchanged.
+                   Example: --codex-compact-at 242000 leaves the 272000 cap unchanged. OpenAI bills
+                   input above 272k tokens at 2x; the crossing turn and compaction request can still
+                   exceed 272k. Existing installations keep their current policy until configured.
+                   --claude sets the native autoCompactWindow in project-wired settings; native
+                   engine headroom applies and the exact trigger is unverified. Claude compact-at
+                   is unsupported. No same-model main/subagent split is applied.
+                   CODEX_GATEWAY_CONTEXT_WINDOW is superseded and only applies when no codex value is saved.
+  env [--write-project | --write-user | --remove] [--reconcile]
+                   print the Claude Code env block, or merge/remove wiring
+                   --remove clears owned routing, discovery, static env and alias pins; preserves and names user pins
+                   (--write-project writes .claude/settings.local.json; --write-user
+                   is an opt-in shared fallback in ~/.claude/settings.json)
+  doctor           full health check, Anthropic catalog age/fallback, pin sources and newest ids
+  remote-control <enable|disable|doctor> [--confirm]
+                   manage the opt-in hosts-file compatibility mode; enable refuses an effective
+                   HTTPS api.anthropic.com process URL before hosts changes
+  serve-shim       (internal) run the router in the foreground
+
+  Request route logging (on by default; set CODEX_GATEWAY_REQUEST_LOG=0 to opt out):
+    CODEX_GATEWAY_REQUEST_LOG=0
+    Writes JSONL route metadata to <request-log>. Override the path with
+    CODEX_GATEWAY_REQUEST_LOG_PATH. It records no request bodies, prompts, tools, or auth.
+`
