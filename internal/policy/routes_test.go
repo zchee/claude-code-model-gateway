@@ -24,6 +24,10 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/proxymodels"
 )
 
+func listedResolver(routes ...proxymodels.Route) policy.Resolver {
+	return policy.NewResolver(policy.ResolverInputs{Routes: proxymodels.NewTable(routes)})
+}
+
 func TestListedRoutes(t *testing.T) {
 	tests := map[string]struct{ id, provider string }{
 		"success: Kimi":                         {"kimi-k3", "kimi"},
@@ -33,7 +37,7 @@ func TestListedRoutes(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			r := policy.Resolver{Routes: proxymodels.NewTable([]proxymodels.Route{{ID: tt.id, Provider: tt.provider}})}
+			r := listedResolver(proxymodels.Route{ID: tt.id, Provider: tt.provider})
 			alias := "claude-" + tt.id
 			want := policy.Model{Backend: tt.provider, Transport: "proxy", BackendID: tt.id, Sentry: "none", AdvertisedWindow: 200000, Measurement: "unmeasured default for claude-code-proxy " + tt.provider + " rows absent from this table", PickerAlias: alias + "[1m]", PickerAliasTemplate: aliasTemplate}
 			equal(t, want, modelFor(t, r, alias))
@@ -45,7 +49,18 @@ func TestListedRoutes(t *testing.T) {
 }
 
 func TestNativeRoutes(t *testing.T) {
-	r := policy.Resolver{Routes: proxymodels.NewTable([]proxymodels.Route{{ID: "grok-4.7", Provider: "grok"}, {ID: "gpt-6-astra", Provider: "codex"}, {ID: "gpt-6-sol-fast", Provider: "codex"}, {ID: "claude-opus-5-5", Provider: "codex"}})}
+	r := listedResolver(
+		proxymodels.Route{ID: "gpt-6-sol", Provider: "codex"},
+		proxymodels.Route{ID: "gpt-6-sol-fast", Provider: "codex"},
+		proxymodels.Route{ID: "cursor-agent", Provider: "cursor"},
+		proxymodels.Route{ID: "composer-2.5", Provider: "cursor"},
+		proxymodels.Route{ID: "grok-4.7", Provider: "grok"},
+		proxymodels.Route{ID: "grok-composer-2.5-fast", Provider: "grok"},
+		proxymodels.Route{ID: "kimi-k3", Provider: "kimi"},
+		proxymodels.Route{ID: "k3", Provider: "kimi"},
+		proxymodels.Route{ID: "glm-5.3", Provider: "opencode"},
+		proxymodels.Route{ID: "opencode-go/kimi-k2.6", Provider: "opencode"},
+	)
 	tests := map[string]struct{ id, backend, transport string }{
 		"success: native Grok":    {"claude-grok-4.7[1m]", "grok", "grok"},
 		"success: measured Codex": {"claude-gpt-6-astra[1m]", "codex", "proxy"},
@@ -89,7 +104,7 @@ func TestPickerSpelling(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			r := policy.Resolver{Routes: proxymodels.NewTable(tt.routes)}
+			r := listedResolver(tt.routes...)
 			equal(t, tt.backend, r.BackendID(tt.id))
 			equal(t, tt.transport, modelFor(t, r, tt.id).Transport)
 			equal(t, tt.client, r.ClientID(tt.id))
@@ -97,16 +112,55 @@ func TestPickerSpelling(t *testing.T) {
 	}
 }
 
+func TestReverseSpellingFollowsRouteSnapshot(t *testing.T) {
+	const backend = "vertex/anthropic/claude-fable-5-2"
+	const renamed = "vertex/anthropic/fable-5-2"
+	const picker = "claude-" + renamed
+	first := listedResolver(proxymodels.Route{ID: backend, Provider: "vertex"}, proxymodels.Route{ID: renamed, Provider: "vertex"})
+	// This unlisted spelling initializes the source's process-wide reverse lookup while the other names collide.
+	equal(t, "vertex/anthropic/claude-fable-5-1", first.BackendID("claude-vertex/anthropic/fable-5-1"))
+	equal(t, renamed, first.BackendID(picker))
+	equal(t, picker, first.ClientID(picker))
+	second := listedResolver()
+	// With the listing cleared the source still returns the short backend ID and Anthropic transport.
+	// The new snapshot instead restores the measured Vertex row's now-unambiguous alias.
+	equal(t, backend, second.BackendID(picker))
+	equal(t, "proxy", modelFor(t, second, picker).Transport)
+	equal(t, picker+"[1m]", second.ClientID(picker))
+	equal(t, renamed, first.BackendID(picker))
+}
+
+func TestResolverOwnsInputs(t *testing.T) {
+	const id = "lmstudio/ibm/granite-4-micro"
+	inputs := policy.ResolverInputs{
+		Routes:          proxymodels.NewTable([]proxymodels.Route{{ID: id, Provider: "lmstudio"}}),
+		Windows:         policy.Windows{"codex": window(200000, "saved")},
+		LMStudioWindows: map[string]int64{"ibm/granite-4-micro": 65536},
+	}
+	first := policy.NewResolver(inputs)
+	inputs.Windows["codex"] = window(300000, "saved")
+	inputs.LMStudioWindows["ibm/granite-4-micro"] = 262144
+	second := policy.NewResolver(inputs)
+	equal(t, int64(200000), first.AdvertisedWindow("gpt-6-astra"))
+	equal(t, int64(300000), second.AdvertisedWindow("gpt-6-astra"))
+	equal(t, int64(65536), first.AdvertisedWindow(id))
+	equal(t, int64(262144), second.AdvertisedWindow(id))
+}
+
 func TestVertexListing(t *testing.T) {
 	const unmeasured = `vertex/anthropic/claude-opus-4-5@20251101 vertex/anthropic/claude-haiku-4-5@20251001 vertex/xai/grok-4.3 vertex/mistralai/mistral-medium-3 vertex/mistralai/mistral-small-2503 vertex/mistralai/codestral-2 vertex/openai/gpt-oss-120b-maas vertex/deepseek-ai/deepseek-v4.1-flash-maas`
 	const registered = `gemini-3-flash-preview gemini-3.1-flash-lite gemini-3.1-pro-preview gemini-3.5-flash gemini-3.5-flash-lite gemini-3.7-flash gemini-3.8-flash gemini-4-argon gemini-4-carbon gemini-4-hydrogen gemini-4-neon vertex/anthropic/claude-fable-5 vertex/anthropic/claude-fable-5-1 vertex/anthropic/claude-fable-5-2 vertex/anthropic/claude-haiku-4-5@20251001 vertex/anthropic/claude-haiku-5-5 vertex/anthropic/claude-opus-4-5@20251101 vertex/anthropic/claude-opus-4-6 vertex/anthropic/claude-opus-4-7 vertex/anthropic/claude-opus-4-8 vertex/anthropic/claude-opus-5 vertex/anthropic/claude-opus-5-5 vertex/anthropic/claude-sonnet-4-6 vertex/anthropic/claude-sonnet-5 vertex/anthropic/claude-sonnet-5-5 vertex/deepseek-ai/deepseek-v4.1-flash-maas vertex/gemini-3-flash-preview vertex/gemini-3.1-flash-lite vertex/gemini-3.1-pro-preview vertex/gemini-3.5-flash vertex/gemini-3.5-flash-lite vertex/gemini-3.7-flash vertex/gemini-3.8-flash vertex/gemini-4-argon vertex/gemini-4-carbon vertex/gemini-4-hydrogen vertex/gemini-4-neon vertex/google/gemma-4-26b-a4b-it-maas vertex/meta/llama-4-maverick-17b-128e-instruct-maas vertex/meta/llama-4-scout-17b-16e-instruct-maas vertex/meta/muse-ember-1.0 vertex/meta/muse-spark-1.3 vertex/meta/muse-wonder-1.0 vertex/mistralai/codestral-2 vertex/mistralai/mistral-medium-3 vertex/mistralai/mistral-small-2503 vertex/openai/gpt-6-astra vertex/openai/gpt-6-luna vertex/openai/gpt-6.1-sol vertex/openai/gpt-6.1-terra vertex/openai/gpt-oss-120b-maas vertex/xai/grok-4.20-non-reasoning vertex/xai/grok-4.20-reasoning vertex/xai/grok-4.3 vertex/xai/grok-4.6 vertex/xai/grok-4.7 vertex/zai-org/glm-5.2-maas`
+	allIDs := map[string]bool{}
+	vertexCount := 0
 	rows := map[string]policy.Model{}
 	bare := 0
 	names := strings.Fields(registered)
 	for _, p := range policy.Rows() {
+		allIDs[p.BackendID] = true
 		if p.Backend != "vertex" {
 			continue
 		}
+		vertexCount++
 		rows[p.BackendID] = p
 		if !slices.Contains(names, p.BackendID) {
 			t.Errorf("%q not registered", p.BackendID)
@@ -115,7 +169,7 @@ func TestVertexListing(t *testing.T) {
 			bare++
 		}
 	}
-	equal(t, 49, len(rows))
+	equal(t, 49, vertexCount)
 	equal(t, 11, bare)
 	for id, p := range rows {
 		if strings.Contains(id, "/") {
@@ -127,7 +181,7 @@ func TestVertexListing(t *testing.T) {
 	}
 	var missing []string
 	for _, id := range names {
-		if _, ok := rows[id]; !ok {
+		if !allIDs[id] {
 			missing = append(missing, id)
 		}
 	}
@@ -135,11 +189,10 @@ func TestVertexListing(t *testing.T) {
 	equal(t, slices.Sorted(strings.FieldsSeq(unmeasured)), missing)
 	for id := range strings.FieldsSeq(unmeasured + " vertex/endpoint/my-llm") {
 		t.Run(id, func(t *testing.T) {
-			_, ok := rows[id]
-			equal(t, false, ok)
+			equal(t, false, allIDs[id])
 			alias := "claude-" + id
 			equal(t, "anthropic", modelFor(t, policy.Resolver{}, alias).Transport)
-			r := policy.Resolver{Routes: proxymodels.NewTable([]proxymodels.Route{{ID: id, Provider: "vertex"}})}
+			r := listedResolver(proxymodels.Route{ID: id, Provider: "vertex"})
 			p := modelFor(t, r, alias)
 			equal(t, "vertex", p.Backend)
 			equal(t, "proxy", p.Transport)
@@ -153,21 +206,23 @@ func TestVertexListing(t *testing.T) {
 
 func TestLiveRows(t *testing.T) {
 	tests := map[string]struct {
-		window, trigger, advertised int64
-		long                        bool
+		probe, window, headroom, trigger, advertised int64
+		long                                         bool
 	}{
-		"success: no probe":                {-1, 0, 200000, false},
-		"success: unloaded or router mode": {0, 0, 200000, false},
-		"success: below floor":             {8192, 0, 8192, false},
-		"success: at floor":                {32768, 21846, 32768, false},
-		"success: one third of 40960":      {40960, 27307, 40960, false},
-		"success: one third of 65536":      {65536, 43691, 65536, false},
-		"success: capped reserve":          {131072, 91072, 131072, false},
-		"success: exact client threshold":  {200000, 160000, 200000, false},
-		"success: first long alias":        {200001, 160001, 200001, true},
-		"success: 256 Ki":                  {262144, 222144, 262144, true},
-		"success: 1 Mi":                    {1048576, 1008576, 1000000, true},
-		"success: 2 Mi":                    {2097152, 2057152, 1000000, true},
+		"success: no probe":                 {-1, 0, 0, 0, 200000, false},
+		"success: unloaded or router mode":  {0, 0, 0, 0, 200000, false},
+		"success: below floor":              {8192, 8192, 0, 0, 8192, false},
+		"success: just below floor":         {32767, 32767, 0, 0, 32767, false},
+		"success: at floor":                 {32768, 32768, 10922, 21846, 32768, false},
+		"success: one third of 40960":       {40960, 40960, 13653, 27307, 40960, false},
+		"success: one third of 65536":       {65536, 65536, 21845, 43691, 65536, false},
+		"success: capped reserve":           {131072, 131072, 40000, 91072, 131072, false},
+		"success: exact client threshold":   {200000, 200000, 40000, 160000, 200000, false},
+		"success: first long alias":         {200001, 200001, 40000, 160001, 200001, true},
+		"success: 256 Ki":                   {262144, 262144, 40000, 222144, 262144, true},
+		"success: 1 Mi":                     {1048576, 1048576, 40000, 1008576, 1000000, true},
+		"success: 2 Mi":                     {2097152, 2097152, 40000, 2057152, 1000000, true},
+		"error: unsafe probe is unmeasured": {1 << 53, 0, 0, 0, 200000, false},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -178,11 +233,12 @@ func TestLiveRows(t *testing.T) {
 					if backend == "local" {
 						id = "local/gguf"
 					}
-					r := policy.Resolver{Routes: proxymodels.NewTable([]proxymodels.Route{{ID: id, Provider: backend}}), LocalPort: 8080, LMStudioURL: "http://127.0.0.1:1234"}
-					if tt.window >= 0 {
-						r.LocalWindow = tt.window
-						r.LMStudioWindows = map[string]int64{key: tt.window, "qwen3-coder-30b": 16384}
+					inputs := policy.ResolverInputs{Routes: proxymodels.NewTable([]proxymodels.Route{{ID: id, Provider: backend}}), LocalPort: 8080, LMStudioURL: "http://127.0.0.1:1234"}
+					if tt.probe >= 0 {
+						inputs.LocalWindow = tt.probe
+						inputs.LMStudioWindows = map[string]int64{key: tt.probe, "qwen3-coder-30b": 16384}
 					}
+					r := policy.NewResolver(inputs)
 					alias := "claude-" + id
 					client := alias
 					if tt.long {
@@ -193,6 +249,11 @@ func TestLiveRows(t *testing.T) {
 						equal(t, backend, p.Backend)
 						equal(t, id, p.BackendID)
 						equal(t, "proxy", p.Transport)
+						equal(t, tt.window, p.BackendWindow)
+						equal(t, tt.advertised, p.AdvertisedWindow)
+						equal(t, tt.headroom, p.CompactHeadroom)
+						equal(t, alias+"[1m]", p.PickerAlias)
+						equal(t, aliasTemplate, p.PickerAliasTemplate)
 						wantSentry := "none"
 						var want *policy.Sentry
 						if tt.trigger != 0 {
@@ -213,6 +274,8 @@ func TestLiveRows(t *testing.T) {
 								note = fmt.Sprintf("LM Studio /api/v1/models loaded context_length %d at http://127.0.0.1:1234, read live", tt.window)
 							}
 							equal(t, note, p.Measurement)
+						} else {
+							equal(t, "unmeasured default for claude-code-proxy "+backend+" rows absent from this table", p.Measurement)
 						}
 					}
 				})

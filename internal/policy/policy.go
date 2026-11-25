@@ -18,6 +18,7 @@ package policy
 import (
 	"encoding/json/jsontext"
 	"errors"
+	"maps"
 
 	"github.com/zchee/claude-code-model-gateway/internal/config"
 	"github.com/zchee/claude-code-model-gateway/internal/proxymodels"
@@ -34,16 +35,26 @@ type Model struct {
 // Rows returns the window table in declaration order, independent of caller mutations.
 func Rows() []Model { return nil }
 
-// Resolver uses a route snapshot and observed server windows without querying running servers.
+// ResolverInputs supplies a route snapshot and observed server windows without querying servers.
 // LMStudioWindows is keyed by the server's model key, without the provider prefix.
 // Nil Windows selects the gateway defaults; zero live windows indicate no measurement.
-type Resolver struct {
+type ResolverInputs struct {
 	Routes          proxymodels.Table
 	Windows         Windows
 	LocalWindow     int64
 	LocalPort       int
 	LMStudioURL     string
 	LMStudioWindows map[string]int64
+}
+
+// Resolver is an immutable snapshot. Its zero value uses defaults with no listed routes.
+type Resolver struct{ inputs ResolverInputs }
+
+// NewResolver takes ownership of copies of the supplied windows; the route table is already immutable.
+func NewResolver(inputs ResolverInputs) Resolver {
+	inputs.Windows = maps.Clone(inputs.Windows)
+	inputs.LMStudioWindows = maps.Clone(inputs.LMStudioWindows)
+	return Resolver{inputs: inputs}
 }
 
 // BackendID resolves a picker spelling to the backend ID, including any service tier.

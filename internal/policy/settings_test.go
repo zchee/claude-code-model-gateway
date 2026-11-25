@@ -116,7 +116,7 @@ func TestBackendCaps(t *testing.T) {
 	equal(t, int64(0), w.Cap("muse"))
 	equal(t, int64(272000), w.Cap("codex"))
 	equal(t, int64(300000), w.Cap("grok"))
-	r := policy.Resolver{Windows: policy.Windows{"codex": window(200000, "saved")}}
+	r := policy.NewResolver(policy.ResolverInputs{Windows: policy.Windows{"codex": window(200000, "saved")}})
 	equal(t, "claude-gpt-5.6-sol", r.ClientID("gpt-5.6-sol"))
 	equal(t, int64(200000), r.AdvertisedWindow("gpt-5.6-sol"))
 }
@@ -204,6 +204,70 @@ func TestCompactAtTypes(t *testing.T) {
 	}
 }
 
+func TestCompactAtContainers(t *testing.T) {
+	const unsupportedIndex = "unsupported compactAt.0: direct compaction maxima are supported for Codex and Grok only; use --claude <tokens|full> for the native window"
+	tests := map[string]struct{ raw, err string }{
+		"success: absent":        {"", ""},
+		"success: empty object":  {`{}`, ""},
+		"success: boolean":       {`true`, ""},
+		"success: number":        {`242000`, ""},
+		"success: empty string":  {`""`, ""},
+		"success: empty array":   {`[]`, ""},
+		"error: nonempty string": {`"abc"`, unsupportedIndex},
+		"error: nonempty array":  {`[242000]`, unsupportedIndex},
+		"error: null":            {`null`, "invalid compactAt: must not be null"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			body := `{"grok":400000`
+			if tt.raw != "" {
+				body += `,"compactAt":` + tt.raw
+			}
+			body += "}"
+			t.Run("read", func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "windows.json")
+				if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				got, err := policy.ReadWindows(path, lookup(nil))
+				if tt.err != "" {
+					if err == nil {
+						t.Fatal("invalid compactAt accepted")
+					}
+					equal(t, tt.err, err.Error())
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				equal(t, policy.Windows{"claude": window(0, "default"), "codex": window(272000, "default"), "grok": window(400000, "saved")}, got)
+			})
+			t.Run("write", func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "nested", "windows.json")
+				err := policy.WriteWindows(path, jsontext.Value(body))
+				if tt.err != "" {
+					if err == nil {
+						t.Fatal("invalid compactAt written")
+					}
+					equal(t, tt.err, err.Error())
+					if _, err := os.Stat(filepath.Dir(path)); !errors.Is(err, fs.ErrNotExist) {
+						t.Fatalf("validation created directory or stat failed: %v", err)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				equal(t, body, compactJSON(t, data))
+			})
+		})
+	}
+}
+
 func TestWriteWindows(t *testing.T) {
 	tests := map[string]struct{ raw, msg string }{
 		"error: unsupported backend": {`{"compactAt":{"claude":242000}}`, "unsupported compactAt.claude"},
@@ -226,7 +290,7 @@ func TestWriteWindows(t *testing.T) {
 	}
 	t.Run("success: readable nested state", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "nested", "windows.json")
-		err := policy.WriteWindows(path, jsontext.Value(`{"codex":"full","claude":50000,"grok":400000}`))
+		err := policy.WriteWindows(path, jsontext.Value(`{"codex":"full","claude":50000,"grok":4e5}`))
 		if err != nil {
 			t.Fatal(err)
 		}
