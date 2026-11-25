@@ -152,7 +152,7 @@ func (c procClock) inspect(root string, pid int, withImage bool) (Identity, erro
 	if !bytes.Equal(cmd, after) {
 		return Identity{}, ErrUnknown
 	}
-	id.Image = ImageEvidence{Image: Image{Path: path, Device: uint64(st.Dev), Inode: st.Ino}, DirectFromExecutable: true}
+	id.Image = ImageEvidence{Path: path, Device: uint64(st.Dev), Inode: st.Ino, DirectFromExecutable: true}
 	return id, nil
 }
 

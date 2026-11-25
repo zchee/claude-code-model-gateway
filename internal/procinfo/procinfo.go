@@ -63,8 +63,10 @@ type Image struct {
 // launch identifier from correlated evidence. The path is never authority to act.
 //
 // The separate type prevents implicit assignment to Image, not misuse of its fields:
-// comparing Device and Inode, building an Image from them, or round-tripping through
-// JSON loses provenance and does not validate the identifier.
+// comparing Device and Inode or copying them into an Image does not validate the identifier.
+// Only a probe constructs ImageEvidence. Decode stored identifiers into Image instead.
+// Never decode JSON into ImageEvidence: decoding ignores DirectFromExecutable and can
+// leave a stale flag beside new device and inode values when the destination is reused.
 type ImageEvidence struct {
 	Image
 	DirectFromExecutable bool `json:"-"`
