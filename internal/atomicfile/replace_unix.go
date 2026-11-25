@@ -149,7 +149,9 @@ func (w writer) replace(root *directory, base string, data []byte, mode fs.FileM
 	published := false
 	defer func() {
 		if !published {
-			err = errors.Join(err, root.Remove(name))
+			if cleanupErr := root.Remove(name); cleanupErr != nil && !errors.Is(cleanupErr, fs.ErrNotExist) {
+				err = errors.Join(err, cleanupErr)
+			}
 		}
 	}()
 	info, err := file.Stat()
@@ -337,7 +339,7 @@ func (w writer) replaceSettings(path string, edit func([]byte) ([]byte, error), 
 			}
 			err = w.replace(root, base, data, mode, owner, before.info != nil, check)
 		}
-		if !errors.Is(err, conflict) {
+		if err != conflict { //nolint:errorlint // Retry the bare conflict, never a conflict joined with a cleanup failure.
 			return err
 		}
 	}

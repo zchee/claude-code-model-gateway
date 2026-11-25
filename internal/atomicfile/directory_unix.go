@@ -27,6 +27,15 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func retryEINTR(call func() (int, error)) (int, error) {
+	for {
+		n, err := call()
+		if !errors.Is(err, unix.EINTR) {
+			return n, err
+		}
+	}
+}
+
 type directory struct{ handle *os.File }
 
 func (d *directory) Close() error { return d.handle.Close() }
@@ -52,7 +61,9 @@ func (d *directory) OpenFile(base string, flags int, mode fs.FileMode) (*os.File
 	if !validBase(base) {
 		return nil, &DestinationError{base}
 	}
-	fd, err := unix.Openat(int(d.handle.Fd()), base, flags|unix.O_NOFOLLOW|unix.O_CLOEXEC, uint32(mode.Perm()))
+	fd, err := retryEINTR(func() (int, error) {
+		return unix.Openat(int(d.handle.Fd()), base, flags|unix.O_NOFOLLOW|unix.O_CLOEXEC, uint32(mode.Perm()))
+	})
 	runtime.KeepAlive(d)
 	if err != nil {
 		return nil, &os.PathError{Op: "open", Path: d.path(base), Err: err}
@@ -66,8 +77,11 @@ func (d *directory) Readlink(base string) (string, error) {
 	}
 	for capacity := 128; ; capacity *= 2 {
 		buf := make([]byte, capacity)
-		n, err := unix.Readlinkat(int(d.handle.Fd()), base, buf)
+		n, err := retryEINTR(func() (int, error) { return unix.Readlinkat(int(d.handle.Fd()), base, buf) })
 		runtime.KeepAlive(d)
+		if errors.Is(err, unix.ERANGE) {
+			continue
+		}
 		if err != nil {
 			return "", &os.PathError{Op: "readlink", Path: d.path(base), Err: err}
 		}
@@ -95,7 +109,7 @@ func (d *directory) Rename(from, to string) error {
 
 func (d *directory) entryNames() ([]string, error) {
 	// A plain dup shares its directory offset. Reopen dot relative to the pinned fd so each sweep starts at the beginning.
-	fd, err := unix.Openat(int(d.handle.Fd()), ".", directoryFlags, 0)
+	fd, err := retryEINTR(func() (int, error) { return unix.Openat(int(d.handle.Fd()), ".", directoryFlags, 0) })
 	runtime.KeepAlive(d)
 	if err != nil {
 		return nil, err
@@ -110,7 +124,7 @@ func (d *directory) Remove(base string) error {
 	if !validBase(base) {
 		return &DestinationError{base}
 	}
-	err := unix.Unlinkat(int(d.handle.Fd()), base, 0)
+	_, err := retryEINTR(func() (int, error) { return 0, unix.Unlinkat(int(d.handle.Fd()), base, 0) })
 	runtime.KeepAlive(d.handle)
 	return err
 }
@@ -135,7 +149,7 @@ const directoryFlags = unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NONBLOCK | unix.O
 // openDirectoryAt leaves the spelling of existing components to the kernel: a symlink
 // followed by .. is not equivalent to removing both from the path string.
 func openDirectoryAt(at int, path string, create bool) (int, error) {
-	fd, err := unix.Openat(at, path, directoryFlags, 0)
+	fd, err := retryEINTR(func() (int, error) { return unix.Openat(at, path, directoryFlags, 0) })
 	if err == nil {
 		return fd, nil
 	}
@@ -155,11 +169,12 @@ func openDirectoryAt(at int, path string, create bool) (int, error) {
 	}
 	defer func() { _ = unix.Close(ancestor) }()
 	if leaf != "." && leaf != ".." {
-		if err := unix.Mkdirat(ancestor, leaf, 0o777); err != nil && !errors.Is(err, fs.ErrExist) {
+		_, err := retryEINTR(func() (int, error) { return 0, unix.Mkdirat(ancestor, leaf, 0o777) })
+		if err != nil && !errors.Is(err, fs.ErrExist) {
 			return -1, &os.PathError{Op: "mkdir", Path: path, Err: err}
 		}
 	}
-	fd, err = unix.Openat(ancestor, leaf, directoryFlags|unix.O_NOFOLLOW, 0)
+	fd, err = retryEINTR(func() (int, error) { return unix.Openat(ancestor, leaf, directoryFlags|unix.O_NOFOLLOW, 0) })
 	if err != nil {
 		return -1, &os.PathError{Op: "open directory", Path: path, Err: err}
 	}

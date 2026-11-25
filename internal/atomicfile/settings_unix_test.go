@@ -29,7 +29,85 @@ import (
 	"time"
 
 	gocmp "github.com/google/go-cmp/cmp"
+	"golang.org/x/sys/unix"
 )
+
+func TestRetryEINTR(t *testing.T) {
+	tests := map[string]struct {
+		interrupts int
+		terminal   error
+	}{
+		"success: interrupted calls then success": {3, nil},
+		"error: other errno is not retried":       {0, unix.EACCES},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			calls := 0
+			n, err := retryEINTR(func() (int, error) {
+				calls++
+				if calls <= tt.interrupts {
+					return -1, unix.EINTR
+				}
+				if calls != tt.interrupts+1 {
+					t.Fatal("retried a terminal result")
+				}
+				return 17, tt.terminal
+			})
+			if calls != tt.interrupts+1 || n != 17 || !errors.Is(err, tt.terminal) {
+				t.Fatalf("got (%d,%v) after %d calls", n, err, calls)
+			}
+		})
+	}
+}
+
+func TestStageCleanupErrors(t *testing.T) {
+	t.Run("missing stage preserves rename error", func(t *testing.T) {
+		path := stateFile(t)
+		w := newWriter()
+		commit := w.commit
+		var renameErr error
+		w.commit = func(stage preparedFile, to string) error {
+			if err := os.Remove(stage.Name()); err != nil {
+				t.Fatal(err)
+			}
+			renameErr = commit(stage, to)
+			return renameErr
+		}
+		err := w.writeFile(path, []byte(newState), 0o600)
+		if !errors.Is(renameErr, fs.ErrNotExist) || !errors.Is(err, renameErr) || err.Error() != renameErr.Error() {
+			t.Fatalf("returned %v; want only the original rename error %v", err, renameErr)
+		}
+		checkContents(t, path, oldState)
+		checkOnlyTarget(t, path)
+	})
+	t.Run("cleanup failure stops conflict retry", func(t *testing.T) {
+		path := stateFile(t)
+		const editor = `{"editor":true}`
+		calls := 0
+		err := newWriter().replaceSettings(path, func([]byte) ([]byte, error) {
+			calls++
+			if calls != 1 {
+				t.Fatal("retried after cleanup failed")
+			}
+			return []byte(newState), nil
+		}, func(stage preparedFile, _ string) {
+			writeFixture(t, path, editor)
+			if err := os.Remove(stage.Name()); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(stage.Name(), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		})
+		if !errors.Is(err, unix.EISDIR) && !errors.Is(err, unix.EPERM) {
+			t.Fatalf("missing unlink failure: %v", err)
+		}
+		if !strings.Contains(err.Error(), "settings changed before replacement") {
+			t.Fatalf("missing conflict: %v", err)
+		}
+		checkContents(t, path, editor)
+	})
+}
 
 func TestDestinationSpelling(t *testing.T) {
 	tests := map[string]struct{ write func(string) error }{"state writer": {func(path string) error { return WriteFile(path, []byte(newState), 0o600) }}, "settings writer": {func(path string) error {
