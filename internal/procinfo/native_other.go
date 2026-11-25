@@ -16,11 +16,16 @@
 
 package procinfo
 
-import "context"
+import (
+	"context"
+	"time"
+)
+
+func nativeBirth(context.Context, int) (time.Time, error) { return time.Time{}, ErrUnsupported }
 
 func nativeExistence(context.Context, int) error            { return ErrUnsupported }
 func nativeIdentity(context.Context, int) (Identity, error) { return Identity{}, ErrUnsupported }
 func nativeTable(context.Context) ([]Identity, error)       { return nil, ErrUnsupported }
-func nativeSockets(context.Context, uint16) ([]socketEvidence, error) {
-	return nil, ErrUnsupported
+func nativeListener(context.Context, uint16) (Listener, error) {
+	return Listener{State: ListenerUnknown}, ErrUnsupported
 }

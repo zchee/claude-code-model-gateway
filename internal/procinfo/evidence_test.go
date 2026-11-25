@@ -124,34 +124,34 @@ func TestProcArgsBoundaries(t *testing.T) {
 	}
 }
 
-func TestNetstatLayout(t *testing.T) {
-	const hdr = "Proto Recv-Q Send-Q Local Address Foreign Address (state)\n"
-	tests := map[string]struct {
-		text  string
-		count int
-		err   error
-	}{"success: known header and no rows": {text: hdr}, "success: listen and established": {text: hdr + "tcp4 0 0 127.0.0.1.27000 *.* LISTEN\ntcp6 0 3 ::1.27000 ::1.27001 ESTABLISHED", count: 1}, "error: unknown header": {text: "another table", err: ErrUnknown}, "error: unknown state": {text: hdr + "tcp4 0 0 *.27000 *.* FUTURE", err: ErrUnknown}, "error: truncated row": {text: hdr + "tcp6 0", err: ErrUnknown}}
-	for name, tt := range tests {
-		t.Run(name, func(t *testing.T) {
-			got, err := countTCPListeners([]byte(tt.text), 27000)
-			if got != tt.count || !errors.Is(err, tt.err) {
-				t.Errorf("got %d,%v want %d,%v", got, err, tt.count, tt.err)
-			}
-		})
-	}
-}
-
 func TestListenerFiles(t *testing.T) {
-	const first = "p17\x00\nf5\x00d0x12\x00\n"
+	const first = "p17\x00\nf3\x00d0x12\x00\n"
+	const second = "p18\x00\nf4\x00d0x13\x00\n"
+	unique := Listener{ListenerIdentified, 17}
+	ambiguous := Listener{State: ListenerAmbiguous}
+	unknown := Listener{State: ListenerUnknown}
 	tests := map[string]struct {
-		text  string
-		count int
-		want  Listener
-	}{"success: same holder two sockets": {first + "f6\x00d0x13\x00\n", 2, Listener{ListenerIdentified, 17}}, "success: inherited socket": {first + "p18\x00\nf4\x00d0x12\x00\n", 1, Listener{State: ListenerAmbiguous}}, "success: duplicate descriptors leave one hidden socket": {first + "f6\x00d0x12\x00\n", 2, Listener{State: ListenerAmbiguous}}, "error: incomplete identifier": {first + "f9\x00\n", 2, Listener{State: ListenerUnknown}}, "error: truncated output": {strings.TrimSuffix(first, "\x00\n"), 1, Listener{State: ListenerUnknown}}}
+		text   string
+		status int
+		want   Listener
+	}{
+		"success: one visible holder":                  {first, 0, unique},
+		"success: same pid duplicate descriptor":       {first + "f4\x00d0x12\x00\n", 0, unique},
+		"success: same holder two sockets":             {first + "f4\x00d0x13\x00\n", 0, unique},
+		"success: different sockets different holders": {first + second, 0, ambiguous},
+		"success: shared descriptor":                   {first + "p18\x00\nf3\x00d0x12\x00\n", 0, ambiguous},
+		"success: clean no match":                      {"", 1, Listener{State: ListenerAbsent}},
+		"error: empty success":                         {"", 0, unknown}, "error: partial output": {first, 1, unknown}, "error: other exit status": {"", 2, unknown},
+		"error: truncated output": {strings.TrimSuffix(first, "\x00\n"), 0, unknown}, "error: incomplete device": {first + "f5\x00\n", 0, unknown},
+		"error: malformed after ambiguous": {first + second + "bad\x00\n", 0, unknown},
+	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			rows, err := listenerFiles([]byte(tt.text), 27000, tt.count)
-			if d := gocmp.Diff(tt.want, classifyListener(rows, err, 27000)); d != "" {
+			got, err := lsofListener([]byte(tt.text), tt.status)
+			if errors.Is(err, ErrUnknown) != (tt.want.State == ListenerUnknown) {
+				t.Fatalf("state=%s err=%v", got.State, err)
+			}
+			if d := gocmp.Diff(tt.want, got); d != "" {
 				t.Fatal(d)
 			}
 		})

@@ -18,7 +18,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"testing"
 
 	gocmp "github.com/google/go-cmp/cmp"
@@ -50,20 +49,21 @@ func TestDarwinMappedVnodeOutput(t *testing.T) {
 }
 
 func TestDarwinSocketToolOutput(t *testing.T) {
-	if _, err := countTCPListeners(nil, 27000); !errors.Is(err, ErrUnknown) || !strings.Contains(err.Error(), "no TCP table header") {
-		t.Fatalf("empty successful netstat output: %v", err)
-	}
-	rows, err := listenerFiles([]byte("p701\x00\nf3\x00d0x1020304050607080\x00\n"), 27000, 1)
-	if got := classifyListener(rows, err, 27000); got != (Listener{ListenerIdentified, 701}) {
+	got, err := lsofListener([]byte("p701\x00\nf3\x00d0x1020304050607080\x00\n"), 0)
+	if got != (Listener{ListenerIdentified, 701}) || err != nil {
 		t.Fatalf("lsof device-character record: %+v err=%v", got, err)
 	}
 }
 
 func TestDarwinCommandDiagnostic(t *testing.T) {
-	tests := map[string]struct{ stderr, want string }{"success: clean": {}, "error: first warning only": {"lsof: WARNING: cannot stat unrelated volume\nOutput information may be incomplete.\n", `, stderr "lsof: WARNING: cannot stat unrelated volume"`}, "error: escaped terminal control": {"failure\x1b\nprivate second line", `, stderr "failure\x1b"`}}
+	tests := map[string]struct{ stderr, want string }{"success: clean": {}, "error: raw marker and controls are discarded": {"private-marker\n\x1b", ", stderr present (16 bytes)"}}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			if got := commandDiagnostic([]byte(tt.stderr)); got != tt.want {
+			var s stderrSize
+			if n, err := s.Write([]byte(tt.stderr)); n != len(tt.stderr) || err != nil {
+				t.Fatal("stderr not fully consumed")
+			}
+			if got := s.diagnostic(); got != tt.want {
 				t.Fatalf("got %q, want %q", got, tt.want)
 			}
 		})
@@ -71,7 +71,7 @@ func TestDarwinCommandDiagnostic(t *testing.T) {
 }
 
 func TestListenerFailureDetail(t *testing.T) {
-	cause := errors.New("decode netstat TCP table: no header")
+	cause := errors.New("lsof listener warning")
 	p := Probe{sockets: func(context.Context) ([]socketEvidence, error) { return nil, cause }}
 	got, err := p.ListenerEvidence(t.Context(), 27123)
 	if got.State != ListenerUnknown || !errors.Is(err, cause) {

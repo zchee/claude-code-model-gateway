@@ -27,8 +27,33 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shirou/gopsutil/v4/common"
 	"golang.org/x/sys/unix"
 )
+
+func TestBirthReadsOnlyStat(t *testing.T) {
+	pid := os.Getpid()
+	root := t.TempDir()
+	dir := filepath.Join(root, strconv.Itoa(pid))
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	putFile(t, filepath.Join(root, "stat"), "btime 1000\n")
+	stat := filepath.Join(dir, "stat")
+	putFile(t, stat, strconv.Itoa(pid)+" (worker) S 1"+strings.Repeat(" 0", 18))
+	ctx := context.WithValue(t.Context(), common.EnvKey, common.EnvMap{common.HostProcEnvKey: root})
+	p := Probe{}
+	got, err := p.Birth(ctx, pid)
+	if err != nil || !got.Equal(time.Unix(1000, 0)) {
+		t.Fatalf("kernel birth without argv/executable: %s, %v", got, err)
+	}
+	if err := os.Remove(stat); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Birth(ctx, pid); !errors.Is(err, ErrUnknown) || errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("lost record for live pid: %v", err)
+	}
+}
 
 func TestOnlyVisibleHolder(t *testing.T) {
 	l := listenerOn(t, net.ListenConfig{}, "127.0.0.1", 0)

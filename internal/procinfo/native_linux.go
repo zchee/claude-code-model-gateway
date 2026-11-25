@@ -76,17 +76,7 @@ func readAt(dir *os.File, name string) ([]byte, error) {
 	return io.ReadAll(f)
 }
 
-func (c procClock) inspect(root string, pid int, withImage bool) (Identity, error) {
-	// A held proc directory refers to this process, even if its pid is reused.
-	dir, err := os.Open(filepath.Join(root, strconv.Itoa(pid)))
-	if err != nil {
-		return Identity{}, err
-	}
-	defer func() { _ = dir.Close() }()
-	stat, err := readAt(dir, "stat")
-	if err != nil {
-		return Identity{}, err
-	}
+func (c procClock) processStat(pid int, stat []byte) (Identity, error) {
 	_, fields, ok := strings.CutLast(string(stat), ") ")
 	cols := strings.Fields(fields)
 	if !ok || len(cols) < 20 {
@@ -100,7 +90,38 @@ func (c procClock) inspect(root string, pid int, withImage bool) (Identity, erro
 	if err != nil || start < 0 {
 		return Identity{}, ErrUnknown
 	}
-	id := Identity{PID: pid, ParentPID: ppid, Birth: time.Unix(c.boot+start/c.ticks, (start%c.ticks)*int64(time.Second)/c.ticks)}
+	return Identity{PID: pid, ParentPID: ppid, Birth: time.Unix(c.boot+start/c.ticks, (start%c.ticks)*int64(time.Second)/c.ticks)}, nil
+}
+
+func nativeBirth(ctx context.Context, pid int) (time.Time, error) {
+	root := procRoot(ctx)
+	clock, err := readClock(root)
+	if err != nil {
+		return time.Time{}, err
+	}
+	stat, err := os.ReadFile(filepath.Join(root, strconv.Itoa(pid), "stat"))
+	if err != nil {
+		return time.Time{}, err
+	}
+	id, err := clock.processStat(pid, stat)
+	return id.Birth, err
+}
+
+func (c procClock) inspect(root string, pid int, withImage bool) (Identity, error) {
+	// A held proc directory refers to this process, even if its pid is reused.
+	dir, err := os.Open(filepath.Join(root, strconv.Itoa(pid)))
+	if err != nil {
+		return Identity{}, err
+	}
+	defer func() { _ = dir.Close() }()
+	stat, err := readAt(dir, "stat")
+	if err != nil {
+		return Identity{}, err
+	}
+	id, err := c.processStat(pid, stat)
+	if err != nil {
+		return Identity{}, err
+	}
 	cmd, err := readAt(dir, "cmdline")
 	if err != nil {
 		return Identity{}, err
@@ -211,8 +232,9 @@ func listeningInodes(root string, port uint16) ([]uint64, error) {
 	return inodes, nil
 }
 
-func nativeSockets(ctx context.Context, port uint16) ([]socketEvidence, error) {
-	return stableSocketHolders(ctx, procRoot(ctx), port, nil, listeningInodes)
+func nativeListener(ctx context.Context, port uint16) (Listener, error) {
+	rows, err := stableSocketHolders(ctx, procRoot(ctx), port, nil, listeningInodes)
+	return classifyListener(rows, err, port), err
 }
 
 func stableSocketHolders(ctx context.Context, root string, port uint16, changed func(), read func(string, uint16) ([]uint64, error)) ([]socketEvidence, error) {

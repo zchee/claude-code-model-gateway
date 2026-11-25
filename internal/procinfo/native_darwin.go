@@ -55,7 +55,8 @@ func signalCommandGroup(group int, signal unix.Signal) error {
 		return err
 	}
 	// XNU killpg1 skips SZOMB members and returns EPERM when none can be
-	// signaled. Accept that only if the complete group is our unreaped zombie.
+	// signaled. Recheck with a fresh kernel census, not an atomic observation
+	// of the preceding signal. Require our unreaped zombie to be its only member.
 	pid := -group
 	members, queryErr := unix.SysctlKinfoProcSlice("kern.proc.pgrp", pid)
 	if queryErr != nil {
@@ -117,6 +118,17 @@ func nativeTable(ctx context.Context) ([]Identity, error) {
 	return rows, nil
 }
 
+func nativeBirth(_ context.Context, pid int) (time.Time, error) {
+	info, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("kern.proc.pid: %w", err)
+	}
+	if int(info.Proc.P_pid) != pid || info.Proc.P_starttime.Sec <= 0 {
+		return time.Time{}, ErrUnknown
+	}
+	return darwinRow(info).Birth, nil
+}
+
 func nativeIdentity(ctx context.Context, pid int) (Identity, error) {
 	info, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
 	if err != nil {
@@ -163,29 +175,17 @@ func nativeIdentity(ctx context.Context, pid int) (Identity, error) {
 	return id, nil
 }
 
-func nativeSockets(ctx context.Context, port uint16) ([]socketEvidence, error) {
-	// lsof reports descriptors visible to this user, not every kernel socket.
-	// Cross-check the listening rows before calling a port vacant or uniquely owned.
-	out, err := darwinCommand(ctx, "/usr/sbin/netstat", "-an", "-p", "tcp")
+func nativeListener(ctx context.Context, port uint16) (Listener, error) {
+	out, err := darwinCommand(ctx, "/usr/sbin/lsof", "+w", "-nP", "-iTCP:"+strconv.Itoa(int(port)), "-sTCP:LISTEN", "-F0pfd")
 	if err != nil {
-		return nil, err
-	}
-	count, err := countTCPListeners(out, port)
-	if err != nil {
-		return nil, fmt.Errorf("decode netstat TCP table (status 0, %d bytes): %w", len(out), err)
-	}
-	if count == 0 {
-		return nil, nil
-	}
-	out, err = darwinCommand(ctx, "/usr/sbin/lsof", "+w", "-nP", "-iTCP:"+strconv.Itoa(int(port)), "-sTCP:LISTEN", "-F0pfd")
-	if err != nil {
-		if e, ok := errors.AsType[*exec.ExitError](err); !ok || e.ExitCode() != 1 || len(out) != 0 {
-			return nil, err
+		if errors.Is(err, context.DeadlineExceeded) {
+			return Listener{State: ListenerTimedOut}, err
 		}
+		e, ok := errors.AsType[*exec.ExitError](err)
+		if !ok {
+			return Listener{State: ListenerUnknown}, err
+		}
+		return lsofListener(out, e.ExitCode())
 	}
-	rows, err := listenerFiles(out, port, count)
-	if err != nil {
-		return nil, fmt.Errorf("decode lsof listener fields (%d bytes, %d kernel sockets): %w", len(out), count, err)
-	}
-	return rows, nil
+	return lsofListener(out, 0)
 }

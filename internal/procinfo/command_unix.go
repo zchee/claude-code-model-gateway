@@ -52,7 +52,8 @@ func darwinCommand(ctx context.Context, path string, args ...string) ([]byte, er
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = 100 * time.Millisecond
 	cmd.Env = []string{"LC_ALL=C", "PATH=/usr/bin:/bin:/usr/sbin:/sbin"}
-	var stdout, stderr bytes.Buffer
+	var stdout bytes.Buffer
+	var stderr stderrSize
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	tool := filepath.Base(path)
 	if err := cmd.Start(); err != nil {
@@ -62,7 +63,7 @@ func darwinCommand(ctx context.Context, path string, args ...string) ([]byte, er
 	cleanupErr := group.stop(ctx, cmd.Process.Pid)
 	waitErr := cmd.Wait()
 	status := cmd.ProcessState.ExitCode()
-	diagnostic := commandDiagnostic(stderr.Bytes())
+	diagnostic := stderr.diagnostic()
 	if cleanupErr != nil {
 		return nil, fmt.Errorf("%s cleanup (status %d%s): %w", tool, status, diagnostic, cleanupErr)
 	}

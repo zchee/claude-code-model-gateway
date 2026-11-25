@@ -22,14 +22,20 @@ import (
 	"strings"
 )
 
-// commandDiagnostic includes only a bounded, quoted first stderr line, never
-// the probe's arguments, environment, or stdout (which may contain other pids).
-func commandDiagnostic(stderr []byte) string {
-	if len(stderr) == 0 {
+// stderrSize counts and discards tool diagnostics. Even the first line can
+// contain names from unrelated mounts or processes; retain no bytes.
+type stderrSize uint64
+
+func (s *stderrSize) Write(data []byte) (int, error) {
+	*s += stderrSize(len(data))
+	return len(data), nil
+}
+
+func (s stderrSize) diagnostic() string {
+	if s == 0 {
 		return ""
 	}
-	line, _, _ := bytes.Cut(stderr, []byte{'\n'})
-	return fmt.Sprintf(", stderr %q", line[:min(len(line), 256)])
+	return fmt.Sprintf(", stderr present (%d bytes)", s)
 }
 
 // decodeProcArgs reads the 64-bit XNU kern.procargs2 layout. XNU aligns the
@@ -140,142 +146,56 @@ func mappedImage(out []byte, pid int, path string) (Image, error) {
 	return match, nil
 }
 
-func countTCPListeners(out []byte, port uint16) (int, error) {
-	var header bool
-	count := 0
-	for line := range strings.SplitSeq(string(out), "\n") {
-		f := strings.Fields(line)
-		if len(f) == 0 {
-			continue
-		}
-		if !header {
-			switch strings.Join(f, " ") {
-			case "Active Internet connections (including servers)":
-				continue
-			case "Proto Recv-Q Send-Q Local Address Foreign Address (state)":
-				header = true
-				continue
-			default:
-				return 0, ErrUnknown
-			}
-		}
-		if len(f) != 6 {
-			return 0, ErrUnknown
-		}
-		switch f[0] {
-		case "tcp4", "tcp6", "tcp46":
-		default:
-			return 0, ErrUnknown
-		}
-		for _, q := range f[1:3] {
-			if _, err := strconv.ParseUint(q, 10, 64); err != nil {
-				return 0, ErrUnknown
-			}
-		}
-		_, suffix, ok := strings.CutLast(f[3], ".")
-		if !ok {
-			return 0, ErrUnknown
-		}
-		var local uint64
-		if suffix != "*" {
-			var err error
-			local, err = strconv.ParseUint(suffix, 10, 16)
-			if err != nil {
-				return 0, ErrUnknown
-			}
-		}
-		switch f[5] {
-		case "LISTEN":
-			if local == 0 {
-				return 0, ErrUnknown
-			}
-			if uint16(local) == port {
-				count++
-			}
-		case "CLOSED", "SYN_SENT", "SYN_RCVD", "ESTABLISHED", "CLOSE_WAIT", "FIN_WAIT_1", "CLOSING", "LAST_ACK", "FIN_WAIT_2", "TIME_WAIT":
-		default:
-			return 0, ErrUnknown
-		}
+// lsofListener decodes a stderr-free listing filtered to one TCP listening port.
+// Validate every process and file set before interpreting any ownership evidence.
+func lsofListener(out []byte, status int) (Listener, error) {
+	unknown := Listener{State: ListenerUnknown}
+	if status == 1 && len(out) == 0 {
+		return Listener{State: ListenerAbsent}, nil
 	}
-	if !header {
-		return 0, fmt.Errorf("no TCP table header: %w", ErrUnknown)
+	if status != 0 {
+		return unknown, fmt.Errorf("lsof listener status %d: %w", status, ErrUnknown)
 	}
-	return count, nil
-}
-
-// listenerFiles joins visible descriptors by the kernel socket identifier in
-// lsof's device character field. Count includes sockets whose holders are hidden.
-func listenerFiles(out []byte, port uint16, count int) ([]socketEvidence, error) {
-	rows := make([]socketEvidence, count)
-	for i := range rows {
-		rows[i] = socketEvidence{port: port, listening: true}
+	records, ok := strings.CutSuffix(string(out), "\x00\n")
+	if !ok {
+		return unknown, fmt.Errorf("incomplete lsof listener listing: %w", ErrUnknown)
 	}
-	if len(out) == 0 {
-		return rows, nil
-	}
-	indices := make(map[uint64]int)
-	var pid int
-	var file, device, listed bool
-	// Field mode terminates each field with NUL and each process/file set with LF.
-	if !bytes.HasSuffix(out, []byte{0, '\n'}) {
-		return nil, ErrUnknown
-	}
-	for field := range bytes.SplitSeq(out, []byte{0}) {
-		field = bytes.TrimPrefix(field, []byte{'\n'})
-		if len(field) == 0 {
-			continue
-		}
-		data := string(field[1:])
-		switch field[0] {
-		case 'p':
-			if file && !device || pid != 0 && !listed {
-				return nil, ErrUnknown
-			}
-			n, err := strconv.ParseInt(data, 10, 32)
-			if err != nil || n <= 0 {
-				return nil, ErrUnknown
+	var pid, owner int
+	var listed, ambiguous bool
+	for record := range strings.SplitSeq(records, "\x00\n") {
+		if val, ok := strings.CutPrefix(record, "p"); ok {
+			n, err := strconv.ParseUint(val, 10, 31)
+			if err != nil || n == 0 || pid != 0 && !listed {
+				return unknown, fmt.Errorf("invalid lsof process set: %w", ErrUnknown)
 			}
 			pid = int(n)
-			file = false
 			listed = false
-		case 'f':
-			if pid == 0 || file && !device {
-				return nil, ErrUnknown
-			}
-			if _, err := strconv.ParseUint(data, 10, 32); err != nil {
-				return nil, ErrUnknown
-			}
-			file = true
-			device = false
-			listed = true
-		case 'd':
-			if !file || device {
-				return nil, ErrUnknown
-			}
-			v, ok := strings.CutPrefix(data, "0x")
-			if !ok {
-				return nil, ErrUnknown
-			}
-			key, err := strconv.ParseUint(v, 16, 64)
-			if err != nil || key == 0 {
-				return nil, ErrUnknown
-			}
-			i, ok := indices[key]
-			if !ok {
-				i = len(indices)
-				if i >= count {
-					return nil, ErrUnknown
-				}
-				indices[key] = i
-			}
-			rows[i].owners = append(rows[i].owners, pid)
-			device = true
-		default:
-			return nil, ErrUnknown
+			continue
 		}
+		fd, dev, ok := strings.Cut(record, "\x00d0x")
+		fd, hasFD := strings.CutPrefix(fd, "f")
+		if !ok || !hasFD || pid == 0 {
+			return unknown, fmt.Errorf("invalid lsof file set: %w", ErrUnknown)
+		}
+		if _, err := strconv.ParseUint(fd, 10, 32); err != nil {
+			return unknown, fmt.Errorf("invalid lsof descriptor: %w", ErrUnknown)
+		}
+		socket, err := strconv.ParseUint(dev, 16, 64)
+		if err != nil || socket == 0 {
+			return unknown, fmt.Errorf("invalid lsof socket identifier: %w", ErrUnknown)
+		}
+		if owner == 0 {
+			owner = pid
+		} else if owner != pid {
+			ambiguous = true
+		}
+		listed = true
 	}
-	if !file || !device {
-		return nil, ErrUnknown
+	if !listed {
+		return unknown, fmt.Errorf("lsof process has no file set: %w", ErrUnknown)
 	}
-	return rows, nil
+	if ambiguous {
+		return Listener{State: ListenerAmbiguous}, nil
+	}
+	return Listener{State: ListenerIdentified, PID: owner}, nil
 }

@@ -15,7 +15,8 @@
 // Package procinfo supplies process and listener evidence to the supervisor.
 // An identified listener has one holder visible to this user. A process whose
 // descriptors are unreadable may share its socket; ownership evidence alone
-// is never authority to signal a process.
+// is never authority to signal a process. Linux reads the kernel's TCP tables
+// from procfs; macOS can observe only the holders visible to lsof for this user.
 package procinfo
 
 import (
@@ -103,21 +104,44 @@ func (p Probe) Identity(ctx context.Context, pid int) (Identity, error) {
 	if err == nil && ctx.Err() == nil && id.PID == pid && id.ParentPID >= 0 && !id.Birth.IsZero() && len(id.Argv) > 0 && id.Argv[0] != "" {
 		return id, nil
 	}
+	return Identity{}, p.inspectionError(ctx, pid, err)
+}
+
+// Birth returns the kernel's process birth time without inspecting argv or the
+// executable. It uses Identity's budget and absence rules; as with Identity,
+// an in-progress kernel read may not be interruptible.
+func (p Probe) Birth(ctx context.Context, pid int) (time.Time, error) {
+	if pid <= 0 || pid > math.MaxInt32 {
+		return time.Time{}, os.ErrNotExist
+	}
+	ctx, cancel := context.WithTimeout(ctx, p.timeout(runtime.GOOS))
+	defer cancel()
+	if ctx.Err() != nil {
+		return time.Time{}, p.inspectionError(ctx, pid, nil)
+	}
+	birth, err := nativeBirth(ctx, pid)
+	if err == nil && ctx.Err() == nil && !birth.IsZero() {
+		return birth, nil
+	}
+	return time.Time{}, p.inspectionError(ctx, pid, err)
+}
+
+func (p Probe) inspectionError(ctx context.Context, pid int, err error) error {
 	if errors.Is(err, ErrUnsupported) {
-		return Identity{}, err
+		return err
 	}
 	if alive, checkErr := p.Alive(ctx, pid); checkErr == nil && !alive {
-		return Identity{}, os.ErrNotExist
+		return os.ErrNotExist
 	}
 	if err != nil {
 		// Inspection can fail with ENOENT for a still-live process. Keep the
 		// diagnostic, but do not expose it as proof that the PID is absent.
-		return Identity{}, fmt.Errorf("%w: pid %d: %s", ErrUnknown, pid, err.Error())
+		return fmt.Errorf("%w: pid %d: %s", ErrUnknown, pid, err.Error())
 	}
 	if err := ctx.Err(); err != nil {
-		return Identity{}, fmt.Errorf("%w: pid %d: %w", ErrUnknown, pid, err)
+		return fmt.Errorf("%w: pid %d: %w", ErrUnknown, pid, err)
 	}
-	return Identity{}, fmt.Errorf("%w: pid %d: incomplete process sample", ErrUnknown, pid)
+	return fmt.Errorf("%w: pid %d: incomplete process sample", ErrUnknown, pid)
 }
 
 // Table returns a snapshot keyed by pid, or no table when the query fails.
@@ -169,7 +193,9 @@ func (p Probe) Alive(ctx context.Context, pid int) (bool, error) {
 	}
 }
 
-// Listener describes evidence for a TCP listening port; PID is nonzero only for a unique owner.
+// Listener describes evidence for a TCP listening port; PID identifies a visible holder.
+// On macOS ListenerAbsent means no listener visible to this user. A listener
+// owned by another user may exist; a caller that needs the port must bind it.
 type Listener struct {
 	State ListenerState
 	PID   int
@@ -193,8 +219,7 @@ const (
 // Identified means the only holder visible to this user, not authority to signal.
 // A deadline abandons this call's worker; it cannot interrupt a stuck kernel read.
 // New probes refuse another query as unknown until that worker finishes. The zero
-// value has no admission limit. On macOS the kernel count and visible holders are
-// separate observations, so their combination is best-effort evidence.
+// value has no admission limit.
 func (p Probe) Listener(ctx context.Context, port uint16) Listener {
 	result, _ := p.ListenerEvidence(ctx, port)
 	return result
@@ -221,14 +246,15 @@ func (p Probe) ListenerEvidence(ctx context.Context, port uint16) (Listener, err
 	}
 	done := make(chan observation, 1)
 	go func() {
-		var rows []socketEvidence
+		var result Listener
 		var err error
 		if p.sockets == nil {
-			rows, err = nativeSockets(ctx, port)
+			result, err = nativeListener(ctx, port)
 		} else {
+			var rows []socketEvidence
 			rows, err = p.sockets(ctx)
+			result = classifyListener(rows, err, port)
 		}
-		result := classifyListener(rows, err, port)
 		if p.listenerBusy != nil {
 			p.listenerBusy.Store(false)
 		}
@@ -298,6 +324,7 @@ func (p Probe) timeout(goos string) time.Duration {
 func LegacyStart(birth time.Time) string { return birth.Format(time.ANSIC) }
 
 // Record is the authoritative on-disk process identity for one instance and role.
+// The file is requested with mode 0600; the creation mask may only remove bits.
 // StartedAt is legacy local wall time at whole-second precision. On Linux a
 // clock step can change the boot wall clock from which it is computed.
 type Record struct {
