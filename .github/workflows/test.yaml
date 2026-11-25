@@ -1,0 +1,51 @@
+name: Build and lint
+
+on:
+  push:
+    branches:
+      - main
+      - 'port/**'
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-26.04
+          - xcode-27
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install pinned tools
+        run: make tools
+      - name: Build, vet, and check formatting
+        run: make build vet fmt-check
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          # Use the version installed by make tools rather than a second pin.
+          install-mode: none
+      - name: Lint with the process tag
+        uses: golangci/golangci-lint-action@v9
+        with:
+          install-mode: none
+          args: --build-tags process
+          skip-cache: true
+          verify: false
+      - name: Cross-compile for Windows
+        if: matrix.runner == 'ubuntu-26.04'
+        run: GOOS=windows GOARCH=amd64 go build ./...
