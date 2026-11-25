@@ -17,6 +17,7 @@
 package wiring_test
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"os"
@@ -25,41 +26,58 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/zchee/claude-code-model-gateway/internal/gatewaytest"
 	"github.com/zchee/claude-code-model-gateway/internal/paths"
 	"github.com/zchee/claude-code-model-gateway/internal/wiring"
 )
 
-func TestAtomicProjectRegistry(t *testing.T) {
-	const marker = "--interrupt-registry-write"
-	const interrupted = 47
-	if len(os.Args) >= 4 && os.Args[len(os.Args)-3] == marker {
-		home, project := os.Args[len(os.Args)-2], os.Args[len(os.Args)-1]
-		lookup := func(k string) (string, bool) {
-			if k == "CODEX_GATEWAY_PORT" {
-				return "49123", true
-			}
-			return "", false
-		}
-		store := wiring.Store{Paths: paths.New(lookup, func() (string, error) { return home, nil }, func() (string, error) { return project, nil }), Project: project, Lookup: lookup}
-		// Allow the first bytes to reach disk. The kernel interrupts the next write to a regular file.
-		signal.Ignore(syscall.SIGXFSZ)
-		check(t, syscall.Setrlimit(syscall.RLIMIT_FSIZE, &syscall.Rlimit{Cur: 32, Max: 32}))
-		err := store.RecordProject()
-		if errors.Is(err, syscall.EFBIG) || errors.Is(err, io.ErrShortWrite) {
-			os.Exit(interrupted)
-		}
+const (
+	registryHelper      = "interrupt-registry-write"
+	registryInterrupted = 47
+	registryMarker      = "registry write hit the file size limit\n"
+)
+
+func TestGatewayFixtureHelper(t *testing.T) {
+	gatewaytest.DispatchHelper(t, map[string]gatewaytest.HelperFunc{registryHelper: interruptRegistryWrite})
+}
+
+func interruptRegistryWrite(t testing.TB, args []string) {
+	if len(args) != 1 {
+		t.Fatalf("expected project directory, got %q", args)
+	}
+	project := args[0]
+	// The guarded launcher provides HOME and the test gateway port without inheriting the parent environment.
+	store := wiring.Store{Paths: paths.New(os.LookupEnv, nil, func() (string, error) { return project, nil }), Project: project, Lookup: os.LookupEnv}
+	// Ignore the signal so the writer must report the kernel's error, not just die during the write.
+	signal.Ignore(syscall.SIGXFSZ)
+	if err := syscall.Setrlimit(syscall.RLIMIT_FSIZE, &syscall.Rlimit{Cur: 32, Max: 32}); err != nil {
+		t.Fatal(err)
+	}
+	err := store.RecordProject()
+	if !errors.Is(err, syscall.EFBIG) && !errors.Is(err, io.ErrShortWrite) {
 		t.Fatalf("expected the registry writer to encounter the file size limit, got %v", err)
 	}
+	if _, err := io.WriteString(os.Stdout, registryMarker); err != nil {
+		t.Fatal(err)
+	}
+	os.Exit(registryInterrupted)
+}
+
+func TestAtomicProjectRegistry(t *testing.T) {
 	f := sandbox(t)
 	putEnv(t, f.local, map[string]any{base: direct})
 	const old = "{\"projects\":[]}\n"
 	put(t, f.registry, old)
-	exe, err := os.Executable()
+	env := gatewaytest.NewEnv(f.home, nil, nil, f.env)
+	cmd, err := env.HelperCommand(t, registryHelper, f.Project)
 	check(t, err)
-	output, err := exec.CommandContext(t.Context(), exe, "-test.run=^TestAtomicProjectRegistry$", "--", marker, f.home, f.Project).CombinedOutput()
-	if exit, ok := errors.AsType[*exec.ExitError](err); !ok || exit.ExitCode() != interrupted {
-		t.Fatalf("writer did not encounter the interruption: %v: %s", err, output)
+	var output bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &output, &output
+	err = env.RunFixture(cmd)
+	if exit, ok := errors.AsType[*exec.ExitError](err); !ok || exit.ExitCode() != registryInterrupted {
+		t.Fatalf("writer did not encounter the interruption: %v: %s", err, output.String())
 	}
+	equal(t, registryMarker, output.String())
 	equal(t, old, text(t, f.registry))
 	prior, err := os.Open(f.registry)
 	check(t, err)
