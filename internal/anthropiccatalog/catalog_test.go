@@ -17,6 +17,7 @@ package anthropiccatalog_test
 import (
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -25,6 +26,7 @@ import (
 	gocmp "github.com/google/go-cmp/cmp"
 
 	"github.com/zchee/claude-code-model-gateway/internal/anthropiccatalog"
+	"github.com/zchee/claude-code-model-gateway/internal/config"
 	"github.com/zchee/claude-code-model-gateway/internal/policy"
 	"github.com/zchee/claude-code-model-gateway/internal/venue"
 )
@@ -64,7 +66,7 @@ func TestPrevious(t *testing.T) {
 			"[" + previous + "]",
 		},
 		"success: replace stale row keep other models": {
-			`[{"id":"claude-fable-5-1[1m]","display_name":"Claude Fable 5.1"},` + codex + `]`,
+			"[" + codex + `,{"id":"claude-fable-5-1[1m]","display_name":"Claude Fable 5.1"}]`,
 			server,
 			"[" + previous + "," + codex + "]",
 		},
@@ -99,24 +101,26 @@ func TestWithCached(t *testing.T) {
 			"[" + cached + "," + cached + "," + other + "," + other + "]",
 		},
 		"success: compare after advertising ids": {
-			`[{"id":"claude-gpt-6-astra[1m]"}]`,
+			`[{"id":"claude-gpt-6-astra[1m]","display_name":"large"},{"id":"claude-gpt-6-astra"}]`,
 			`[{"id":"claude-gpt-6-astra","display_name":"upstream"}]`,
-			`[{"id":"claude-gpt-6-astra[1m]","display_name":"upstream"}]`,
+			`[{"id":"claude-gpt-6-astra[1m]","display_name":"upstream"},{"id":"claude-gpt-6-astra"}]`,
 		},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			checkJSON(
-				t,
-				tt.want,
-				anthropiccatalog.WithCached(
-					jsontext.Value(tt.models),
-					jsontext.Value(tt.rows),
-					policy.Resolver{},
-				),
-			)
+			checkJSON(t, tt.want, anthropiccatalog.WithCached(jsontext.Value(tt.models), jsontext.Value(tt.rows), policy.Resolver{}))
 		})
 	}
+}
+
+func TestWithCachedWindowCap(t *testing.T) {
+	resolver := policy.NewResolver(policy.ResolverInputs{Windows: policy.Windows{
+		"codex": {Value: config.ContextWindow{Tokens: 185000}, Source: "saved"},
+	}})
+	const models = `[{"id":"claude-gpt-6-astra[1m]","display_name":"large"},{"id":"claude-gpt-6-astra"}]`
+	const cachedRows = `[{"id":"claude-gpt-6-astra","display_name":"upstream"}]`
+	const want = `[{"id":"claude-gpt-6-astra","display_name":"upstream"},{"id":"claude-gpt-6-astra[1m]","display_name":"large"}]`
+	checkJSON(t, want, anthropiccatalog.WithCached(jsontext.Value(models), jsontext.Value(cachedRows), resolver))
 }
 
 func TestRead(t *testing.T) {
@@ -134,6 +138,10 @@ func TestRead(t *testing.T) {
 			`{"extra":1,"updatedAt":"0x10","error":"bad","attemptedAt":22,"data":[null,{},` + row + `,{"id":"Claude-a","display_name":"a"},{"id":"claude-a[1m]","display_name":"b"},{"id":"claude-a","display_name":42},{"id":"claude-A","display_name":"UPPER"}]}`,
 			`{"extra":1,"updatedAt":16,"error":"bad","attemptedAt":22,"data":[` + row + `]}`,
 		},
+		"success: drop nonstring id": {
+			`{"data":[{"id":["claude-opus-6"],"display_name":"Array"},` + row + `]}`,
+			`{"data":[` + row + `],"updatedAt":0}`,
+		},
 		"success: invalid time becomes zero": {
 			`{"data":[],"updatedAt":"abc"}`,
 			empty,
@@ -148,7 +156,50 @@ func TestRead(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			checkJSON(t, tt.want, anthropiccatalog.Read(path))
+			checkJSON(t, tt.want, anthropiccatalog.Read(path).Object)
+		})
+	}
+}
+
+func TestCacheFreshness(t *testing.T) {
+	at := time.UnixMilli(3600017)
+	tests := map[string]struct {
+		stamp     string
+		updatedAt float64
+		fresh     bool
+	}{
+		"success: string infinity":        {`"Infinity"`, math.Inf(1), true},
+		"success: overflowing number":     {`1e400`, math.Inf(1), true},
+		"success: last fresh millisecond": {`18`, 18, true},
+		"success: exactly one hour old":   {`17`, 17, false},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "anthropic-models.json")
+			if err := os.WriteFile(path, []byte(`{"data":[],"updatedAt":`+tt.stamp+`}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			snapshot := anthropiccatalog.Read(path)
+			if snapshot.UpdatedAt != tt.updatedAt {
+				t.Errorf("updatedAt = %v, want %v", snapshot.UpdatedAt, tt.updatedAt)
+			}
+			if got := snapshot.Fresh(at); got != tt.fresh {
+				t.Errorf("Fresh = %t, want %t", got, tt.fresh)
+			}
+			if !math.IsInf(tt.updatedAt, 1) {
+				return
+			}
+			if err := anthropiccatalog.WriteFailure(path, snapshot, "failed", at); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			const want = "{\n  \"data\": [],\n  \"updatedAt\": null,\n  \"error\": \"failed\",\n  \"attemptedAt\": 3600017\n}\n"
+			if diff := gocmp.Diff(want, string(data)); diff != "" {
+				t.Errorf("cache bytes (-want +got):\n%s", diff)
+			}
 		})
 	}
 }
@@ -171,26 +222,27 @@ func TestCacheBytes(t *testing.T) {
 `,
 		},
 		"success: failure preserves snapshot fields and their positions": {
-			snapshot: `{"x_before":1,"error":null,"data":[{"id":"claude-old","display_name":"Old"}],"updatedAt":17,"extra":true}`,
+			snapshot: `{"z_before":1,"attemptedAt":9,"error":"old","data":[{"z_last":1,"id":"claude-old","a_first":2,"display_name":"Old"},{"id":"bad","display_name":"drop"}],"updatedAt":"17","a_after":true}`,
 			message:  "upstream HTTP 503",
 			want: `{
-  "x_before": 1,
+  "z_before": 1,
+  "attemptedAt": 12345,
   "error": "upstream HTTP 503",
   "data": [
     {
+      "z_last": 1,
       "id": "claude-old",
+      "a_first": 2,
       "display_name": "Old"
     }
   ],
   "updatedAt": 17,
-  "extra": true,
-  "attemptedAt": 12345
+  "a_after": true
 }
 `,
 		},
 		"success: first failure": {
-			snapshot: `{"data":[],"updatedAt":0}`,
-			message:  "catalog timeout",
+			message: "catalog timeout",
 			want: `{
   "data": [],
   "updatedAt": 0,
@@ -208,12 +260,15 @@ func TestCacheBytes(t *testing.T) {
 			if tt.message == "" {
 				err = anthropiccatalog.WriteSuccess(path, jsontext.Value(tt.rows), at)
 			} else {
-				err = anthropiccatalog.WriteFailure(
-					path,
-					jsontext.Value(tt.snapshot),
-					tt.message,
-					at,
-				)
+				if tt.snapshot != "" {
+					if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(path, []byte(tt.snapshot), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				err = anthropiccatalog.WriteFailure(path, anthropiccatalog.Read(path), tt.message, at)
 			}
 			if err != nil {
 				t.Fatal(err)
@@ -229,8 +284,16 @@ func TestCacheBytes(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := info.Mode().Perm(); got != 0o600 {
-				t.Errorf("permissions = %o, want 600", got)
+			control := filepath.Join(filepath.Dir(path), "mode-reference")
+			if err := os.WriteFile(control, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			reference, err := os.Stat(control)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, want := info.Mode().Perm(), reference.Mode().Perm(); got != want {
+				t.Errorf("permissions = %o, want %o", got, want)
 			}
 		})
 	}

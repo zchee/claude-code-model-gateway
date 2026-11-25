@@ -23,9 +23,19 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/policy"
 )
 
+// Snapshot holds the normalized catalog in member order and its numeric update time.
+// UpdatedAt is in milliseconds and may be infinite even though JSON serializes it as null.
+type Snapshot struct {
+	Object    jsontext.Value
+	UpdatedAt float64
+}
+
+// Fresh reports whether the supplied time is less than one hour after the last update.
+func (Snapshot) Fresh(at time.Time) bool { return false }
+
 // Read returns a normalized cache object, retaining unknown fields and their ordering.
 // A missing or malformed cache supplies empty data and a zero update time.
-func Read(path string) jsontext.Value { return nil }
+func Read(path string) Snapshot { return Snapshot{} }
 
 // WriteSuccess stores valid upstream rows with the supplied refresh time and clears old errors.
 func WriteSuccess(path string, rows jsontext.Value, at time.Time) error {
@@ -33,7 +43,7 @@ func WriteSuccess(path string, rows jsontext.Value, at time.Time) error {
 }
 
 // WriteFailure records the failed attempt against the snapshot that triggered the refresh.
-func WriteFailure(path string, snapshot jsontext.Value, message string, at time.Time) error {
+func WriteFailure(path string, snapshot Snapshot, message string, at time.Time) error {
 	return errors.New("catalog write not implemented")
 }
 

@@ -218,12 +218,12 @@ func TestFollowCatalog(t *testing.T) {
 		"success: filter candidates keep first tie retire previous": {
 			prior,
 			[]pins.Candidate{
+				{ID: "claude-opus-6-9"},
 				{ID: "claude-opus-7"},
 				{ID: "claude-opus-7-0"},
 				{ID: "claude-opus-10", Lifecycle: "deprecated"},
 				{ID: "claude-opus-20", Lifecycle: "retired"},
 				{ID: "claude-opus-8"},
-				{ID: "claude-opus-6-9"},
 				{ID: "claude-opus-5"},
 				{ID: "claude-opus-9-1-20251101"},
 				{ID: "claude-haiku-99"},
@@ -353,6 +353,19 @@ func TestFableOption(t *testing.T) {
 	}
 }
 
+func TestEmptyFamilyDescription(t *testing.T) {
+	in := pins.Inputs{Overrides: map[string]string{"fable": "claude--5"}}
+	const want = "claude--5 · current Fable, through the gateway"
+	for _, entry := range in.PinEnv() {
+		if entry.Key == description {
+			equal(t, want, entry.Value)
+			equal(t, true, in.Owned()[description][want])
+			return
+		}
+	}
+	t.Fatalf("missing %s", description)
+}
+
 func TestEnvBlock(t *testing.T) {
 	tests := map[string]struct{ mode, url string }{
 		"success: default":      {"default", "http://127.0.0.1:31234"},
@@ -427,7 +440,21 @@ func TestStale(t *testing.T) {
 	tests := map[string]struct {
 		env  map[string]any
 		want []pins.Update
-	}{"success: change owned values only": {map[string]any{description: "Fable 5.1 · current Fable, through the gateway", optionName: "mine", option: 32, fableKey: shipped, sonnetKey: "claude-sonnet-5-5[1m]", opusKey: "claude-opus-4-8[1m]", "OTHER": "old"}, []pins.Update{{Key: opusKey, From: "claude-opus-4-8[1m]", To: "claude-opus-5-5[1m]"}, {Key: fableKey, From: shipped, To: catalog}, {Key: description, From: "Fable 5.1 · current Fable, through the gateway", To: "Fable 5.3 · current Fable, through the gateway"}}}, "success: user set values survive": {map[string]any{option: "mine", sonnetKey: shipped}, nil}}
+	}{
+		"success: change owned values only": {
+			env: map[string]any{
+				description: "Fable 5.1 · current Fable, through the gateway",
+				optionName:  "mine", option: 32, fableKey: shipped,
+				sonnetKey: "claude-sonnet-5-5[1m]", opusKey: "claude-opus-4-8[1m]", "OTHER": "old",
+			},
+			want: []pins.Update{
+				{Key: opusKey, From: "claude-opus-4-8[1m]", To: "claude-opus-5-5[1m]"},
+				{Key: fableKey, From: shipped, To: catalog},
+				{Key: description, From: "Fable 5.1 · current Fable, through the gateway", To: "Fable 5.3 · current Fable, through the gateway"},
+			},
+		},
+		"success: user set values survive": {env: map[string]any{option: "mine", sonnetKey: shipped}},
+	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			got := in.Stale(tt.env)

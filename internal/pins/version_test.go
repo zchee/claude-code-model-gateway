@@ -42,6 +42,7 @@ func TestCompare(t *testing.T) {
 		sign          float64
 		ok            bool
 	}{
+		"success: unknown family":      {"claude-NewFamily-4-10", "claude-newfamily-4-9", 1, true},
 		"success: older minor":         {"claude-opus-5-4[1m]", baseline, -1, true},
 		"success: equal":               {baseline, baseline, 0, true},
 		"success: newer major":         {"claude-opus-6-0[1m]", baseline, 1, true},
@@ -162,7 +163,15 @@ func TestValidOverride(t *testing.T) {
 	tests := map[string]struct {
 		value string
 		want  bool
-	}{"success: custom spelling": {"custom:/target@v+1[1m]", true}, "success: whitespace not in ECMAScript": {"a\u0085b", true}, "error: empty": {"", false}, "error: leading space": {" value", false}, "error: trailing space": {"value ", false}, "error: internal whitespace": {"a b", false}, "error: byte order mark": {"a" + string(rune(0xfeff)) + "b", false}}
+	}{
+		"success: custom spelling":              {"custom:/target@v+1[1m]", true},
+		"success: whitespace not in ECMAScript": {"a\u0085b", true},
+		"error: empty":                          {"", false},
+		"error: leading space":                  {" value", false},
+		"error: trailing space":                 {"value ", false},
+		"error: internal whitespace":            {"a b", false},
+		"error: byte order mark":                {"a" + string(rune(0xfeff)) + "b", false},
+	}
 	for _, r := range "\x7f\"'`$\\;&|<>(){}" {
 		tests["error: forbidden "+string(r)] = struct {
 			value string

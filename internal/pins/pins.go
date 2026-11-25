@@ -70,6 +70,7 @@ func (Inputs) PinEnv() []Entry { return nil }
 func (Inputs) EnvBlock(mode, defaultURL string) []Entry { return nil }
 
 // Owned lists values the gateway recognizes under each pin setting key.
+// The sets are unordered; iterate PinEnv for settings order.
 func (Inputs) Owned() map[string]map[string]bool { return nil }
 
 // Update describes one stale gateway-written setting.
