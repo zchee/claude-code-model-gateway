@@ -18,6 +18,8 @@ package gatewaytest
 import (
 	"context"
 	"errors"
+	"net"
+	"os/exec"
 )
 
 var (
@@ -38,17 +40,24 @@ func NewEnv(home string, parent, overrides, isolatedOverrides map[string]string)
 	return nil
 }
 
-// CheckBind reports whether the requested port may be bound.
-func (env Environment) CheckBind(port int) error { return errNotImplemented }
+// RunFixture runs a context-bound command with this exact child environment.
+func (env Environment) RunFixture(cmd *exec.Cmd) error { return errNotImplemented }
 
-// CheckClaude reports whether the selected probe executable may be launched.
-func (env Environment) CheckClaude() error { return errNotImplemented }
+// Listen invokes listen only if the bind is permitted and returns its listener.
+func (env Environment) Listen(ctx context.Context, network, address string, listen func(context.Context, string, string) (net.Listener, error)) (net.Listener, error) {
+	return nil, errNotImplemented
+}
+
+// StartClaude invokes start with the selected executable only if its path is permitted.
+func (env Environment) StartClaude(ctx context.Context, start func(context.Context, string) error) error {
+	return errNotImplemented
+}
 
 // UserSettingsPath resolves the user settings file subject to the product guard.
 func (env Environment) UserSettingsPath() (string, error) { return "", errNotImplemented }
 
-// WriteSettings writes settings through the guarded settings writer.
-func (env Environment) WriteSettings(path string, settings map[string]any) error {
+// WriteSettings invokes write with the supplied settings only if the destination is permitted.
+func (env Environment) WriteSettings(path string, settings map[string]any, write func(string, map[string]any) error) error {
 	return errNotImplemented
 }
 

@@ -47,32 +47,6 @@ func insideDirectory(t *testing.T, root, dir string) {
 	}
 }
 
-func TestThrowawayHome(t *testing.T) {
-	home := t.TempDir()
-	env := gatewaytest.NewEnv(home, map[string]string{"HOME": "/inherited-home", "USERPROFILE": "/inherited-profile"}, nil, nil)
-	t.Run("home", func(t *testing.T) {
-		if env["HOME"] != home || env["USERPROFILE"] != home {
-			t.Errorf("HOME=%q USERPROFILE=%q; want %q", env["HOME"], env["USERPROFILE"], home)
-		}
-		insideDirectory(t, os.TempDir(), env["HOME"])
-	})
-	t.Run("config", func(t *testing.T) {
-		if got, want := env["CLAUDE_CONFIG_DIR"], filepath.Join(home, ".claude"); got != want {
-			t.Errorf("CLAUDE_CONFIG_DIR=%q, want %q", got, want)
-		}
-	})
-}
-
-func TestFixtureClaudeBinary(t *testing.T) {
-	home := t.TempDir()
-	env := gatewaytest.NewEnv(home, map[string]string{"CODEX_GATEWAY_CLAUDE_BIN": "claude"}, nil, nil)
-	bin := env["CODEX_GATEWAY_CLAUDE_BIN"]
-	if bin != filepath.Join(home, "missing-claude") {
-		t.Errorf("probe executable=%q, want the nonexistent fixture executable", bin)
-	}
-	insideDirectory(t, os.TempDir(), filepath.Dir(bin))
-}
-
 func TestFixtureEnvironment(t *testing.T) {
 	home := t.TempDir()
 	want := gatewaytest.Environment{

@@ -15,9 +15,11 @@
 package gatewaytest_test
 
 import (
+	"context"
 	json "encoding/json/v2"
 	"errors"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -28,16 +30,20 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/gatewaytest"
 )
 
+const (
+	sandbox = "MODEL_GATEWAY_TEST_SANDBOX"
+	runner  = "NODE_TEST_CONTEXT"
+)
+
 // Both sides of the boundary belong to the test, even if the guard regresses.
 func guardFixture(t *testing.T, trigger string) (gatewaytest.Environment, string) {
 	t.Helper()
 	root, outside := t.TempDir(), filepath.Join(t.TempDir(), "untouched")
-	env := gatewaytest.Environment{"HOME": root, "USERPROFILE": root}
-	if trigger == "NODE_TEST_CONTEXT" {
-		t.Setenv("TMPDIR", root)
-		env["TMPDIR"], env[trigger] = root, "child"
+	env := gatewaytest.Environment{"HOME": root, "USERPROFILE": root, "TMPDIR": root}
+	if trigger == runner {
+		env[runner] = "child"
 	} else {
-		env[trigger] = root
+		env[sandbox] = root
 	}
 	return env, outside
 }
@@ -50,19 +56,23 @@ func wantAbsent(t *testing.T, path string) {
 }
 
 func TestUserSettingsPath(t *testing.T) {
-	env, _ := guardFixture(t, "MODEL_GATEWAY_TEST_SANDBOX")
-	file, err := env.UserSettingsPath()
-	if err != nil {
-		t.Errorf("UserSettingsPath: %v", err)
+	for _, key := range []string{sandbox, runner} {
+		t.Run(key, func(t *testing.T) {
+			env, _ := guardFixture(t, key)
+			file, err := env.UserSettingsPath()
+			if err != nil {
+				t.Errorf("UserSettingsPath: %v", err)
+			}
+			if want := filepath.Join(env["HOME"], ".claude", "settings.json"); file != want {
+				t.Errorf("settings path=%q, want %q", file, want)
+			}
+			insideDirectory(t, os.TempDir(), filepath.Dir(filepath.Dir(file)))
+		})
 	}
-	if got, want := file, filepath.Join(env["HOME"], ".claude", "settings.json"); got != want {
-		t.Errorf("settings path=%q, want %q", got, want)
-	}
-	insideDirectory(t, os.TempDir(), filepath.Dir(filepath.Dir(file)))
 }
 
 func TestRefuseOutsideUserHome(t *testing.T) {
-	for _, key := range []string{"MODEL_GATEWAY_TEST_SANDBOX", "NODE_TEST_CONTEXT"} {
+	for _, key := range []string{sandbox, runner} {
 		t.Run(key, func(t *testing.T) {
 			env, outside := guardFixture(t, key)
 			env["HOME"], env["USERPROFILE"] = outside, outside
@@ -75,19 +85,19 @@ func TestRefuseOutsideUserHome(t *testing.T) {
 	}
 }
 
+func refusedWrite(env gatewaytest.Environment, path string) (int, error) {
+	calls := 0
+	err := env.WriteSettings(path, map[string]any{"env": map[string]string{"SHOULD_NOT": "land"}}, func(string, map[string]any) error { calls++; return nil })
+	return calls, err
+}
+
 func TestRefuseOutsideSettingsWrite(t *testing.T) {
-	t.Run("fixture_guard_enabled", func(t *testing.T) {
-		home := t.TempDir()
-		if got := gatewaytest.NewEnv(home, nil, nil, nil)["MODEL_GATEWAY_TEST_SANDBOX"]; got != home {
-			t.Errorf("fixture guard=%q, want %q", got, home)
-		}
-	})
-	for _, key := range []string{"MODEL_GATEWAY_TEST_SANDBOX", "NODE_TEST_CONTEXT"} {
+	for _, key := range []string{sandbox, runner} {
 		t.Run(key, func(t *testing.T) {
 			env, outside := guardFixture(t, key)
-			err := env.WriteSettings(filepath.Join(outside, ".claude", "settings.json"), map[string]any{"env": map[string]string{"SHOULD_NOT": "land"}})
-			if !errors.Is(err, gatewaytest.ErrOutsideSandbox) {
-				t.Errorf("WriteSettings: got %v, want ErrOutsideSandbox", err)
+			calls, err := refusedWrite(env, filepath.Join(outside, ".claude", "settings.json"))
+			if !errors.Is(err, gatewaytest.ErrOutsideSandbox) || calls != 0 {
+				t.Errorf("outside write: error=%v calls=%d, want ErrOutsideSandbox and zero calls", err, calls)
 			}
 			wantAbsent(t, outside)
 		})
@@ -95,7 +105,7 @@ func TestRefuseOutsideSettingsWrite(t *testing.T) {
 }
 
 func TestRefuseSymlinkSettingsWrite(t *testing.T) {
-	for _, key := range []string{"MODEL_GATEWAY_TEST_SANDBOX", "NODE_TEST_CONTEXT"} {
+	for _, key := range []string{sandbox, runner} {
 		t.Run(key, func(t *testing.T) {
 			env, outside := guardFixture(t, key)
 			dest := filepath.Dir(outside)
@@ -103,9 +113,9 @@ func TestRefuseSymlinkSettingsWrite(t *testing.T) {
 			if err := os.Symlink(dest, link); err != nil {
 				t.Fatal(err)
 			}
-			err := env.WriteSettings(filepath.Join(link, "settings.json"), map[string]any{})
-			if !errors.Is(err, gatewaytest.ErrOutsideSandbox) {
-				t.Errorf("WriteSettings through symlink: got %v, want ErrOutsideSandbox", err)
+			calls, err := refusedWrite(env, filepath.Join(link, "settings.json"))
+			if !errors.Is(err, gatewaytest.ErrOutsideSandbox) || calls != 0 {
+				t.Errorf("symlink write: error=%v calls=%d, want ErrOutsideSandbox and zero calls", err, calls)
 			}
 			wantAbsent(t, filepath.Join(dest, "settings.json"))
 		})
@@ -113,71 +123,118 @@ func TestRefuseSymlinkSettingsWrite(t *testing.T) {
 }
 
 func TestAllowSandboxSettingsWrite(t *testing.T) {
-	env, _ := guardFixture(t, "MODEL_GATEWAY_TEST_SANDBOX")
-	file := filepath.Join(env["HOME"], ".claude", "settings.json")
-	want := map[string]any{"env": map[string]any{"OK": "1"}}
-	if err := env.WriteSettings(file, want); err != nil {
-		t.Errorf("WriteSettings: %v", err)
-	}
-	data, err := os.ReadFile(file)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var got map[string]any
-	if err := json.Unmarshal(data, &got); err != nil {
-		t.Fatal(err)
-	}
-	if diff := gocmp.Diff(map[string]any{"env": map[string]any{"OK": "1"}}, got); diff != "" {
-		t.Errorf("settings on disk (-want +got):\n%s", diff)
+	for _, key := range []string{sandbox, runner} {
+		t.Run(key, func(t *testing.T) {
+			env, _ := guardFixture(t, key)
+			file := filepath.Join(env["HOME"], ".claude", "settings.json")
+			calls := 0
+			err := env.WriteSettings(file, map[string]any{"env": map[string]any{"OK": "1"}}, func(path string, settings map[string]any) error {
+				calls++
+				if path != file {
+					t.Fatalf("writer received %q, want %q", path, file)
+				}
+				if err := os.MkdirAll(filepath.Dir(file), 0o700); err != nil {
+					return err
+				}
+				data, err := json.Marshal(settings)
+				if err != nil {
+					return err
+				}
+				return os.WriteFile(file, data, 0o600)
+			})
+			if err != nil || calls != 1 {
+				t.Errorf("allowed write: error=%v calls=%d, want nil and one call", err, calls)
+			}
+			data, err := os.ReadFile(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got map[string]any
+			if err := json.Unmarshal(data, &got); err != nil {
+				t.Fatal(err)
+			}
+			if diff := gocmp.Diff(map[string]any{"env": map[string]any{"OK": "1"}}, got); diff != "" {
+				t.Errorf("settings on disk (-want +got):\n%s", diff)
+			}
+		})
 	}
 }
 
 func TestClaudeLaunchGuard(t *testing.T) {
-	for _, key := range []string{"MODEL_GATEWAY_TEST_SANDBOX", "NODE_TEST_CONTEXT"} {
+	for _, key := range []string{sandbox, runner} {
 		t.Run(key, func(t *testing.T) {
-			env, _ := guardFixture(t, key)
-			t.Run("named_fixture", func(t *testing.T) {
-				env["CODEX_GATEWAY_CLAUDE_BIN"] = filepath.Join(env["HOME"], "missing-claude")
-				if err := env.CheckClaude(); err != nil {
-					t.Errorf("named fixture executable refused: %v", err)
+			env, outside := guardFixture(t, key)
+			fixture := filepath.Join(env["HOME"], "claude")
+			for _, name := range []string{fixture, outside} {
+				if err := os.WriteFile(name, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+					t.Fatal(err)
 				}
-			})
-			t.Run("real_claude", func(t *testing.T) {
-				delete(env, "CODEX_GATEWAY_CLAUDE_BIN")
-				if err := env.CheckClaude(); !errors.Is(err, gatewaytest.ErrRealClaude) {
-					t.Errorf("implicit claude: got %v, want ErrRealClaude", err)
-				}
-			})
+			}
+			link := filepath.Join(env["HOME"], "linked-claude")
+			if err := os.Symlink(outside, link); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", env["HOME"])
+			t.Setenv("CODEX_GATEWAY_CLAUDE_BIN", fixture)
+			tests := map[string]struct {
+				path  string
+				calls int
+				err   error
+			}{
+				"named_fixture":   {fixture, 1, nil},
+				"missing_fixture": {filepath.Join(env["HOME"], "missing-claude"), 1, nil},
+				"real_claude":     {"", 0, gatewaytest.ErrRealClaude},
+				"bare_name":       {"claude", 0, gatewaytest.ErrRealClaude},
+				"outside_fixture": {outside, 0, gatewaytest.ErrRealClaude},
+				"symlink_outside": {link, 0, gatewaytest.ErrRealClaude},
+			}
+			for name, tt := range tests {
+				t.Run(name, func(t *testing.T) {
+					delete(env, "CODEX_GATEWAY_CLAUDE_BIN")
+					if tt.path != "" {
+						env["CODEX_GATEWAY_CLAUDE_BIN"] = tt.path
+					}
+					calls := 0
+					err := env.StartClaude(t.Context(), func(_ context.Context, path string) error {
+						calls++
+						if tt.calls == 0 || path != tt.path {
+							t.Errorf("unexpected launcher call with path %q", path)
+						}
+						return nil
+					})
+					if calls != tt.calls || !errors.Is(err, tt.err) {
+						t.Errorf("StartClaude: error=%v calls=%d, want %v and %d calls", err, calls, tt.err, tt.calls)
+					}
+				})
+			}
 		})
 	}
 }
 
 func TestPortGuard(t *testing.T) {
-	tests := map[string]struct {
-		ports []int
-		want  error
-	}{
-		"MODEL_GATEWAY_TEST_SANDBOX": {[]int{18764, 18765, 80}, gatewaytest.ErrReservedPort},
-		"NODE_TEST_CONTEXT":          {[]int{18764, 18765, 80}, gatewaytest.ErrReservedPort},
-		"unguarded":                  {[]int{18764, 18765, 80}, nil},
-	}
-	for name, tt := range tests {
-		t.Run(name, func(t *testing.T) {
+	for _, key := range []string{sandbox, runner, "unguarded"} {
+		t.Run(key, func(t *testing.T) {
 			env := gatewaytest.Environment{}
-			if name != "unguarded" {
-				env, _ = guardFixture(t, name)
+			wantCalls := 1
+			var wantErr error
+			if key != "unguarded" {
+				env, _ = guardFixture(t, key)
+				wantCalls = 0
+				wantErr = gatewaytest.ErrReservedPort
 			}
-			for _, port := range tt.ports {
+			for _, port := range []int{18764, 18765, 80} {
 				t.Run(strconv.Itoa(port), func(t *testing.T) {
-					if err := env.CheckBind(port); !errors.Is(err, tt.want) {
-						t.Errorf("CheckBind(%d): got %v, want %v", port, err, tt.want)
-					}
-				})
-			}
-			if name != "unguarded" {
-				t.Run("ephemeral", func(t *testing.T) {
-					if err := env.CheckBind(0); err != nil {
-						t.Errorf("ephemeral port refused: %v", err)
+					calls := 0
+					address := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+					_, err := env.Listen(t.Context(), "tcp", address, func(_ context.Context, network, addr string) (net.Listener, error) {
+						calls++
+						if network != "tcp" || addr != address {
+							t.Errorf("listen leaf received %q, %q, want tcp, %q", network, addr, address)
+						}
+						return nil, nil
+					})
+					if calls != wantCalls || !errors.Is(err, wantErr) {
+						t.Errorf("Listen(%q): error=%v calls=%d, want %v and %d calls", address, err, calls, wantErr, wantCalls)
 					}
 				})
 			}
