@@ -58,8 +58,13 @@ jobs:
       - name: Check test obligations
         run: ./hack/parity-check structure
       - name: Attest hosted runner
+        id: attest
         run: ./hack/venue-attest-ci
       - name: Run tests
+        id: tests
         run: make test
       - name: Run process tests
+        # A failure in the plain suite must not hide the process suite's result.
+        # Both run only on an attested runner.
+        if: ${{ !cancelled() && steps.attest.outcome == 'success' && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure') }}
         run: make test-process
