@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
+caller=$(pwd -P)
+exec go -C "$root" run ./internal/tools/paritycheck "$root" "$caller" "$@"

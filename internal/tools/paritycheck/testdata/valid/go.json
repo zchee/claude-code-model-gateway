@@ -1,0 +1,15 @@
+{"Action":"start","Package":"example.org/port/internal/gate"}
+{"Action":"run","Package":"example.org/port/internal/gate","Test":"TestGate"}
+{"Action":"run","Package":"example.org/port/internal/gate","Test":"TestGate/shared"}
+{"Action":"pass","Package":"example.org/port/internal/gate","Test":"TestGate/shared"}
+{"Action":"run","Package":"example.org/port/internal/gate","Test":"TestGate/child"}
+{"Action":"pass","Package":"example.org/port/internal/gate","Test":"TestGate/child"}
+{"Action":"pass","Package":"example.org/port/internal/gate","Test":"TestGate"}
+{"Action":"run","Package":"example.org/port/internal/gate","Test":"TestReplacement"}
+{"Action":"run","Package":"example.org/port/internal/gate","Test":"TestReplacement/subtest"}
+{"Action":"pass","Package":"example.org/port/internal/gate","Test":"TestReplacement/subtest"}
+{"Action":"pass","Package":"example.org/port/internal/gate","Test":"TestReplacement"}
+{"Action":"run","Package":"example.org/port/internal/gate","Test":"TestPackagedReplacement"}
+{"Action":"pass","Package":"example.org/port/internal/gate","Test":"TestPackagedReplacement"}
+{"Action":"output","Package":"example.org/port/internal/gate","Output":"ok  \texample.org/port/internal/gate\t0.014s\n"}
+{"Action":"pass","Package":"example.org/port/internal/gate"}

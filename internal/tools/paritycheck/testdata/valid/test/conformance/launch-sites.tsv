@@ -1,0 +1,2 @@
+path	line	column	kind	via	case	argv
+test/source.test.js	30	2	worker	startGateway	Launch	serve-worker

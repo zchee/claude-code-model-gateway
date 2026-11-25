@@ -1,0 +1,2 @@
+path	line	column	name	class	approved
+test/source.test.js	4	1	Dormant	unsupported:dormant-code	Inventory reviewer: no shipped path invokes this helper.

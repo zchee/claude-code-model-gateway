@@ -1,0 +1,6 @@
+path	line	column	depth	name	status	detail
+test/source.test.js	1	1	0	Alpha	pass	-
+test/source.test.js	1	1	0	Beta	pass	-
+test/source.test.js	2	1	0	Launch	pass	-
+test/source.test.js	3	1	0	Replacement	pass	-
+test/source.test.js	4	1	0	Dormant	skip	outside milestone

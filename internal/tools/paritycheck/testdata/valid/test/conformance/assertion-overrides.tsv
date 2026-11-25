@@ -1,0 +1,3 @@
+path	line	column	name	site_path	site_line	site_column	action	reason
+test/source.test.js	4	1	Dormant	test/source.test.js	37	2	add	An explicit predicate in generated fixture code.
+test/source.test.js	4	1	Dormant	test/source.test.js	38	2	remove	The test-looking call is only fixture text.

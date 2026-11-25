@@ -1,0 +1,7 @@
+path	line	column	name	site_path	site_line	site_column	call	via
+test/source.test.js	1	1	Alpha	test/helper.js	20	3	assert.equal	helper:check
+test/source.test.js	1	1	Beta	test/helper.js	20	3	assert.equal	helper:check
+test/source.test.js	1	1	Beta	test/source.test.js	25	2	assert.match	embedded:node-e
+test/source.test.js	2	1	Launch	test/source.test.js	31	2	assert.equal	direct
+test/source.test.js	3	1	Replacement	test/source.test.js	35	2	assert.equal	direct
+test/source.test.js	4	1	Dormant	test/source.test.js	37	2	assert.equal	override

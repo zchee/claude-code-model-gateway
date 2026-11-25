@@ -1,0 +1,6 @@
+name	column	line	path	class	phase	package	gate	note
+Alpha	1	1	test/source.test.js	go-port	phase-2	internal/gate	task	Shared assertion.
+Beta	1	1	test/source.test.js	go-port	phase-2	internal/gate	phase	Shared assertion and child fixture.
+Launch	1	2	test/source.test.js	conformance	phase-2	internal/gate	phase	Check the Go launch.
+Replacement	1	3	test/source.test.js	difference:new-form	phase-4	internal/gate	phase	Check the new form.
+Dormant	1	4	test/source.test.js	unsupported:dormant-code				Outside the milestone.
