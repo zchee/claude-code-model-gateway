@@ -1200,6 +1200,92 @@
       "same": true,
       "wire": "{\"title\":{\"pattern\":\"[^\\\\p{Cc}a]\"},\"pattern\":42}",
       "edits": []
+    },
+    "surrogate-replacement": {
+      "same": false,
+      "wire": "{\"pattern\":\"[^\\ud800]\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "[^\ud800]"
+        }
+      ]
+    },
+    "surrogate-edit-pointer": {
+      "same": false,
+      "wire": "{\"properties\":{\"a~/\\udfff\":{\"pattern\":\"[^x]\"}}}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/properties/a~0~1\udfff/pattern",
+          "replacement": "[^x]"
+        }
+      ]
+    },
+    "surrogate-refusal-pointer": {
+      "error": {
+        "reasonCode": "property-outside-negated-character-class",
+        "pointer": "/tools/0/input_schema/properties/a~0~1\ud800/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "surrogate-tool-name": {
+      "error": {
+        "reasonCode": "property-outside-negated-character-class",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "tool\udfff"
+      }
+    },
+    "regex-empty-class-in-negative-lookaround": {
+      "error": {
+        "reasonCode": "empty-negated-character-class",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "regex-kelvin-control": {
+      "error": {
+        "reasonCode": "invalid-regex",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "regex-kelvin-control-positive-class": {
+      "error": {
+        "reasonCode": "positive-character-class",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "regex-long-s-control": {
+      "error": {
+        "reasonCode": "invalid-regex",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "regex-long-s-control-positive-class": {
+      "error": {
+        "reasonCode": "positive-character-class",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "engine-tulu-tigalari-script": {
+      "same": false,
+      "wire": "{\"pattern\":\"[^x]\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "[^x]"
+        }
+      ]
+    },
+    "engine-sidetic-script": {
+      "error": {
+        "reasonCode": "invalid-regex",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
     }
   }
 }

@@ -125,5 +125,16 @@
   {"name":"regex-inline-group-flags","schema":{"pattern":"(?i:[^\\p{Cc}x])"}},
   {"name":"schema-malformed-pattern-key","schema":{"patternProperties":{"\\p{":{"type":"string"}}}},
   {"name":"numeric-property-order-first-refusal","schema":{"properties":{"alpha":true,"10":{"pattern":"[\\p{Cc}x]"},"2":{"pattern":"\\p{Cc}"}}}},
-  {"name":"untouched-known-scalar-value","schema":{"title":{"pattern":"[^\\p{Cc}a]"},"pattern":42}}
+  {"name":"untouched-known-scalar-value","schema":{"title":{"pattern":"[^\\p{Cc}a]"},"pattern":42}},
+  {"name":"surrogate-replacement","schema":{"pattern":"[^\\p{Cc}\ud800]"}},
+  {"name":"surrogate-edit-pointer","schema":{"properties":{"a~/\udfff":{"pattern":"[^\\p{Cc}x]"}}}},
+  {"name":"surrogate-refusal-pointer","schema":{"properties":{"a~/\ud800":{"pattern":"\\p{Cc}"}}}},
+  {"name":"surrogate-tool-name","tools":[{"name":"tool\udfff","input_schema":{"pattern":"\\p{Cc}"}}]},
+  {"name":"regex-empty-class-in-negative-lookaround","schema":{"pattern":"(?!(?:[^\\p{Cc}]))"}},
+  {"name":"regex-kelvin-control","schema":{"pattern":"\\cK[^\\p{Cc}x]"}},
+  {"name":"regex-kelvin-control-positive-class","schema":{"pattern":"[\\cK\\p{Cc}]"}},
+  {"name":"regex-long-s-control","schema":{"pattern":"\\cſ[^\\p{Cc}x]"}},
+  {"name":"regex-long-s-control-positive-class","schema":{"pattern":"[\\cſ\\p{Cc}]"}},
+  {"name":"engine-tulu-tigalari-script","schema":{"pattern":"[^\\p{Script=Tulu_Tigalari}x]"}},
+  {"name":"engine-sidetic-script","schema":{"pattern":"[^\\p{Script=Sidetic}x]"}}
 ]

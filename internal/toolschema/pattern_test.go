@@ -25,6 +25,17 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
 )
 
+func TestCompatibilityDiagnostic(t *testing.T) {
+	err := &CompatibilityError{
+		ReasonCode: "invalid-regex",
+		ToolName:   []uint16{'x', 0xdfff, 0xd83d, 0xde00},
+		Pointer:    []uint16{'/', 0xd800, '/', 0xfffd},
+	}
+	if diff := gocmp.Diff(`Codex schema compatibility refused x\udfff😀 at /\ud800/� (invalid-regex)`, err.Error()); diff != "" {
+		t.Errorf("diagnostic (-want +got):\n%s", diff)
+	}
+}
+
 func TestPotentialProperty(t *testing.T) {
 	tests := map[string]struct {
 		pattern string
@@ -52,7 +63,7 @@ func TestAcceptedEscapeKinds(t *testing.T) {
 
 func toolsWithPattern(t *testing.T, pattern string) jsonx.WireValue {
 	t.Helper()
-	tools := decode(t, []byte(`[{"input_schema":{"pattern":""}}]`))
+	tools := decode(t, []byte(`[{"name":"search","description":"search by name","input_schema":{"type":"string","pattern":"","examples":["example"]}}]`))
 	member(t, *schemaOf(t, tools), "pattern").Text = utf16.Encode([]rune(pattern))
 	return tools
 }
@@ -122,8 +133,9 @@ func FuzzAdaptPattern(f *testing.F) {
 		if got := wire(t, input); got != before {
 			t.Fatalf("mutated input: %s != %s", got, before)
 		}
+		path := utf16.Encode([]rune("/tools/0/input_schema/pattern"))
 		if err != nil {
-			if refusal, ok := errors.AsType[*CompatibilityError](err); !ok || refusal == nil || refusal.Pointer != "/tools/0/input_schema/pattern" || out.Kind != 0 || len(edits) != 0 {
+			if refusal, ok := errors.AsType[*CompatibilityError](err); !ok || refusal == nil || !slices.Equal(refusal.Pointer, path) || out.Kind != 0 || len(edits) != 0 {
 				t.Errorf("unexpected refusal: %v, edits=%+v, kind=%s", err, edits, out.Kind)
 			}
 			return
@@ -134,9 +146,14 @@ func FuzzAdaptPattern(f *testing.F) {
 				t.Error("no edits but tools changed")
 			}
 		case 1:
-			replacement := member(t, *schemaOf(t, out), "pattern")
-			if identical(input, out) || edits[0].Pointer != "/tools/0/input_schema/pattern" || replacement.Kind != '"' || !slices.Equal(utf16.Encode([]rune(edits[0].Replacement)), replacement.Text) {
-				t.Errorf("edit does not describe rewritten pattern: %+v", edits)
+			want := decode(t, []byte(before))
+			target := member(t, *schemaOf(t, want), "pattern")
+			if identical(input, out) || !slices.Equal(edits[0].Pointer, path) || slices.Equal(edits[0].Replacement, target.Text) {
+				t.Fatalf("edit does not change the original pattern: %+v", edits)
+			}
+			target.Text = edits[0].Replacement
+			if diff := gocmp.Diff(wire(t, want), wire(t, out)); diff != "" {
+				t.Errorf("applying the reported edit did not reproduce the whole output (-want +got):\n%s", diff)
 			}
 		default:
 			t.Fatalf("single pattern produced %d edits", len(edits))

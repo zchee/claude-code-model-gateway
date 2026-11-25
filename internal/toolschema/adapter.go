@@ -17,30 +17,57 @@ package toolschema
 
 import (
 	"errors"
+	"fmt"
+	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
 )
 
-// Edit records a replacement pattern and its RFC 6901 pointer rooted at /tools.
+// Edit records the RFC 6901 pointer rooted at /tools and its replacement pattern.
+// Both fields contain UTF-16 code units, like jsonx.WireValue.Text.
 type Edit struct {
-	Pointer     string `json:"pointer"`
-	Replacement string `json:"replacement"`
+	Pointer     []uint16 `json:"pointer"`
+	Replacement []uint16 `json:"replacement"`
 }
 
-// CompatibilityError identifies the tool and schema location that prevented adaptation.
+// CompatibilityError identifies a refusal. Pointer and ToolName are the original
+// UTF-16 code units to use when constructing the wire error; ReasonCode is ASCII.
 type CompatibilityError struct {
-	ReasonCode string `json:"reasonCode"`
-	Pointer    string `json:"pointer"`
-	ToolName   string `json:"toolName"`
+	ReasonCode string   `json:"reasonCode"`
+	Pointer    []uint16 `json:"pointer"`
+	ToolName   []uint16 `json:"toolName"`
 }
 
-// Error describes the refusal for the caller.
+// Error describes the refusal for diagnostics, escaping unpaired surrogates.
 func (e *CompatibilityError) Error() string {
-	return "Codex schema compatibility refused " + e.ToolName + " at " + e.Pointer + " (" + e.ReasonCode + ")"
+	return "Codex schema compatibility refused " + diagnosticText(e.ToolName) + " at " + diagnosticText(e.Pointer) + " (" + e.ReasonCode + ")"
 }
 
-// Adapt rewrites eligible tool schemas without mutating tools. Unchanged containers
-// retain their original backing slices. Edits follow traversal order. A refusal
+func diagnosticText(text []uint16) string {
+	var out []byte
+	for i := 0; i < len(text); i++ {
+		r := rune(text[i])
+		if utf16.IsSurrogate(r) {
+			if i+1 < len(text) {
+				if pair := utf16.DecodeRune(r, rune(text[i+1])); pair != utf8.RuneError {
+					out = utf8.AppendRune(out, pair)
+					i++
+					continue
+				}
+			}
+			out = fmt.Appendf(out, `\u%04x`, r)
+			continue
+		}
+		out = utf8.AppendRune(out, r)
+	}
+	return string(out)
+}
+
+// Adapt rewrites eligible tool schemas without mutating tools. Its input must use
+// the object member order established by jsonx.DecodeWire. A no-op returns the
+// original value. Otherwise it preserves unaffected tool identities and clones the
+// entire input schema of each changed tool. Edits follow traversal order. A refusal
 // returns no output or edits and identifies the first incompatible schema.
 func Adapt(tools jsonx.WireValue) (jsonx.WireValue, []Edit, error) {
 	return jsonx.WireValue{}, nil, errors.New("tool schema adaptation not implemented")

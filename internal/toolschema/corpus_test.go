@@ -26,6 +26,7 @@ import (
 	_ "embed"
 
 	gocmp "github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
 	"github.com/zchee/claude-code-model-gateway/internal/venue"
@@ -66,10 +67,23 @@ func TestNodeCorpus(t *testing.T) {
 	var golden struct {
 		Cases map[string]corpusResult `json:"cases"`
 	}
-	if err := json.Unmarshal(nodeInputs, &inputs); err != nil {
+	if err := json.Unmarshal(nodeInputs, &inputs, jsontext.AllowInvalidUTF8(true)); err != nil {
 		t.Fatal(err)
 	}
-	if err := json.Unmarshal(nodeGolden, &golden); err != nil {
+	// Decode journal and refusal strings before any conversion to UTF-8; JSON
+	// permits isolated surrogate escapes that a Go string decoder would replace.
+	units := json.UnmarshalFunc(func(raw []byte, text *[]uint16) error {
+		v, err := jsonx.DecodeWire(raw)
+		if err != nil {
+			return err
+		}
+		if v.Kind != '"' {
+			return errors.New("expected a JSON string for UTF-16 field")
+		}
+		*text = v.Text
+		return nil
+	})
+	if err := json.Unmarshal(nodeGolden, &golden, jsontext.AllowInvalidUTF8(true), json.WithUnmarshalers(units)); err != nil {
 		t.Fatal(err)
 	}
 	byName := make(map[string]corpusInput, len(inputs))
@@ -247,7 +261,7 @@ func checkCase(t *testing.T, in corpusInput, want corpusResult, requireValidPatt
 	if err != nil {
 		t.Fatalf("adapt: %v", err)
 	}
-	if diff := gocmp.Diff(want.Edits, edits, gocmp.Comparer(slices.Equal[[]Edit])); diff != "" {
+	if diff := gocmp.Diff(want.Edits, edits, cmpopts.EquateEmpty()); diff != "" {
 		t.Errorf("edits (-want +got):\n%s", diff)
 	}
 	observed, original := got, tools
@@ -277,7 +291,19 @@ func checkCase(t *testing.T, in corpusInput, want corpusResult, requireValidPatt
 		t.Fatal("missing golden wire")
 	}
 	if diff := gocmp.Diff(*want.Wire, wire(t, observed)); diff != "" {
-		t.Errorf("wire (-want +got):\n%s", diff)
+		t.Fatalf("wire (-want +got):\n%s", diff)
+	}
+	if in.Name == "sibling-regex" {
+		repeated := member(t, *member(t, observed, "properties"), "repeated")
+		before := member(t, *member(t, original, "properties"), "repeated")
+		if identical(*repeated, *before) {
+			t.Fatal("unchanged sibling inside the cloned schema shares object storage")
+		}
+		pattern := member(t, *repeated, "pattern")
+		pattern.Text[0] = '!'
+		if diff := gocmp.Diff(snapshot, tools); diff != "" {
+			t.Fatalf("writing to cloned sibling mutated input (-before +after):\n%s", diff)
+		}
 	}
 }
 
