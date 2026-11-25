@@ -56,6 +56,10 @@ func TestResolve(t *testing.T) {
 			info: buildInfo("v0.57.1-0.20200102030405-0123456789ab", ""),
 			want: "0.0.0-dev",
 		},
+		"success: pseudo-version following prerelease": {
+			info: buildInfo("v0.57.0-rc.1.0.20200102030405-0123456789ab", revision),
+			want: "0.0.0-dev+" + revision,
+		},
 		"success: pseudo-version following prerelease with dirty metadata": {
 			info: buildInfo("v0.57.0-rc.1.0.20200102030405-0123456789ab+dirty", revision),
 			want: "0.0.0-dev+" + revision,

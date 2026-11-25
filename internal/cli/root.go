@@ -18,6 +18,8 @@ package cli
 import (
 	"fmt"
 	"io"
+	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -25,12 +27,13 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/cli/version"
 )
 
-// Run dispatches args (excluding the executable name) using the supplied streams and returns an exit status.
-func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	root := newRoot()
-	if args == nil {
-		// Cobra treats nil as a request to read process arguments.
-		args = []string{}
+// Run dispatches argv, including the executable name, and returns an exit status.
+func Run(argv []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	root := newRoot(commandName(argv))
+	// Cobra treats nil as a request to read process arguments.
+	args := []string{}
+	if len(argv) > 0 {
+		args = argv[1:]
 	}
 	root.SetArgs(args)
 	root.SetIn(stdin)
@@ -42,12 +45,26 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func newRoot() *cobra.Command {
+const installedName = "model-gateway"
+
+// commandName keeps help and shell completions aligned with either installed binary name.
+func commandName(argv []string) string {
+	if len(argv) > 0 {
+		name := strings.TrimSuffix(filepath.Base(argv[0]), ".exe")
+		if name == "claude-code-model-gateway" {
+			return name
+		}
+	}
+	return installedName
+}
+
+func newRoot(name string) *cobra.Command {
 	root := &cobra.Command{
-		Use:               "model-gateway",
+		Use:               name,
 		Short:             "Manage the Claude Code model gateway",
 		CompletionOptions: cobra.CompletionOptions{DisableDefaultCmd: true},
 	}
+	root.SetErrPrefix(installedName + ":")
 	for _, stub := range []struct {
 		name, short string
 		hidden      bool
@@ -80,7 +97,6 @@ func newRoot() *cobra.Command {
 				return fmt.Errorf("%s: not implemented", cmd.Name())
 			},
 		}
-		cmd.SetErrPrefix(root.Name() + ":")
 		root.AddCommand(cmd)
 	}
 	root.AddCommand(version.NewCommand(), completions.NewCommand())

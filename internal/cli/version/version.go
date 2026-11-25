@@ -33,9 +33,10 @@ var pseudoVersion = regexp.MustCompile(`^v\d+\.(?:0\.0-|\d+\.\d+-(?:[^+]+\.)?0\.
 // NewCommand returns a command that prints the build version.
 func NewCommand() *cobra.Command {
 	return &cobra.Command{
-		Use:   "version",
-		Short: "Print the build version",
-		Args:  cobra.NoArgs,
+		Use:          "version",
+		Short:        "Print the build version",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			info, _ := debug.ReadBuildInfo()
 			_, err := fmt.Fprintln(cmd.OutOrStdout(), resolve(releaseVersion, info))
