@@ -43,6 +43,7 @@ override run_script = if [ -f "hack/$@" ] && [ -x "hack/$@" ]; then \
 	fi
 
 TRIPWIRE_NAME ?= phase-0-baseline
+unexport TRIPWIRE_NAME
 
 .PHONY: build vet build-windows fmt fmt-check lint test test-process conformance baseline-node bench tripwire tools
 
@@ -99,7 +100,7 @@ conformance baseline-node bench:
 	@$(require_test_venue) && $(run_script)
 
 tripwire:
-	@./hack/tripwire compare $(call shell_quote,$(TRIPWIRE_NAME))
+	@./hack/tripwire compare $(call shell_quote,$(value TRIPWIRE_NAME))
 
 tools:
 	go install mvdan.cc/gofumpt@$(GOFUMPT_VERSION)
