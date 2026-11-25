@@ -14,16 +14,14 @@ const Ajv2020 = deps('./node_modules/ajv/dist/2020.js');
 const ajv = deps('./node_modules/ajv/package.json').version;
 assert.equal(ajv, '8.20.0');
 
-function verdicts(schema, instances) {
+function verdicts(schema, instances, expectInvalidRewrittenPattern = false) {
   const validator = new Ajv2020({ strict: false, unicodeRegExp: true });
-  let validate;
-  try {
-    validate = validator.compile(schema);
-  } catch (error) {
-    // An accepted edit can make the pattern invalid even though the input compiled.
-    if (!(error instanceof SyntaxError)) throw error;
+  if (expectInvalidRewrittenPattern) {
+    assert.throws(() => validator.compile(schema), error =>
+      error instanceof SyntaxError && error.message.startsWith('Invalid regular expression: '));
     return { compiled: false };
   }
+  const validate = validator.compile(schema);
   return instances.map(instance => validate(instance));
 }
 
@@ -51,10 +49,13 @@ for (const input of inputs) {
   const { name } = input;
   assert.ok(typeof name === 'string' && name.length > 0, 'expected a nonempty case name');
   assert.ok(!Object.hasOwn(cases, name), `duplicate case: ${name}`);
-  assert.ok(Object.keys(input).every(key => ['name', 'schema', 'tools', 'selfCycle', 'instances'].includes(key)), `${name}: unknown case field`);
+  assert.ok(Object.keys(input).every(key => ['name', 'schema', 'tools', 'selfCycle', 'instances', 'expectInvalidRewrittenPattern'].includes(key)), `${name}: unknown case field`);
   const single = Object.hasOwn(input, 'schema');
   assert.notEqual(single, Object.hasOwn(input, 'tools'), `${name}: expected exactly one of schema and tools`);
   if (Object.hasOwn(input, 'instances')) assert.ok(single && Array.isArray(input.instances), `${name}: expected schema with instances array`);
+  if (Object.hasOwn(input, 'expectInvalidRewrittenPattern')) {
+    assert.ok(input.expectInvalidRewrittenPattern === true && Array.isArray(input.instances), `${name}: expected a true rewrite-failure marker and instances`);
+  }
   if (Object.hasOwn(input, 'selfCycle')) {
     assert.ok(input.selfCycle === true && single && !input.instances && input.schema !== null && typeof input.schema === 'object'
       && !Array.isArray(input.schema) && !Object.hasOwn(input.schema, 'self'), `${name}: expected an object schema without self or instances`);
@@ -74,9 +75,9 @@ for (const input of inputs) {
     if (!single && Array.isArray(tools)) result.sameTools = adapted.map((tool, i) => tool === tools[i]);
     result.edits = [];
     edits(tools, adapted, '/tools', result.edits);
-    if (input.instances) result.after = verdicts(output, input.instances);
+    if (input.instances) result.after = verdicts(output, input.instances, input.expectInvalidRewrittenPattern);
   } catch (error) {
-    if (!(error instanceof ToolSchemaCompatibilityError)) throw error;
+    if (!(error instanceof ToolSchemaCompatibilityError) || input.expectInvalidRewrittenPattern) throw error;
     const { reasonCode, pointer, toolName } = error;
     result.error = { reasonCode, pointer, toolName };
   }

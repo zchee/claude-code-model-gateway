@@ -119,7 +119,7 @@
   {"name":"container-unaffected-malformed-siblings","schema":{"pattern":"[^\\p{Cc}a]","properties":null,"allOf":{},"patternProperties":false,"customApplicator":{"note":"kept"}}},
   {"name":"untouched-malformed-unaffected","schema":{"$schema":42,"$ref":"#absent","pattern":"[","oneOf":"invalid"}},
   {"name":"__proto__","schema":false},
-  {"name":"engine-invalid-after-removal","schema":{"type":"string","pattern":"[^\\0\\p{Cc}1]"},"instances":[]},
+  {"name":"engine-invalid-after-removal","schema":{"type":"string","pattern":"[^\\0\\p{Cc}1]"},"instances":[],"expectInvalidRewrittenPattern":true},
   {"name":"schema-dialect-nonstring","schema":{"$schema":42,"pattern":"[^\\p{Cc}x]"}},
   {"name":"regex-double-hyphen-in-property-name","schema":{"pattern":"[^\\p{C--c}x]"}},
   {"name":"regex-inline-group-flags","schema":{"pattern":"(?i:[^\\p{Cc}x])"}},
