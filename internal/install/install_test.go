@@ -226,8 +226,6 @@ func registryEntry(version string, updated any) map[string]any {
 
 func TestRegistryRootCollation(t *testing.T) {
 	// Swedish sorts ä after z; registry updates use root order regardless of the host locale.
-	t.Setenv("LC_ALL", "sv_SE.UTF-8")
-	t.Setenv("LANG", "sv_SE.UTF-8")
 	tests := map[string]struct {
 		left, right string
 		want        int

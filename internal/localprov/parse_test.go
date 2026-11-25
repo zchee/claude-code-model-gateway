@@ -65,7 +65,7 @@ func TestStudioModels(t *testing.T) {
 			{"type":"llm","key":"named","loaded_instances":[{"id":"copy","config":{"context_length":8192}},{"id":"named","config":{"context_length":131072}}]},
 			{"type":"llm","key":"renamed","loaded_instances":[{"id":"large","config":{"context_length":40960}},{"id":"bad","config":{"context_length":-3}},{"id":"small","config":{"context_length":16384}}]},
 			{"type":"llm","key":"unknown","loaded_instances":[{"id":"copy","config":{"context_length":65536}},{"id":"unknown","config":{"context_length":0}}]},
-			{"type":"llm","key":"unloaded","max_context_length":131072},
+			{"type":"llm","key":"unloaded","max_context_length":131072,"loaded_instances":{"length":1}},
 			{"type":"embedding","key":"embedding"},{"type":"llm","key":""},{"type":"llm","key":1},null]}`,
 			want: []localprov.Model{{Key: "named", Loaded: true, ContextWindow: 131072}, {Key: "renamed", Loaded: true, ContextWindow: 16384}, {Key: "unknown", Loaded: true}, {Key: "unloaded"}},
 		},
