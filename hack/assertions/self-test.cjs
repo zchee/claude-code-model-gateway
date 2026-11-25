@@ -48,10 +48,43 @@ test('default and method', () => checks.verify());
 test('child flags', () => cp.spawn(process.execPath,argv()));
 test('fork entry', () => cp.fork(path.join(__dirname,'entry.cjs')));
 test('unknown entry', () => cp.fork(choose()));
+function launchOptions(options) { cp.spawn(process.execPath, ['-e', ''], options); }
+function launchEnvironment(env) { launchOptions({env}); }
+test('variable preload', () => {
+  const env = {NODE_OPTIONS: '--require=' + JSON.stringify(path.join(__dirname,'preload.cjs'))};
+  launchEnvironment(env);
+});
+test('unknown environment', () => launchEnvironment(choose()));
+test('preload already owned', () => cp.fork(path.join(__dirname,'preload.cjs')));
+test('options wrapper', () => {
+  const options = () => ({env:{NODE_OPTIONS:'--import=' + path.join(__dirname,'imported.mjs')}});
+  launchOptions(options());
+});
+test('opaque options', () => launchOptions(choose()));
+test('bound execArgv', () => {
+  const flags = ['-r',path.join(__dirname,'preload.cjs')];
+  const options = {execArgv:flags,env:{}};
+  cp.fork(path.join(__dirname,'entry.cjs'),options);
+});
+test('opaque execArgv', () => cp.fork(path.join(__dirname,'entry.cjs'),{execArgv:choose(),env:{}}));
+test('second shared launch', () => {
+  launchEnvironment({});
+  const env = {NODE_OPTIONS: \`--require=\${JSON.stringify(path.join(__dirname,'preload.cjs'))}\`};
+  launchEnvironment(env);
+});
+test('spread then explicit preload', () => {
+  const env = {...choose(), NODE_OPTIONS: '--require=' + path.join(__dirname,'preload.cjs')};
+  launchEnvironment(env);
+});
+test('opaque final spread', () => {
+  const env = {NODE_OPTIONS:'--require=' + path.join(__dirname,'preload.cjs'), ...choose()};
+  launchEnvironment(env);
+});
+test('opaque argv', () => cp.spawn(process.execPath,choose(),{env:{}}));
 `;
   fs.writeFileSync(path.join(dir, 'test/example.test.js'), source);
   const lines = source.split('\n');
-  const cases = [['a',5],['b',6],['c',6],['parent',7],['parent > child',7],['embedded',8],['unknown',9],['projected helper',12],['imported callback',13],['assertion values',16],['default and method',27],['child flags',28],['fork entry',29],['unknown entry',30]].map(([name,line]) => ({
+  const cases = [['a',5],['b',6],['c',6],['parent',7],['parent > child',7],['embedded',8],['unknown',9],['projected helper',12],['imported callback',13],['assertion values',16],['default and method',27],['child flags',28],['fork entry',29],['unknown entry',30],['variable preload',33],['unknown environment',37],['preload already owned',38],['options wrapper',39],['opaque options',43],['bound execArgv',44],['opaque execArgv',49],['second shared launch',50],['spread then explicit preload',55],['opaque final spread',59],['opaque argv',63]].map(([name,line]) => ({
     path: 'test/example.test.js', name, line, column: lines[line-1].indexOf(name.includes(' > ') ? '.test(' : 'test(') + (name.includes(' > ') ? 2 : 1)}));
   const {pairs, unresolved} = analyze(dir, cases);
   const got = [...pairs.values()].map(r => [r[3],r[4],r[5],r[6],r[7]]);
@@ -66,6 +99,8 @@ test('unknown entry', () => cp.fork(choose()));
   assert.equal(handed?.[8],'callback:kill');
   expected.push(['default and method','test/methods.mjs',2,'eq'], ['child flags','test/preload.cjs',2,'assert.ok'],
     ['child flags','test/imported.mjs',2,"assert['match']"], ['child flags','test/entry.cjs',2,'assert.equal'], ['fork entry','test/entry.cjs',2,'assert.equal']);
+  for (const name of ['variable preload','preload already owned','bound execArgv','second shared launch','spread then explicit preload','opaque final spread']) expected.push([name,'test/preload.cjs',2,'assert.ok']);
+  expected.push(['options wrapper','test/imported.mjs',2,"assert['match']"],['bound execArgv','test/entry.cjs',2,'assert.equal'],['opaque execArgv','test/entry.cjs',2,'assert.equal']);
   const withColumns = expected.map(([name,file,line,call])=>{
     const sourceLine=fs.readFileSync(path.join(dir,file),'utf8').split('\n')[line-1];
     const start=sourceLine.indexOf(call);
@@ -74,6 +109,8 @@ test('unknown entry', () => cp.fork(choose()));
   });
   assert.deepEqual(got.sort(),withColumns.sort());
   assert(unresolved.some(r=>r[3]==='unknown entry' && r.at(-1)==='child-launch:fork'));
+  for (const name of ['unknown environment','opaque options','opaque execArgv','opaque final spread','opaque argv']) assert(unresolved.some(r=>r[3]===name && r.at(-1).startsWith('child-launch:')),name);
+  for (const name of ['variable preload','options wrapper','bound execArgv','second shared launch','spread then explicit preload']) assert(!unresolved.some(r=>r[3]===name && r.at(-1).startsWith('child-launch:')),name);
   assert(unresolved.some(r => r[3] === 'unknown' && r.at(-1) === 'globalThis[choose()]'));
   assert(unresolved.some(r => r[3] === 'unknown' && r.at(-1) === 'globalThis[choose()].map'));
   assert(unresolved.some(r => r[3] === 'unknown' && r.at(-1) === 'require'));

@@ -120,7 +120,7 @@ function analyze(plugin, cases) {
     const registration = registrations.get(key(caseKey.slice(0,3)));
     assert(registration, `missing registration: ${key(caseKey)}`);
     checked.add(registration);
-    const visited = new Set(), bound = new Map(), pending = new Map();
+    const visited = new Set(), bound = new Map(), pending = new Map(), launchSites = new Map();
     function bind(d,args) {
       for (const [i,param] of d.parameters.entries()) {
         if (!bound.has(param)) bound.set(param,new Set());
@@ -143,6 +143,17 @@ function analyze(plugin, cases) {
       const value = [...caseKey,...position(n.getSourceFile(),n.getStart()),spelling];
       if (rule) resolvedCalls.set(key(value),[...value,rule]);
       else unresolved.set(key(value),value);
+    }
+    function traceLaunch(n) {
+      const launch = launches(n,checker,program,plugin,value,bound,programs);
+      if (!launch) return;
+      launchSites.set(n,launch);
+      for (const script of launch.entries) if (local(script) && !visited.has(script)) {
+        visited.add(script);
+        const prior=childLaunch;
+        childLaunch=`embedded:node-entry:${position(n.getSourceFile(),n.getStart()).join(':')}`;
+        scan(script,childLaunch); childLaunch=prior;
+      }
     }
     function scan(n, via) {
       if (ts.isFunctionDeclaration(n)) return; // declaration alone does not invoke it
@@ -178,16 +189,7 @@ function analyze(plugin, cases) {
           if (rule) opaque(n,spelling,typeof rule !== 'string' ? 'resolved-function' : rule);
           else pending.set(n,spelling);
         }
-        const launch = launches(n,checker,program,plugin,value,bound,programs);
-        if (launch) {
-          if (launch.unknown) opaque(n,`child-launch:${launch.api}`);
-          for (const script of launch.entries) if (local(script) && !visited.has(script)) {
-            visited.add(script);
-            const prior = childLaunch;
-            childLaunch = `embedded:node-entry:${position(sf,n.getStart()).join(':')}`;
-            scan(script,childLaunch); childLaunch=prior;
-          }
-        }
+        traceLaunch(n);
         if (d && isFunction(d)) follow(d,`helper:${flat(d.name?.getText() || text)}`);
       }
       if (ts.isIdentifier(n) && !(ts.isPropertyAccessExpression(n.parent) && n.parent.name === n)) {
@@ -224,6 +226,14 @@ function analyze(plugin, cases) {
       }
       opaque(n,spelling,targets ? 'case-bound-callback' : null);
     }
+    // A later call to a shared launcher may supply a different environment.
+    // Reinspect each launch with the accumulated bindings for this case.
+    let previousSize;
+    do {
+      previousSize=visited.size;
+      for (const n of launchSites.keys()) traceLaunch(n);
+    } while (visited.size!==previousSize);
+    for (const [n,launch] of launchSites) if (launch.unknown) opaque(n,`child-launch:${launch.api}`);
   }
   assert.equal(checked.size,registrations.size,'registration absent from census');
   return {pairs,unresolved:[...unresolved.values()],resolvedCalls:[...resolvedCalls.values()],callbackAssertions:[...callbackAssertions.values()],productFiles,sites,
