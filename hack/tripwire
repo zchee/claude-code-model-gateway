@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Copyright 2026 The claude-code-model-gateway Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+set -euo pipefail
+[[ $# == 2 && ( $1 == record || $1 == compare ) && $2 =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || {
+    printf 'usage: tripwire {record|compare} <name>\n' >&2; exit 2;
+}
+checkout=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+# A linked worktree must still watch the settings of the live project.
+common=$(git -C "$checkout" rev-parse --path-format=absolute --git-common-dir)
+project=$(dirname "$common")
+dir=$checkout/.omc/artifacts/tripwire
+file=$dir/$2.tsv
+umask 077
+if [[ $1 == record ]]; then mkdir -p "$dir"; fi
+if [[ $1 == compare && ( ! -f $file || -L $file ) ]]; then
+    printf 'missing regular tripwire baseline: %s\n' "$file" >&2; exit 1
+fi
+tmp=$(mktemp -d "$dir/.capture.XXXXXXXX")
+trap 'rm -rf -- "$tmp"' EXIT
+export LC_ALL=C
+perl - "$project" > "$tmp/rows" <<'PERL'
+use strict;
+use warnings;
+use Digest::SHA;
+use Fcntl qw(O_RDONLY O_NOFOLLOW O_NONBLOCK :mode);
+use Errno qw(ENOENT);
+my ($project) = @ARGV;
+my $home = (getpwuid($>))[7] // die "cannot determine account home\n";
+my $state = "$home/.claude/model-gateway";
+my @paths = map { ("$_/.claude/settings.json", "$_/.claude/settings.local.json") } ($home, $project);
+push @paths, map { "$state/$_" } qw(wired-projects.json pins.json detected-pins.json context-window.json intentionally-stopped.json model-gateway.js update.js wiring.json);
+if (opendir(my $dh, $state)) {
+    push @paths, map { "$state/$_" } sort grep { /pid/ && !/token|auth|credential|secret/i } readdir($dh);
+    closedir($dh) or die "cannot close state directory: $!\n";
+} elsif ($! != ENOENT) { die "cannot enumerate state directory: $!\n"; }
+print "path\tstate\tsha256\tbytes\n";
+for my $path (@paths) {
+    die "unrepresentable tripwire path\n" if $path =~ /[\t\r\n]/;
+    my @stat = lstat($path);
+    if (!@stat && $! == ENOENT) { print "$path\tabsent\t-\t-\n"; next; }
+    # Report an unsafe replacement without ever opening a symlink, device, or FIFO.
+    die "cannot inspect $path: $!\n" unless @stat;
+    if (!S_ISREG($stat[2])) { print "$path\tnonregular\t-\t-\n"; next; }
+    sysopen(my $fh, $path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK) or die "cannot open $path: $!\n";
+    my @opened = stat($fh);
+    die "file changed during capture: $path\n" unless @opened && S_ISREG($opened[2]) && $opened[0] == $stat[0] && $opened[1] == $stat[1];
+    my $hash = Digest::SHA->new(256)->addfile($fh)->hexdigest;
+    my $bytes = tell($fh);
+    die "cannot measure $path: $!\n" if $bytes < 0;
+    close($fh) or die "cannot close $path: $!\n";
+    print "$path\tpresent\t$hash\t$bytes\n";
+}
+PERL
+if [[ $1 == record ]]; then
+    { printf '# digest manifest captured %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"; cat "$tmp/rows"; } > "$tmp/manifest"
+    ln "$tmp/manifest" "$file"
+    printf 'recorded %s\n' "$file"
+else
+    awk '!/^#/' "$file" > "$tmp/baseline"
+    diff -u "$tmp/baseline" "$tmp/rows"
+    printf 'tripwire matches: %s\n' "$2"
+fi
