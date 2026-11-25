@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# Copyright 2026 The claude-code-model-gateway Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+set -euo pipefail
+
+commit=a8501f25175572071a0d085d34346dcf67e49b23
+root_tree=22be5dae8859c7307906f938fa364b7ffadf006c
+plugin_tree=aaf4f26b527c2ff08dbc47707a5f69e6ec2cf40a
+source_repo=https://github.com/zchee/eigenwise-toolshed
+
+fail() {
+    printf 'pinned-source: %s\n' "$*" >&2
+    exit 1
+}
+
+if [[ $# == 2 && $1 == --from && -n $2 ]]; then
+    source_repo=$2
+elif [[ $# != 0 ]]; then
+    fail 'usage: pinned-source [--from <local checkout or URL>]'
+fi
+
+root=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+cache=$root/.cache
+export_dir=$cache/model-gateway-js
+[[ ! -L $cache ]] || fail "cache directory is a symlink: $cache"
+mkdir -p -- "$cache" || fail "cannot create cache directory: $cache"
+tmp=$(mktemp -d "$cache/pinned-source.XXXXXXXX") || fail 'cannot create staging directory'
+trap 'rm -rf -- "$tmp"' EXIT
+trap 'exit 1' HUP INT TERM
+
+git_dir=$tmp/source.git
+staging=$tmp/model-gateway-js
+
+# Isolate the temporary repository from the caller's Git configuration and objects.
+unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+    GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_ATTR_SOURCE
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_ATTR_NOSYSTEM=1 \
+    GIT_NO_REPLACE_OBJECTS=1 GIT_TERMINAL_PROMPT=0
+
+git init --quiet --bare --template= --object-format=sha1 -- "$git_dir" || fail 'cannot initialize temporary repository'
+repo_git() {
+    git --git-dir="$git_dir" -c core.autocrlf=false -c core.filemode=true -c core.symlinks=true "$@"
+}
+
+check_trees() {
+    local tree=$1 label=$2 plugin
+    if [[ $tree != "$root_tree" ]]; then
+        printf 'pinned-source: %s root tree is %s, expected %s\n' "$label" "$tree" "$root_tree" >&2
+        return 1
+    fi
+    plugin=$(repo_git rev-parse --verify "$tree:plugins/model-gateway") || return 2
+    if [[ $plugin != "$plugin_tree" ]]; then
+        printf 'pinned-source: %s plugin tree is %s, expected %s\n' "$label" "$plugin" "$plugin_tree" >&2
+        return 1
+    fi
+}
+
+# Unlike archive, checkout-index ignores export attributes. These higher-priority
+# attributes disable byte conversions in both checkout-index and add.
+mkdir -- "$git_dir/info"
+printf '%s\n' '* -text -crlf -ident -filter -working-tree-encoding' > "$git_dir/info/attributes"
+
+verify_export() (
+    local dir=$1
+    # A fresh index makes Git hash the filesystem contents rather than reuse entries.
+    export GIT_INDEX_FILE=$tmp/verify-index
+    rm -f -- "$GIT_INDEX_FILE" || return 2
+    (
+        cd -- "$dir" || return 2
+        repo_git --work-tree="$dir" add --force --all -- .
+    ) || return 2
+    local tree
+    tree=$(repo_git write-tree) || return 2
+    check_trees "$tree" "$dir"
+)
+
+if [[ -d $export_dir && ! -L $export_dir ]]; then
+    status=0
+    verify_export "$export_dir" || status=$?
+    case $status in
+        0) printf '%s\n' "$export_dir"; exit 0 ;;
+        1) ;; # The directory was read successfully but did not match the pin.
+        *) fail "cannot verify existing export: $export_dir" ;;
+    esac
+fi
+if [[ -e $export_dir || -L $export_dir ]]; then
+    printf 'pinned-source: replacing invalid export: %s\n' "$export_dir" >&2
+    rm -rf -- "$export_dir" || fail "cannot remove invalid export: $export_dir"
+fi
+
+repo_git fetch --quiet --depth=1 --no-tags --no-recurse-submodules -- "$source_repo" "$commit" ||
+    fail "cannot fetch pinned commit $commit from $source_repo"
+object_tree=$(repo_git rev-parse --verify "$commit^{tree}") || fail 'cannot resolve pinned commit tree'
+check_trees "$object_tree" 'pinned commit' || exit 1
+
+mkdir -- "$staging" || fail 'cannot create staging tree'
+repo_git read-tree "$object_tree" || fail 'cannot load pinned tree into index'
+repo_git --work-tree="$staging" checkout-index --all --prefix="$staging/" || fail 'cannot export pinned tree'
+verify_export "$staging" || fail 'exported files do not reproduce the pinned tree'
+mv -- "$staging" "$cache/" || fail "cannot publish export: $export_dir"
+printf '%s\n' "$export_dir"

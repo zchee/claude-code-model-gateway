@@ -26,6 +26,9 @@ profile.cov
 # Dependency directories
 vendor/
 
+# Pinned upstream source and temporary exports
+.cache/
+
 # Editor/IDE
 # .idea/
 # .vscode/
