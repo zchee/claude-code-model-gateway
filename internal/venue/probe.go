@@ -18,11 +18,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -32,6 +35,7 @@ func query(path string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, path, args...)
+	cmd.WaitDelay = time.Second
 	cmd.Env = []string{"LC_ALL=C", "PATH=/usr/bin:/bin:/usr/sbin:/sbin"}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -49,93 +53,126 @@ func query(path string, args ...string) (string, error) {
 // back to environment variables when built without cgo and a record is absent.
 func homeDir() (string, error) {
 	uid := strconv.Itoa(os.Geteuid())
+	var out string
+	var err error
 	switch runtime.GOOS {
 	case "linux":
-		out, err := query("/usr/bin/getent", "passwd", uid)
-		if err != nil {
-			return "", err
-		}
-		fields := strings.Split(strings.TrimSuffix(out, "\n"), ":")
-		if len(fields) == 7 && fields[2] == uid && !strings.Contains(fields[5], "\n") {
+		out, err = query("/usr/bin/getent", "passwd", uid)
+	case "darwin":
+		out, err = query("/usr/bin/dscacheutil", "-q", "user", "-a", "uid", uid)
+	default:
+		return "", errors.New("no password database probe on this platform")
+	}
+	if err != nil {
+		return "", err
+	}
+	return accountHome(runtime.GOOS, out, uid)
+}
+
+func accountHome(platform, out, uid string) (string, error) {
+	record, ok := strings.CutSuffix(out, "\n")
+	if !ok || strings.ContainsAny(record, "\r\x00") {
+		return "", errors.New("invalid account record")
+	}
+	switch platform {
+	case "linux":
+		fields := strings.Split(record, ":")
+		if !strings.Contains(record, "\n") && len(fields) == 7 && fields[2] == uid && fields[5] != "" {
 			return fields[5], nil
 		}
 	case "darwin":
-		out, err := query("/usr/bin/dscacheutil", "-q", "user", "-a", "uid", uid)
-		if err != nil {
-			return "", err
-		}
-		var home, id string
-		for line := range strings.SplitSeq(out, "\n") {
-			if value, ok := strings.CutPrefix(line, "dir: "); ok && home == "" {
-				home = value
-			} else if value, ok := strings.CutPrefix(line, "uid: "); ok && id == "" {
-				id = value
-			} else if strings.HasPrefix(line, "dir:") || strings.HasPrefix(line, "uid:") {
-				return "", errors.New("ambiguous password database record")
+		// dscacheutil separates records with a blank line. A blank inside a
+		// record, a continuation, or a repeated key makes the reply ambiguous.
+		fields := make(map[string]string, 7)
+		for line := range strings.SplitSeq(strings.TrimSuffix(record, "\n"), "\n") {
+			key, value, ok := strings.Cut(line, ": ")
+			if !ok {
+				return "", errors.New("malformed account field")
 			}
+			switch key {
+			case "name", "password", "uid", "gid", "dir", "shell", "gecos":
+			default:
+				return "", errors.New("unknown account field")
+			}
+			if _, exists := fields[key]; exists {
+				return "", errors.New("duplicate account field")
+			}
+			fields[key] = value
 		}
-		if id == uid {
-			return home, nil
+		if len(fields) == 7 && fields["uid"] == uid && fields["dir"] != "" {
+			return fields["dir"], nil
 		}
 	}
 	return "", errors.New("no unique password database record")
 }
 
-// listening reads the kernel TCP listener table for both address families:
-// ss filters by local port on Linux; netstat lists numeric TCP endpoints on
-// Darwin. Neither command binds, dials, accepts, or sends gateway traffic, so
-// concurrently starting test binaries cannot interfere with each other's probe.
-func listening(port string) (bool, error) {
-	switch runtime.GOOS {
-	case "linux":
+// listenerProbe returns a lazy probe: Linux reads the kernel TCP listener
+// table per port. Darwin takes one lsof snapshot for both ports; an unprivileged
+// listing protects against a gateway running as this user, not all users.
+// Neither probe connects to or sends traffic to a gateway.
+func listenerProbe() func(string) (bool, error) {
+	if runtime.GOOS == "darwin" {
+		snapshot := sync.OnceValues(darwinListeners)
+		return func(port string) (bool, error) { busy, err := snapshot(); return busy[port], err }
+	}
+	return func(port string) (bool, error) {
+		if runtime.GOOS != "linux" {
+			return false, errors.New("no listener probe on this platform")
+		}
 		out, err := query("/usr/bin/ss", "-ltn", "sport = :"+port)
 		if err != nil {
 			return false, err
 		}
-		header, rows, _ := strings.Cut(out, "\n")
-		if !strings.HasPrefix(header, "State ") || !strings.Contains(header, "Local Address:Port") {
-			return false, errors.New("missing TCP table header")
-		}
-		return strings.TrimSpace(rows) != "", nil
-	case "darwin":
-		out, err := query("/usr/sbin/netstat", "-an", "-p", "tcp")
-		if err != nil {
-			return false, err
-		}
-		return darwinListener(out, port)
-	default:
-		return false, errors.New("no listener probe on this platform")
+		return ssListener(out, port)
 	}
 }
 
-func darwinListener(out, port string) (bool, error) {
-	var header bool
-	for line := range strings.SplitSeq(out, "\n") {
+func ssListener(out, port string) (bool, error) {
+	table, ok := strings.CutSuffix(out, "\n")
+	if !ok {
+		return false, errors.New("unterminated TCP table")
+	}
+	header, rows, hasRows := strings.Cut(table, "\n")
+	if strings.Join(strings.Fields(header), " ") != "State Recv-Q Send-Q Local Address:Port Peer Address:Port" {
+		return false, errors.New("invalid ss header")
+	}
+	if !hasRows {
+		return false, nil
+	}
+	for line := range strings.SplitSeq(rows, "\n") {
 		fields := strings.Fields(line)
-		switch {
-		case len(fields) == 0, strings.HasPrefix(line, "Active Internet connections"):
-			continue
-		case strings.Join(fields, " ") == "Proto Recv-Q Send-Q Local Address Foreign Address (state)":
-			header = true
-		case header && len(fields) == 6 && strings.HasPrefix(fields[0], "tcp"):
-			_, localPort, ok := strings.CutLast(fields[3], ".")
-			if !ok {
-				return false, errors.New("invalid local TCP endpoint")
+		if len(fields) != 5 || fields[0] != "LISTEN" {
+			return false, errors.New("invalid ss listener row")
+		}
+		for _, q := range fields[1:3] {
+			if _, err := strconv.ParseUint(q, 10, 64); err != nil {
+				return false, errors.New("invalid TCP queue length")
 			}
-			if fields[5] == "LISTEN" {
-				if _, err := strconv.ParseUint(localPort, 10, 16); err != nil {
-					return false, errors.New("invalid local TCP port")
-				}
-				if localPort == port {
-					return true, nil
-				}
-			}
-		default:
-			return false, errors.New("unrecognized TCP table")
+		}
+		if local, ok := endpointPort(fields[3]); !ok || local != port {
+			return false, errors.New("unexpected local endpoint in filtered TCP table")
+		}
+		if _, ok := endpointPort(fields[4]); !ok {
+			return false, errors.New("invalid remote TCP endpoint")
 		}
 	}
-	if !header {
-		return false, errors.New("missing TCP table header")
+	return true, nil
+}
+
+// endpointPort accepts numeric addresses and the socket tools' wildcard forms.
+func endpointPort(endpoint string) (string, bool) {
+	host, port, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return "", false
 	}
-	return false, nil
+	if host != "*" {
+		if _, err := netip.ParseAddr(host); err != nil {
+			return "", false
+		}
+	}
+	if port == "*" {
+		return port, true
+	}
+	n, err := strconv.ParseUint(port, 10, 16)
+	return strconv.FormatUint(n, 10), err == nil
 }

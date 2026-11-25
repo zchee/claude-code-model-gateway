@@ -15,31 +15,63 @@
 package venue
 
 import (
+	"strings"
 	"testing"
 
 	gocmp "github.com/google/go-cmp/cmp"
 )
 
-func TestDarwinListener(t *testing.T) {
-	const header = "Active Internet connections (including servers)\nProto Recv-Q Send-Q Local Address Foreign Address (state)\n"
+func TestSSListener(t *testing.T) {
+	const header = "State Recv-Q Send-Q Local Address:Port Peer Address:Port\n"
+	const listener = "LISTEN 0 128 0.0.0.0:18764 0.0.0.0:*   \n"
 	tests := map[string]struct {
 		table        string
 		busy, failed bool
 	}{
-		"success: no listeners":           {table: header},
-		"success: IPv4 wildcard":          {table: header + "tcp4 0 0 *.18764 *.* LISTEN", busy: true},
-		"success: IPv6 interface":         {table: header + "tcp6 0 0 fe80::1%lo0.18764 *.* LISTEN", busy: true},
-		"success: another listener":       {table: header + "tcp46 0 0 *.18765 *.* LISTEN"},
-		"success: established connection": {table: header + "tcp4 0 0 127.0.0.1.18764 127.0.0.1.4321 ESTABLISHED"},
-		"error: missing header":           {failed: true},
-		"error: malformed row":            {table: header + "truncated", failed: true},
-		"error: unknown endpoint":         {table: header + "tcp4 0 0 unknown *.* LISTEN", failed: true},
+		"success: header only":                       {header, false, false},
+		"success: IPv4 and IPv6 listeners":           {header + listener + "LISTEN 0 128 [::]:18764 [::]:*   \n", true, false},
+		"error: missing header":                      {"", false, true},
+		"error: unterminated header":                 {strings.TrimSuffix(header, "\n"), false, true},
+		"error: incomplete header":                   {"State Recv-Q Send-Q Local Address:Port\n", false, true},
+		"error: unreadable row after valid listener": {header + listener + "truncated\n", false, true},
+		"error: unknown state":                       {header + "ESTAB 0 0 *:18764 *:*\n", false, true},
+		"error: invalid queue":                       {header + "LISTEN ? 0 *:18764 *:*\n", false, true},
+		"error: unfiltered row":                      {header + "LISTEN 0 0 *:80 *:*\n", false, true},
+		"error: invalid peer":                        {header + "LISTEN 0 0 *:18764 invalid\n", false, true},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			busy, err := darwinListener(tc.table, "18764")
+			busy, err := ssListener(tc.table, "18764")
 			if diff := gocmp.Diff([2]bool{tc.busy, tc.failed}, [2]bool{busy, err != nil}); diff != "" {
 				t.Errorf("listener and failure (-want +got):\n%s; err=%v", diff, err)
+			}
+		})
+	}
+}
+
+func TestAccountHome(t *testing.T) {
+	const darwin = "name: venue\npassword: *\nuid: 501\ngid: 20\ndir: /Users/venue\nshell: /bin/sh\ngecos: Venue User\n\n"
+	const linux = "venue:x:501:20::/home/venue:/bin/sh\n"
+	tests := map[string]struct{ platform, record, want string }{
+		"success: complete Darwin record":      {"darwin", darwin, "/Users/venue"},
+		"success: complete Linux record":       {"linux", linux, "/home/venue"},
+		"error: Darwin directory continuation": {"darwin", strings.ReplaceAll(darwin, "/Users/venue", "/Users/venue\nbackup"), ""},
+		"error: Darwin unknown field":          {"darwin", strings.ReplaceAll(darwin, "gecos:", "extra:"), ""},
+		"error: Darwin repeated field":         {"darwin", strings.ReplaceAll(darwin, "dir: ", "dir: \ndir: "), ""},
+		"error: Darwin record boundary":        {"darwin", strings.ReplaceAll(darwin, "\ndir:", "\n\ndir:"), ""},
+		"error: Darwin second record":          {"darwin", darwin + darwin, ""},
+		"error: Darwin different UID":          {"darwin", strings.ReplaceAll(darwin, "uid: 501", "uid: 502"), ""},
+		"error: Linux record continuation":     {"linux", strings.ReplaceAll(linux, "venue:x", "venue\n:x"), ""},
+		"error: Linux second record":           {"linux", linux + linux, ""},
+		"error: Linux different UID":           {"linux", strings.ReplaceAll(linux, ":501:", ":502:"), ""},
+		"error: Linux missing field":           {"linux", strings.ReplaceAll(linux, "::", ":"), ""},
+		"error: Linux truncated record":        {"linux", strings.TrimSuffix(linux, "\n"), ""},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			got, err := accountHome(tc.platform, tc.record, "501")
+			if diff := gocmp.Diff(tc.want, got); diff != "" || (err != nil) != (tc.want == "") {
+				t.Errorf("home (-want +got):\n%s; err=%v", diff, err)
 			}
 		})
 	}

@@ -31,32 +31,37 @@ func TestCheck(t *testing.T) {
 	calls := []string{"home", filepath.Join(home, ".model-gateway-test-venue"), filepath.Join(home, ".claude", "model-gateway"), "18764", "18765"}
 	tests := map[string]struct {
 		homeErr, attestErr, stateErr, portErr error
-		relative, statePresent                bool
+		badHome                               string
+		statePresent                          bool
 		mode                                  fs.FileMode
 		busy                                  string
 		reason                                string
 		steps                                 int
 	}{
-		"success: attested and idle":      {steps: 5},
-		"error: home lookup":              {homeErr: fs.ErrPermission, reason: "cannot establish account home", steps: 1},
-		"error: relative home":            {relative: true, reason: "cannot establish account home", steps: 1},
-		"error: missing attestation":      {attestErr: fs.ErrNotExist, reason: "attestation missing", steps: 2},
-		"error: inaccessible attestation": {attestErr: fs.ErrPermission, reason: "cannot inspect attestation", steps: 2},
-		"error: symlink attestation":      {mode: fs.ModeSymlink, reason: "attestation is not a regular file", steps: 2},
-		"error: directory attestation":    {mode: fs.ModeDir, reason: "attestation is not a regular file", steps: 2},
-		"error: gateway state":            {statePresent: true, reason: "gateway state present", steps: 3},
-		"error: inaccessible state":       {stateErr: fs.ErrPermission, reason: "cannot inspect gateway state", steps: 3},
-		"error: first port busy":          {busy: "18764", reason: "TCP port 18764 has a listener", steps: 4},
-		"error: second port busy":         {busy: "18765", reason: "TCP port 18765 has a listener", steps: 5},
-		"error: port table unavailable":   {portErr: fs.ErrPermission, reason: "cannot inspect TCP port 18764", steps: 4},
+		"success: attested and idle":             {steps: 5},
+		"error: home lookup":                     {homeErr: fs.ErrPermission, reason: "cannot establish account home", steps: 1},
+		"error: relative home":                   {badHome: "relative", reason: "account home is not a clean absolute path", steps: 1},
+		"error: dot component":                   {badHome: home + "/./user", reason: "account home is not a clean absolute path", steps: 1},
+		"error: symlink before parent component": {badHome: home + "/link/../user", reason: "account home is not a clean absolute path", steps: 1},
+		"error: doubled separator":               {badHome: home + "//user", reason: "account home is not a clean absolute path", steps: 1},
+		"error: trailing separator":              {badHome: home + "/", reason: "account home is not a clean absolute path", steps: 1},
+		"error: missing attestation":             {attestErr: fs.ErrNotExist, reason: "attestation missing", steps: 2},
+		"error: inaccessible attestation":        {attestErr: fs.ErrPermission, reason: "cannot inspect attestation", steps: 2},
+		"error: symlink attestation":             {mode: fs.ModeSymlink, reason: "attestation is not a regular file", steps: 2},
+		"error: directory attestation":           {mode: fs.ModeDir, reason: "attestation is not a regular file", steps: 2},
+		"error: gateway state":                   {statePresent: true, reason: "gateway state present", steps: 3},
+		"error: inaccessible state":              {stateErr: fs.ErrPermission, reason: "cannot inspect gateway state", steps: 3},
+		"error: first port busy":                 {busy: "18764", reason: "TCP port 18764 has a listener", steps: 4},
+		"error: second port busy":                {busy: "18765", reason: "TCP port 18765 has a listener", steps: 5},
+		"error: port table unavailable":          {portErr: fs.ErrPermission, reason: "cannot inspect TCP port 18764", steps: 4},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			var gotCalls []string
 			lookup := func() (string, error) {
 				gotCalls = append(gotCalls, "home")
-				if tc.relative {
-					return "relative", nil
+				if tc.badHome != "" {
+					return filepath.FromSlash(tc.badHome), nil
 				}
 				return home, tc.homeErr
 			}

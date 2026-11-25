@@ -22,21 +22,28 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"syscall"
 )
 
 // Require exits with status 97 unless the effective account is attested, its
-// gateway state is absent, and neither gateway port has a TCP listener.
+// gateway state is absent, and neither gateway port has a TCP listener. The
+// refusal diagnostic is best effort when stderr is unusable. Unlike os.Exit,
+// the immediate exit does not run coverage hooks that write files or warnings.
 func Require() {
-	if reason := check(homeDir, os.Lstat, listening); reason != "" {
+	if reason := check(homeDir, os.Lstat, listenerProbe()); reason != "" {
 		fmt.Fprintln(os.Stderr, "not a test venue:", reason)
-		os.Exit(97)
+		syscall.Exit(97)
 	}
 }
 
 func check(homeDir func() (string, error), lstat func(string) (fs.FileInfo, error), listening func(string) (bool, error)) string {
 	home, err := homeDir()
-	if err != nil || !filepath.IsAbs(home) {
+	if err != nil {
 		return "cannot establish account home"
+	}
+	// Join cleans its arguments, which can change where a symlink/.. resolves.
+	if !filepath.IsAbs(home) || filepath.Clean(home) != home {
+		return "account home is not a clean absolute path"
 	}
 	info, err := lstat(filepath.Join(home, ".model-gateway-test-venue"))
 	switch {
