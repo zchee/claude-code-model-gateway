@@ -24,13 +24,14 @@ import time
 job, root, work = sys.argv[1:]
 interrupt_file = work + '/interrupted'
 interrupted = False
+supervisor_started = time.monotonic()
 
 
 def report(message):
     try:
-        print(message, file=sys.stderr, flush=True)
+        print(f'+{time.monotonic() - supervisor_started:.3f}s {message}', file=sys.stderr, flush=True)
     except OSError:
-        pass  # A disconnected log consumer must not interrupt containment.
+        pass  # The private log is evidence, not a condition for containment.
 
 
 def note_interrupt(_signum, _frame):
@@ -670,12 +671,17 @@ JS
 # Invoked by the EXIT trap.
 # shellcheck disable=SC2329
 cleanup() {
-    local rc=$? result='' stamp
+    local rc=$? result='' stamp log
+    local -a logs=()
     trap '' HUP INT TERM
+    if (( interrupted )) || [[ -n $work && -e $work/interrupted ]]; then rc=1; fi
     if [[ -z $work ]]; then exit "$rc"; fi
-    if [[ -f $work/job.log ]] && ! timeout --kill-after=1s 10s cat -- "$work/job.log" 9<&- >&2; then
-        rc=1
-    fi
+    for log in "$work/supervisor.log" "$work/job.log"; do
+        if [[ -f $log ]]; then logs+=("$log"); fi
+    done
+    # The supervisor has completed containment. Deliver buffered diagnostics
+    # like other venue targets, even if the remote reader delays delivery.
+    if (( ${#logs[@]} )) && ! cat -- "${logs[@]}" 9<&- >&2; then rc=1; fi
     if (( rc == 0 )); then
         if ! timeout --kill-after=1s 10s "$root/hack/venue-check" 9<&- ||
            ! IFS= read -r result < "$work/result" || [[ $result != NODE-BENCH-V1\ * ]]; then
@@ -718,8 +724,9 @@ work=$(trap '' HUP INT TERM; exec mktemp -d "${TMPDIR:-/tmp}/gateway-bench.XXXXX
 (( interrupted == 0 )) || exit 1
 job=$(declare -f run_job)
 # The run starts only after subreaping is established. Neither the supervisor
-# nor its children inherit the remote runner's flock descriptor.
-supervise_job "$job" "$root" "$work" 9<&- &
+# nor its children inherit the remote runner's flock descriptor. Keep both
+# streams private so containment cannot wait for the output reader.
+supervise_job "$job" "$root" "$work" 9<&- > "$work/supervisor.log" 2>&1 &
 pid=$!
 rc=0
 wait "$pid" || rc=$?

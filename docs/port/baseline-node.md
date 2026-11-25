@@ -231,12 +231,17 @@ a Linux child subreaper. Detached orphans are adopted by that supervisor. The
 supervisor signals only its own children and accepts `waitpid` returning
 `ECHILD`, not a process listing or an environment marker, as proof of cleanup.
 It fails on a cleanup deadline or when a normally successful run required forced
-termination. The wrapper removes its private scratch (home, sockets, and files);
-the remote runner retains its separate staging copy on failure.
+termination. The subreaper writes diagnostics to a private file, so containment
+can prove emptiness or fail within its budget without waiting for the client
+to read. Output is delivered afterward; as for other venue targets, an unread
+connection can delay delivery and release of the venue lock. The wrapper removes
+its private scratch (home, sockets, and files); the remote runner retains its
+separate staging copy on failure.
 
 The [cleanup controls](baseline-node-samples/cleanup-controls.txt) include
 interruptions during the first supervisor's detached worker identity probe,
-with an unmarked descendant in a separate process group. The
+with an unmarked descendant in a separate process group. One control also
+filled the harness's stderr pipe and verified containment without reading it. The
 [post-run venue status](baseline-node-samples/venue-status.txt) links the
 latest control's venue completion time and run identifier to the immediate
 status check: attestation present, no gateway state, no standard listeners,
