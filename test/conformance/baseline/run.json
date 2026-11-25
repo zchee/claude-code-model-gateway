@@ -53,8 +53,8 @@
   },
   "command": "node --require ./test/isolate-home.js --test --test-concurrency=2 --test-timeout=300000 \"test/*.test.js\"",
   "invocation": "npm test",
-  "started": "2026-11-25T16:34:55Z",
-  "ended": "2026-11-25T16:36:33Z",
+  "started": "2026-11-25T16:46:56Z",
+  "ended": "2026-11-25T16:48:34Z",
   "exit": 0,
   "bus_environment_present": {
     "XDG_RUNTIME_DIR": false,
@@ -63,8 +63,8 @@
   "processes": {
     "excluded": [
       {
-        "pid": 89687,
-        "start_tick": 9571014,
+        "pid": 98928,
+        "start_tick": 9643085,
         "name": "dbus-daemon",
         "cgroup": "/user.slice/user-1000.slice/user@1000.service/session.slice/dbus.service"
       }
@@ -315,5 +315,6 @@
     "todo": 0,
     "cancelled": 0
   },
-  "duration_seconds": 98
+  "duration_seconds": 98,
+  "census_sha256": "b1bf3ee79eca258496b7ded720c1a903da204f2c00fa21ece20cfabf37e4a52b"
 }
