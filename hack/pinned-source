@@ -47,32 +47,42 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Defer signals until the owner marker and the cleanup flag have both been set.
+# Defer signal handling until the acquisition result is recorded for cleanup.
 interrupted=0
 trap 'interrupted=1' HUP INT TERM
 host=$(hostname) || fail 'cannot determine lock hostname'
+started=$(LC_ALL=C TZ=UTC0 ps -p "$$" -o lstart=) || fail 'cannot determine lock owner start time'
+[[ -n $started ]] || fail 'empty lock owner start time'
+marker=owner.$$.$started
+candidate=$tmp/${lock##*/}
+mkdir -- "$candidate" || fail 'cannot prepare cache lock'
+printf '%s\n' "$host" > "$candidate/$marker" || fail 'cannot record cache lock owner'
 for (( attempt = 0; attempt < 60; attempt++ )); do
     (( ! interrupted )) || exit 1
-    if mkdir -- "$lock" 2>/dev/null; then
+    [[ ! -L $lock ]] || fail "cache lock is a symlink: $lock"
+    # Rename a directory that already has an owner. An empty lock can be
+    # replaced, but rename cannot overwrite a nonempty lock directory.
+    if mv -- "$candidate" "$cache/" 2>/dev/null; then
         locked=1
-        printf '%s\n' "$host" > "$lock/owner.$$" || fail 'cannot record cache lock owner'
         break
     fi
-    [[ ! -L $lock ]] || fail "cache lock is a symlink: $lock"
     [[ ! -e $lock || -d $lock ]] || fail "cannot acquire cache lock: $lock"
     for owner in "$lock"/owner.*; do
         [[ -f $owner && ! -L $owner ]] || continue
-        pid=${owner##*.}
+        identity=${owner##*/owner.}
+        pid=${identity%%.*}
         case $pid in ''|*[!0-9]*|0) continue ;; esac
         IFS= read -r owner_host 2>/dev/null < "$owner" || continue
         [[ $owner_host == "$host" ]] || continue
-        if ! ps -p "$pid" -o pid= >/dev/null 2>&1; then
-            # Transfer the specific dead PID's marker, not the lock directory:
-            # concurrent waiters cannot move the same marker twice.
-            if mv -- "$owner" "$lock/owner.$$" 2>/dev/null; then
-                locked=1
-                break 2
-            fi
+        if live_start=$(LC_ALL=C TZ=UTC0 ps -p "$pid" -o lstart=) &&
+            [[ $identity == "$pid.$live_start" || $identity == "$pid" ]]; then
+            continue
+        fi
+        # Transfer only this dead owner's marker. The name includes the
+        # identity so the stale check and takeover cannot hit a new owner.
+        if mv -- "$owner" "$lock/$marker" 2>/dev/null; then
+            locked=1
+            break 2
         fi
     done
     sleep 1
@@ -89,7 +99,7 @@ git_env() {
     env -i PATH="$PATH" HOME="$tmp" TMPDIR="$tmp" LC_ALL=C \
         GIT_CONFIG_NOSYSTEM=1 GIT_ATTR_NOSYSTEM=1 GIT_NO_REPLACE_OBJECTS=1 GIT_TERMINAL_PROMPT=0 "$@"
 }
-git_env git init --quiet --bare --template= --object-format=sha1 -- "$git_dir" || fail 'cannot initialize temporary repository'
+git_env git -c init.defaultObjectFormat=sha1 init --quiet --bare --template= -- "$git_dir" || fail 'cannot initialize temporary repository'
 repo_git() {
     git_env git --git-dir="$git_dir" -c core.autocrlf=false -c core.filemode=true -c core.symlinks=true "$@"
 }
@@ -150,15 +160,16 @@ verify_export() (
     tree=$(repo_git write-tree) || return 2
     check_trees "$tree" "$dir" || return "$?"
 
-    repo_git ls-tree -rtz --format='%(objectmode) %(path)' "$tree" > "$tmp/tree-paths" || return 2
+    repo_git ls-tree -rtz "$tree" > "$tmp/tree-paths" || return 2
     while IFS= read -r -d '' entry; do
+        [[ $entry == *$'\t'* ]] || return 2
         case ${entry%% *} in
             040000) kind=d ;;
             100644|100755) kind=f ;;
             120000) kind=l ;;
             *) return 1 ;;
         esac
-        printf '%s %s\0' "$kind" "${entry#* }" || return 2
+        printf '%s %s\0' "$kind" "${entry#*$'\t'}" || return 2
     done < "$tmp/tree-paths" > "$tmp/tree-entries" || return 2
     LC_ALL=C sort -z "$tmp/disk-entries" > "$tmp/disk-sorted" || return 2
     LC_ALL=C sort -z "$tmp/tree-entries" > "$tmp/tree-sorted" || return 2
