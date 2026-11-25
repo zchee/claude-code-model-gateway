@@ -28,6 +28,88 @@ import (
 	gocmp "github.com/google/go-cmp/cmp"
 )
 
+func TestDestinationSpelling(t *testing.T) {
+	tests := map[string]struct{ write func(string) error }{"state writer": {func(path string) error { return WriteFile(path, []byte(newState), 0o600) }}, "settings writer": {func(path string) error {
+		return ReplaceSettings(path, func([]byte) ([]byte, error) { return []byte(newState), nil })
+	}}}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, p := range []string{"", dir + "/"} {
+				err := tt.write(p)
+				if _, ok := errors.AsType[*DestinationError](err); !ok {
+					t.Fatalf("%q: got %v, want destination error", p, err)
+				}
+			}
+			entries, err := os.ReadDir(dir)
+			if err != nil || len(entries) != 0 {
+				t.Fatalf("trailing slash changed directory: %v, %v", entries, err)
+			}
+			physical := filepath.Join(dir, "actual")
+			child := filepath.Join(physical, "child")
+			if err := os.MkdirAll(child, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			link := filepath.Join(dir, "link")
+			if err := os.Symlink(child, link); err != nil {
+				t.Fatal(err)
+			}
+			if err := tt.write(link + "/../state.json"); err != nil {
+				t.Fatal(err)
+			}
+			checkContents(t, filepath.Join(physical, "state.json"), newState)
+			if _, err := os.Stat(filepath.Join(dir, "state.json")); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("lexical parent touched: %v", err)
+			}
+		})
+	}
+}
+
+func TestFileOnlyUnlink(t *testing.T) {
+	path := stateFile(t)
+	root, _, err := openParent(nil, path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = root.Close() }()
+	const name = "state.json.1.abcdef012345.tmp"
+	if err := root.Mkdir(name, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.Remove(name); err == nil {
+		t.Fatal("file-only unlink removed a directory")
+	}
+	info, err := root.Lstat(name)
+	if err != nil || !info.IsDir() {
+		t.Fatalf("directory not preserved: %v", err)
+	}
+}
+
+func TestStageMetadataReadback(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "stage")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := ownerOf(info)
+	tests := map[string]struct {
+		mode  fs.FileMode
+		owner ownership
+	}{"error: setgid not retained": {info.Mode() | fs.ModeSetgid, owner}, "error: group not retained": {info.Mode(), ownership{owner.uid, owner.gid + 1}}}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			err := verifyMetadata(f, f.Name(), tt.mode, tt.owner)
+			if _, ok := errors.AsType[*OwnershipError](err); !ok {
+				t.Fatalf("expected metadata refusal, got %v", err)
+			}
+		})
+	}
+}
+
 func TestSweepRetainsSymlink(t *testing.T) {
 	path := stateFile(t)
 	dest := filepath.Join(filepath.Dir(path), "authored")
@@ -72,6 +154,36 @@ func TestSettingsParentIdentity(t *testing.T) {
 		if err != nil || len(contents) != 0 {
 			t.Fatalf("unexpected contents of %s: %v %v", p, contents, err)
 		}
+	}
+}
+
+func TestExistingSettingsParentChangesDuringRead(t *testing.T) {
+	dir := t.TempDir()
+	parent := filepath.Join(dir, "config")
+	newDir := filepath.Join(dir, "new-config")
+	oldDir := filepath.Join(dir, "old-config")
+	const file = "settings.json"
+	for _, d := range []string{parent, newDir} {
+		if err := os.Mkdir(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		writeFixture(t, filepath.Join(d, file), oldState)
+	}
+	err := newWriter().replaceSettings(filepath.Join(parent, file), func([]byte) ([]byte, error) { return []byte(newState), nil }, func(preparedFile, string) {
+		if err := os.Rename(parent, oldDir); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(newDir, parent); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if err == nil {
+		t.Fatal("published into detached parent")
+	}
+	for _, d := range []string{parent, oldDir} {
+		path := filepath.Join(d, file)
+		checkContents(t, path, oldState)
+		checkOnlyTarget(t, path)
 	}
 }
 

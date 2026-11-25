@@ -13,6 +13,8 @@
 // limitations under the License.
 
 // Package atomicfile replaces state and settings files without truncating the destination.
+// Stale-file cleanup checks the entry with lstat before a separate file-only unlink.
+// The package does not protect directories writable by other users.
 package atomicfile
 
 import (
@@ -20,6 +22,13 @@ import (
 	"io/fs"
 	"time"
 )
+
+// DestinationError reports a path without a destination file name.
+type DestinationError struct{ Path string }
+
+func (e *DestinationError) Error() string {
+	return fmt.Sprintf("atomic replacement needs a file name: %q", e.Path)
+}
 
 // OwnershipError reports that replacement would change the file's owner or group.
 type OwnershipError struct {

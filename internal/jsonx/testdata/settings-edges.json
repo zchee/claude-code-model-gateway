@@ -1,5 +1,6 @@
 {
   "success: CRLF insertion": {"before":"{\r\n  \"env\": {}\r\n}\r\n","after":"{\r\n  \"env\": {\r\n    \"owned\": {\r\n      \"n\": 1\r\n    }\r\n  }\r\n}\r\n","edit":{"Path":"/env/owned","Value":{"n":1}}},
-  "success: remove sole CRLF member": {"before":"{\r\n  \"env\": {\r\n    \"owned\": 1\r\n  }\r\n}\r\n","after":"{\r\n  \"env\": {}\r\n}\r\n","edit":{"Path":"/env/owned"}},
+  "success: remove sole CRLF member": {"before":"{\r\n  \"env\": {\r\n    \"owned\": 1\r\n  }\r\n}\r\n","after":"{\r\n  \"env\": {\r\n    \r\n  }\r\n}\r\n","edit":{"Path":"/env/owned"}},
+  "success: remove sole array element": {"before":"{\"items\":[ \t 42  \r\n]}","after":"{\"items\":[ \t   \r\n]}","edit":{"Path":"/items/0"}},
   "error: invalid UTF-8 sibling name": {"hex":"7b22656e76223a7b226f776e6564223a312c22ff223a327d7d","edit":{"Path":"/env/owned","Value":3}}
 }

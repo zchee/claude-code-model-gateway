@@ -170,9 +170,6 @@ func locateEdit(root []byte, tokens []string, value jsontext.Value) (int, int, [
 				return 0, 0, nil, nil
 			}
 			p := items[found]
-			if len(items) == 1 {
-				return offset + 1, offset + len(raw) - 1, nil, nil
-			}
 			from, to := p.start, p.end
 			if found+1 < len(items) {
 				to = items[found+1].start

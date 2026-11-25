@@ -25,7 +25,6 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -35,14 +34,14 @@ import (
 )
 
 type stagedFile struct {
-	root         *os.Root
+	root         *directory
 	name, target string
 }
 
-func (s stagedFile) Name() string                  { return filepath.Join(s.root.Name(), s.name) }
+func (s stagedFile) Name() string                  { return s.root.path(s.name) }
 func (s stagedFile) CloseAtomicallyReplace() error { return s.root.Rename(s.name, s.target) }
 
-func createSibling(root *os.Root, base string, mode fs.FileMode) (*os.File, string, error) {
+func createSibling(root *directory, base string, mode fs.FileMode) (*os.File, string, error) {
 	for {
 		var random [6]byte
 		_, _ = rand.Read(random[:])
@@ -80,7 +79,7 @@ func generatedName(name, base string) bool {
 	return true
 }
 
-func sweep(root *os.Root, base, staged string, now time.Time) {
+func sweep(root *directory, base, staged string, now time.Time) {
 	entries, _ := fs.ReadDir(root.FS(), ".")
 	for _, e := range entries {
 		name := e.Name()
@@ -96,7 +95,7 @@ func sweep(root *os.Root, base, staged string, now time.Time) {
 
 // creationMode observes the directory's actual creation policy without changing
 // the process-wide umask or exposing data in an initially permissive file.
-func creationMode(root *os.Root, base string, mode fs.FileMode, stage fs.FileInfo) (fs.FileMode, error) {
+func creationMode(root *directory, base string, mode fs.FileMode, stage fs.FileInfo) (fs.FileMode, error) {
 	if mode.Perm()&^0o600 == 0 {
 		return stage.Mode().Perm() & mode.Perm(), nil
 	}
@@ -130,7 +129,19 @@ func preserveOwner(f *os.File, path string, from, to ownership) error {
 	return nil
 }
 
-func (w writer) replace(root *os.Root, base string, data []byte, mode fs.FileMode, existing fs.FileInfo, retainMode bool, check func(preparedFile) error) (err error) {
+func verifyMetadata(f *os.File, path string, mode fs.FileMode, owner ownership) error {
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	got := ownerOf(info)
+	if info.Mode() != mode || got != owner {
+		return &OwnershipError{path, fmt.Errorf("staged mode %v uid:gid %d:%d, want %v %d:%d", info.Mode(), got.uid, got.gid, mode, owner.uid, owner.gid)}
+	}
+	return nil
+}
+
+func (w writer) replace(root *directory, base string, data []byte, mode fs.FileMode, existing fs.FileInfo, retainMode bool, check func(preparedFile) error) (err error) {
 	file, name, err := createSibling(root, base, 0o600)
 	if err != nil {
 		return err
@@ -144,7 +155,7 @@ func (w writer) replace(root *os.Root, base string, data []byte, mode fs.FileMod
 	}()
 	info, err := file.Stat()
 	if err == nil && existing != nil {
-		err = preserveOwner(file, filepath.Join(root.Name(), base), ownerOf(info), ownerOf(existing))
+		err = preserveOwner(file, root.path(base), ownerOf(info), ownerOf(existing))
 	}
 	if err == nil && !retainMode {
 		mode, err = creationMode(root, base, mode, info)
@@ -154,6 +165,13 @@ func (w writer) replace(root *os.Root, base string, data []byte, mode fs.FileMod
 	}
 	if err == nil {
 		err = file.Chmod(mode)
+	}
+	if err == nil {
+		want := ownerOf(info)
+		if existing != nil {
+			want = ownerOf(existing)
+		}
+		err = verifyMetadata(file, root.path(base), mode, want)
 	}
 	if err == nil {
 		err = file.Sync()
@@ -169,7 +187,7 @@ func (w writer) replace(root *os.Root, base string, data []byte, mode fs.FileMod
 			}
 		}
 		// A competing editor can still write between this final read and the rename.
-		err = w.commit(stage, filepath.Join(root.Name(), base))
+		err = w.commit(stage, root.path(base))
 		if err == nil {
 			published = true
 			sweep(root, base, name, w.now())
@@ -184,12 +202,11 @@ func (w writer) replace(root *os.Root, base string, data []byte, mode fs.FileMod
 }
 
 func (w writer) writeFile(path string, data []byte, mode fs.FileMode) error {
-	root, err := os.OpenRoot(filepath.Dir(path))
+	root, base, err := openParent(nil, path, false)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = root.Close() }()
-	base := filepath.Base(path)
 	info, err := root.Lstat(base)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
@@ -197,28 +214,16 @@ func (w writer) writeFile(path string, data []byte, mode fs.FileMode) error {
 	return w.replace(root, base, data, mode, info, false, nil)
 }
 
-func settingsTarget(path string) (string, error) {
-	target, err := filepath.EvalSymlinks(path)
-	if !errors.Is(err, fs.ErrNotExist) {
-		return target, err
-	}
-	if _, e := os.Lstat(path); !errors.Is(e, fs.ErrNotExist) {
-		return "", err
-	}
-	dir, err := filepath.EvalSymlinks(filepath.Dir(path))
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, filepath.Base(path)), nil
-}
-
 type snapshot struct {
 	info fs.FileInfo
 	data []byte
 }
 
-func readSettings(root *os.Root, base string) (snapshot, error) {
+func readSettings(root *directory, base string, duringRead func()) (snapshot, error) {
 	info, err := root.Lstat(base)
+	if duringRead != nil {
+		duringRead()
+	}
 	if errors.Is(err, fs.ErrNotExist) {
 		return snapshot{data: []byte("{}")}, nil
 	}
@@ -245,14 +250,7 @@ func readSettings(root *os.Root, base string) (snapshot, error) {
 }
 
 func (w writer) replaceSettings(path string, edit func([]byte) ([]byte, error), afterStage func(preparedFile, string)) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o777); err != nil {
-		return err
-	}
-	target, err := settingsTarget(path)
-	if err != nil {
-		return err
-	}
-	root, err := os.OpenRoot(filepath.Dir(target))
+	root, base, err := openSettingsParent(path, true)
 	if err != nil {
 		return err
 	}
@@ -261,10 +259,10 @@ func (w writer) replaceSettings(path string, edit func([]byte) ([]byte, error), 
 	if err != nil {
 		return err
 	}
-	base := filepath.Base(target)
+	target := root.path(base)
 	conflict := fmt.Errorf("%s: settings changed before replacement", path)
 	for range 3 {
-		before, err := readSettings(root, base)
+		before, err := readSettings(root, base, nil)
 		if err != nil {
 			return err
 		}
@@ -276,25 +274,34 @@ func (w writer) replaceSettings(path string, edit func([]byte) ([]byte, error), 
 			return err
 		}
 		check := func(f preparedFile) error {
+			var duringRead func()
 			if f != nil && afterStage != nil {
-				afterStage(f, target)
+				duringRead = func() { afterStage(f, target) }
 			}
-			current, err := settingsTarget(path)
-			if err != nil {
-				return err
-			}
-			dir, err := os.Stat(filepath.Dir(current))
-			if err != nil {
-				return err
-			}
-			if base != filepath.Base(current) || !os.SameFile(dir, parent) {
-				return fmt.Errorf("%s: settings target directory or name changed", path)
-			}
-			after, err := readSettings(root, base)
+			after, err := readSettings(root, base, duringRead)
 			if err != nil {
 				return err
 			}
 			if (before.info == nil) != (after.info == nil) || before.info != nil && (!os.SameFile(before.info, after.info) || before.info.Mode() != after.info.Mode() || ownerOf(before.info) != ownerOf(after.info)) || !bytes.Equal(before.data, after.data) {
+				return conflict
+			}
+			current, name, err := openSettingsParent(path, false)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = current.Close() }()
+			leaf, err := current.Lstat(name)
+			if err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return err
+			}
+			dir, err := current.handle.Stat()
+			if err != nil {
+				return err
+			}
+			if name != base || !os.SameFile(dir, parent) {
+				return fmt.Errorf("%s: settings target directory or name changed", path)
+			}
+			if (leaf == nil) != (after.info == nil) || leaf != nil && !os.SameFile(leaf, after.info) {
 				return conflict
 			}
 			return nil
