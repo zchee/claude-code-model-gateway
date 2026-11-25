@@ -21,10 +21,11 @@ import (
 	"time"
 )
 
-// Store uses a gateway state directory and an injected clock.
+// Store uses a gateway state directory, a clock, and the stable binary path used in guidance.
 type Store struct {
-	Dir string
-	Now func() time.Time
+	Dir         string
+	Now         func() time.Time
+	CommandPath string
 }
 
 // Blocked describes an upstream rejection; only rate limits have an expiry.
@@ -68,8 +69,8 @@ func (s Store) ReadUnavailable() *Unavailable { return nil }
 // ClearUnavailable removes the recorded transient failure if present.
 func (s Store) ClearUnavailable() {}
 
-// ReadinessMessage describes the block and how to resume dispatch using the stable binary.
-func (b Blocked) ReadinessMessage(commandPath string) string { return "" }
+// BlockedReadinessMessage describes the block and how to resume dispatch using the stable binary.
+func (s Store) BlockedReadinessMessage(block Blocked) string { return "" }
 
 // ReadinessMessage describes when the transient failure occurred and when it lifts.
 func (u Unavailable) ReadinessMessage() string { return "" }

@@ -16,6 +16,7 @@ package controlauth_test
 
 import (
 	"bytes"
+	"errors"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
@@ -45,20 +46,30 @@ func TestAuthenticated(t *testing.T) {
 		ports                                       []int
 		compat, want                                bool
 	}{
-		"success: matching request":      {method: "POST", host: host, contentType: "application/json", server: token, supplied: token, ports: []int{0, 12345}, want: true},
-		"error: missing header":          {method: "POST", host: host, contentType: "application/json", server: token, ports: []int{12345}},
-		"error: wrong token":             {method: "POST", host: host, contentType: "application/json", server: token, supplied: strings.Repeat("b", 64), ports: []int{12345}},
-		"error: short token":             {method: "POST", host: host, contentType: "application/json", server: token, supplied: "short", ports: []int{12345}},
-		"error: invalid matching tokens": {method: "POST", host: host, contentType: "application/json", server: strings.Repeat("A", 64), supplied: strings.Repeat("A", 64), ports: []int{12345}},
-		"error: browser origin":          {method: "POST", host: host, contentType: "application/json", server: token, supplied: token, origin: new("https://fixture.invalid"), ports: []int{12345}},
-		"error: null origin":             {method: "POST", host: host, contentType: "application/json", server: token, supplied: token, origin: new("null"), ports: []int{12345}},
-		"error: foreign host":            {method: "POST", host: "fixture.invalid:12345", contentType: "application/json", server: token, supplied: token, ports: []int{12345}},
-		"error: incorrect port":          {method: "POST", host: host, contentType: "application/json", server: token, supplied: token, ports: []int{12346}},
-		"error: zero port":               {method: "POST", host: "127.0.0.1:0", contentType: "application/json", server: token, supplied: token, ports: []int{0}},
-		"error: plain text":              {method: "POST", host: host, contentType: "text/plain", server: token, supplied: token, ports: []int{12345}},
-		"error: charset parameter":       {method: "POST", host: host, contentType: "application/json; charset=utf-8", server: token, supplied: token, ports: []int{12345}},
-		"error: wrong method":            {method: "GET", host: host, contentType: "application/json", server: token, supplied: token, ports: []int{12345}},
-		"error: compatibility listener":  {method: "POST", host: host, contentType: "application/json", server: token, supplied: token, ports: []int{12345}, compat: true},
+		"success: matching request":              {method: "POST", host: host, contentType: "application/json", server: token, supplied: token, ports: []int{0, 12345}, want: true},
+		"error: present empty origin":            {method: "POST", host: host, contentType: "application/json", server: token, supplied: token, ports: []int{12345}, origin: new("")},
+		"error: missing host":                    {method: "POST", contentType: "application/json", server: token, supplied: token, ports: []int{12345}},
+		"error: localhost is not a control host": {method: "POST", host: "localhost:12345", contentType: "application/json", server: token, supplied: token, ports: []int{12345}},
+		"error: port with leading zero":          {method: "POST", host: "127.0.0.1:012345", contentType: "application/json", server: token, supplied: token, ports: []int{12345}},
+		"error: no ports":                        {method: "POST", host: host, contentType: "application/json", server: token, supplied: token},
+		"error: negative port":                   {method: "POST", host: "127.0.0.1:-1", contentType: "application/json", server: token, supplied: token, ports: []int{-1}},
+		"error: matching nonhex letters":         {method: "POST", host: host, contentType: "application/json", server: strings.Repeat("g", 64), supplied: strings.Repeat("g", 64), ports: []int{12345}},
+		"error: matching token with punctuation": {method: "POST", host: host, contentType: "application/json", server: token[:63] + "!", supplied: token[:63] + "!", ports: []int{12345}},
+		"error: nonhex supplied token":           {method: "POST", host: host, contentType: "application/json", server: token, supplied: strings.Repeat("g", 64), ports: []int{12345}},
+		"error: nonhex server token":             {method: "POST", host: host, contentType: "application/json", server: strings.Repeat("g", 64), supplied: token, ports: []int{12345}},
+		"error: missing header":                  {method: "POST", host: host, contentType: "application/json", server: token, ports: []int{12345}},
+		"error: wrong token":                     {method: "POST", host: host, contentType: "application/json", server: token, supplied: strings.Repeat("b", 64), ports: []int{12345}},
+		"error: short token":                     {method: "POST", host: host, contentType: "application/json", server: token, supplied: "short", ports: []int{12345}},
+		"error: invalid matching tokens":         {method: "POST", host: host, contentType: "application/json", server: strings.Repeat("A", 64), supplied: strings.Repeat("A", 64), ports: []int{12345}},
+		"error: browser origin":                  {method: "POST", host: host, contentType: "application/json", server: token, supplied: token, origin: new("https://fixture.invalid"), ports: []int{12345}},
+		"error: null origin":                     {method: "POST", host: host, contentType: "application/json", server: token, supplied: token, origin: new("null"), ports: []int{12345}},
+		"error: foreign host":                    {method: "POST", host: "fixture.invalid:12345", contentType: "application/json", server: token, supplied: token, ports: []int{12345}},
+		"error: incorrect port":                  {method: "POST", host: host, contentType: "application/json", server: token, supplied: token, ports: []int{12346}},
+		"error: zero port":                       {method: "POST", host: "127.0.0.1:0", contentType: "application/json", server: token, supplied: token, ports: []int{0}},
+		"error: plain text":                      {method: "POST", host: host, contentType: "text/plain", server: token, supplied: token, ports: []int{12345}},
+		"error: charset parameter":               {method: "POST", host: host, contentType: "application/json; charset=utf-8", server: token, supplied: token, ports: []int{12345}},
+		"error: wrong method":                    {method: "GET", host: host, contentType: "application/json", server: token, supplied: token, ports: []int{12345}},
+		"error: compatibility listener":          {method: "POST", host: host, contentType: "application/json", server: token, supplied: token, ports: []int{12345}, compat: true},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -86,6 +97,7 @@ func TestLocalRequestAllowed(t *testing.T) {
 		want   bool
 	}{
 		"success: exact host":               {host: "localhost:12345", want: true},
+		"error: local host on another port": {host: "127.0.0.1:12346"},
 		"error: different host case":        {host: "LOCALHOST:12345"},
 		"error: empty origin still present": {host: "127.0.0.1:12345", origin: new("")},
 	}
@@ -162,6 +174,109 @@ func TestEnsureToken(t *testing.T) {
 		if diff := gocmp.Diff(fs.FileMode(0o600), info.Mode().Perm()); diff != "" {
 			t.Fatalf("token permissions (-want +got):\n%s", diff)
 		}
+	}
+}
+
+type entropyFunc func([]byte) (int, error)
+
+func (f entropyFunc) Read(p []byte) (int, error) { return f(p) }
+
+func TestEnsureTokenCollision(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "control-token")
+	winner := strings.Repeat("cd", 32)
+	winnerFile := file + ".winner"
+	if err := os.WriteFile(winnerFile, []byte(winner+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entropy := bytes.NewReader(bytes.Repeat([]byte{0xab}, 32))
+	reader := entropyFunc(func(p []byte) (int, error) {
+		if entropy.Len() == 32 {
+			if err := os.Link(winnerFile, file); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return entropy.Read(p)
+	})
+	got, err := controlauth.EnsureToken(file, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := gocmp.Diff(winner, got); diff != "" {
+		t.Fatalf("token returned after collision (-want +got):\n%s", diff)
+	}
+	data, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := gocmp.Diff(winner+"\n", string(data)); diff != "" {
+		t.Fatalf("stored token after collision (-want +got):\n%s", diff)
+	}
+}
+
+func TestStoredTokenForms(t *testing.T) {
+	valid := strings.Repeat("dc", 32)
+	tests := map[string]struct {
+		data  string
+		valid bool
+	}{
+		"success: surrounding whitespace": {data: " \t\r\n" + valid + "\n\t ", valid: true},
+		"error: one character short":      {data: valid[:63]},
+		"error: one character long":       {data: valid + "0"},
+		"error: uppercase hex":            {data: strings.ToUpper(valid)},
+		"error: nonhex":                   {data: valid[:63] + "g"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "control-token")
+			if err := os.WriteFile(file, []byte(tt.data), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			read, readErr := controlauth.ReadToken(file)
+			ensured, ensureErr := controlauth.EnsureToken(file, strings.NewReader(""))
+			headers, headersErr := controlauth.RequestHeaders(file)
+			if tt.valid {
+				if err := errors.Join(readErr, ensureErr, headersErr); err != nil {
+					t.Fatal(err)
+				}
+				if diff := gocmp.Diff([]string{valid, valid, valid}, []string{read, ensured, headers.Get("X-Model-Gateway-Control-Token")}); diff != "" {
+					t.Fatal(diff)
+				}
+			} else {
+				for operation, err := range map[string]error{"ReadToken": readErr, "EnsureToken": ensureErr, "RequestHeaders": headersErr} {
+					if err == nil || !strings.Contains(err.Error(), "invalid local control token") {
+						t.Errorf("%s: got %v, want invalid local control token", operation, err)
+					}
+				}
+			}
+			data, err := os.ReadFile(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if diff := gocmp.Diff(tt.data, string(data)); diff != "" {
+				t.Fatal(diff)
+			}
+		})
+	}
+}
+
+func TestTokenReadError(t *testing.T) {
+	dir := t.TempDir()
+	_, err := os.ReadFile(dir)
+	pathErr, ok := errors.AsType[*os.PathError](err)
+	if !ok || errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("directory fixture: want a non-absence read error, got %v", err)
+	}
+	_, readErr := controlauth.ReadToken(dir)
+	_, ensureErr := controlauth.EnsureToken(dir, bytes.NewReader(make([]byte, 32)))
+	_, headersErr := controlauth.RequestHeaders(dir)
+	for operation, err := range map[string]error{"ReadToken": readErr, "EnsureToken": ensureErr, "RequestHeaders": headersErr} {
+		if !errors.Is(err, pathErr.Err) {
+			t.Errorf("%s: got %v, want read error %v", operation, err, pathErr.Err)
+		}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("token directory changed: entries %v, error %v", entries, err)
 	}
 }
 

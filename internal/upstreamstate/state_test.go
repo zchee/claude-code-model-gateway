@@ -112,17 +112,22 @@ func TestBlockLifetime(t *testing.T) {
 	if block == nil {
 		t.Fatal("no rate limit returned")
 	}
-	checkFile(t, filepath.Join(store.Dir, blockFile), `{"state":"upstream-blocked","observedAt":"2026-09-28T10:00:00.000Z","statusCode":429,"evidence":"headers:x-openai-request-id","expiresAt":"2026-09-28T10:01:00.000Z","expiresAtMs":1790589660000}`)
-	if message := block.ReadinessMessage("gw"); !strings.Contains(message, "rate-limited by OpenAI (429) until 2026-09-28T10:01:00.000Z. The block lifts by itself then") {
+	const stored = `{"state":"upstream-blocked","observedAt":"2026-09-28T10:00:00.000Z","statusCode":429,"evidence":"headers:x-openai-request-id","expiresAt":"2026-09-28T10:01:00.000Z","expiresAtMs":1790589660000}`
+	file := filepath.Join(store.Dir, blockFile)
+	checkFile(t, file, stored)
+	if message := store.BlockedReadinessMessage(*block); !strings.Contains(message, "rate-limited by OpenAI (429) until 2026-09-28T10:01:00.000Z. The block lifts by itself then") {
 		t.Fatalf("missing expiry guidance: %q", message)
 	}
 	now = now.Add(60*time.Second - time.Millisecond)
 	if active := store.ReadBlocked(); active == nil || active.State != "upstream-blocked" {
 		t.Fatalf("block before expiry = %+v", active)
 	}
-	now = now.Add(time.Millisecond)
-	if active := store.ReadBlocked(); active != nil {
-		t.Fatalf("block at expiry = %+v", active)
+	for range 2 {
+		now = now.Add(time.Millisecond)
+		if active := store.ReadBlocked(); active != nil {
+			t.Fatalf("block at or after expiry = %+v", active)
+		}
+		checkFile(t, file, stored)
 	}
 }
 
@@ -147,10 +152,6 @@ func TestCredentialBlock(t *testing.T) {
 	if active := store.ReadBlocked(); active == nil || active.State != "upstream-blocked" {
 		t.Fatalf("credential block the next day = %+v", active)
 	}
-	msg := block.ReadinessMessage("gw")
-	if !strings.Contains(msg, "Run `gw setup`") && !strings.Contains(msg, "Run `\"gw\" setup`") {
-		t.Fatalf("missing direct stable binary setup guidance: %q", msg)
-	}
 	unavailable, err := store.SetUnavailable(503)
 	if err != nil || unavailable != nil {
 		t.Fatalf("SetUnavailable with active block = (%+v, %v)", unavailable, err)
@@ -158,10 +159,18 @@ func TestCredentialBlock(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(store.Dir, unavailableFile)); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("unavailable file with active block: %v", err)
 	}
-	store.ClearBlocked()
-	if _, err := os.Stat(file); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("block file after clear: %v", err)
-	}
+}
+
+func TestReadinessGuidance(t *testing.T) {
+	t.Run("QuotedStableLauncher", func(t *testing.T) {
+		launcher := filepath.Join(t.TempDir(), "gateway user", ".claude", "model-gateway", "bin", "model-gateway")
+		store := upstreamstate.Store{CommandPath: launcher}
+		block := upstreamstate.Blocked{State: "upstream-blocked", StatusCode: 401, Evidence: evidence}
+		want := "Codex is blocked by an OpenAI rejection. Run `\"" + launcher + "\" setup`; if it persists, wait for a claude-code-proxy update or explicitly re-route this ticket. Codex tickets remain blocked."
+		if diff := gocmp.Diff(want, store.BlockedReadinessMessage(block)); diff != "" {
+			t.Fatalf("credential guidance (-want +got):\n%s", diff)
+		}
+	})
 }
 
 func TestUnavailableLifetime(t *testing.T) {
@@ -178,7 +187,8 @@ func TestUnavailableLifetime(t *testing.T) {
 		t.Fatalf("expiresAt (-want +got):\n%s", diff)
 	}
 	file := filepath.Join(store.Dir, unavailableFile)
-	checkFile(t, file, `{"state":"upstream-unavailable","observedAt":"2026-09-23T15:05:55.807Z","observedAtMs":1790175955807,"expiresAt":"2026-09-23T15:06:25.807Z","statusCode":503}`)
+	const stored = `{"state":"upstream-unavailable","observedAt":"2026-09-23T15:05:55.807Z","observedAtMs":1790175955807,"expiresAt":"2026-09-23T15:06:25.807Z","statusCode":503}`
+	checkFile(t, file, stored)
 	if msg := u.ReadinessMessage(); !strings.Contains(msg, "terminal upstream failure (HTTP 503) at 2026-09-23T15:05:55.807Z. Dispatch holds until 2026-09-23T15:06:25.807Z, or until a Codex request succeeds") {
 		t.Fatalf("missing failure guidance: %q", msg)
 	}
@@ -186,12 +196,49 @@ func TestUnavailableLifetime(t *testing.T) {
 	if active := store.ReadUnavailable(); active == nil || active.State != "upstream-unavailable" {
 		t.Fatalf("transient state before expiry = %+v", active)
 	}
-	now = now.Add(time.Millisecond)
-	if active := store.ReadUnavailable(); active != nil {
-		t.Fatalf("transient state at expiry = %+v", active)
+	for range 2 {
+		now = now.Add(time.Millisecond)
+		if active := store.ReadUnavailable(); active != nil {
+			t.Fatalf("transient state at or after expiry = %+v", active)
+		}
+		checkFile(t, file, stored)
 	}
+}
+
+func TestSeededStore(t *testing.T) {
+	dir := t.TempDir()
+	blocked := filepath.Join(dir, blockFile)
+	unavailable := filepath.Join(dir, unavailableFile)
+	const initialBlocked = `{"state":"upstream-blocked","observedAt":"2026-09-28T10:00:00.000Z","statusCode":401,"evidence":"seeded rejection"}`
+	const initialUnavailable = `{"state":"upstream-unavailable","observedAt":"2026-09-28T10:00:00.000Z","observedAtMs":1790589600000,"expiresAt":"2026-09-28T10:00:30.000Z","statusCode":502}`
+	if err := os.WriteFile(blocked, []byte(initialBlocked+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unavailable, []byte(initialUnavailable+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := upstreamstate.Store{Dir: dir, Now: func() time.Time { return time.Date(2026, 9, 28, 10, 0, 1, 0, time.UTC) }}
+	if b := store.ReadBlocked(); b == nil || b.StatusCode != 401 || b.Evidence != "seeded rejection" {
+		t.Fatalf("read seeded block: %+v", b)
+	}
+	if u := store.ReadUnavailable(); u == nil || u.StatusCode != 502 || u.ObservedAtMs != 1790589600000 {
+		t.Fatalf("read seeded transient state: %+v", u)
+	}
+	if _, err := store.SetBlocked(403, "replacement rejection", nil); err != nil {
+		t.Fatal(err)
+	}
+	checkFile(t, blocked, `{"state":"upstream-blocked","observedAt":"2026-09-28T10:00:01.000Z","statusCode":403,"evidence":"replacement rejection"}`)
+	store.ClearBlocked()
+	if _, err := os.Stat(blocked); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("block file after clear: %v", err)
+	}
+	checkFile(t, unavailable, initialUnavailable)
+	if _, err := store.SetUnavailable(503); err != nil {
+		t.Fatal(err)
+	}
+	checkFile(t, unavailable, `{"state":"upstream-unavailable","observedAt":"2026-09-28T10:00:01.000Z","observedAtMs":1790589601000,"expiresAt":"2026-09-28T10:00:31.000Z","statusCode":503}`)
 	store.ClearUnavailable()
-	if _, err := os.Stat(file); !errors.Is(err, fs.ErrNotExist) {
+	if _, err := os.Stat(unavailable); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("transient file after clear: %v", err)
 	}
 }
