@@ -5,18 +5,29 @@ GOLANGCI_LINT_VERSION := v2.14.0
 
 # Space-separated, repository-relative package directories, including descendants.
 FMT_PATHS ?= .
-fmt_paths = $(or $(strip $(FMT_PATHS)),.)
-fmt_packages = $(foreach dir,$(fmt_paths),$(if $(filter . ./,$(dir)),./...,./$(patsubst ./%,%,$(patsubst %/,%,$(dir)))/...))
-imports_flags := -project-name=github.com/zchee/claude-code-model-gateway -use-cache -cache-fast-skip -rm-unused -set-alias -recursive
+override shell_quote = '$(subst ','"'"',$(1))'
+override fmt_dirs = $(or $(strip $(FMT_PATHS)),.)
+override fmt_paths = $(foreach dir,$(fmt_dirs),$(call shell_quote,$(dir)))
+override fmt_packages = $(foreach dir,$(fmt_dirs),$(call shell_quote,$(if $(filter . ./,$(dir)),./...,./$(patsubst ./%,%,$(patsubst %/,%,$(dir)))/...)))
+override imports_flags := -project-name=github.com/zchee/claude-code-model-gateway -use-cache -cache-fast-skip -rm-unused -set-alias -recursive
+
+override validate_fmt_paths = for dir in $(fmt_paths); do \
+		case "/$$dir/" in \
+			/-*|//*|*/../*) \
+				printf 'invalid FMT_PATHS entry: %s (must not start with - or / or contain a .. component)\n' "$$dir" >&2; exit 1 ;; \
+		esac; \
+	done
 
 # Keep the guard and the protected command in one shell, even with make -i or -k.
-require_test_venue = if [ ! -f hack/venue-check ] || [ ! -x hack/venue-check ]; then \
+override require_test_venue = if [ -L hack ] || [ -L hack/venue-check ]; then \
+		printf '%s\n' 'not a test venue: hack and hack/venue-check must not be symbolic links' >&2; exit 1; \
+	elif [ ! -f hack/venue-check ] || [ ! -x hack/venue-check ]; then \
 		printf '%s\n' 'not a test venue: hack/venue-check is missing or not executable' >&2; exit 1; \
 	elif ! ./hack/venue-check; then \
 		printf '%s\n' 'not a test venue: hack/venue-check failed' >&2; exit 1; \
 	fi
 
-run_script = if [ -f "hack/$@" ] && [ -x "hack/$@" ]; then \
+override run_script = if [ -f "hack/$@" ] && [ -x "hack/$@" ]; then \
 		"./hack/$@"; \
 	else \
 		printf 'hack/%s is missing or not executable\n' "$@" >&2; exit 1; \
@@ -33,22 +44,28 @@ vet:
 build-windows:
 	GOOS=windows GOARCH=amd64 go build ./...
 
+# modernize's -tags flag is a no-op; GOFLAGS passes tags to go list.
 fmt:
-	gofmt -s -w $(fmt_paths) && \
-	gofumpt -w -extra $(fmt_paths) && \
-	modernize -fix -test $(fmt_packages) && \
-	goimports-rereviser $(imports_flags) $(fmt_paths)
+	@$(validate_fmt_paths) && \
+	gofmt -s -w -- $(fmt_paths) && \
+	gofumpt -w -extra -- $(fmt_paths) && \
+	modernize -fix -test -- $(fmt_packages) && \
+	GOFLAGS="$${GOFLAGS:+$$GOFLAGS }-tags=process" modernize -fix -test -- $(fmt_packages) && \
+	goimports-rereviser $(imports_flags) -- $(fmt_paths)
 
 fmt-check:
-	@status=0; \
+	@$(validate_fmt_paths); \
+	export GOFLAGS=-mod=readonly GOWORK=off; \
+	status=0; \
 	check() { \
 		output=$$("$$@") || status=1; \
 		if [ -n "$$output" ]; then printf '%s\n' "$$output"; status=1; fi; \
 	}; \
-	check gofmt -s -l $(fmt_paths); \
-	check gofumpt -l -extra $(fmt_paths); \
-	check modernize -fix -diff -test $(fmt_packages); \
-	check goimports-rereviser $(imports_flags) -list-diff $(fmt_paths); \
+	check gofmt -s -l -- $(fmt_paths); \
+	check gofumpt -l -extra -- $(fmt_paths); \
+	check modernize -fix -diff -test -- $(fmt_packages); \
+	check env GOFLAGS='-mod=readonly -tags=process' modernize -fix -diff -test -- $(fmt_packages); \
+	check goimports-rereviser $(imports_flags) -list-diff -- $(fmt_paths); \
 	exit "$$status"
 
 lint:

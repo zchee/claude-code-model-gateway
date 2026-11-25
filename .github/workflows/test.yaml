@@ -31,7 +31,11 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Install pinned tools
-        run: make tools
+        env:
+          GOBIN: ${{ runner.temp }}/go-tools
+        run: |
+          make tools
+          printf '%s\n' "$GOBIN" >> "$GITHUB_PATH"
       - name: Build, vet, and check formatting
         run: make build vet fmt-check
       - name: Lint
