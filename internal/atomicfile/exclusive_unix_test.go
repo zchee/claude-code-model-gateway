@@ -23,6 +23,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -130,6 +131,59 @@ func TestCreateExclusiveExisting(t *testing.T) {
 	}
 }
 
+func TestWriterDestinationNames(t *testing.T) {
+	tests := map[string]struct {
+		write func(string, *Dir, string) error
+	}{
+		"WriteFile":       {func(path string, _ *Dir, _ string) error { return WriteFile(path, []byte(newState), 0o600) }},
+		"CreateExclusive": {func(path string, _ *Dir, _ string) error { return CreateExclusive(path, []byte(newState), 0o600) }},
+		"ReplaceSettings": {func(path string, _ *Dir, _ string) error {
+			return ReplaceSettings(path, func([]byte) ([]byte, error) { return []byte(newState), nil })
+		}},
+		"Dir.WriteFile":       {func(_ string, d *Dir, base string) error { return d.WriteFile(base, []byte(newState), 0o600) }},
+		"Dir.CreateExclusive": {func(_ string, d *Dir, base string) error { return d.CreateExclusive(base, []byte(newState), 0o600) }},
+	}
+	for writer, tt := range tests {
+		t.Run(writer, func(t *testing.T) {
+			longest := strings.Repeat("λ", 113) + "x"
+			for name, tc := range map[string]struct {
+				base   string
+				refuse bool
+			}{
+				"success: longest basename":     {longest, false},
+				"error: one byte too long":      {longest + "y", true},
+				"error: reserved stage name":    {"example.dotted.42.0123456789ab.tmp", true},
+				"success: unrelated tmp suffix": {"example.dotted.42.other.tmp", false},
+			} {
+				t.Run(name, func(t *testing.T) {
+					root := t.TempDir()
+					d := openTestDir(t, root)
+					path := filepath.Join(root, tc.base)
+					if tc.refuse {
+						// A path writer must reject the base even before opening or creating its parent.
+						path = filepath.Join(root, "missing", tc.base)
+					}
+					err := tt.write(path, d, tc.base)
+					if tc.refuse {
+						if _, ok := errors.AsType[*DestinationError](err); !ok {
+							t.Fatalf("want DestinationError, got %v", err)
+						}
+						if entries, err := os.ReadDir(root); err != nil || len(entries) != 0 {
+							t.Fatalf("refusal touched directory: %v, %v", entries, err)
+						}
+						return
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					checkContents(t, path, newState)
+					checkOnlyTarget(t, path)
+				})
+			}
+		})
+	}
+}
+
 func TestCreateExclusiveDestination(t *testing.T) {
 	dir := t.TempDir()
 	tests := map[string]struct {
@@ -159,28 +213,105 @@ func TestCreateExclusiveDestination(t *testing.T) {
 	}
 }
 
+func TestCreateExclusiveKernelParent(t *testing.T) {
+	dir := t.TempDir()
+	physical := filepath.Join(dir, "physical")
+	child := filepath.Join(physical, "child")
+	if err := os.MkdirAll(child, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(child, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := CreateExclusive(link+"/../file", []byte(newState), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	checkContents(t, filepath.Join(physical, "file"), newState)
+	if _, err := os.Lstat(filepath.Join(dir, "file")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("lexical parent touched: %v", err)
+	}
+}
+
+func TestCreateExclusiveCleanup(t *testing.T) {
+	tests := map[string]struct{ loseRace, failCleanup bool }{
+		"error: competitor publishes before link":       {true, false},
+		"error: losing writer cannot unlink its stage":  {true, true},
+		"error: winning writer cannot unlink its stage": {false, true},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "file")
+			w := newWriter()
+			want := newState
+			if tt.loseRace {
+				want = oldState
+				w.beforeLink = func() {
+					if err := CreateExclusive(path, []byte(oldState), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if tt.failCleanup {
+				w.remove = func(preparedFile) error { return unix.EPERM }
+			}
+			err := w.createExclusive(path, []byte(newState), 0o600)
+			if errors.Is(err, fs.ErrExist) != tt.loseRace || errors.Is(err, unix.EPERM) != tt.failCleanup {
+				t.Fatalf("publication or unlink error lost: %v", err)
+			}
+			checkContents(t, path, want)
+			cleanup, ok := errors.AsType[*StageCleanupError](err)
+			if !tt.failCleanup {
+				if ok {
+					t.Fatalf("unexpected cleanup failure: %v", cleanup)
+				}
+				checkOnlyTarget(t, path)
+				return
+			}
+			if !ok || cleanup.Published == tt.loseRace || !errors.Is(cleanup, unix.EPERM) || !generatedName(filepath.Base(cleanup.Staged), "file") || filepath.Dir(cleanup.Staged) != filepath.Dir(path) {
+				t.Fatalf("incorrect cleanup diagnostic: %#v", cleanup)
+			}
+			checkContents(t, cleanup.Staged, newState)
+			stage, target := exclusiveStat(t, cleanup.Staged), exclusiveStat(t, path)
+			if (stage.Dev == target.Dev && stage.Ino == target.Ino) != cleanup.Published {
+				t.Fatalf("staged and final inode do not match publication state: %v", cleanup)
+			}
+			stale := time.Now().Add(-2 * time.Hour)
+			if err := os.Chtimes(cleanup.Staged, stale, stale); err != nil {
+				t.Fatal(err)
+			}
+			if err := CreateExclusive(path, nil, 0o600); !errors.Is(err, fs.ErrExist) {
+				t.Fatalf("retry: %v", err)
+			}
+			checkContents(t, cleanup.Staged, newState)
+			if err := WriteFile(path, []byte(want), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			checkOnlyTarget(t, path)
+		})
+	}
+}
+
 func TestCreateExclusiveMovedParent(t *testing.T) {
 	dir := t.TempDir()
 	parent, moved := filepath.Join(dir, "parent"), filepath.Join(dir, "moved")
 	if err := os.Mkdir(parent, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	root, base, err := openParent(nil, filepath.Join(parent, "file"), false)
-	if err != nil {
+	w := newWriter()
+	w.afterOpen = func() {
+		if err := os.Rename(parent, moved); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(parent, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.createExclusive(filepath.Join(parent, "file"), []byte(newState), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = root.Close() }()
-	if err := os.Rename(parent, moved); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(parent, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := createExclusiveAt(root, base, []byte(newState), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	checkContents(t, filepath.Join(moved, base), newState)
-	checkOnlyTarget(t, filepath.Join(moved, base))
+	checkContents(t, filepath.Join(moved, "file"), newState)
+	checkOnlyTarget(t, filepath.Join(moved, "file"))
 	if entries, err := os.ReadDir(parent); err != nil || len(entries) != 0 {
 		t.Fatalf("replacement parent contains %v, %v", entries, err)
 	}
@@ -230,10 +361,12 @@ func TestCreateExclusiveVisibleContents(t *testing.T) {
 	data := bytes.Repeat([]byte("abcd0123"), 1<<20)
 	for range 4 {
 		path := filepath.Join(t.TempDir(), "file")
-		start, done := make(chan struct{}), make(chan error, 1)
+		start, done := make(chan struct{}), make(chan struct{})
+		var writeErr error
 		go func() {
 			<-start
-			done <- CreateExclusive(path, data, 0o600)
+			writeErr = CreateExclusive(path, data, 0o600)
+			close(done)
 		}()
 		// Start polling before the writer. Check size on first sight: reading
 		// to EOF alone could catch up with an in-place writer and hide a prefix.
@@ -241,26 +374,37 @@ func TestCreateExclusiveVisibleContents(t *testing.T) {
 			t.Fatalf("expected absent destination, got %v", err)
 		}
 		close(start)
+	poll:
 		for {
 			info, err := os.Lstat(path)
 			if err == nil {
 				if info.Size() != int64(len(data)) {
 					t.Fatalf("saw %d of %d bytes", info.Size(), len(data))
 				}
-				got, err := os.ReadFile(path)
-				if err != nil || !bytes.Equal(got, data) {
-					t.Fatalf("first visible content differs: read %d bytes, err=%v", len(got), err)
-				}
 				break
 			}
-			if !errors.Is(err, fs.ErrNotExist) || ctx.Err() != nil {
-				t.Fatalf("reader: %v, context: %v", err, ctx.Err())
+			if !errors.Is(err, fs.ErrNotExist) {
+				t.Fatal(err)
+			}
+			select {
+			case <-done:
+				if writeErr != nil {
+					t.Fatal(writeErr)
+				}
+				break poll
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			default:
 			}
 		}
+		got, err := os.ReadFile(path)
+		if err != nil || !bytes.Equal(got, data) {
+			t.Fatalf("first visible content differs: read %d bytes, err=%v", len(got), err)
+		}
 		select {
-		case err := <-done:
-			if err != nil {
-				t.Fatal(err)
+		case <-done:
+			if writeErr != nil {
+				t.Fatal(writeErr)
 			}
 		case <-ctx.Done():
 			t.Fatal(ctx.Err())

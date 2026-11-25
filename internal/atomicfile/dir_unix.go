@@ -32,12 +32,16 @@ func OpenDir(path string) (*Dir, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Dir{directory{os.NewFile(uintptr(fd), path)}}, nil
+	return &Dir{root: directory{os.NewFile(uintptr(fd), path)}}, nil
 }
 
 // ReadFile reads a regular file named by one component. It does not follow
 // symlinks; symlinks and special files yield a *NonRegularError.
 func (d *Dir) ReadFile(name string) ([]byte, error) {
+	return d.readFile(name, nil)
+}
+
+func (d *Dir) readFile(name string, beforeOpen func()) ([]byte, error) {
 	if d.root.handle == nil {
 		return nil, fs.ErrClosed
 	}
@@ -50,6 +54,9 @@ func (d *Dir) ReadFile(name string) ([]byte, error) {
 	}
 	// The entry may have changed since lstat. Never follow a new link or
 	// wait for a FIFO writer, and check the opened file before reading it.
+	if beforeOpen != nil {
+		beforeOpen()
+	}
 	f, err := d.root.OpenFile(name, os.O_RDONLY|unix.O_NONBLOCK, 0)
 	if errors.Is(err, unix.ELOOP) {
 		return nil, &NonRegularError{d.root.path(name)}
@@ -73,13 +80,20 @@ func (d *Dir) WriteFile(name string, data []byte, mode fs.FileMode) error {
 	if d.root.handle == nil {
 		return fs.ErrClosed
 	}
+	if !validWriteBase(name) {
+		return &DestinationError{name}
+	}
 	return newWriter().writeFileAt(&d.root, name, data, mode)
 }
 
-// CreateExclusive publishes a single named entry using the same semantics as CreateExclusive.
+// CreateExclusive publishes a single named entry with the creation and cleanup
+// guarantees of [CreateExclusive], including its [StageCleanupError].
 func (d *Dir) CreateExclusive(name string, data []byte, mode fs.FileMode) error {
 	if d.root.handle == nil {
 		return fs.ErrClosed
 	}
-	return createExclusiveAt(&d.root, name, data, mode)
+	if !validWriteBase(name) {
+		return &DestinationError{name}
+	}
+	return newWriter().createExclusiveAt(&d.root, name, data, mode)
 }

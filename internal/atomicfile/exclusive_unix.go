@@ -18,7 +18,6 @@ package atomicfile
 
 import (
 	"errors"
-	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -29,20 +28,31 @@ import (
 // CreateExclusive publishes a synced regular file with the given data and mode
 // in an existing parent directory. It never replaces an entry: an existing
 // name, including a dangling symlink, causes an error matching fs.ErrExist.
-// The filesystem must support hard links. A failure to unlink the staged name
-// after publication is reported as a cleanup error; the final name remains.
-// A process crash can likewise leave the staged sibling for a later sweep.
+// The filesystem must support hard links. If removing the staged sibling fails,
+// the error contains a *StageCleanupError. After successful publication the
+// sibling is a second name for the complete inode (Published is true). After
+// losing a race the sibling is an orphan, Published is false, and the error
+// also matches fs.ErrExist. A process crash can likewise leave a staged sibling.
+// Retrying and getting fs.ErrExist does not sweep: only a later successful
+// write to the same base name sweeps stale siblings.
 // The parent directory is not synced for power-loss durability.
 func CreateExclusive(path string, data []byte, mode fs.FileMode) error {
+	return newWriter().createExclusive(path, data, mode)
+}
+
+func (w writer) createExclusive(path string, data []byte, mode fs.FileMode) error {
 	root, base, err := openParent(nil, path, false)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = root.Close() }()
-	return createExclusiveAt(root, base, data, mode)
+	if w.afterOpen != nil {
+		w.afterOpen()
+	}
+	return w.createExclusiveAt(root, base, data, mode)
 }
 
-func createExclusiveAt(root *directory, base string, data []byte, mode fs.FileMode) error {
+func (w writer) createExclusiveAt(root *directory, base string, data []byte, mode fs.FileMode) error {
 	// An existing entry does not require enough space or permission to stage a file.
 	_, err := root.lstatRetry(base)
 	if err == nil {
@@ -52,18 +62,20 @@ func createExclusiveAt(root *directory, base string, data []byte, mode fs.FileMo
 		return err
 	}
 
-	w := newWriter()
 	var cleanupErr error
 	w.commit = func(stage preparedFile, target string) error {
 		name := filepath.Base(stage.Name())
 		fd := int(root.handle.Fd())
+		if w.beforeLink != nil {
+			w.beforeLink()
+		}
 		_, err := retryEINTR(func() (int, error) { return 0, unix.Linkat(fd, name, fd, base, 0) })
 		if err != nil {
 			return &os.LinkError{Op: "link", Old: stage.Name(), New: target, Err: err}
 		}
 		// The link has committed. Do not retry publication on an unlink error.
-		if err := root.removeIfPresent(name); err != nil {
-			cleanupErr = fmt.Errorf("%s published; removing staged sibling %s: %w", target, name, err)
+		if err := w.remove(stage); err != nil {
+			cleanupErr = &StageCleanupError{Staged: stage.Name(), Published: true, Err: err}
 		}
 		return nil
 	}

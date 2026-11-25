@@ -17,13 +17,12 @@
 package atomicfile
 
 import (
-	"context"
 	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
-	"time"
 
 	gocmp "github.com/google/go-cmp/cmp"
 	"golang.org/x/sys/unix"
@@ -168,15 +167,15 @@ func TestDirReadFileRefusals(t *testing.T) {
 func TestDirNameAndClose(t *testing.T) {
 	root := t.TempDir()
 	d := openTestDir(t, root)
-	tests := map[string]struct{ call func(string) error }{
-		"read":   {func(name string) error { _, err := d.ReadFile(name); return err }},
-		"write":  {func(name string) error { return d.WriteFile(name, nil, 0o600) }},
-		"create": {func(name string) error { return d.CreateExclusive(name, nil, 0o600) }},
+	tests := map[string]struct{ call func(*Dir, string) error }{
+		"read":   {func(d *Dir, name string) error { _, err := d.ReadFile(name); return err }},
+		"write":  {func(d *Dir, name string) error { return d.WriteFile(name, nil, 0o600) }},
+		"create": {func(d *Dir, name string) error { return d.CreateExclusive(name, nil, 0o600) }},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			for _, invalid := range []string{"", ".", "..", "nested/file", "file/", "/absolute"} {
-				err := tt.call(invalid)
+				err := tt.call(d, invalid)
 				if dest, ok := errors.AsType[*DestinationError](err); !ok || dest.Path != invalid {
 					t.Fatalf("%q: want DestinationError; got %v", invalid, err)
 				}
@@ -188,10 +187,17 @@ func TestDirNameAndClose(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for name, tt := range tests {
-		if err := tt.call("file"); !errors.Is(err, fs.ErrClosed) {
-			t.Errorf("%s after Close: %v", name, err)
-		}
+	for state, handle := range map[string]*Dir{"closed": d, "zero value": {}} {
+		t.Run(state, func(t *testing.T) {
+			for name, tt := range tests {
+				if err := tt.call(handle, "file"); !errors.Is(err, fs.ErrClosed) {
+					t.Errorf("%s: want fs.ErrClosed, got %v", name, err)
+				}
+			}
+			if err := handle.Close(); err != nil {
+				t.Error(err)
+			}
+		})
 	}
 	if entries, err := os.ReadDir(root); err != nil || len(entries) != 0 {
 		t.Fatalf("directory changed despite refusals: %v, %v", entries, err)
@@ -200,34 +206,33 @@ func TestDirNameAndClose(t *testing.T) {
 
 func TestDirCompetingCreates(t *testing.T) {
 	dir := t.TempDir()
-	handles := [...]*Dir{openTestDir(t, dir), openTestDir(t, dir)}
 	contents := [...]string{"first", "second"}
-	type result struct {
-		i   int
-		err error
-	}
-	start, results := make(chan struct{}), make(chan result, len(handles))
-	for i, d := range handles {
-		go func() {
-			<-start
-			results <- result{i, d.CreateExclusive("file", []byte(contents[i]), 0o600)}
-		}()
-	}
-	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
-	defer cancel()
-	close(start)
-	wins := 0
-	for range handles {
-		select {
-		case r := <-results:
-			if r.err == nil {
-				wins++
-				checkContents(t, filepath.Join(dir, "file"), contents[r.i])
-			} else if !errors.Is(r.err, fs.ErrExist) {
-				t.Fatal(r.err)
+	var results [len(contents)]struct{ openErr, createErr, closeErr error }
+	var ready, writers sync.WaitGroup
+	ready.Add(len(contents))
+	for i, data := range contents {
+		writers.Go(func() {
+			d, err := OpenDir(dir)
+			results[i].openErr = err
+			ready.Done()
+			ready.Wait()
+			if err == nil {
+				results[i].createErr = d.CreateExclusive("file", []byte(data), 0o600)
+				results[i].closeErr = d.Close()
 			}
-		case <-ctx.Done():
-			t.Fatal(ctx.Err())
+		})
+	}
+	writers.Wait()
+	wins := 0
+	for i, r := range results {
+		if err := errors.Join(r.openErr, r.closeErr); err != nil {
+			t.Fatal(err)
+		}
+		if r.createErr == nil {
+			wins++
+			checkContents(t, filepath.Join(dir, "file"), contents[i])
+		} else if !errors.Is(r.createErr, fs.ErrExist) {
+			t.Fatal(r.createErr)
 		}
 	}
 	if wins != 1 {

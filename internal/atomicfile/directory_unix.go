@@ -161,9 +161,25 @@ func (d *directory) path(base string) string {
 	return strings.TrimSuffix(d.handle.Name(), "/") + "/" + base
 }
 
+// Reserve the longest suffix even when the current pid has fewer than ten digits.
+const maxDestinationBase = 255 - len(".2147483647.0123456789ab.tmp")
+
+func validWriteBase(base string) bool {
+	if !validBase(base) || len(base) > maxDestinationBase {
+		return false
+	}
+	stem, ok := strings.CutSuffix(base, ".tmp")
+	if !ok {
+		return true
+	}
+	stem, _, _ = strings.CutLast(stem, ".")
+	target, _, ok := strings.CutLast(stem, ".")
+	return !ok || target == "" || !generatedName(base, target)
+}
+
 func splitDestination(path string) (string, string, error) {
 	parent, base := filepath.Split(path)
-	if !validBase(base) {
+	if !validWriteBase(base) {
 		return "", "", &DestinationError{path}
 	}
 	if parent == "" {

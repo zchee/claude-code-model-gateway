@@ -42,6 +42,33 @@ func TestDirFIFO(t *testing.T) {
 		if _, ok := errors.AsType[*NonRegularError](err); !ok || data != nil {
 			t.Fatalf("ReadFile(fifo) = %q, %v", data, err)
 		}
+		writeFixture(t, "target", "regular target")
+		tests := map[string]struct{ replacement func(string) error }{
+			"error: regular file becomes a FIFO":    {func(path string) error { return unix.Mkfifo(path, 0o600) }},
+			"error: regular file becomes a symlink": {func(path string) error { return os.Symlink("target", path) }},
+		}
+		for name, tt := range tests {
+			t.Run(name, func(t *testing.T) {
+				const leaf = "candidate"
+				writeFixture(t, leaf, oldState)
+				t.Cleanup(func() {
+					if err := os.Remove(leaf); err != nil {
+						t.Error(err)
+					}
+				})
+				data, err := d.readFile(leaf, func() {
+					if err := os.Remove(leaf); err != nil {
+						t.Fatal(err)
+					}
+					if err := tt.replacement(leaf); err != nil {
+						t.Fatal(err)
+					}
+				})
+				if refusal, ok := errors.AsType[*NonRegularError](err); !ok || refusal.Path != "./"+leaf || data != nil {
+					t.Fatalf("read after replacement: %q, %v", data, err)
+				}
+			})
+		}
 		return
 	}
 	dir := t.TempDir()

@@ -13,7 +13,12 @@
 // limitations under the License.
 
 // Package atomicfile replaces state and settings files without truncating the destination.
-// Stale-file cleanup checks the entry with lstat before a separate file-only unlink.
+// Writers accept destination names of at most 227 bytes, leaving room for the
+// staging suffix within a 255-byte directory entry. Names of the form
+// <destination>.<positive decimal pid>.<12 lowercase hex digits>.tmp are
+// reserved and must not be used as destinations: a successful write to the
+// same base name may sweep stale staged siblings. Stale-file cleanup checks
+// the entry with lstat before a separate file-only unlink.
 // The package does not protect directories writable by other users.
 package atomicfile
 
@@ -23,12 +28,30 @@ import (
 	"time"
 )
 
-// DestinationError reports a path without a destination file name.
+// DestinationError reports a missing, invalid, reserved, or overlong destination name.
 type DestinationError struct{ Path string }
 
 func (e *DestinationError) Error() string {
-	return fmt.Sprintf("atomic replacement needs a file name: %q", e.Path)
+	return fmt.Sprintf("invalid atomic file destination: %q", e.Path)
 }
+
+// StageCleanupError reports that unlinking a staged sibling failed. If Published
+// is true, Staged is a second name for the published inode. Otherwise publication
+// did not succeed and Staged is an orphan. Err is the unlink error.
+type StageCleanupError struct {
+	Staged    string
+	Published bool
+	Err       error
+}
+
+func (e *StageCleanupError) Error() string {
+	if e.Published {
+		return fmt.Sprintf("file published; removing staged sibling %s: %v", e.Staged, e.Err)
+	}
+	return fmt.Sprintf("file not published; removing staged sibling %s: %v", e.Staged, e.Err)
+}
+
+func (e *StageCleanupError) Unwrap() error { return e.Err }
 
 // OwnershipError reports that replacement would change the file's owner or group.
 type OwnershipError struct {
@@ -46,15 +69,18 @@ func (e *OwnershipError) Unwrap() error { return e.Err }
 type preparedFile interface {
 	Name() string
 	CloseAtomicallyReplace() error
+	remove() error
 }
 
 type writer struct {
-	now    func() time.Time
-	commit func(preparedFile, string) error
+	now                   func() time.Time
+	commit                func(preparedFile, string) error
+	remove                func(preparedFile) error
+	afterOpen, beforeLink func()
 }
 
 func newWriter() writer {
-	return writer{now: time.Now, commit: func(file preparedFile, _ string) error { return file.CloseAtomicallyReplace() }}
+	return writer{now: time.Now, commit: func(file preparedFile, _ string) error { return file.CloseAtomicallyReplace() }, remove: preparedFile.remove}
 }
 
 // WriteFile replaces path with data using mode for the temporary sibling.

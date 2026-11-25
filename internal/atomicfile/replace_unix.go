@@ -40,6 +40,7 @@ type stagedFile struct {
 
 func (s stagedFile) Name() string                  { return s.root.path(s.name) }
 func (s stagedFile) CloseAtomicallyReplace() error { return s.root.Rename(s.name, s.target) }
+func (s stagedFile) remove() error                 { return s.root.removeIfPresent(s.name) }
 
 func createSibling(root *directory, base string, mode fs.FileMode) (*os.File, string, error) {
 	for {
@@ -149,8 +150,8 @@ func (w writer) replace(root *directory, base string, data []byte, mode fs.FileM
 	published := false
 	defer func() {
 		if !published {
-			if cleanupErr := root.removeIfPresent(name); cleanupErr != nil {
-				err = errors.Join(err, cleanupErr)
+			if cleanupErr := w.remove(stage); cleanupErr != nil {
+				err = errors.Join(err, &StageCleanupError{Staged: stage.Name(), Err: cleanupErr})
 			}
 		}
 	}()

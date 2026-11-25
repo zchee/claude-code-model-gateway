@@ -18,10 +18,18 @@ import "os"
 
 type directory struct{ handle *os.File }
 
+type noCopy struct{}
+
+func (*noCopy) Lock()   {}
+func (*noCopy) Unlock() {}
+
 // Dir anchors single-component file operations to one opened directory, even
-// if it is renamed. Use a Dir from only one goroutine at a time and do not
-// copy it. Its zero value is closed.
-type Dir struct{ root directory }
+// if it is renamed. A Dir must not be copied or used concurrently. In
+// particular, Close must not race any operation. Its zero value is closed.
+type Dir struct {
+	_    noCopy
+	root directory
+}
 
 // Close releases the directory descriptor. Closing a closed Dir succeeds;
 // subsequent file operations return fs.ErrClosed.
