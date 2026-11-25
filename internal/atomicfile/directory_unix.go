@@ -36,8 +36,6 @@ func retryEINTR(call func() (int, error)) (int, error) {
 	}
 }
 
-type directory struct{ handle *os.File }
-
 func (d *directory) Close() error { return d.handle.Close() }
 
 func validBase(base string) bool {
@@ -55,6 +53,16 @@ func (d *directory) Lstat(base string) (*unix.Stat_t, error) {
 		return nil, &os.PathError{Op: "lstat", Path: d.path(base), Err: err}
 	}
 	return &st, nil
+}
+
+func (d *directory) lstatRetry(base string) (*unix.Stat_t, error) {
+	var st *unix.Stat_t
+	_, err := retryEINTR(func() (int, error) {
+		var err error
+		st, err = d.Lstat(base)
+		return 0, err
+	})
+	return st, err
 }
 
 func (d *directory) OpenFile(base string, flags int, mode fs.FileMode) (*os.File, error) {

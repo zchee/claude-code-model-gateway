@@ -208,6 +208,10 @@ func (w writer) writeFile(path string, data []byte, mode fs.FileMode) error {
 		return err
 	}
 	defer func() { _ = root.Close() }()
+	return w.writeFileAt(root, base, data, mode)
+}
+
+func (w writer) writeFileAt(root *directory, base string, data []byte, mode fs.FileMode) error {
 	info, err := root.Lstat(base)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err

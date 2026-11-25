@@ -44,10 +44,7 @@ func CreateExclusive(path string, data []byte, mode fs.FileMode) error {
 
 func createExclusiveAt(root *directory, base string, data []byte, mode fs.FileMode) error {
 	// An existing entry does not require enough space or permission to stage a file.
-	_, err := retryEINTR(func() (int, error) {
-		_, err := root.Lstat(base)
-		return 0, err
-	})
+	_, err := root.lstatRetry(base)
 	if err == nil {
 		return &os.PathError{Op: "create", Path: root.path(base), Err: fs.ErrExist}
 	}
