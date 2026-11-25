@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Collect static assertion evidence; never load the plugin or its tests.
+set -euo pipefail
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
+"$root/hack/venue-check"
+plugin=$("$root/hack/pinned-source")/plugins/model-gateway
+"$root/hack/baseline-extract" --verify
+work=$(mktemp -d "$root/.cache/assertions.XXXXXXXX")
+trap 'rm -rf -- "$work"' EXIT
+mkdir "$work/home"
+clean=(env -i "PATH=$PATH" "HOME=$work/home" "npm_config_cache=${npm_config_cache:?missing venue npm cache}")
+"${clean[@]}" npm --prefix "$root/hack/assertions" ci --ignore-scripts --no-audit --no-fund
+"${clean[@]}" node "$root/hack/assertions/self-test.cjs"
+pin=$("$root/hack/pinned-source" --print-pin)
+rc=0
+"${clean[@]}" node "$root/hack/assertions/collect.cjs" "$plugin" "$root/test/conformance" "$pin" > "$work/frame" || rc=$?
+"$root/hack/venue-check"
+if IFS= read -r frame < "$work/frame"; then printf '%s\n' "$frame"; else exit 1; fi
+exit "$rc"

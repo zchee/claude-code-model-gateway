@@ -45,7 +45,7 @@ override run_script = if [ -f "hack/$@" ] && [ -x "hack/$@" ]; then \
 TRIPWIRE_NAME ?= phase-0-baseline
 unexport TRIPWIRE_NAME
 
-.PHONY: build vet build-windows fmt fmt-check lint test test-process conformance baseline-node bench tripwire tools
+.PHONY: build vet build-windows fmt fmt-check lint test test-process conformance baseline-node assertion-sites bench tripwire tools
 
 build:
 	go build ./...
@@ -96,7 +96,7 @@ test:
 test-process:
 	@$(require_test_venue) && go test -count=1 -tags process ./...
 
-conformance baseline-node bench:
+conformance baseline-node assertion-sites bench:
 	@$(require_test_venue) && $(run_script)
 
 tripwire:

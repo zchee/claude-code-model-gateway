@@ -1,0 +1,8 @@
+{
+  "name": "assertion-inventory",
+  "private": true,
+  "dependencies": {
+    "@types/node": "24.10.1",
+    "typescript": "5.9.3"
+  }
+}

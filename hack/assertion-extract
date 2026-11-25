@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# Decode a complete venue frame; do not overwrite an edited handoff mapping.
+set -euo pipefail
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
+exec python3 -I - "$root" "$@" <<'PY'
+import argparse, base64, gzip, hashlib, json, re, sys
+from collections import defaultdict
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+
+root = Path(sys.argv.pop(1))
+parser = argparse.ArgumentParser(description='Extract the pinned assertion inventory.')
+parser.add_argument('log', type=Path)
+parser.add_argument('--initialize-mapping', action='store_true')
+parser.add_argument('--classification', type=Path, default=root/'test/conformance/classification.tsv', help='case classification for mapping initialization')
+parser.add_argument('--audit', type=Path, help='new path for the complete resolution report (JSON)')
+args = parser.parse_args()
+out = root / 'test/conformance'
+frames = [line.split() for line in args.log.read_bytes().splitlines() if line.startswith(b'ASSERTION-SITES-V1 ')]
+if len(frames) != 1 or len(frames[0]) != 3: sys.exit('expected exactly one complete assertion frame')
+_, checksum, encoded = frames[0]
+payload = base64.b64decode(encoded, validate=True)
+if hashlib.sha256(payload).hexdigest().encode() != checksum: sys.exit('damaged assertion frame')
+record = json.loads(gzip.decompress(payload))
+for field, name in [('census','baseline/census.tsv'),('overrides','assertion-overrides.tsv')]:
+    if record[field] != hashlib.sha256((out/name).read_bytes()).hexdigest(): sys.exit('stale input: '+name)
+rows = [line.split('\t') for line in record['pairs'].splitlines()]
+keys = 'path line column name site_path site_line site_column'.split()
+if rows[0] != keys + ['call','via']: sys.exit('unexpected pair header')
+source = args.classification.read_text().splitlines()
+columns = source[0].split('\t')
+phases = {}
+for line in source[1:]:
+    row = dict(zip(columns, line.split('\t'), strict=True))
+    due = row['class'] in ('go-port','conformance') or row['class'].startswith('difference:')
+    if due != bool(row['phase']): sys.exit('classification phase does not match obligation class: '+row['name'])
+    phases[tuple(row[k] for k in keys[:4])] = row['phase']
+seen = set()
+for row in rows[1:]:
+    pair = tuple(row[:7])
+    if len(row) != 9 or pair[:4] not in phases or pair in seen: sys.exit(f'invalid pair: {pair}')
+    seen.add(pair)
+if args.audit:
+    with args.audit.open('x') as f:
+        json.dump({k: record[k] for k in ('unresolved','resolvedAtOpenSites','rules','productFiles','unreached','unmatched','embeddedInputs')}, f)
+for field in ('unreached','unmatched'):
+    if record[field]: sys.exit(f'{len(record[field])} {field}; inventory withheld (use --audit for details)')
+call_cases = defaultdict(set)
+for row in record['unresolved']:
+    if len(row) != 8: sys.exit('invalid generated call edge')
+    call_cases[tuple(map(str,row[4:]))].add(tuple(map(str,row[:4])))
+for row in record['resolvedAtOpenSites']:
+    site = tuple(map(str,row[4:8]))
+    if site not in call_cases: sys.exit('call-site reachability mismatch in frame')
+    call_cases[site].add(tuple(map(str,row[:4])))
+review_rows = (out/'assertion-unresolved.tsv').read_text().splitlines()
+if not review_rows or review_rows[0].split('\t') != 'path line column callee cases disposition reason'.split(): sys.exit('invalid unresolved header')
+adds = defaultdict(set)
+for line in (out/'assertion-overrides.tsv').read_text().splitlines()[1:]:
+    parts = line.split('\t')
+    if parts[7] == 'add': adds[':'.join(parts[4:7])].add(tuple(parts[:4]))
+seen_calls = set()
+for line in review_rows[1:]:
+    fields = line.split('\t')
+    if len(fields) != 7: sys.exit('invalid unresolved record')
+    site, count, disposition, reason = tuple(fields[:4]), *fields[4:]
+    if site in seen_calls or site not in call_cases: sys.exit(f'stale or duplicate unresolved record: {site}')
+    if count != str(len(call_cases[site])) or not reason.strip(): sys.exit(f'invalid affected case count or reason: {site}')
+    if disposition == 'resolved-by-override':
+        linked = re.findall(r'(?:^|\s)override-site:(\S+)(?=\s|$)',reason)
+        if not linked or any(not (adds[k] & call_cases[site]) for k in linked): sys.exit(f'no applicable override: {site}')
+    elif disposition != 'no-assertion-reachable': sys.exit(f'invalid call disposition: {site}')
+    seen_calls.add(site)
+if missing := call_cases.keys()-seen_calls: sys.exit(f'{len(missing)} unresolved calls lack reviews; use --audit')
+baseline = json.loads((out/'baseline/run.json').read_bytes())
+if record['pin'] != '\t'.join(baseline[k] for k in ('commit','root_tree','plugin_tree')): sys.exit('stale source pin')
+if args.initialize_mapping:
+    with (out/'assertion-sites.tsv').open('x') as f:
+        f.write('\t'.join(keys + ['target','review','due'])+'\n')
+        for row in rows[1:]:
+            phase = phases[tuple(row[:4])]
+            if phase: f.write('\t'.join([*row[:7],'','',phase])+'\n')
+with NamedTemporaryFile(dir=out, delete=False) as f: f.write(record['pairs'].encode())
+Path(f.name).replace(out/'assertion-pairs.tsv')
+print(f'{len(seen)} case/site pairs; {len(call_cases)} reviewed indirect calls; no unmatched reviews or unattributed assertions')
+PY
