@@ -26,38 +26,59 @@ import (
 )
 
 func TestRequestBodyHighWater(t *testing.T) {
-	directory := filepath.Join(t.TempDir(), "state")
-	stamp := time.Unix(123, 123456789).UTC()
-	clock := func() time.Time { return stamp }
-	h := NewHighWater(directory, clock)
-	if diff := gocmp.Diff(new(int64(1234)), h.Record("high-water-session", 1234)); diff != "" {
-		t.Errorf("first observation (-want +got):\n%s", diff)
+	const initial = `{"value":1234,"observed_at":"1970-01-01T00:02:03.123Z"}`
+	const seeded = `{"value":4321,"observed_at":"1970-01-01T00:00:01.000Z"}`
+	tests := map[string]struct {
+		seed, wantFile string
+		maximum        int64
+	}{
+		"success: record new maximum":             {wantFile: initial, maximum: 1234},
+		"success: restore independent state file": {seed: seeded, wantFile: seeded, maximum: 4321},
 	}
-	stamp = stamp.Add(time.Hour)
-	if diff := gocmp.Diff(new(int64(1234)), h.Record("high-water-session", 1000)); diff != "" {
-		t.Errorf("smaller observation (-want +got):\n%s", diff)
-	}
-	path := filepath.Join(directory, "aGlnaC13YXRlci1zZXNzaW9u.json")
-	got, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if diff := gocmp.Diff(`{"value":1234,"observed_at":"1970-01-01T00:02:03.123Z"}`, string(got)); diff != "" {
-		t.Errorf("state bytes (-want +got):\n%s", diff)
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0o600 {
-		t.Errorf("state mode = %o, want 0600", info.Mode().Perm())
-	}
-	fresh := NewHighWater(directory, clock)
-	if diff := gocmp.Diff(new(int64(1234)), fresh.Record("high-water-session", 50)); diff != "" {
-		t.Errorf("restored maximum (-want +got):\n%s", diff)
-	}
-	if diff := gocmp.Diff(new(int64(50)), fresh.Record("other-session", 50)); diff != "" {
-		t.Errorf("independent session (-want +got):\n%s", diff)
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			directory := filepath.Join(t.TempDir(), "state")
+			path := filepath.Join(directory, "aGlnaC13YXRlci1zZXNzaW9u.json")
+			if tt.seed != "" {
+				if err := os.Mkdir(directory, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(tt.seed), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			stamp := time.Unix(123, 123456789).UTC()
+			clock := func() time.Time { return stamp }
+			h := NewHighWater(directory, clock)
+			if diff := gocmp.Diff(new(tt.maximum), h.Record("high-water-session", 1234)); diff != "" {
+				t.Errorf("first observation (-want +got):\n%s", diff)
+			}
+			stamp = stamp.Add(time.Hour)
+			if diff := gocmp.Diff(new(tt.maximum), h.Record("high-water-session", 1000)); diff != "" {
+				t.Errorf("smaller observation (-want +got):\n%s", diff)
+			}
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if diff := gocmp.Diff(tt.wantFile, string(got)); diff != "" {
+				t.Errorf("state bytes (-want +got):\n%s", diff)
+			}
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Mode().Perm() != 0o600 {
+				t.Errorf("state mode = %o, want 0600", info.Mode().Perm())
+			}
+			fresh := NewHighWater(directory, clock)
+			if diff := gocmp.Diff(new(tt.maximum), fresh.Record("high-water-session", 50)); diff != "" {
+				t.Errorf("restored maximum (-want +got):\n%s", diff)
+			}
+			if diff := gocmp.Diff(new(int64(50)), fresh.Record("other-session", 50)); diff != "" {
+				t.Errorf("independent session (-want +got):\n%s", diff)
+			}
+		})
 	}
 }
 

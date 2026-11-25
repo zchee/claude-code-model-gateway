@@ -26,6 +26,8 @@ import (
 )
 
 // Request contains the inputs needed to attribute a completed response.
+// Response capture will supply the message ID and model, route model and backend,
+// elapsed time, response byte count, and completion and overflow state.
 type Request struct {
 	Body            jsonx.WireValue
 	BodyBytes       int64
@@ -40,6 +42,8 @@ type Request struct {
 type Record struct {
 	EventName  string
 	ObservedAt time.Time
+	TraceID    string
+	SpanID     string
 	Attributes map[string]any
 }
 

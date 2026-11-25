@@ -17,8 +17,10 @@ package usage
 import (
 	"bytes"
 	json "encoding/json/v2"
+	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -97,17 +99,38 @@ func events(records []Record, event string) []Record {
 }
 
 func TestInputComposition(t *testing.T) {
-	got := inputComposition(wire(t, compositionBody), 9876)
-	want := map[string]int64{"request_body_bytes": 9876, "input_system_bytes": 41, "input_tools_bytes": 123, "input_native_tools_bytes": 53, "input_mcp_tools_bytes": 67, "input_messages_bytes": 258, "input_first_message_bytes": 49, "input_history_bytes": 205, "input_tool_results_bytes": 72}
-	checkJSON(t, want, got)
-	if bytes.Contains(encoded(t, got), []byte("private")) {
-		t.Error("request content retained in composition")
+	tests := map[string]struct{ size, wantBody int64 }{
+		"success: explicit size":                       {size: 9876, wantBody: 9876},
+		"success: zero size":                           {},
+		"success: negative size measures compact body": {size: -1, wantBody: 482},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			got := inputComposition(wire(t, compositionBody), tt.size)
+			want := map[string]int64{"request_body_bytes": tt.wantBody, "input_system_bytes": 41, "input_tools_bytes": 123, "input_native_tools_bytes": 53, "input_mcp_tools_bytes": 67, "input_messages_bytes": 258, "input_first_message_bytes": 49, "input_history_bytes": 205, "input_tool_results_bytes": 72}
+			checkJSON(t, want, got)
+			if bytes.Contains(encoded(t, got), []byte("private")) {
+				t.Error("request content retained in composition")
+			}
+		})
 	}
 }
 
 func TestLargestRemainder(t *testing.T) {
-	if diff := gocmp.Diff([]int64{3, 2, 2}, allocateLargestRemainder(7, []int64{1, 1, 1})); diff != "" {
-		t.Errorf("allocation (-want +got):\n%s", diff)
+	tests := map[string]struct {
+		total         int64
+		weights, want []int64
+	}{
+		"success: equal weights retain order": {total: 7, weights: []int64{1, 1, 1}, want: []int64{3, 2, 2}},
+		"success: fraction below one third":   {total: 2, weights: []int64{4, 1, 1}, want: []int64{1, 1, 0}},
+		"success: fraction above one third":   {total: 3, weights: []int64{1, 1, 7}, want: []int64{0, 0, 3}},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			if diff := gocmp.Diff(tt.want, allocateLargestRemainder(tt.total, tt.weights)); diff != "" {
+				t.Errorf("allocation (-want +got):\n%s", diff)
+			}
+		})
 	}
 }
 
@@ -130,6 +153,33 @@ func TestInputAttribution(t *testing.T) {
 				}
 				t.Run(key, func(t *testing.T) { checkJSON(t, want, got) })
 			}
+		})
+	}
+}
+
+func TestMCPServerAttribution(t *testing.T) {
+	tests := map[string]struct{ servers, reported int }{"success: at reporting limit": {servers: 20, reported: 20}, "success: beyond reporting limit": {servers: 21, reported: 20}}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			var tools []map[string]string
+			for i := tt.servers - 1; i >= 0; i-- {
+				tools = append(tools, map[string]string{"name": fmt.Sprintf("mcp__s%02d__tool", i)})
+			}
+			body := encoded(t, map[string]any{"tools": tools})
+			request := Request{Body: wire(t, string(body)), StatusCode: 200, Usage: map[string]any{"input_tokens": tt.servers}}
+			record := onlyEvent(t, NewBuilder(options(t)).Build(request), "gateway.token.usage")
+			checkJSON(t, tt.servers, record.Attributes["input_mcp_tools_tokens"])
+			got := map[string]any{}
+			for k, v := range record.Attributes {
+				if strings.HasPrefix(k, "input_mcp_tools_") && strings.HasSuffix(k, "_tokens") && k != "input_mcp_tools_tokens" {
+					got[k] = v
+				}
+			}
+			want := map[string]int{}
+			for i := range tt.reported {
+				want[fmt.Sprintf("input_mcp_tools_s%02d_tokens", i)] = 1
+			}
+			checkJSON(t, want, got)
 		})
 	}
 }
@@ -157,19 +207,38 @@ func TestExactUsage(t *testing.T) {
 }
 
 func TestMergeUsage(t *testing.T) {
-	start := map[string]any{"input_tokens": 100, "cache_creation": map[string]any{"ephemeral_5m_input_tokens": 10}}
-	end := map[string]any{"output_tokens": 20, "input_tokens": 101, "cache_creation": map[string]any{"ephemeral_1h_input_tokens": 4}}
-	checkJSON(t, map[string]any{"input_tokens": 101, "output_tokens": 20, "cache_creation": map[string]any{"ephemeral_5m_input_tokens": 10, "ephemeral_1h_input_tokens": 4}}, MergeUsage(start, end))
+	tests := map[string]struct{ start, end, want map[string]any }{
+		"success: final count and new cache duration": {
+			start: map[string]any{"input_tokens": 100, "cache_creation": map[string]any{"ephemeral_5m_input_tokens": 10}},
+			end:   map[string]any{"output_tokens": 20, "input_tokens": 101, "cache_creation": map[string]any{"ephemeral_1h_input_tokens": 4}},
+			want:  map[string]any{"input_tokens": 101, "output_tokens": 20, "cache_creation": map[string]any{"ephemeral_5m_input_tokens": 10, "ephemeral_1h_input_tokens": 4}},
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) { checkJSON(t, tt.want, MergeUsage(tt.start, tt.end)) })
+	}
 }
 
 func TestLimitEvidence(t *testing.T) {
-	h := http.Header{}
-	for k, v := range map[string]string{"anthropic-ratelimit-input-tokens-limit": "100000", "anthropic-ratelimit-input-tokens-remaining": "25000", "anthropic-ratelimit-input-tokens-reset": "2026-07-19T20:00:00Z", "retry-after": "2.5", "x-codex-primary-used-percent": "72%", "x-codex-secondary-used-percent": "64", "x-private-header": "private value"} {
-		h.Set(k, v)
+	tests := map[string]struct {
+		header, value string
+		want          int64
+	}{
+		"rate_limit_input_tokens_limit":       {header: "anthropic-ratelimit-input-tokens-limit", value: "100000", want: 100000},
+		"rate_limit_input_tokens_remaining":   {header: "anthropic-ratelimit-input-tokens-remaining", value: "25000", want: 25000},
+		"rate_limit_input_tokens_reset_at_ms": {header: "anthropic-ratelimit-input-tokens-reset", value: "2026-07-19T20:00:00Z", want: 1784491200000},
+		"retry_after_ms":                      {header: "retry-after", value: "2.5", want: 2500},
+		"codex_throttle_used_percent":         {header: "x-codex-primary-used-percent", value: "72%", want: 72},
 	}
+	h := http.Header{}
+	for _, tt := range tests {
+		h.Set(tt.header, tt.value)
+	}
+	h.Set("x-codex-secondary-used-percent", "64")
+	h.Set("x-private-header", "private value")
 	r := onlyEvent(t, NewBuilder(options(t)).Build(Request{Body: wire(t, `{}`), StatusCode: 429, ResponseHeaders: h}), "gateway.limit.signal")
-	for k, want := range map[string]int64{"rate_limit_input_tokens_limit": 100000, "rate_limit_input_tokens_remaining": 25000, "rate_limit_input_tokens_reset_at_ms": 1784491200000, "retry_after_ms": 2500, "codex_throttle_used_percent": 72} {
-		t.Run(k, func(t *testing.T) { checkJSON(t, want, r.Attributes[k]) })
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) { checkJSON(t, tt.want, r.Attributes[name]) })
 	}
 	if bytes.Contains(encoded(t, r), []byte("private")) {
 		t.Error("private header in limit record")

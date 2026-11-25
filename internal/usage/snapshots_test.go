@@ -55,7 +55,11 @@ func TestToolResultAttribution(t *testing.T) {
 	}{
 		"success: one result":       {exactBase, exactNext, 100, 137, "SQ-1234", "private exact result", map[string]map[string]any{"tool-exact": {"tool_name": "mcp__sidequest__claim", "tool_result_tokens": 37, "tool_result_tokens_unit": "tokens", "tool_result_tokens_quality": "derived_exact", "ticket_ref": "SQ-1234"}}},
 		"success: weighted results": {`{"messages":[` + multiMessages + `]}`, `{"messages":[` + multiMessages + `,{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-short","content":"x"},{"type":"tool_result","tool_use_id":"tool-long","content":"` + strings.Repeat("long private result", 8) + `"}]}]}`, 200, 219, "", "long private result", map[string]map[string]any{"tool-short": {"tool_name": "Read", "tool_result_tokens": 4, "tool_result_tokens_quality": "estimate"}, "tool-long": {"tool_name": "mcp__sidequest__comments", "tool_result_tokens": 15, "tool_result_tokens_quality": "estimate"}}},
-		"success: compaction":       {base: exactBase, next: exactNext, start: 300, end: 90},
+		"success: fresh text also consumes context": {
+			base: exactBase, next: `{"messages":[` + exactMessages + `,{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-exact","content":"private exact result"},{"type":"text","text":"fresh text"}]}]}`,
+			start: 100, end: 120, private: "private exact result", want: map[string]map[string]any{"tool-exact": {"tool_result_tokens": 14, "tool_result_tokens_quality": "estimate"}},
+		},
+		"success: compaction": {base: exactBase, next: exactNext, start: 300, end: 90},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -86,24 +90,37 @@ func TestToolResultAttribution(t *testing.T) {
 }
 
 func TestAgentIsolation(t *testing.T) {
-	b := NewBuilder(options(t))
-	var all []Record
-	for _, turn := range []struct {
+	type turn struct {
 		agent, body string
 		tokens      int
-	}{{"agent-a", exactBase, 100}, {"agent-b", exactBase, 400}, {"agent-a", exactNext, 111}, {"agent-b", exactNext, 407}} {
-		all = append(all, observe(t, b, turn.body, "shared", turn.agent, "", "", turn.tokens)...)
 	}
-	r := events(all, toolEvent)
-	if len(r) != 2 {
-		t.Fatalf("got %d records, want 2", len(r))
+	tests := map[string]struct {
+		turns []turn
+		want  map[string]int
+	}{
+		"success: shared session and tool id": {
+			turns: []turn{{agent: "agent-a", body: exactBase, tokens: 100}, {agent: "agent-b", body: exactBase, tokens: 400}, {agent: "agent-a", body: exactNext, tokens: 111}, {agent: "agent-b", body: exactNext, tokens: 407}}, want: map[string]int{"agent-a": 11, "agent-b": 7},
+		},
 	}
-	totals := map[string]any{}
-	for _, v := range r {
-		id, _ := v.Attributes["agent_id"].(string)
-		totals[id] = v.Attributes["tool_result_tokens"]
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			b := NewBuilder(options(t))
+			var all []Record
+			for _, turn := range tt.turns {
+				all = append(all, observe(t, b, turn.body, "shared", turn.agent, "", "", turn.tokens)...)
+			}
+			r := events(all, toolEvent)
+			if len(r) != len(tt.want) {
+				t.Fatalf("got %d records, want %d", len(r), len(tt.want))
+			}
+			totals := map[string]any{}
+			for _, v := range r {
+				id, _ := v.Attributes["agent_id"].(string)
+				totals[id] = v.Attributes["tool_result_tokens"]
+			}
+			checkJSON(t, tt.want, totals)
+		})
 	}
-	checkJSON(t, map[string]int{"agent-a": 11, "agent-b": 7}, totals)
 }
 
 func TestSnapshotBounds(t *testing.T) {
@@ -117,6 +134,11 @@ func TestSnapshotBounds(t *testing.T) {
 		ttl   time.Duration
 		turns []turn
 	}{
+		"success: compaction replaces the baseline": {max: 2, ttl: time.Hour, turns: []turn{
+			{session: "s", agent: "a", body: exactNext, total: 300, want: -1},
+			{session: "s", agent: "a", body: exactBase, total: 90, want: -1},
+			{session: "s", agent: "a", body: exactNext, total: 107, want: 17},
+		}},
 		"success: expires exactly at idle deadline":          {2, time.Hour, []turn{{0, "s", "a", "", exactBase, 100, -1}, {time.Hour, "s", "a", "", exactNext, 140, -1}}},
 		"success: refresh before expiry":                     {2, time.Hour, []turn{{0, "s", "a", "", exactBase, 100, -1}, {time.Hour - time.Millisecond, "s", "a", "", exactBase, 110, -1}, {time.Millisecond, "s", "a", "", exactNext, 140, 30}}},
 		"success: least recently used identity evicted":      {2, time.Hour, []turn{{0, "s", "a", "", exactBase, 100, -1}, {0, "s", "b", "", exactBase, 10, -1}, {0, "s", "a", "", exactBase, 120, -1}, {0, "s", "c", "", exactBase, 1, -1}, {0, "s", "a", "", exactNext, 133, 13}, {0, "s", "b", "", exactNext, 20, -1}}},
