@@ -87,6 +87,16 @@ func TestTranslateRequest(t *testing.T) {
 	}
 }
 
+func TestTranslateRequestNullMessage(t *testing.T) {
+	got, err := grok.TranslateRequest(decode(t, `{"messages":[{"role":"user","content":"before"},null]}`), "grok-4.5")
+	if err == nil {
+		t.Error("accepted a null message")
+	}
+	if diff := gocmp.Diff(jsonx.WireValue{}, got); diff != "" {
+		t.Errorf("returned a partial request (-want +got):\n%s", diff)
+	}
+}
+
 const (
 	model        = "claude-grok-4.5"
 	zeroUsage    = `{"input_tokens":0,"output_tokens":0,"output_tokens_details":{"reasoning_tokens":0}}`

@@ -24,6 +24,7 @@ import (
 )
 
 // TranslateRequest builds a Responses input for the backend model.
+// A null entry in messages returns a zero WireValue and an error instead of a partial request.
 func TranslateRequest(payload jsonx.WireValue, model string) (jsonx.WireValue, error) {
 	return jsonx.WireValue{}, errors.New("request translation not implemented")
 }

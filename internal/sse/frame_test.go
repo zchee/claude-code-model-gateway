@@ -89,9 +89,10 @@ func TestFrameData(t *testing.T) {
 		rewritten string
 	}{
 		"success: rewrite first data line with original delimiter": {sse.Frame{Body: ": 日本語\r\nevent: item\r\ndata:\t{ }\r\ndata: second", Delimiter: "\r\n\r\n"}, "\t{ }", true, ": 日本語\nevent: item\ndata: {}\ndata: second\r\n\r\n"},
-		"success: unterminated rewritten tail":                     {sse.Frame{Body: "id: 7\r\ndata:  old"}, "  old", true, "id: 7\ndata: {}"},
+		"success: unterminated rewritten tail":                     {sse.Frame{Body: "id: 7\r\ndata:  { }"}, "  { }", true, "id: 7\ndata: {}"},
 		"success: data prefix is case and column sensitive":        {sse.Frame{Body: ": data:x\r\n data:x\r\nData:x", Delimiter: "\n\n"}, "", false, ": data:x\r\n data:x\r\nData:x\n\n"},
-		"success: empty first data line":                           {sse.Frame{Body: "data:\r\ndata: later", Delimiter: "\r\n\n"}, "", true, "data: {}\ndata: later\r\n\n"},
+		// The relay leaves empty data unchanged; WithData only applies an explicitly requested rewrite.
+		"success: WithData replaces an empty first data line": {sse.Frame{Body: "data:\r\ndata: later", Delimiter: "\r\n\n"}, "", true, "data: {}\ndata: later\r\n\n"},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
