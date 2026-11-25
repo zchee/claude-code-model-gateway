@@ -42,7 +42,9 @@ override run_script = if [ -f "hack/$@" ] && [ -x "hack/$@" ]; then \
 		printf 'hack/%s is missing or not executable\n' "$@" >&2; exit 1; \
 	fi
 
-.PHONY: build vet build-windows fmt fmt-check lint test test-process conformance bench tripwire tools
+TRIPWIRE_NAME ?= phase-0-baseline
+
+.PHONY: build vet build-windows fmt fmt-check lint test test-process conformance baseline-node bench tripwire tools
 
 build:
 	go build ./...
@@ -83,6 +85,7 @@ fmt-check:
 	exit "$$status"
 
 lint:
+	./hack/lint-venue
 	golangci-lint run
 	golangci-lint run --build-tags process
 
@@ -92,11 +95,11 @@ test:
 test-process:
 	@$(require_test_venue) && go test -count=1 -tags process ./...
 
-conformance bench:
+conformance baseline-node bench:
 	@$(require_test_venue) && $(run_script)
 
 tripwire:
-	@$(run_script)
+	@./hack/tripwire compare $(call shell_quote,$(TRIPWIRE_NAME))
 
 tools:
 	go install mvdan.cc/gofumpt@$(GOFUMPT_VERSION)
