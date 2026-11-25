@@ -45,7 +45,7 @@ override run_script = if [ -f "hack/$@" ] && [ -x "hack/$@" ]; then \
 TRIPWIRE_NAME ?= phase-0-baseline
 unexport TRIPWIRE_NAME
 
-.PHONY: build vet build-windows fmt fmt-check lint test test-process conformance baseline-node assertion-sites bench tripwire tools
+.PHONY: build vet build-windows fmt fmt-check env-doc lint test test-process conformance baseline-node assertion-sites bench tripwire tools
 
 build:
 	go build ./...
@@ -83,7 +83,11 @@ fmt-check:
 	check modernize -fix -diff -test -- $(fmt_packages); \
 	check env $(fmt_process_flags) modernize -fix -diff -test -- $(fmt_packages); \
 	check goimports-rereviser $(imports_flags) -list-diff -- $(fmt_paths); \
+	check go run ./internal/tools/envdoc -check docs/env.md; \
 	exit "$$status"
+
+env-doc:
+	$(fmt_environment) go run ./internal/tools/envdoc docs/env.md
 
 lint:
 	./hack/lint-venue
