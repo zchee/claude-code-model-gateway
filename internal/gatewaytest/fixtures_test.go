@@ -18,6 +18,7 @@ package gatewaytest_test
 
 import (
 	"bytes"
+	"context"
 	json "encoding/json/v2"
 	"errors"
 	"io"
@@ -27,9 +28,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	gocmp "github.com/google/go-cmp/cmp"
 
@@ -143,29 +145,139 @@ func TestRunFixtureRefusesExternalExecutable(t *testing.T) {
 	}
 }
 
-func TestFakeClaudeProcess(t *testing.T) {
-	if i := slices.Index(os.Args, "--"); i >= 0 && len(os.Args) > i+1 && os.Args[i+1] == "fixture-claude" {
-		if err := gatewaytest.FakeClaude(os.Args[i+2:], os.Stdout); err != nil {
-			t.Fatal(err)
-		}
-		return
+func TestFixtureDispatch(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
 	}
 	env := gatewaytest.NewEnv(t.TempDir(), nil, nil, nil)
+	outside := filepath.Join(t.TempDir(), "fixture-command")
+	if err := os.WriteFile(outside, []byte(launchCanary), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	tests := map[string]struct {
+		env  gatewaytest.Environment
+		path string
 		args []string
-		want string
 	}{
-		"success: version":     {[]string{"--version"}, "fake-claude 2.0.0"},
-		"success: opus init":   {[]string{"--model", "opus"}, "claude-opus-5-5"},
-		"success: sonnet init": {[]string{"--model", "sonnet"}, "claude-sonnet-5"},
+		"error: empty environment outside executable": {nil, outside, nil},
+		"error: no test selector":                     {env, self, nil},
+		"error: unrelated test":                       {nil, self, []string{"-test.run=^TestFakeClaudeProcess$", "--", "--gatewaytest-helper=claude"}},
+		"error: no child mode":                        {env, self, []string{helperTest, "--"}},
+		"error: unknown child mode":                   {env, self, []string{helperTest, "--", helperPrefix + "unknown"}},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			cmd := gatewaytest.HelperCommand(t, "TestFakeClaudeProcess", append([]string{"fixture-claude"}, tt.args...)...)
+			// A cancelled command cannot recursively launch the suite even if validation regresses.
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			cmd := exec.CommandContext(ctx, tt.path, tt.args...)
 			cmd.Dir = env["HOME"]
+			if err := tt.env.RunFixture(cmd); !errors.Is(err, gatewaytest.ErrRealClaude) {
+				t.Fatalf("RunFixture returned %v, want refusal", err)
+			}
+		})
+	}
+	if cmd, err := env.HelperCommand(t, "TestFakeClaudeProcess"); err == nil || cmd != nil {
+		t.Errorf("unregistered helper: cmd=%v err=%v", cmd, err)
+	}
+}
+
+func TestHelperDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		env := gatewaytest.NewEnv(t.TempDir(), nil, nil, nil)
+		cmd, err := env.HelperCommand(t, "claude", "--version")
+		if err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(6 * time.Second)
+		if err := env.RunFixture(cmd); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("expired helper: %v", err)
+		}
+	})
+}
+
+func TestProbeEndpointRefusal(t *testing.T) {
+	env := gatewaytest.NewEnv(t.TempDir(), nil, nil, nil)
+	bin := filepath.Join(env["HOME"], "fixture-claude")
+	if err := os.WriteFile(bin, []byte(launchCanary), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	env["CODEX_GATEWAY_CLAUDE_BIN"] = bin
+	tests := map[string]struct{ endpoint string }{
+		"error: hostname":                      {"http://localhost:9"},
+		"error: non-loopback IP":               {"http://192.0.2.1:9"},
+		"error: implicit port":                 {"http://127.0.0.1"},
+		"error: gateway port":                  {"http://127.0.0.1:18764"},
+		"error: proxy port":                    {"http://[::1]:18765"},
+		"error: HTTP port":                     {"http://127.0.0.1:80"},
+		"error: HTTPS":                         {"https://127.0.0.1:9"},
+		"error: mapped loopback reserved port": {"http://[::ffff:127.0.0.1]:18764"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			model, err := env.ProbeAlias(t.Context(), "sonnet", tt.endpoint)
+			if !errors.Is(err, gatewaytest.ErrProbeEndpoint) || model != nil {
+				t.Fatalf("model=%v err=%v", model, err)
+			}
+			wantAbsent(t, filepath.Join(env["HOME"], "launched"))
+		})
+	}
+}
+
+func TestProbeProxyEnvironment(t *testing.T) {
+	env := gatewaytest.NewEnv(t.TempDir(), nil, nil, nil)
+	const endpoint = "http://[::1]:9"
+	var script strings.Builder
+	script.WriteString("#!/bin/sh\n")
+	for _, key := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy", "ANTHROPIC_UNIX_SOCKET", "CODEX_GATEWAY_SOCKET_PATH"} {
+		env[key] = "fixture-override"
+		script.WriteString("[ -z \"${")
+		script.WriteString(key)
+		script.WriteString("+x}\" ] || exit 1\n")
+	}
+	script.WriteString("[ \"$ANTHROPIC_BASE_URL\" = '" + endpoint + "' ] || exit 1\nprintf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"model\":\"claude-sonnet-fixture\"}'\n")
+	bin := filepath.Join(env["HOME"], "fixture-claude")
+	if err := os.WriteFile(bin, []byte(script.String()), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	env["CODEX_GATEWAY_CLAUDE_BIN"] = bin
+	got, err := env.ProbeAlias(t.Context(), "sonnet", endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := gocmp.Diff(new("claude-sonnet-fixture[1m]"), got); diff != "" {
+		t.Fatal(diff)
+	}
+}
+
+func TestGatewayFixtureHelper(t *testing.T) { gatewaytest.DispatchHelper(t) }
+
+func TestFakeClaudeProcess(t *testing.T) {
+	env := gatewaytest.NewEnv(t.TempDir(), nil, nil, nil)
+	tests := map[string]struct {
+		args  []string
+		want  string
+		child gatewaytest.Environment
+	}{
+		"success: version with empty environment": {[]string{"--version"}, "fake-claude 2.0.0", nil},
+		"success: opus init":                      {[]string{"--model", "opus"}, "claude-opus-5-5", env},
+		"success: sonnet init":                    {[]string{"--model", "sonnet"}, "claude-sonnet-5", env},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			cmd, err := env.HelperCommand(t, "claude", tt.args...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			insideDirectory(t, env[sandbox], cmd.Dir)
+			info, err := os.Stat(cmd.Dir)
+			if err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 || cmd.WaitDelay <= 0 {
+				t.Fatalf("unsafe child directory or wait delay: mode=%v delay=%v err=%v", info, cmd.WaitDelay, err)
+			}
 			var out bytes.Buffer
 			cmd.Stdout, cmd.Stderr = &out, &out
-			if err := env.RunFixture(cmd); err != nil {
+			if err := tt.child.RunFixture(cmd); err != nil {
 				t.Fatalf("fixture: %v: %s", err, &out)
 			}
 			line, _, _ := strings.Cut(out.String(), "\n")

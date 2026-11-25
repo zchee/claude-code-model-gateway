@@ -13,6 +13,8 @@
 // limitations under the License.
 
 // Package gatewaytest isolates gateway fixtures and guards product operations under test.
+// Child environments are exact on the Linux and macOS test venues. Windows is compile-only:
+// environment names there are case-insensitive and os/exec may supply SYSTEMROOT.
 package gatewaytest
 
 import (
@@ -44,14 +46,13 @@ var (
 // Environment is the environment of a gateway process, not its parent's live environment.
 type Environment map[string]string
 
-// NewEnv builds an isolated environment in the caller's temporary home. Isolated overrides apply last.
+// NewEnv builds an isolated environment in the caller's temporary home. Overrides cannot move the sandbox root.
 func NewEnv(home string, parent, overrides, isolatedOverrides map[string]string) Environment {
 	socket := filepath.Join(home, "gateway.sock")
 	if runtime.GOOS == "windows" {
 		socket = `\\.\pipe\model-gateway-test-` + filepath.Base(home)
 	}
 	env := Environment{
-		sandboxKey:                          home,
 		"HOME":                              home,
 		"USERPROFILE":                       home,
 		"CLAUDE_CONFIG_DIR":                 filepath.Join(home, ".claude"),
@@ -95,6 +96,7 @@ func NewEnv(home string, parent, overrides, isolatedOverrides map[string]string)
 		env[key] = value
 	}
 	maps.Copy(env, isolatedOverrides)
+	env[sandboxKey] = home
 	return env
 }
 
@@ -148,19 +150,44 @@ func (env Environment) contains(path string) bool {
 	return err == nil && rel != "." && filepath.IsLocal(rel)
 }
 
-// RunFixture runs a context-bound command with this exact child environment. Under
-// test, only the current helper binary and explicitly named sandbox programs may run.
+const helperSelector = "-test.run=^TestGatewayFixtureHelper$"
+
+func registeredDispatch(args []string) bool {
+	if len(args) < 3 || args[1] != "--" {
+		return false
+	}
+	switch args[0] {
+	case helperSelector:
+		return args[2] == "--gatewaytest-helper=claude"
+	case "-test.run=^TestEmptyEnvironmentHelper$":
+		mode, ok := strings.CutPrefix(args[2], "--gatewaytest-helper=")
+		return ok && len(args) == 3 && slices.Contains([]string{"empty", "fixture", "alias", "pins", "named-alias", "named-pins"}, mode)
+	default:
+		return false
+	}
+}
+
+// RunFixture runs a sandbox executable or a registered helper dispatch with exactly env.
+// Only a registered dispatch of the current test executable may run without a sandbox.
 func (env Environment) RunFixture(cmd *exec.Cmd) error {
-	if env.guarded() {
-		if len(cmd.Args) == 0 || !filepath.IsAbs(cmd.Path) || cmd.Args[0] != cmd.Path {
+	if cmd == nil || len(cmd.Args) == 0 || !filepath.IsAbs(cmd.Path) || cmd.Args[0] != cmd.Path {
+		return ErrRealClaude
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	selfInfo, err := os.Stat(self)
+	if err != nil {
+		return err
+	}
+	program, err := os.Stat(cmd.Path)
+	if cmd.Path == self || (err == nil && os.SameFile(program, selfInfo)) {
+		if !registeredDispatch(cmd.Args[1:]) || !filepath.IsAbs(cmd.Dir) {
 			return ErrRealClaude
 		}
-		if !env.contains(cmd.Path) {
-			self, err := os.Executable()
-			if err != nil || cmd.Path != self {
-				return ErrRealClaude
-			}
-		}
+	} else if !env.guarded() || !env.contains(cmd.Path) {
+		return ErrRealClaude
 	}
 	cmd.Env = make([]string, 0, len(env)) // A nil slice inherits the ambient environment.
 	for name, value := range env {
@@ -168,6 +195,8 @@ func (env Environment) RunFixture(cmd *exec.Cmd) error {
 	}
 	return cmd.Run()
 }
+
+func reservedPort(port int) bool { return port == 18764 || port == 18765 || port == 80 }
 
 // Listen invokes listen only if the bind is permitted and returns its listener.
 func (env Environment) Listen(ctx context.Context, network, address string, listen func(context.Context, string, string) (net.Listener, error)) (net.Listener, error) {
@@ -180,8 +209,7 @@ func (env Environment) Listen(ctx context.Context, network, address string, list
 		if err != nil {
 			return nil, err
 		}
-		switch port {
-		case 18764, 18765, 80:
+		if reservedPort(port) {
 			return nil, ErrReservedPort
 		}
 	}
@@ -191,8 +219,21 @@ func (env Environment) Listen(ctx context.Context, network, address string, list
 // StartClaude invokes start with the selected executable only if its path is permitted.
 func (env Environment) StartClaude(ctx context.Context, start func(context.Context, string) error) error {
 	path := config.ClaudeBin.Get(env.lookup)
-	if env.guarded() && !env.contains(path) {
-		return ErrRealClaude
+	if env.guarded() {
+		if !env.contains(path) {
+			return ErrRealClaude
+		}
+		info, err := os.Stat(path)
+		switch {
+		case errors.Is(err, fs.ErrNotExist): // The launcher reports an explicitly named missing fixture.
+		case err != nil || !info.Mode().IsRegular():
+			return ErrRealClaude
+		case runtime.GOOS != "windows":
+			// For an absolute Unix path LookPath checks execute access without searching PATH.
+			if _, err := exec.LookPath(path); err != nil {
+				return ErrRealClaude
+			}
+		}
 	}
 	return start(ctx, path)
 }

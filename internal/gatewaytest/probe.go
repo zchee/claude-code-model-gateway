@@ -19,6 +19,9 @@ import (
 	"context"
 	json "encoding/json/v2"
 	"errors"
+	"maps"
+	"net/netip"
+	"net/url"
 	"os/exec"
 	"regexp"
 	"slices"
@@ -28,19 +31,35 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/config"
 )
 
+// ErrProbeEndpoint identifies a fixture endpoint that is not a safe loopback HTTP address.
+var ErrProbeEndpoint = errors.New("fixture probe requires an HTTP loopback IP with an explicit non-reserved port")
+
 // ProbeAlias reads the init event from an explicitly named sandbox fixture. A refused,
 // missing, timed-out or unsuccessful fixture produces no model. It never falls back to PATH.
 func (env Environment) ProbeAlias(ctx context.Context, alias, endpoint string) (*string, error) {
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Scheme != "http" || u.User != nil {
+		return nil, ErrProbeEndpoint
+	}
+	addr, err := netip.ParseAddrPort(u.Host)
+	if err != nil || addr.Addr().Zone() != "" || !addr.Addr().Unmap().IsLoopback() || addr.Port() == 0 || reservedPort(int(addr.Port())) {
+		return nil, ErrProbeEndpoint
+	}
 	if !env.guarded() {
 		return nil, nil
 	}
 	var output initLines
-	err := env.StartClaude(ctx, func(ctx context.Context, path string) error {
+	err = env.StartClaude(ctx, func(ctx context.Context, path string) error {
 		ctx, cancel := context.WithTimeout(ctx, time.Duration(config.PinProbeTimeout.Get(env.lookup))*time.Millisecond)
 		defer cancel()
 		child := Environment(config.PinProbeEnvironment(env))
-		bypass := config.NoProxyForPinProbe(env.lookup)
-		child["NO_PROXY"], child["no_proxy"] = bypass, bypass
+		maps.DeleteFunc(child, func(key, _ string) bool {
+			switch strings.ToUpper(key) {
+			case "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "ANTHROPIC_UNIX_SOCKET", "CODEX_GATEWAY_SOCKET_PATH":
+				return true
+			}
+			return false
+		})
 		child["ANTHROPIC_BASE_URL"] = endpoint
 		for _, name := range []string{"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_AUTOUPDATER", "DISABLE_TELEMETRY", "DISABLE_ERROR_REPORTING"} {
 			child[name] = "1"

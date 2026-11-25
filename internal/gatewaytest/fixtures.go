@@ -18,6 +18,7 @@ package gatewaytest
 
 import (
 	"context"
+	"crypto/rand"
 	json "encoding/json/v2"
 	"errors"
 	"fmt"
@@ -26,7 +27,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"regexp"
+	"path/filepath"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -138,18 +139,51 @@ func (env Environment) StartCountingProxy(t testing.TB) *CountingProxy {
 	return p
 }
 
-// HelperCommand selects one test in the current executable as a subprocess. Its
-// arguments follow --. Use Environment.RunFixture to supply its entire environment.
-func HelperCommand(t testing.TB, testName string, args ...string) *exec.Cmd {
+// HelperCommand prepares a registered helper in its own private sandbox directory.
+// The caller's test binary must define TestGatewayFixtureHelper(t *testing.T) calling
+// DispatchHelper(t). RunFixture supplies the child environment, which may be empty.
+func (env Environment) HelperCommand(t testing.TB, helper string, args ...string) (*exec.Cmd, error) {
 	t.Helper()
+	dispatch := append([]string{helperSelector, "--", "--gatewaytest-helper=" + helper}, args...)
+	if !registeredDispatch(dispatch) {
+		return nil, errors.New("unregistered gateway fixture helper")
+	}
 	exe, err := os.Executable()
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
-	cmd := exec.CommandContext(t.Context(), exe, append([]string{"-test.run=^" + regexp.QuoteMeta(testName) + "$", "--"}, args...)...)
-	cmd.Env = []string{}
-	cmd.WaitDelay = time.Second
-	return cmd
+	name := "gatewaytest-helper-" + rand.Text()
+	dir := filepath.Join(env["HOME"], name)
+	if !env.guarded() || !env.contains(dir) {
+		return nil, ErrOutsideSandbox
+	}
+	root, err := os.OpenRoot(env["HOME"])
+	if err != nil {
+		return nil, err
+	}
+	if err := root.Mkdir(name, 0o700); err != nil {
+		return nil, errors.Join(err, root.Close())
+	}
+	t.Cleanup(func() {
+		if err := errors.Join(root.RemoveAll(name), root.Close()); err != nil {
+			t.Error(err)
+		}
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	t.Cleanup(cancel)
+	cmd := exec.CommandContext(ctx, exe, dispatch...)
+	cmd.Dir, cmd.Env, cmd.WaitDelay = dir, []string{}, time.Second
+	return cmd, nil
+}
+
+// DispatchHelper handles the reserved subprocess invocation, doing nothing during ordinary test runs.
+func DispatchHelper(t testing.TB) {
+	t.Helper()
+	if len(os.Args) >= 4 && os.Args[1] == helperSelector && registeredDispatch(os.Args[1:]) {
+		if err := FakeClaude(os.Args[4:], os.Stdout); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 // FakeClaude answers the version and stream-json requests used by a fixture Claude executable.
