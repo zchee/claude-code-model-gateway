@@ -41,25 +41,37 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/procinfo"
 )
 
-// Both supported venues provide POSIX signal zero and SIGKILL wait status.
 func nativeIdentity(ctx context.Context, pid int) (lifecycle.ProcessState, string) {
+	state, birth := nativeBirth(ctx, pid)
+	if state != lifecycle.Alive {
+		return state, ""
+	}
+	return state, procinfo.LegacyStart(birth)
+}
+
+// Both supported venues provide POSIX signal zero and SIGKILL wait status.
+func nativeBirth(ctx context.Context, pid int) (lifecycle.ProcessState, time.Time) {
 	probeCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
 	probe := procinfo.New(nil)
 	alive, err := probe.Alive(probeCtx, pid)
 	if err != nil {
-		return lifecycle.Unknown, ""
+		return lifecycle.Unknown, time.Time{}
 	}
 	if !alive {
-		return lifecycle.Absent, ""
+		return lifecycle.Absent, time.Time{}
 	}
 	birthCtx, cancelBirth := context.WithTimeout(ctx, 4*time.Second)
 	defer cancelBirth()
-	id, err := probe.Identity(birthCtx, pid)
-	if err != nil {
-		return lifecycle.Alive, ""
+	birth, err := probe.Birth(birthCtx, pid)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return lifecycle.Absent, time.Time{}
+	case err != nil:
+		return lifecycle.Unknown, time.Time{}
+	default:
+		return lifecycle.Alive, birth
 	}
-	return lifecycle.Alive, procinfo.LegacyStart(id.Birth)
 }
 
 func TestLegacyProcessInterop(t *testing.T) {
@@ -96,9 +108,12 @@ func legacyOracle(t testing.TB) {
 		t.Fatal("ps returned no birth")
 	}
 	cancel()
-	state, gotBirth := nativeIdentity(t.Context(), lock.PID)
+	state, sample := nativeBirth(t.Context(), lock.PID)
 	equal(t, lifecycle.Alive, state)
-	equal(t, birth, gotBirth)
+	if zone, offset := sample.Zone(); offset != 9*60*60 {
+		t.Fatalf("native birth zone %q has UTC offset %d seconds, want +09:00; Asia/Tokyo time zone data may be missing", zone, offset)
+	}
+	equal(t, birth, procinfo.LegacyStart(sample))
 	// The legacy encoder inserts these fields in this order; its birth text is taken from ps, not from our formatter.
 	ownerBytes := func(name string) []byte {
 		data, err := json.Marshal(struct {
