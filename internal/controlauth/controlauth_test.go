@@ -46,30 +46,32 @@ func TestAuthenticated(t *testing.T) {
 		ports                                       []int
 		compat, want                                bool
 	}{
-		"success: matching request":              {method: "POST", host: host, contentType: "application/json", server: token, supplied: token, ports: []int{0, 12345}, want: true},
-		"error: present empty origin":            {method: "POST", host: host, contentType: "application/json", server: token, supplied: token, ports: []int{12345}, origin: new("")},
-		"error: missing host":                    {method: "POST", contentType: "application/json", server: token, supplied: token, ports: []int{12345}},
-		"error: localhost is not a control host": {method: "POST", host: "localhost:12345", contentType: "application/json", server: token, supplied: token, ports: []int{12345}},
-		"error: port with leading zero":          {method: "POST", host: "127.0.0.1:012345", contentType: "application/json", server: token, supplied: token, ports: []int{12345}},
-		"error: no ports":                        {method: "POST", host: host, contentType: "application/json", server: token, supplied: token},
-		"error: negative port":                   {method: "POST", host: "127.0.0.1:-1", contentType: "application/json", server: token, supplied: token, ports: []int{-1}},
-		"error: matching nonhex letters":         {method: "POST", host: host, contentType: "application/json", server: strings.Repeat("g", 64), supplied: strings.Repeat("g", 64), ports: []int{12345}},
-		"error: matching token with punctuation": {method: "POST", host: host, contentType: "application/json", server: token[:63] + "!", supplied: token[:63] + "!", ports: []int{12345}},
-		"error: nonhex supplied token":           {method: "POST", host: host, contentType: "application/json", server: token, supplied: strings.Repeat("g", 64), ports: []int{12345}},
-		"error: nonhex server token":             {method: "POST", host: host, contentType: "application/json", server: strings.Repeat("g", 64), supplied: token, ports: []int{12345}},
-		"error: missing header":                  {method: "POST", host: host, contentType: "application/json", server: token, ports: []int{12345}},
-		"error: wrong token":                     {method: "POST", host: host, contentType: "application/json", server: token, supplied: strings.Repeat("b", 64), ports: []int{12345}},
-		"error: short token":                     {method: "POST", host: host, contentType: "application/json", server: token, supplied: "short", ports: []int{12345}},
-		"error: invalid matching tokens":         {method: "POST", host: host, contentType: "application/json", server: strings.Repeat("A", 64), supplied: strings.Repeat("A", 64), ports: []int{12345}},
-		"error: browser origin":                  {method: "POST", host: host, contentType: "application/json", server: token, supplied: token, origin: new("https://fixture.invalid"), ports: []int{12345}},
-		"error: null origin":                     {method: "POST", host: host, contentType: "application/json", server: token, supplied: token, origin: new("null"), ports: []int{12345}},
-		"error: foreign host":                    {method: "POST", host: "fixture.invalid:12345", contentType: "application/json", server: token, supplied: token, ports: []int{12345}},
-		"error: incorrect port":                  {method: "POST", host: host, contentType: "application/json", server: token, supplied: token, ports: []int{12346}},
-		"error: zero port":                       {method: "POST", host: "127.0.0.1:0", contentType: "application/json", server: token, supplied: token, ports: []int{0}},
-		"error: plain text":                      {method: "POST", host: host, contentType: "text/plain", server: token, supplied: token, ports: []int{12345}},
-		"error: charset parameter":               {method: "POST", host: host, contentType: "application/json; charset=utf-8", server: token, supplied: token, ports: []int{12345}},
-		"error: wrong method":                    {method: "GET", host: host, contentType: "application/json", server: token, supplied: token, ports: []int{12345}},
-		"error: compatibility listener":          {method: "POST", host: host, contentType: "application/json", server: token, supplied: token, ports: []int{12345}, compat: true},
+		"success: matching request":               {method: "POST", host: host, contentType: "application/json", server: token, supplied: token, ports: []int{0, 12345}, want: true},
+		"error: present empty origin":             {method: "POST", host: host, contentType: "application/json", server: token, supplied: token, ports: []int{12345}, origin: new("")},
+		"error: missing host":                     {method: "POST", contentType: "application/json", server: token, supplied: token, ports: []int{12345}},
+		"error: localhost is not a control host":  {method: "POST", host: "localhost:12345", contentType: "application/json", server: token, supplied: token, ports: []int{12345}},
+		"error: port with leading zero":           {method: "POST", host: "127.0.0.1:012345", contentType: "application/json", server: token, supplied: token, ports: []int{12345}},
+		"error: no ports":                         {method: "POST", host: host, contentType: "application/json", server: token, supplied: token},
+		"error: negative port":                    {method: "POST", host: "127.0.0.1:-1", contentType: "application/json", server: token, supplied: token, ports: []int{-1}},
+		"error: matching nonhex letters":          {method: "POST", host: host, contentType: "application/json", server: strings.Repeat("g", 64), supplied: strings.Repeat("g", 64), ports: []int{12345}},
+		"error: matching token with punctuation":  {method: "POST", host: host, contentType: "application/json", server: token[:63] + "!", supplied: token[:63] + "!", ports: []int{12345}},
+		"error: nonhex supplied token":            {method: "POST", host: host, contentType: "application/json", server: token, supplied: strings.Repeat("g", 64), ports: []int{12345}},
+		"error: nonhex server token":              {method: "POST", host: host, contentType: "application/json", server: strings.Repeat("g", 64), supplied: token, ports: []int{12345}},
+		"error: missing header":                   {method: "POST", host: host, contentType: "application/json", server: token, ports: []int{12345}},
+		"error: wrong token":                      {method: "POST", host: host, contentType: "application/json", server: token, supplied: strings.Repeat("b", 64), ports: []int{12345}},
+		"error: short token":                      {method: "POST", host: host, contentType: "application/json", server: token, supplied: "short", ports: []int{12345}},
+		"error: matching hex one character short": {method: "POST", host: host, contentType: "application/json", server: token[:63], supplied: token[:63], ports: []int{12345}},
+		"error: matching hex one character long":  {method: "POST", host: host, contentType: "application/json", server: token + "a", supplied: token + "a", ports: []int{12345}},
+		"error: invalid matching tokens":          {method: "POST", host: host, contentType: "application/json", server: strings.Repeat("A", 64), supplied: strings.Repeat("A", 64), ports: []int{12345}},
+		"error: browser origin":                   {method: "POST", host: host, contentType: "application/json", server: token, supplied: token, origin: new("https://fixture.invalid"), ports: []int{12345}},
+		"error: null origin":                      {method: "POST", host: host, contentType: "application/json", server: token, supplied: token, origin: new("null"), ports: []int{12345}},
+		"error: foreign host":                     {method: "POST", host: "fixture.invalid:12345", contentType: "application/json", server: token, supplied: token, ports: []int{12345}},
+		"error: incorrect port":                   {method: "POST", host: host, contentType: "application/json", server: token, supplied: token, ports: []int{12346}},
+		"error: zero port":                        {method: "POST", host: "127.0.0.1:0", contentType: "application/json", server: token, supplied: token, ports: []int{0}},
+		"error: plain text":                       {method: "POST", host: host, contentType: "text/plain", server: token, supplied: token, ports: []int{12345}},
+		"error: charset parameter":                {method: "POST", host: host, contentType: "application/json; charset=utf-8", server: token, supplied: token, ports: []int{12345}},
+		"error: wrong method":                     {method: "GET", host: host, contentType: "application/json", server: token, supplied: token, ports: []int{12345}},
+		"error: compatibility listener":           {method: "POST", host: host, contentType: "application/json", server: token, supplied: token, ports: []int{12345}, compat: true},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -210,6 +212,17 @@ func TestEnsureTokenCollision(t *testing.T) {
 	}
 	if diff := gocmp.Diff(winner+"\n", string(data)); diff != "" {
 		t.Fatalf("stored token after collision (-want +got):\n%s", diff)
+	}
+	winningInfo, err := os.Stat(winnerFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalInfo, err := os.Stat(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(winningInfo, finalInfo) {
+		t.Fatal("token creation replaced the winner's file")
 	}
 }
 

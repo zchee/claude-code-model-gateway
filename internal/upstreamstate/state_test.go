@@ -163,7 +163,7 @@ func TestCredentialBlock(t *testing.T) {
 
 func TestReadinessGuidance(t *testing.T) {
 	t.Run("QuotedStableLauncher", func(t *testing.T) {
-		launcher := filepath.Join(t.TempDir(), "gateway user", ".claude", "model-gateway", "bin", "model-gateway")
+		const launcher = "/home/gateway user/.claude/model-gateway/bin/model-gateway"
 		store := upstreamstate.Store{CommandPath: launcher}
 		block := upstreamstate.Blocked{State: "upstream-blocked", StatusCode: 401, Evidence: evidence}
 		want := "Codex is blocked by an OpenAI rejection. Run `\"" + launcher + "\" setup`; if it persists, wait for a claude-code-proxy update or explicitly re-route this ticket. Codex tickets remain blocked."
