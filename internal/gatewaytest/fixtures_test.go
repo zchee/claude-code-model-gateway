@@ -364,7 +364,10 @@ func TestEmptyFixtureRun(t *testing.T) {
 	}
 }
 
-const fixtureBuiltinOverride = "GATEWAYTEST_ATTEMPT_BUILTIN_OVERRIDE"
+const (
+	fixtureBuiltinOverride = "GATEWAYTEST_ATTEMPT_BUILTIN_OVERRIDE"
+	blockingHelperMarker   = "fixture-blocking-ready"
+)
 
 type namedHelperReport struct {
 	Directory string
@@ -385,6 +388,13 @@ func TestGatewayFixtureHelper(t *testing.T) {
 			t.Fatal(err)
 		}
 	}}
+	helpers["wait-for-deadline"] = func(t testing.TB, _ []string) {
+		if err := os.WriteFile(blockingHelperMarker, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// Keep the child alive past the fixture deadline but let a broken test finish.
+		time.Sleep(30 * time.Second)
+	}
 	if name := os.Getenv(fixtureBuiltinOverride); name != "" {
 		helpers[name] = func(t testing.TB, _ []string) { t.Fatal("replacement built-in helper was called") }
 	}
@@ -404,6 +414,57 @@ func TestGatewayFixtureHelper(t *testing.T) {
 		if !os.SameFile(current, expected) {
 			t.Fatal("child did not enter the prepared working directory")
 		}
+	}
+}
+
+func TestDirectHelperLaunchDeadline(t *testing.T) {
+	tests := map[string]struct {
+		collector        bool
+		delay, wantDelay time.Duration
+	}{
+		"error: usage disabled without caller context":   {wantDelay: time.Second},
+		"error: active collector caps wait delay":        {collector: true, delay: 2 * time.Second, wantDelay: time.Second},
+		"error: active collector preserves shorter wait": {collector: true, delay: 100 * time.Millisecond, wantDelay: 100 * time.Millisecond},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			home := t.TempDir()
+			dir := filepath.Join(home, "fixture-helper")
+			if err := os.Mkdir(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			self, err := os.Executable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmd := &exec.Cmd{
+				Path: self,
+				Args: []string{self, "-test.run=^TestGatewayFixtureHelper$", "--", helperPrefix + "wait-for-deadline"},
+				Dir:  dir, WaitDelay: tt.delay,
+			}
+			env := gatewaytest.NewEnv(home, nil, nil, nil)
+			launch := env.RunFixture
+			if tt.collector {
+				collector := env.StartUsageCollector(t)
+				env[fixtureUsageKey] = collector.URL
+				launch = func(cmd *exec.Cmd) error { return collector.RunFixture(env, cmd) }
+			}
+			started := time.Now()
+			err = launch(cmd)
+			if !errors.Is(err, context.DeadlineExceeded) || cmd.ProcessState == nil || cmd.ProcessState.Success() {
+				t.Fatalf("RunFixture: error=%v state=%v, want deadline exceeded and reaped child", err, cmd.ProcessState)
+			}
+			if elapsed := time.Since(started); elapsed < 5*time.Second || elapsed > 9*time.Second {
+				t.Errorf("RunFixture took %v, want the five-second deadline", elapsed)
+			}
+			if cmd.WaitDelay != tt.wantDelay {
+				t.Errorf("WaitDelay=%v, want %v", cmd.WaitDelay, tt.wantDelay)
+			}
+			if _, err := os.Stat(filepath.Join(dir, blockingHelperMarker)); err != nil {
+				t.Errorf("blocking helper did not enter the checked directory: %v", err)
+			}
+		})
 	}
 }
 

@@ -307,7 +307,11 @@ func (env Environment) runFixture(cmd *exec.Cmd, collector *usageCollectorState)
 	if len(dispatch) > 0 && dispatch[2] == usageHelperDispatch && endpoint != dispatch[3] {
 		return ErrUsageEndpoint
 	}
+	modernHelper := len(dispatch) > 0 && dispatch[0] == helperSelector
 	run := cmd.Run
+	if modernHelper {
+		run = func() error { return runBoundedFixture(context.Background(), cmd) }
+	}
 	legacyEmpty := len(env) == 0 && slices.Equal(dispatch, []string{legacyHelperSelector, "--", emptyLegacyDispatch})
 	if endpoint != "0" && !legacyEmpty {
 		if collector == nil || endpoint != collector.endpoint || !validUsageEndpoint(endpoint) {
@@ -316,7 +320,7 @@ func (env Environment) runFixture(cmd *exec.Cmd, collector *usageCollectorState)
 		run = func() error { return collector.run(cmd) }
 	}
 
-	if len(dispatch) > 0 && dispatch[0] == helperSelector {
+	if modernHelper {
 		root, err := env.openSandboxDir(cmd.Dir, false)
 		if err != nil {
 			return err

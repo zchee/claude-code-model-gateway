@@ -16,6 +16,7 @@ package gatewaytest
 
 import (
 	"context"
+	"errors"
 	"os/exec"
 	"slices"
 	"sync"
@@ -91,9 +92,12 @@ func (s *usageCollectorState) run(cmd *exec.Cmd) error {
 		}
 		s.mu.Unlock()
 	}()
+	return runBoundedFixture(s.ctx, cmd)
+}
 
+func runBoundedFixture(parent context.Context, cmd *exec.Cmd) error {
 	// Cmd retains its original, private context. Enforce the fixture deadline separately.
-	ctx, cancel := context.WithTimeout(s.ctx, fixtureTimeout)
+	ctx, cancel := context.WithTimeout(parent, fixtureTimeout)
 	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return err
@@ -106,6 +110,9 @@ func (s *usageCollectorState) run(cmd *exec.Cmd) error {
 	}
 	process := cmd.Process
 	stop := context.AfterFunc(ctx, func() { _ = process.Kill() })
-	defer stop()
-	return cmd.Wait()
+	err := cmd.Wait()
+	if !stop() {
+		return errors.Join(ctx.Err(), err)
+	}
+	return err
 }

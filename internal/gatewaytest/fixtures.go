@@ -184,6 +184,7 @@ func (env Environment) StartUsageCollector(t testing.TB) *UsageCollector {
 
 // HelperCommand prepares a subprocess helper in its own private sandbox directory.
 // A consuming package must declare exactly one TestGatewayFixtureHelper that calls DispatchHelper under the process build tag.
+// That entry is a caller contract, not an enforced check. Assert on helper-produced output or a file, not exit status alone.
 // Custom names match [a-z][a-z0-9-]{0,63}. Use RunFixture on the sandbox environment to launch the helper.
 func (env Environment) HelperCommand(t testing.TB, helper string, args ...string) (*exec.Cmd, error) {
 	t.Helper()
@@ -224,6 +225,8 @@ type HelperFunc func(t testing.TB, args []string)
 
 // DispatchHelper handles the reserved subprocess invocation, doing nothing during ordinary test runs.
 // A consuming package must declare exactly one TestGatewayFixtureHelper that calls DispatchHelper under the process build tag.
+// This is a caller contract: entries in both internal and external test packages can both run, and a missing entry can exit successfully without dispatching.
+// Assert on helper-produced output or a file, not exit status alone.
 // Pass nil for built-in helpers only; the usage helper returns its validated endpoint argument.
 func DispatchHelper(t testing.TB, helpers map[string]HelperFunc) string {
 	t.Helper()
