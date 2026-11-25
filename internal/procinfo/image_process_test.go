@@ -16,15 +16,18 @@
 
 package procinfo
 
-import "testing"
+import (
+	"runtime"
+	"testing"
+)
 
-func TestLiveImageKernelNamed(t *testing.T) {
+func TestLiveImageProvenance(t *testing.T) {
 	pid := startChild(t, "/bin/cat")
 	id, err := (Probe{}).Identity(t.Context(), pid)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !id.Image.KernelNamed || id.Image.Inode == 0 {
-		t.Fatalf("live executable: kernel named=%t inode=%d", id.Image.KernelNamed, id.Image.Inode)
+	if want := runtime.GOOS == "linux"; id.Image.DirectFromExecutable != want || id.Image.Inode == 0 {
+		t.Fatalf("live executable: direct=%t want %t; inode=%d", id.Image.DirectFromExecutable, want, id.Image.Inode)
 	}
 }

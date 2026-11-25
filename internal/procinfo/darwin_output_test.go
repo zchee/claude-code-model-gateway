@@ -91,7 +91,7 @@ func TestUnlinkedMappedVnode(t *testing.T) {
 			if !errors.Is(err, tt.err) {
 				t.Fatalf("mapped image error=%v want %v", err, tt.err)
 			}
-			if d := gocmp.Diff(ImageEvidence{Image: tt.want, KernelNamed: false}, got); d != "" {
+			if d := gocmp.Diff(ImageEvidence{Image: tt.want, DirectFromExecutable: false}, got); d != "" {
 				t.Fatal(d)
 			}
 		})
@@ -132,8 +132,8 @@ func TestRetargetedImageAlias(t *testing.T) {
 	}{
 		"error: two launch leaves with old parent first":                       {rows: oldRow + newRow, err: ErrUnknown},
 		"error: two launch leaves with current parent first":                   {rows: newRow + oldRow, err: ErrUnknown},
-		"success: only replacement row visible is still correlated":            {rows: newRow, want: ImageEvidence{Image: newImage, KernelNamed: false}},
-		"success: sole launch leaf in retargeted directory is only correlated": {rows: row(renamed, 41) + newRow, want: ImageEvidence{Image: newImage, KernelNamed: false}},
+		"success: only replacement row visible is still correlated":            {rows: newRow, want: ImageEvidence{Image: newImage, DirectFromExecutable: false}},
+		"success: sole launch leaf in retargeted directory is only correlated": {rows: row(renamed, 41) + newRow, want: ImageEvidence{Image: newImage, DirectFromExecutable: false}},
 		"error: incomplete unrelated row cannot be ruled out":                  {rows: newRow + "ftxt\x00D0xc\x00n/usr/lib/dyld\x00\n", err: ErrUnknown},
 	}
 	for name, tt := range tests {
@@ -146,6 +146,31 @@ func TestRetargetedImageAlias(t *testing.T) {
 				t.Fatal(d)
 			}
 		})
+	}
+}
+
+func TestKernelPathRenamedBeforeVnodeList(t *testing.T) {
+	dir := t.TempDir()
+	kernelPath := filepath.Join(dir, "tool")
+	replacement := filepath.Join(dir, "other")
+	renamed := filepath.Join(dir, "renamed")
+	putFile(t, kernelPath, "executable")
+	putFile(t, replacement, "other mapping")
+	got, err := darwinImageEvidence(701, kernelPath, "", func() ([]byte, error) {
+		if err := os.Rename(kernelPath, renamed); err != nil {
+			return nil, err
+		}
+		if err := os.Rename(replacement, kernelPath); err != nil {
+			return nil, err
+		}
+		return []byte(fmt.Sprintf("p701\x00\nftxt\x00D0xc\x00i41\x00n%s\x00\nftxt\x00D0xc\x00i42\x00n%s\x00\n", renamed, kernelPath)), nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := ImageEvidence{Path: kernelPath, Device: 12, Inode: 42, DirectFromExecutable: false}
+	if diff := gocmp.Diff(want, got); diff != "" {
+		t.Fatal(diff)
 	}
 }
 

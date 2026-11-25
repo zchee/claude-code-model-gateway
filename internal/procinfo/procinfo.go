@@ -54,17 +54,20 @@ type Image struct {
 	Inode  uint64 `json:"inode"`
 }
 
-// ImageEvidence describes a mapped file observed in a live process. KernelNamed
-// means the kernel named the process's executable. When false, a nonempty Image
-// is only correlated: its device and inode were mapped under the launch leaf in
-// the directory the saved launch path resolves to now. It may not be the main image.
+// ImageEvidence describes a mapped file observed in a live process. DirectFromExecutable
+// means the device and inode were read through the kernel's reference to the executable.
+// Linux uses fstat on that reference. On macOS both path sources are correlated with
+// a later mapping list; even a kernel-supplied path does not identify the mapped file.
 // For deletion, relaunch and signaling, a correlated match does not prove sameness
 // and a mismatch does not prove difference. Never create or update the recorded
-// launch identifier from correlated evidence.
-// The returned path is not authority to act, regardless of provenance.
+// launch identifier from correlated evidence. The path is never authority to act.
+//
+// The separate type prevents implicit assignment to Image, not misuse of its fields:
+// comparing Device and Inode, building an Image from them, or round-tripping through
+// JSON loses provenance and does not validate the identifier.
 type ImageEvidence struct {
 	Image
-	KernelNamed bool
+	DirectFromExecutable bool `json:"-"`
 }
 
 // Identity describes a running process. ParentPID zero denotes a proven root.
@@ -103,11 +106,11 @@ type Probe struct {
 func New(lookup config.LookupEnv) Probe { return Probe{lookup: lookup, listenerBusy: new(atomic.Bool)} }
 
 // Identity returns the live identity, os.ErrNotExist for confirmed absence, or ErrUnknown for inconclusive inspection.
-// PID and birth survive exec. If Image.KernelNamed is false, neither a match nor a mismatch
+// PID and birth survive exec. If Image.DirectFromExecutable is false, neither a match nor a mismatch
 // establishes executable identity for deletion, relaunch, signaling or recording a launch.
-// The path alone is never authority. On macOS the fallback opens and stats the saved launch
-// parent and stats candidate mapped parents; the command deadline cannot interrupt these
-// filesystem operations. A pending kernel read may also outlast the context.
+// The path alone is never authority. On macOS both the kernel-path and launch-path branches
+// open and stat the executable's parent and stat candidate mappings' parents. The command
+// deadline cannot interrupt these lookups; a pending kernel read may outlast the context.
 func (p Probe) Identity(ctx context.Context, pid int) (Identity, error) {
 	if pid <= 0 || pid > math.MaxInt32 {
 		return Identity{}, os.ErrNotExist

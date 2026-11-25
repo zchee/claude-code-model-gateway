@@ -90,7 +90,9 @@ func darwinImageEvidence(pid int, kernelPath, launchPath string, list func() ([]
 	if err != nil {
 		return ImageEvidence{}, err
 	}
-	return ImageEvidence{Image: img, KernelNamed: kernelPath != ""}, nil
+	// Both paths are sampled before lsof. Neither is a kernel reference to the
+	// vnode whose device and inode lsof reports.
+	return ImageEvidence{Image: img}, nil
 }
 
 // mappedImage holds the executable's parent directory across the vnode query.
