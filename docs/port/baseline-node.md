@@ -222,15 +222,22 @@ chunk-framed body, and extracts the headers at the first delimiter only.
 
 ## Cleanup
 
-Each pinned gateway child and its worker exited, and the harness checked that
-none of the ephemeral gateway or fake provider ports still had a listener.
-On exit the shell verifies that no process bearing its run marker remains,
-including detached descendants, and that it removed its private scratch (home,
-sockets, and temporary files). The remote wrapper retains its separate staging
-copy on failure. The [cleanup controls](baseline-node-samples/cleanup-controls.txt)
-record a supervisor stopped before the fixture shutdown and an interruption
-after supervisor readiness with a stopped detached helper. The
-[post-run venue status](baseline-node-samples/venue-status.txt) shows that the
-attestation remained present, the standard gateway ports had no listeners, the
-account's gateway state was absent, and the venue lock was free. The real CLI
-pin probe was not run.
+The measurement run verified that each pinned gateway child and worker exited
+and that no ephemeral fixture port still had a listener. The measurements and
+workload are unchanged by the later containment change.
+
+The harness now runs pin export, dependency installation, and the Node job under
+a Linux child subreaper. Detached orphans are adopted by that supervisor. The
+supervisor signals only its own children and accepts `waitpid` returning
+`ECHILD`, not a process listing or an environment marker, as proof of cleanup.
+It fails on a cleanup deadline or when a normally successful run required forced
+termination. The wrapper removes its private scratch (home, sockets, and files);
+the remote runner retains its separate staging copy on failure.
+
+The [cleanup controls](baseline-node-samples/cleanup-controls.txt) include
+interruptions during the first supervisor's detached worker identity probe,
+with an unmarked descendant in a separate process group. The
+[post-run venue status](baseline-node-samples/venue-status.txt) links the
+latest control's venue completion time and run identifier to the immediate
+status check: attestation present, no gateway state, no standard listeners,
+and lock free. The real CLI pin probe was not run.

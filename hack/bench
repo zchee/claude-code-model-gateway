@@ -13,109 +13,149 @@ for port in 80 18764 18765; do
 done
 if command -v claude >/dev/null; then printf 'bench: claude resolves on venue PATH\n' >&2; exit 1; fi
 
-# /proc reports the initial environment. Mark at exec, not by exporting inside
-# the running shell, so even a detached descendant can be found.
-# Read and signal by pinned process identity; an exiting PID can be reused.
-# shellcheck disable=SC2329
-sweep_marked() {
-    python3 -I - "$1" "$2" <<'PY'
-import errno
+supervise_job() {
+    exec python3 -I - "$1" "$2" "$3" <<'PY'
+import ctypes
 import os
-import select
 import signal
 import sys
 import time
 
-work, phase = sys.argv[1:]
-marker = b'MODEL_GATEWAY_BENCH_RUN=' + os.fsencode(work)
-uid = os.getuid()
-vanished = {errno.ENOENT, errno.ESRCH}
+job, root, work = sys.argv[1:]
+interrupt_file = work + '/interrupted'
+interrupted = False
 
 
-def processes():
-    for name in os.listdir('/proc'):
-        if not name.isdecimal():
-            continue
+def report(message):
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except OSError:
+        pass  # A disconnected log consumer must not interrupt containment.
+
+
+def note_interrupt(_signum, _frame):
+    global interrupted
+    interrupted = True
+
+
+def stopping():
+    return interrupted or os.path.exists(interrupt_file)
+
+
+def children():
+    # This lists only our own direct children, including adopted orphans. It
+    # nominates PIDs to signal, but can never certify that the tree is empty.
+    with open('/proc/thread-self/children', encoding='ascii') as file:
+        return [int(pid) for pid in file.read().split()]
+
+
+def supervise():
+    watched = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
+    for sig in watched:
+        signal.signal(sig, note_interrupt)
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    libc = ctypes.CDLL(None, use_errno=True)
+    pr_set_child_subreaper = 36
+    if libc.prctl(pr_set_child_subreaper, 1, 0, 0, 0) == -1:
+        errno = ctypes.get_errno()
+        raise OSError(errno, os.strerror(errno), 'PR_SET_CHILD_SUBREAPER')
+    children()  # Refuse before launch if the signal target interface is absent.
+
+    job_deadline = time.monotonic() + 360
+    job_pid = None if stopping() else os.fork()
+    if job_pid == 0:
         try:
-            directory = os.open('/proc/' + name, os.O_PATH | os.O_DIRECTORY)
-        except OSError as exc:
-            if exc.errno in vanished:
-                continue
-            raise
-        try:
-            if os.fstat(directory).st_uid == uid:
-                yield int(name), directory
+            for sig in watched:
+                signal.signal(sig, signal.SIG_DFL)
+            # A child still alive at the cleanup deadline must not hold the
+            # SSH session open through an inherited output pipe.
+            log = os.open(work + '/job.log', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.dup2(log, 1)
+            os.dup2(log, 2)
+            os.close(log)
+            os.environ['MODEL_GATEWAY_BENCH_RUN'] = work
+            os.execvp('bash', ['bash', '-euo', 'pipefail', '-c', job + '\nrun_job "$@"', 'bench', root, work])
+        except OSError as error:
+            report(f'bench: cannot exec job: {error}')
         finally:
-            os.close(directory)
+            os._exit(127)
 
+    job_status = None
+    signaled = {}
 
-def identity(pid, directory):
-    data = os.open('stat', os.O_RDONLY, dir_fd=directory)
-    with os.fdopen(data, 'rb') as stat:
-        fields = stat.read().rsplit(b')', 1)[1].split()
-    return (pid, int(fields[19]))
-
-
-snapshot = work + '/processes-before'
-if phase == 'snapshot':
-    # Older processes cannot have inherited the new marker. Compare start
-    # ticks so a reused PID cannot exempt a benchmark child.
-    with open(snapshot, 'x') as file:
-        for pid, directory in processes():
+    def reap(deadline):
+        nonlocal job_status
+        while True:
             try:
-                print(*identity(pid, directory), file=file)
-            except OSError as exc:
-                if exc.errno not in vanished:
-                    raise
-    sys.exit(0)
-with open(snapshot) as file:
-    previous = {tuple(map(int, line.split())) for line in file}
+                pid, status = os.waitpid(-1, os.WNOHANG)
+            except ChildProcessError:
+                return True  # ECHILD: there is no remaining child to own descendants.
+            if pid == 0:
+                return False
+            signaled.pop(pid, None)
+            if pid == job_pid:
+                job_status = os.waitstatus_to_exitcode(status)
+            if time.monotonic() >= deadline:
+                return False
 
+    rc = 1
+    try:
+        while not stopping() and time.monotonic() < job_deadline:
+            if reap(job_deadline) or job_status is not None:
+                break
+            time.sleep(0.025)
+        if stopping():
+            report('bench: interrupted')
+        elif job_status is None:
+            report('bench: job exceeded outer deadline')
+            rc = 124
+        else:
+            rc = job_status if job_status >= 0 else 128 - job_status
+    except OSError as error:
+        report(f'bench: waiting for job failed: {error}')
 
-def scan(sig=None):
-    found, unknown = [], []
-    for pid, directory in processes():
-        try:
-            if identity(pid, directory) in previous:
-                continue
-            pidfd = os.pidfd_open(pid)
-            try:
-                data = os.open('environ', os.O_RDONLY, dir_fd=directory)
-                with os.fdopen(data, 'rb') as env:
-                    if marker not in env.read().split(b'\0'):
-                        continue
-                found.append(pid)
-                if sig is not None:
-                    print(f'bench: {sig.name} marked PID {pid}', file=sys.stderr)
-                    signal.pidfd_send_signal(pidfd, sig)
-            except PermissionError:
-                poll = select.poll()
-                poll.register(pidfd, select.POLLIN)
-                if not poll.poll(0):
-                    raise
-            finally:
-                os.close(pidfd)
-        except OSError as exc:
-            if exc.errno not in vanished:
-                unknown.append(f'PID {pid}: {exc}')
-    return found, unknown
-
-
-terminated, _ = scan(signal.SIGTERM)
-for sig in (None, signal.SIGKILL):
-    deadline = time.monotonic() + 3
+    cleanup_started = time.monotonic()
+    deadline = cleanup_started + 6
+    forced = False
+    pending, error = [], None
     while True:
-        pending, unknown = scan(sig)
-        if not (pending or unknown) or time.monotonic() >= deadline:
-            break
-        time.sleep(0.1)
-    if not (pending or unknown):
-        break
-else:
-    sys.exit(f'bench: marked processes remain: {pending}; inspection failures: {unknown}')
-print('bench: no marked processes remain', file=sys.stderr)
-if terminated and phase == '0':
-    sys.exit('bench: unexpectedly needed to terminate marked processes after success')
+        try:
+            if reap(deadline):
+                report('bench: subreaper has no remaining children (waitpid: ECHILD)')
+                if rc == 0 and forced:
+                    report('bench: refusing evidence after forced child termination')
+                    return 1
+                return 1 if stopping() and rc == 0 else rc
+            pending = children()
+            # We alone reap these PIDs. An exit between listing and signaling
+            # leaves a waitable zombie, so a PID cannot be reused here.
+            sig = signal.SIGTERM if time.monotonic() < cleanup_started + 3 else signal.SIGKILL
+            for pid in pending:
+                if signaled.get(pid) == sig:
+                    continue
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    continue
+                except OSError as err:
+                    error = f'{sig.name} PID {pid}: {err}'
+                    continue
+                signaled[pid] = sig
+                forced = True
+                report(f'bench: {sig.name} child PID {pid}')
+        except OSError as err:
+            error = str(err)
+        if time.monotonic() >= deadline:
+            leftover = pending or list(signaled) or ([job_pid] if job_status is None else [])
+            report(f'bench: cleanup deadline without ECHILD; child PIDs (last known): {leftover}; last error: {error}')
+            return 1
+        time.sleep(0.025)
+
+
+try:
+    sys.exit(supervise())
+except OSError as error:
+    sys.exit(f'bench: cannot establish containment: {error}')
 PY
 }
 
@@ -630,51 +670,64 @@ JS
 # Invoked by the EXIT trap.
 # shellcheck disable=SC2329
 cleanup() {
-    local rc=$? result=''
+    local rc=$? result='' stamp
     trap '' HUP INT TERM
-    if [[ -n $pid ]]; then
-        if sweep_marked "$work" "$rc"; then
-            # After interruption, reap the shell's child after the sweep.
-            wait "$pid" 2>/dev/null || :
-        else
-            rc=1
-        fi
+    if [[ -z $work ]]; then exit "$rc"; fi
+    if [[ -f $work/job.log ]] && ! timeout --kill-after=1s 10s cat -- "$work/job.log" 9<&- >&2; then
+        rc=1
     fi
     if (( rc == 0 )); then
-        if ! "$root/hack/venue-check" || ! IFS= read -r result < "$work/result" || [[ $result != NODE-BENCH-V1\ * ]]; then
+        if ! timeout --kill-after=1s 10s "$root/hack/venue-check" 9<&- ||
+           ! IFS= read -r result < "$work/result" || [[ $result != NODE-BENCH-V1\ * ]]; then
             printf 'bench: missing valid evidence or venue check failed\n' >&2
             rc=1
         fi
     fi
     # Only the benchmark's private scratch belongs to this script. The
     # remote runner retains its separate staging tree on failure for diagnosis.
-    if rm -rf -- "$work" && [[ ! -e $work && ! -L $work ]]; then
+    if timeout --kill-after=1s 10s rm -rf -- "$work" 9<&- && [[ ! -e $work && ! -L $work ]]; then
         printf 'bench: removed private scratch %s\n' "$work" >&2
     else
         printf 'bench: private scratch remains: %s\n' "$work" >&2
+        rc=1
+    fi
+    if stamp=$(timeout --kill-after=1s 2s date -u '+%Y-%m-%dT%H:%M:%S.%NZ' 9<&-); then
+        printf 'bench: run %s ended at %s (exit %s)\n' "${work##*/}" "$stamp" "$rc" >&2
+    else
         rc=1
     fi
     if (( rc == 0 )); then printf '%s\n' "$result"; fi
     exit "$rc"
 }
 
+# Invoked by the signal traps. A file is reliable even if the supervisor has
+# not yet installed its signal handlers, or a signal arrives during the fork.
+# shellcheck disable=SC2329
+interrupt() {
+    interrupted=1
+    if [[ -n $work ]]; then : > "$work/interrupted"; fi
+}
+
 umask 077
-work=$(mktemp -d "${TMPDIR:-/tmp}/gateway-bench.XXXXXXXX")
-pid=''
+work=''
 interrupted=0
 trap cleanup EXIT
-trap 'interrupted=1' HUP INT TERM
-sweep_marked "$work" snapshot
+trap interrupt HUP INT TERM
+# Let mktemp return the path it owns even if a signal reaches the whole group.
+work=$(trap '' HUP INT TERM; exec mktemp -d "${TMPDIR:-/tmp}/gateway-bench.XXXXXXXX" 9<&-)
 (( interrupted == 0 )) || exit 1
 job=$(declare -f run_job)
-# The watchdog covers pin export, dependency installation and every Node phase.
-# The cleanup sweep also reaches children that escaped the job's process group.
-MODEL_GATEWAY_BENCH_RUN="$work" timeout --foreground --kill-after=5s 360s \
-    bash -euo pipefail -c "$job"$'\nrun_job "$@"' bench "$root" "$work" 9<&- &
+# The run starts only after subreaping is established. Neither the supervisor
+# nor its children inherit the remote runner's flock descriptor.
+supervise_job "$job" "$root" "$work" 9<&- &
 pid=$!
-trap 'printf "bench: interrupted\n" >&2; exit 1' HUP INT TERM
-(( interrupted == 0 )) || exit 1
 rc=0
 wait "$pid" || rc=$?
-if (( rc == 124 || rc == 137 )); then printf 'bench: job exceeded outer deadline (status %s)\n' "$rc" >&2; fi
+if (( interrupted )); then
+    # A trapped signal interrupts Bash's wait, not the supervisor's cleanup.
+    # That cleanup has its own deadline and completes before scratch removal.
+    trap '' HUP INT TERM
+    wait "$pid" || :
+    exit 1
+fi
 exit "$rc"

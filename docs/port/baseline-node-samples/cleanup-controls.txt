@@ -36,3 +36,61 @@ gateway state: absent
 TCP listeners on 18764/18765: none
 lock: free
 status rc=0
+
+Interrupted startup in the detached worker identity probe, with a separate unmarked process group
+
+Command: VENUE_HOST=debian-13-trixie.gaudiy-platform ./hack/remote run bench
+
+bench: interrupted
+bench: SIGTERM child PID 397274
+bench: SIGTERM child PID 397376
+bench: SIGTERM child PID 397395
+bench: SIGKILL child PID 397376
+bench: SIGKILL child PID 397395
+bench: subreaper has no remaining children (waitpid: ECHILD)
+control: detached startup ps PID/PGID 397384 from gateway PID 397376, worker PID 397383, marker absent
+control: independent unmarked helper PID/PGID 397395
+bench: removed private scratch /tmp/model-gateway-venue/tmp/gateway-bench.rr1L72Yl
+bench: run gateway-bench.rr1L72Yl ended at 2026-11-25T20:53:48.578930310Z (exit 1)
+control rc=2 elapsed=6 s
+attestation: regular file
+gateway state: absent
+TCP listeners on 18764/18765: none
+lock: free
+status rc=0
+
+bench: interrupted
+bench: SIGTERM child PID 397609
+bench: SIGTERM child PID 397708
+bench: SIGTERM child PID 397727
+bench: SIGKILL child PID 397708
+bench: SIGKILL child PID 397727
+bench: subreaper has no remaining children (waitpid: ECHILD)
+control: detached startup ps PID/PGID 397716 from gateway PID 397708, worker PID 397715, marker absent
+control: independent unmarked helper PID/PGID 397727
+bench: removed private scratch /tmp/model-gateway-venue/tmp/gateway-bench.e1EuWcWK
+bench: run gateway-bench.e1EuWcWK ended at 2026-11-25T20:53:55.874518117Z (exit 1)
+control rc=2 elapsed=6 s
+attestation: regular file
+gateway state: absent
+TCP listeners on 18764/18765: none
+lock: free
+status rc=0
+
+bench: interrupted
+bench: SIGTERM child PID 397944
+bench: SIGTERM child PID 398043
+bench: SIGTERM child PID 398062
+bench: SIGKILL child PID 398043
+bench: SIGKILL child PID 398062
+bench: subreaper has no remaining children (waitpid: ECHILD)
+control: detached startup ps PID/PGID 398051 from gateway PID 398043, worker PID 398050, marker absent
+control: independent unmarked helper PID/PGID 398062
+bench: removed private scratch /tmp/model-gateway-venue/tmp/gateway-bench.u3Y4n8tY
+bench: run gateway-bench.u3Y4n8tY ended at 2026-11-25T20:54:03.085300149Z (exit 1)
+control rc=2 elapsed=7 s
+attestation: regular file
+gateway state: absent
+TCP listeners on 18764/18765: none
+lock: free
+status rc=0
