@@ -72,15 +72,17 @@ type socketEvidence struct {
 // Probe reads native process facts. A zero-valued Probe uses the default budget.
 // Its configuration never falls back to the process environment.
 type Probe struct {
-	lookup    config.LookupEnv
-	inspect   func(context.Context, int) (Identity, error)
-	existence func(context.Context, int) error
-	processes func(context.Context) ([]Identity, error)
-	sockets   func(context.Context) ([]socketEvidence, error)
+	listenerBusy *atomic.Bool
+	lookup       config.LookupEnv
+	inspect      func(context.Context, int) (Identity, error)
+	existence    func(context.Context, int) error
+	processes    func(context.Context) ([]Identity, error)
+	sockets      func(context.Context) ([]socketEvidence, error)
 }
 
 // New returns a Probe whose budget uses lookup. A nil lookup selects the platform default.
-func New(lookup config.LookupEnv) Probe { return Probe{lookup: lookup} }
+// The probe and its copies share a single outstanding listener query slot.
+func New(lookup config.LookupEnv) Probe { return Probe{lookup: lookup, listenerBusy: new(atomic.Bool)} }
 
 // Identity returns the live identity, os.ErrNotExist for confirmed absence, or ErrUnknown for inconclusive inspection.
 // A pending kernel read may not return when the context expires.
@@ -179,6 +181,9 @@ const (
 // Listener returns TCP listener evidence within the configured probe budget.
 // Identified means the only holder visible to this user, not authority to signal.
 // A deadline abandons this call's worker; it cannot interrupt a stuck kernel read.
+// New probes refuse another query as unknown until that worker finishes. The zero
+// value has no admission limit. On macOS the kernel count and visible holders are
+// separate observations, so their combination is best-effort evidence.
 func (p Probe) Listener(ctx context.Context, port uint16) Listener {
 	if port == 0 {
 		return Listener{State: ListenerAbsent}
@@ -187,17 +192,26 @@ func (p Probe) Listener(ctx context.Context, port uint16) Listener {
 	defer cancel()
 	// Some kernel reads cannot be canceled. Let the caller leave at the deadline
 	// without leaving the query waiting on a receiver when it eventually returns.
-	var inconsistent atomic.Bool
+	if err := ctx.Err(); err != nil {
+		return classifyListener(nil, err, port)
+	}
+	if p.listenerBusy != nil && !p.listenerBusy.CompareAndSwap(false, true) {
+		return Listener{State: ListenerUnknown}
+	}
 	done := make(chan Listener, 1)
 	go func() {
 		var rows []socketEvidence
 		var err error
 		if p.sockets == nil {
-			rows, err = nativeSockets(ctx, port, func() { inconsistent.Store(true) })
+			rows, err = nativeSockets(ctx, port)
 		} else {
 			rows, err = p.sockets(ctx)
 		}
-		done <- classifyListener(rows, err, port)
+		result := classifyListener(rows, err, port)
+		if p.listenerBusy != nil {
+			p.listenerBusy.Store(false)
+		}
+		done <- result
 	}()
 	select {
 	case result := <-done:
@@ -205,9 +219,6 @@ func (p Probe) Listener(ctx context.Context, port uint16) Listener {
 			return result
 		}
 	case <-ctx.Done():
-	}
-	if inconsistent.Load() {
-		return Listener{State: ListenerUnknown}
 	}
 	return classifyListener(nil, ctx.Err(), port)
 }
@@ -251,8 +262,8 @@ func classifyListener(rows []socketEvidence, err error, port uint16) Listener {
 	}
 }
 
-// ProbeTimeout returns the default probe budget for the given GOOS.
-func ProbeTimeout(goos string) time.Duration { return (Probe{}).timeout(goos) }
+// DefaultProbeTimeout returns the probe budget for the given GOOS without a configuration lookup.
+func DefaultProbeTimeout(goos string) time.Duration { return (Probe{}).timeout(goos) }
 
 func (p Probe) timeout(goos string) time.Duration {
 	ms := config.ProbeTimeoutFor(p.lookup, goos)

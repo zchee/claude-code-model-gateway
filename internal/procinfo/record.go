@@ -103,6 +103,8 @@ func writeRecord(root, name string, record Record, replace func(string, []byte) 
 }
 
 // ReadRecord reads the authoritative JSON and repairs a stale or missing mirror.
+// A repair racing a writer may leave an older mirror until the next read or write;
+// the JSON remains authoritative.
 // It returns the valid record alongside ErrMirrorRepair if repair is impossible.
 // Symlinks and special files in either position are refused with ErrRecordEntry.
 func ReadRecord(root, name string) (Record, error) {

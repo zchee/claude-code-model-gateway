@@ -28,6 +28,20 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// Darwin's kern.proc.pid includes zombies. Reading SZOMB observes exit without
+// consuming the wait status or releasing the leader's process group identity.
+func leaderExited(pid int) (bool, error) {
+	const zombie = 5 // SZOMB in sys/proc.h.
+	p, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	if err != nil {
+		return false, err
+	}
+	if int(p.Proc.P_pid) != pid || int(p.Eproc.Ppid) != unix.Getpid() {
+		return false, unix.ECHILD
+	}
+	return p.Proc.P_stat == zombie, nil
+}
+
 func procArgs(pid int) (string, []string, error) {
 	raw, err := unix.SysctlRaw("kern.procargs2", pid)
 	if err != nil {
@@ -174,7 +188,7 @@ func mappedImage(out []byte, pid int, path string) (Image, error) {
 	return match, nil
 }
 
-func nativeSockets(ctx context.Context, port uint16, _ func()) ([]socketEvidence, error) {
+func nativeSockets(ctx context.Context, port uint16) ([]socketEvidence, error) {
 	// lsof reports descriptors visible to this user, not every kernel socket.
 	// Cross-check the listening rows before calling a port vacant or uniquely owned.
 	out, err := darwinCommand(ctx, "/usr/sbin/netstat", "-an", "-p", "tcp")

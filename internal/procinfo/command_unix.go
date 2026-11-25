@@ -20,7 +20,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"os"
 	"os/exec"
 	"syscall"
 	"time"
@@ -29,25 +28,56 @@ import (
 )
 
 func darwinCommand(ctx context.Context, path string, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, path, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		err := unix.Kill(-cmd.Process.Pid, unix.SIGKILL)
-		if errors.Is(err, unix.ESRCH) {
-			return os.ErrProcessDone
-		}
-		return err
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
+	// Only this goroutine may signal the group and reap its leader. In particular,
+	// do not give os/exec an independent context watcher that races with Wait.
+	cmd := exec.CommandContext(context.WithoutCancel(ctx), path, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = 100 * time.Millisecond
 	cmd.Env = []string{"LC_ALL=C", "PATH=/usr/bin:/bin:/usr/sbin:/sbin"}
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	pid := cmd.Process.Pid
+	observeErr := waitForLeader(ctx, pid)
+	// The leader (even as a zombie) pins its numeric process group until Wait.
+	// ECHILD means we no longer own a waitable child; never signal that number.
+	var killErr error
+	if !errors.Is(observeErr, unix.ECHILD) {
+		killErr = unix.Kill(-pid, unix.SIGKILL)
+	}
+	waitErr := cmd.Wait() // Reap first, then drain both output pipes under WaitDelay.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if observeErr != nil {
+		return nil, observeErr
+	}
+	if killErr != nil && !errors.Is(killErr, unix.ESRCH) {
+		return nil, killErr
 	}
 	if stderr.Len() != 0 {
 		return nil, ErrUnknown
 	}
-	return out, err
+	return stdout.Bytes(), waitErr
+}
+
+func waitForLeader(ctx context.Context, pid int) error {
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		exited, err := leaderExited(pid)
+		if !errors.Is(err, unix.EINTR) && (err != nil || exited) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-tick.C:
+		}
+	}
 }

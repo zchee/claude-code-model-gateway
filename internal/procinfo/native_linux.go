@@ -31,6 +31,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func leaderExited(pid int) (bool, error) {
+	var status unix.Siginfo
+	err := unix.Waitid(unix.P_PID, pid, &status, unix.WEXITED|unix.WNOWAIT|unix.WNOHANG, nil)
+	return status.Signo != 0, err
+}
+
 func procRoot(ctx context.Context) string {
 	if env, ok := ctx.Value(common.EnvKey).(common.EnvMap); ok && env[common.HostProcEnvKey] != "" {
 		return env[common.HostProcEnvKey]
@@ -211,8 +217,8 @@ func listeningInodes(root string, port uint16) ([]uint64, error) {
 	return inodes, nil
 }
 
-func nativeSockets(ctx context.Context, port uint16, changed func()) ([]socketEvidence, error) {
-	return stableSocketHolders(ctx, procRoot(ctx), port, changed, listeningInodes)
+func nativeSockets(ctx context.Context, port uint16) ([]socketEvidence, error) {
+	return stableSocketHolders(ctx, procRoot(ctx), port, nil, listeningInodes)
 }
 
 func stableSocketHolders(ctx context.Context, root string, port uint16, changed func(), read func(string, uint16) ([]uint64, error)) ([]socketEvidence, error) {
@@ -220,7 +226,10 @@ func stableSocketHolders(ctx context.Context, root string, port uint16, changed 
 	if err != nil {
 		return nil, err
 	}
-	for ctx.Err() == nil {
+	for range 2 {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		rows, err := socketHolders(ctx, root, port, before)
 		if err != nil {
 			return nil, err
@@ -232,10 +241,12 @@ func stableSocketHolders(ctx context.Context, root string, port uint16, changed 
 		if slices.Equal(before, after) {
 			return rows, nil
 		}
-		changed()
+		if changed != nil {
+			changed()
+		}
 		before = after
 	}
-	return nil, ctx.Err()
+	return nil, ErrUnknown
 }
 
 func socketHolders(ctx context.Context, root string, port uint16, ids []uint64) ([]socketEvidence, error) {

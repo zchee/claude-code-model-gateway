@@ -29,6 +29,6 @@ func readRecordEntry(*os.File, string) ([]byte, error) { return nil, ErrUnsuppor
 func nativeExistence(context.Context, int) error            { return ErrUnsupported }
 func nativeIdentity(context.Context, int) (Identity, error) { return Identity{}, ErrUnsupported }
 func nativeTable(context.Context) ([]Identity, error)       { return nil, ErrUnsupported }
-func nativeSockets(context.Context, uint16, func()) ([]socketEvidence, error) {
+func nativeSockets(context.Context, uint16) ([]socketEvidence, error) {
 	return nil, ErrUnsupported
 }
