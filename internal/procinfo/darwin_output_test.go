@@ -18,6 +18,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	gocmp "github.com/google/go-cmp/cmp"
@@ -36,12 +38,60 @@ func TestDarwinMappedVnodeOutput(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			data := []byte(fmt.Sprintf("p701\x00\nftxt\x00D0x100000d\x00i%d\x00n%s\x00\nftxt\x00D0x100000d\x00i1152921500312633471\x00n/usr/share/locale/en_US.UTF-8/LC_COLLATE\x00\n", tt.wantInode, tt.field))
-			got, err := mappedImage(data, pid, tt.path)
+			dir := t.TempDir()
+			path := filepath.Join(dir, filepath.Base(tt.path))
+			field := filepath.Join(dir, filepath.Base(tt.field))
+			data := []byte(fmt.Sprintf("p701\x00\nftxt\x00D0x100000d\x00i%d\x00n%s\x00\nftxt\x00D0x100000d\x00i1152921500312633471\x00n/usr/share/locale/en_US.UTF-8/LC_COLLATE\x00\n", tt.wantInode, field))
+			got, err := mappedImage(pid, path, func() ([]byte, error) { return data, nil })
 			if err != nil {
 				t.Fatal(err)
 			}
-			if d := gocmp.Diff(Image{tt.path, 0x100000d, tt.wantInode}, got); d != "" {
+			if d := gocmp.Diff(Image{field, 0x100000d, tt.wantInode}, got); d != "" {
+				t.Fatal(d)
+			}
+		})
+	}
+}
+
+func TestUnlinkedMappedVnode(t *testing.T) {
+	root := t.TempDir()
+	actual := filepath.Join(root, "private")
+	other := filepath.Join(root, "other")
+	alias := filepath.Join(root, "alias")
+	for _, d := range []string{actual, other} {
+		if err := os.Mkdir(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(actual, alias); err != nil {
+		t.Fatal(err)
+	}
+	const leaf = "private-cat"
+	const loader = "ftxt\x00D0x100000f\x00i1152921500312609216\x00n/usr/lib/dyld\x00\n"
+	row := func(parent string) string {
+		return "ftxt\x00D0x100000f\x00i2120580\x00n" + filepath.Join(parent, leaf) + "\x00\n"
+	}
+	gone := filepath.Join(root, "gone")
+	correct := Image{Path: filepath.Join(actual, leaf), Device: 0x100000f, Inode: 2120580}
+	tests := map[string]struct {
+		parent, rows string
+		want         Image
+		err          error
+	}{
+		"success: symlinked parent of unlinked executable":      {alias, row(actual) + loader, correct, nil},
+		"error: same leaf in a different directory":             {alias, row(other) + loader, Image{}, ErrUnknown},
+		"error: launch parent no longer exists":                 {gone, row(gone) + loader, Image{}, ErrUnknown},
+		"error: mapped parent no longer exists":                 {alias, row(gone) + loader, Image{}, ErrUnknown},
+		"error: two matching records even with identical inode": {alias, row(actual) + row(actual) + loader, Image{}, ErrUnknown},
+		"error: loader is not an executable candidate":          {alias, loader, Image{}, ErrUnknown},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			got, err := mappedImage(701, filepath.Join(tt.parent, leaf), func() ([]byte, error) { return []byte("p701\x00\n" + tt.rows), nil })
+			if !errors.Is(err, tt.err) {
+				t.Fatalf("mapped image error=%v want %v", err, tt.err)
+			}
+			if d := gocmp.Diff(tt.want, got); d != "" {
 				t.Fatal(d)
 			}
 		})

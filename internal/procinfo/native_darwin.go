@@ -150,11 +150,9 @@ func nativeIdentity(ctx context.Context, pid int) (Identity, error) {
 	}
 	// lsof's txt records contain device and inode from the mapped vnode, not
 	// from stat(path), which could already identify a replacement executable.
-	out, err := darwinCommand(ctx, "/usr/sbin/lsof", "+w", "-nP", "-a", "-p", strconv.Itoa(pid), "-d", "txt", "-F0pDfni")
-	if err != nil {
-		return Identity{}, err
-	}
-	id.Image, err = mappedImage(out, pid, path)
+	id.Image, err = mappedImage(pid, path, func() ([]byte, error) {
+		return darwinCommand(ctx, "/usr/sbin/lsof", "+w", "-nP", "-a", "-p", strconv.Itoa(pid), "-d", "txt", "-F0pDfni")
+	})
 	if err != nil {
 		return Identity{}, fmt.Errorf("correlate lsof txt vnode with executable: %w", err)
 	}

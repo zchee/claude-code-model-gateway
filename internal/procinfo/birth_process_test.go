@@ -23,6 +23,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -39,16 +40,24 @@ func TestNativeBirthOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	exited := exec.CommandContext(t.Context(), "/usr/bin/true")
-	if err := exited.Run(); err != nil {
-		t.Fatal(err)
-	}
+	t.Run("error: confirmed missing process", func(t *testing.T) {
+		const target = 701
+		p := Probe{existence: func(_ context.Context, got int) error {
+			if got != target {
+				t.Fatalf("checked pid %d; want %d", got, target)
+			}
+			return syscall.ESRCH
+		}}
+		if err := p.inspectionError(t.Context(), target, syscall.EIO); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("failed birth inspection followed by ESRCH: %v", err)
+		}
+	})
 	tests := map[string]struct {
 		pid    int
 		cancel bool
 		want   time.Time
 		err    error
-	}{"success: kernel birth matches ps": {pid: pid, want: want}, "error: reaped child": {pid: exited.Process.Pid, err: os.ErrNotExist}, "error: expired context is not evidence of death": {pid: pid, cancel: true, err: ErrUnknown}}
+	}{"success: kernel birth matches ps": {pid: pid, want: want}, "error: expired context is not evidence of death": {pid: pid, cancel: true, err: ErrUnknown}}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())

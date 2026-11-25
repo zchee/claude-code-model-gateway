@@ -18,6 +18,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -79,71 +81,101 @@ func checkedTableRow(before, after Identity, argv []string) (Identity, bool) {
 	return before, true
 }
 
-func mappedImage(out []byte, pid int, path string) (Image, error) {
-	if !bytes.HasSuffix(out, []byte{0, '\n'}) {
-		return Image{}, fmt.Errorf("truncated lsof output: %w", ErrUnknown)
+// mappedImage holds the executable's parent directory across the vnode query.
+// Match only an exact leaf name whose parent resolves to that same directory;
+// neither spelling of the executable leaf is statted or opened.
+func mappedImage(pid int, path string, list func() ([]byte, error)) (Image, error) {
+	parent, leaf := filepath.Split(path)
+	if !filepath.IsAbs(path) || leaf == "" || leaf == "." || leaf == ".." {
+		return Image{}, fmt.Errorf("invalid executable path: %w", ErrUnknown)
 	}
-	var match, current Image
-	var seenPID, text, device bool
-	var mappings int
-	finish := func() error {
-		if !text || current.Path != path {
-			return nil
-		}
-		if !device || current.Inode == 0 || match.Inode != 0 && current != match {
-			return fmt.Errorf("incomplete or conflicting vnode: %w", ErrUnknown)
-		}
-		match = current
-		return nil
+	dir, err := os.Open(parent)
+	if err != nil {
+		return Image{}, fmt.Errorf("open executable parent: %w", ErrUnknown)
 	}
-	for field := range bytes.SplitSeq(out, []byte{0}) {
-		field = bytes.TrimPrefix(field, []byte{'\n'})
-		if len(field) == 0 {
-			continue
-		}
-		value := string(field[1:])
-		switch field[0] {
-		case 'p':
-			if seenPID || value != strconv.Itoa(pid) {
-				return Image{}, fmt.Errorf("lsof pid mismatch: %w", ErrUnknown)
-			}
-			seenPID = true
-		case 'f':
-			if err := finish(); err != nil {
-				return Image{}, err
-			}
-			current = Image{}
-			text = value == "txt"
-			device = false
-			if text {
-				mappings++
-			}
-		case 'D':
-			n, err := strconv.ParseUint(value, 0, 64)
-			if err != nil {
-				return Image{}, fmt.Errorf("invalid vnode device: %w", ErrUnknown)
-			}
-			current.Device = n
-			device = true
-		case 'i':
-			n, err := strconv.ParseUint(value, 10, 64)
-			if err != nil {
-				return Image{}, fmt.Errorf("invalid vnode inode: %w", ErrUnknown)
-			}
-			current.Inode = n
-		case 'n':
-			current.Path = value
-		default:
-			return Image{}, fmt.Errorf("unexpected lsof field %q: %w", field[0], ErrUnknown)
-		}
+	defer func() { _ = dir.Close() }()
+	info, err := dir.Stat()
+	if err != nil || !info.IsDir() {
+		return Image{}, fmt.Errorf("inspect executable parent: %w", ErrUnknown)
 	}
-	if err := finish(); err != nil {
+	out, err := list()
+	if err != nil {
 		return Image{}, err
 	}
-	if !seenPID || match.Inode == 0 {
-		return Image{}, fmt.Errorf("no executable match across %d txt records: %w", mappings, ErrUnknown)
+	listing, ok := strings.CutSuffix(string(out), "\x00\n")
+	if !ok {
+		return Image{}, fmt.Errorf("truncated lsof output: %w", ErrUnknown)
+	}
+	process, rows, ok := strings.Cut(listing, "\x00\n")
+	if !ok || process != "p"+strconv.Itoa(pid) {
+		return Image{}, fmt.Errorf("invalid lsof process set: %w", ErrUnknown)
+	}
+	var match Image
+	for row := range strings.SplitSeq(rows, "\x00\n") {
+		item, err := parseTextVnode(row)
+		if err != nil {
+			return Image{}, err
+		}
+		otherDir, otherLeaf := filepath.Split(item.Path)
+		if otherLeaf != leaf {
+			continue
+		}
+		other, err := os.Stat(otherDir)
+		if err != nil {
+			return Image{}, fmt.Errorf("inspect mapped vnode parent: %w", ErrUnknown)
+		}
+		if !os.SameFile(info, other) {
+			continue
+		}
+		if match.Inode != 0 {
+			return Image{}, fmt.Errorf("multiple matching txt vnodes: %w", ErrUnknown)
+		}
+		match = item
+	}
+	if match.Inode == 0 {
+		return Image{}, fmt.Errorf("no matching txt vnode: %w", ErrUnknown)
 	}
 	return match, nil
+}
+
+func parseTextVnode(row string) (Image, error) {
+	fields, ok := strings.CutPrefix(row, "ftxt\x00")
+	if !ok {
+		return Image{}, fmt.Errorf("invalid lsof txt set: %w", ErrUnknown)
+	}
+	var v Image
+	var device bool
+	for f := range strings.SplitSeq(fields, "\x00") {
+		if len(f) < 2 {
+			return Image{}, ErrUnknown
+		}
+		switch f[0] {
+		case 'D':
+			n, err := strconv.ParseUint(f[1:], 0, 64)
+			if err != nil || device {
+				return Image{}, fmt.Errorf("invalid vnode device: %w", ErrUnknown)
+			}
+			v.Device = n
+			device = true
+		case 'i':
+			n, err := strconv.ParseUint(f[1:], 10, 64)
+			if err != nil || n == 0 || v.Inode != 0 {
+				return Image{}, fmt.Errorf("invalid vnode inode: %w", ErrUnknown)
+			}
+			v.Inode = n
+		case 'n':
+			if v.Path != "" || !filepath.IsAbs(f[1:]) {
+				return Image{}, fmt.Errorf("invalid vnode name: %w", ErrUnknown)
+			}
+			v.Path = f[1:]
+		default:
+			return Image{}, fmt.Errorf("unexpected lsof txt field: %w", ErrUnknown)
+		}
+	}
+	if !device || v.Inode == 0 || v.Path == "" {
+		return Image{}, fmt.Errorf("incomplete mapped vnode: %w", ErrUnknown)
+	}
+	return v, nil
 }
 
 // lsofListener decodes a stderr-free listing filtered to one TCP listening port.

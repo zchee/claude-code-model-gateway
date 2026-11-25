@@ -217,6 +217,7 @@ const (
 
 // Listener returns TCP listener evidence within the configured probe budget.
 // Identified means the only holder visible to this user, not authority to signal.
+// On macOS absent means no visible match; a caller that needs the port must bind it.
 // A deadline abandons this call's worker; it cannot interrupt a stuck kernel read.
 // New probes refuse another query as unknown until that worker finishes. The zero
 // value has no admission limit.
@@ -226,6 +227,7 @@ func (p Probe) Listener(ctx context.Context, port uint16) Listener {
 }
 
 // ListenerEvidence returns the same evidence as Listener, plus the reason a query failed.
+// On macOS absent means no visible match; a caller that needs the port must bind it.
 func (p Probe) ListenerEvidence(ctx context.Context, port uint16) (Listener, error) {
 	if port == 0 {
 		return Listener{State: ListenerAbsent}, nil
