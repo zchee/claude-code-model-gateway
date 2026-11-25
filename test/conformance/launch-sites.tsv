@@ -207,9 +207,11 @@ test/gateway-process-isolation.test.js	1433	14	cli	spawn	sibling ensure retires 
 test/gateway-process-isolation.test.js	1456	24	cli	runGatewayCli	sibling ensure retires dead records without deleting replacement worker and proxy records	newerCli 'doctor'
 test/gateway-process-isolation.test.js	1478	25	cli	runGatewayCli	sibling ensure retires dead records without deleting replacement worker and proxy records	newerCli 'stop'
 test/gateway-process-isolation.test.js	1531	16	supervisor	spawnGatewayProcess	-	optional delayed-start preload; CLI serve-shim
-test/gateway-process-isolation.test.js	1555	9	cli	versionChangeRestartScenario	version-change restart leaves the replacement proxy under its live supervisor	[cliPath, command, ...commandArguments]
+test/gateway-process-isolation.test.js	1543	25	cli	runGatewayCli	version-change restart leaves the replacement proxy under its live supervisor	CLI ensure --quiet
+test/gateway-process-isolation.test.js	1543	25	cli	runGatewayCli	version-change restart preserves its assertions after delayed initial proxy readiness	CLI ensure --quiet
+test/gateway-process-isolation.test.js	1555	9	cli	versionChangeRestartScenario	version-change restart leaves the replacement proxy under its live supervisor	CLI ensure --quiet
 test/gateway-process-isolation.test.js	1555	9	supervisor	versionChangeRestartScenario	version-change restart leaves the replacement proxy under its live supervisor	CLI serve-shim
-test/gateway-process-isolation.test.js	1559	9	cli	versionChangeRestartScenario	version-change restart preserves its assertions after delayed initial proxy readiness	[cliPath, command, ...commandArguments]
+test/gateway-process-isolation.test.js	1559	9	cli	versionChangeRestartScenario	version-change restart preserves its assertions after delayed initial proxy readiness	CLI ensure --quiet
 test/gateway-process-isolation.test.js	1559	9	supervisor	versionChangeRestartScenario	version-change restart preserves its assertions after delayed initial proxy readiness	CLI serve-shim with delayed proxy preload
 test/gateway-process-isolation.test.js	1585	19	helper	spawn	foreign configured-port supervisor is preserved and reported	foreign fixture CLI: serve-shim (not the gateway)
 test/gateway-process-isolation.test.js	1602	19	cli	spawnGatewayProcessSync	foreign configured-port supervisor is preserved and reported	[CLI, 'ensure', '--quiet']
@@ -260,11 +262,19 @@ test/lmstudio.test.js	523	26	supervisor	spawnShim	a prompt LM Studio refuses wit
 test/lmstudio.test.js	554	30	supervisor	spawnShim	a prompt LM Studio refuses inside a 200 stream becomes a real 413 > success: the engine text is not JSON, so the wording gives the counts	serve-shim
 test/lmstudio.test.js	554	30	supervisor	spawnShim	a prompt LM Studio refuses inside a 200 stream becomes a real 413 > success: the error event arrives at once	serve-shim
 test/lmstudio.test.js	554	30	supervisor	spawnShim	a prompt LM Studio refuses inside a 200 stream becomes a real 413 > success: the error event arrives in two writes, after a comment frame	serve-shim
+test/lmstudio.test.js	554	30	supervisor	subtest: success: the engine text is not JSON, so the wording gives the counts	a prompt LM Studio refuses inside a 200 stream becomes a real 413	serve-shim
+test/lmstudio.test.js	554	30	supervisor	subtest: success: the error event arrives at once	a prompt LM Studio refuses inside a 200 stream becomes a real 413	serve-shim
+test/lmstudio.test.js	554	30	supervisor	subtest: success: the error event arrives in two writes, after a comment frame	a prompt LM Studio refuses inside a 200 stream becomes a real 413	serve-shim
 test/lmstudio.test.js	591	30	supervisor	spawnShim	an LM Studio stream that is not an overflow reaches the client as a 200 stream > error: a stream that ends before one frame is complete	serve-shim
 test/lmstudio.test.js	591	30	supervisor	spawnShim	an LM Studio stream that is not an overflow reaches the client as a 200 stream > error: an empty stream	serve-shim
 test/lmstudio.test.js	591	30	supervisor	spawnShim	an LM Studio stream that is not an overflow reaches the client as a 200 stream > error: another error event stays an in-band error	serve-shim
 test/lmstudio.test.js	591	30	supervisor	spawnShim	an LM Studio stream that is not an overflow reaches the client as a 200 stream > success: an ordinary answer arrives whole	serve-shim
 test/lmstudio.test.js	591	30	supervisor	spawnShim	an LM Studio stream that is not an overflow reaches the client as a 200 stream > success: an ordinary answer split inside its first frame	serve-shim
+test/lmstudio.test.js	591	30	supervisor	subtest: error: a stream that ends before one frame is complete	an LM Studio stream that is not an overflow reaches the client as a 200 stream	serve-shim
+test/lmstudio.test.js	591	30	supervisor	subtest: error: an empty stream	an LM Studio stream that is not an overflow reaches the client as a 200 stream	serve-shim
+test/lmstudio.test.js	591	30	supervisor	subtest: error: another error event stays an in-band error	an LM Studio stream that is not an overflow reaches the client as a 200 stream	serve-shim
+test/lmstudio.test.js	591	30	supervisor	subtest: success: an ordinary answer arrives whole	an LM Studio stream that is not an overflow reaches the client as a 200 stream	serve-shim
+test/lmstudio.test.js	591	30	supervisor	subtest: success: an ordinary answer split inside its first frame	an LM Studio stream that is not an overflow reaches the client as a 200 stream	serve-shim
 test/lmstudio.test.js	614	26	supervisor	spawnShim	a first event that stalls past the wait gets the stream heartbeat back, and still arrives whole	serve-shim
 test/lmstudio.test.js	644	26	supervisor	spawnShim	an overflow that arrives after the wait stays an in-band error on a 200 stream	serve-shim
 test/lmstudio.test.js	658	26	supervisor	spawnShim	other providers' streams are not held for a first event	serve-shim
@@ -275,6 +285,9 @@ test/local-llama.test.js	120	26	supervisor	startGateway	-	serve-shim
 test/local-llama.test.js	279	29	supervisor	spawnShim	the shim advertises the local row at the window its llama-server reports > success: a 262144 context gets the [1m] alias	serve-shim
 test/local-llama.test.js	279	29	supervisor	spawnShim	the shim advertises the local row at the window its llama-server reports > success: a 40960 context	serve-shim
 test/local-llama.test.js	279	29	supervisor	spawnShim	the shim advertises the local row at the window its llama-server reports > success: router mode stays an unmeasured row	serve-shim
+test/local-llama.test.js	279	29	supervisor	subtest: success: a 262144 context gets the [1m] alias	the shim advertises the local row at the window its llama-server reports	serve-shim
+test/local-llama.test.js	279	29	supervisor	subtest: success: a 40960 context	the shim advertises the local row at the window its llama-server reports	serve-shim
+test/local-llama.test.js	279	29	supervisor	subtest: success: router mode stays an unmeasured row	the shim advertises the local row at the window its llama-server reports	serve-shim
 test/local-llama.test.js	290	26	supervisor	spawnShim	a llama-server stream that reports input only in message_start still arms the sentry	serve-shim
 test/local-llama.test.js	309	31	supervisor	spawnShim	a local row below the sentry floor forwards every turn	serve-shim
 test/local-llama.test.js	325	26	supervisor	spawnShim	llama-server context overflow becomes a 413 with its own token counts	serve-shim
@@ -289,10 +302,15 @@ test/proxy-providers.test.js	342	26	supervisor	spawnShim	a non-Codex context ove
 test/proxy-providers.test.js	585	26	supervisor	startGateway	a shim that starts before the proxy lists the proxy models without waiting for a request	serve-shim
 test/proxy-providers.test.js	613	30	supervisor	spawnShim	Grok 4.7 Fast rows reach the proxy and compact 40000 below their 500000 window > backend id	serve-shim
 test/proxy-providers.test.js	613	30	supervisor	spawnShim	Grok 4.7 Fast rows reach the proxy and compact 40000 below their 500000 window > local alias	serve-shim
+test/proxy-providers.test.js	613	30	supervisor	subtest: backend id	Grok 4.7 Fast rows reach the proxy and compact 40000 below their 500000 window	serve-shim
+test/proxy-providers.test.js	613	30	supervisor	subtest: local alias	Grok 4.7 Fast rows reach the proxy and compact 40000 below their 500000 window	serve-shim
 test/proxy-providers.test.js	639	26	supervisor	spawnShim	Muse rows reach the proxy and compact 40000 below their 1007997 window	serve-shim
 test/proxy-providers.test.js	671	30	supervisor	spawnShim	Vertex AI rows reach the proxy and compact 40000 below their documented window > Claude on Vertex, a window equal to the client window	serve-shim
 test/proxy-providers.test.js	671	30	supervisor	spawnShim	Vertex AI rows reach the proxy and compact 40000 below their documented window > Gemini, a window above the [1m] client window	serve-shim
 test/proxy-providers.test.js	671	30	supervisor	spawnShim	Vertex AI rows reach the proxy and compact 40000 below their documented window > Gemma, a window far below the [1m] client window	serve-shim
+test/proxy-providers.test.js	671	30	supervisor	subtest: Claude on Vertex, a window equal to the client window	Vertex AI rows reach the proxy and compact 40000 below their documented window	serve-shim
+test/proxy-providers.test.js	671	30	supervisor	subtest: Gemini, a window above the [1m] client window	Vertex AI rows reach the proxy and compact 40000 below their documented window	serve-shim
+test/proxy-providers.test.js	671	30	supervisor	subtest: Gemma, a window far below the [1m] client window	Vertex AI rows reach the proxy and compact 40000 below their documented window	serve-shim
 test/proxy-providers.test.js	697	26	supervisor	spawnShim	a Vertex AI row with no policy row has no sentry and forwards every turn	serve-shim
 test/proxy-upgrade.test.js	144	18	shim	spawnGatewayProcessSync	stable command launcher follows registry changes and forwards command exits	[updateLauncher]
 test/proxy-upgrade.test.js	152	17	shim	spawnGatewayProcessSync	stable command launcher follows registry changes and forwards command exits	[launcher, 'status', '--json']
