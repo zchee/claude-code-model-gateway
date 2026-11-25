@@ -59,6 +59,8 @@ func TestFixtureEnvironment(t *testing.T) {
 		"CODEX_GATEWAY_CLAUDE_BIN": filepath.Join(home, "missing-claude"), "CODEX_GATEWAY_HOSTS_FILE": filepath.Join(home, "hosts"),
 		"CODEX_GATEWAY_DISPATCH_CACHE_PATH": filepath.Join(home, "dispatch-routes.json"), "CODEX_GATEWAY_REQUEST_LOG_PATH": filepath.Join(home, "request-routes.jsonl"),
 		"CODEX_GATEWAY_TELEMETRY_ENDPOINT": "http://127.0.0.1:9", "KEEP_ME": "parent",
+		// Usage reporting is off unless a test names a collector it owns; the source's default is a fixed local endpoint.
+		"CODEX_GATEWAY_USAGE_ENDPOINT": "0",
 	}
 	parent := map[string]string{"ANTHROPIC_BASE_URL": "inherited", "ANTHROPIC_UNIX_SOCKET": "inherited", "CLAUDE_CODE_PLUGIN_CACHE_DIR": "inherited", "CODEX_GATEWAY_UNKNOWN": "inherited", "MODEL_GATEWAY_UNKNOWN": "inherited", "MODEL_GATEWAY_STATE_DIR": "inherited"}
 	for key := range want {
