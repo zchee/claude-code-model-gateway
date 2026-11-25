@@ -29,8 +29,12 @@ const (
 	fixtureWaitDelay  = time.Second
 )
 
-// ErrInvalidFixtureLimit identifies a fixture launch limit outside (0, 30s].
-var ErrInvalidFixtureLimit = errors.New("fixture limit must be positive and at most 30 seconds")
+var (
+	// ErrInvalidFixtureLimit identifies a fixture launch limit outside (0, 30s].
+	ErrInvalidFixtureLimit = errors.New("fixture limit must be positive and at most 30 seconds")
+	// ErrFixtureNotValidated identifies a prepared helper started without the fixture launcher.
+	ErrFixtureNotValidated = errors.New("prepared helper must be started through a fixture launcher")
+)
 
 // UsageRequest records the parts of a request observed by a fixture collector.
 type UsageRequest struct {
@@ -114,7 +118,15 @@ func runBoundedFixture(parent context.Context, cmd *exec.Cmd, limit time.Duratio
 	if cmd.WaitDelay <= 0 || cmd.WaitDelay > fixtureWaitDelay {
 		cmd.WaitDelay = fixtureWaitDelay
 	}
+	// The launcher has validated this command. Clear only the preparation sentinel, not a lookup error.
+	prepared := cmd.Err == ErrFixtureNotValidated //nolint:errorlint // A wrapped error is not the launcher-owned sentinel.
+	if prepared {
+		cmd.Err = nil
+	}
 	if err := cmd.Start(); err != nil {
+		if prepared {
+			cmd.Err = ErrFixtureNotValidated
+		}
 		return err
 	}
 	process := cmd.Process

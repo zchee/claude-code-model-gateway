@@ -340,10 +340,16 @@ func (env Environment) runFixture(cmd *exec.Cmd, collector *usageCollectorState,
 		}
 		// Bootstrap in the trusted sandbox root, not a second lookup of the requested
 		// directory. DispatchHelper enters the checked handle before doing fixture work.
+		originalDir, originalFiles, originalEnv := cmd.Dir, cmd.ExtraFiles, cmd.Env
 		cmd.Dir = env.sandboxRoot()
 		cmd.ExtraFiles = append([]*os.File{dir}, cmd.ExtraFiles...)
 		cmd.Env = entries
-		return errors.Join(run(), dir.Close(), root.Close())
+		err = run()
+		if cmd.Process == nil {
+			// A collector can refuse before Start. Leave no closed descriptor on a retry.
+			cmd.Dir, cmd.ExtraFiles, cmd.Env = originalDir, originalFiles, originalEnv
+		}
+		return errors.Join(err, dir.Close(), root.Close())
 	}
 	cmd.Env = entries
 	return run()

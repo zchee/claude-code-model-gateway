@@ -425,17 +425,92 @@ func TestGatewayFixtureHelper(t *testing.T) {
 	}
 }
 
+func TestPreparedHelperRequiresLauncher(t *testing.T) {
+	tests := map[string]struct{ start func(*exec.Cmd) error }{
+		"error: direct Run":   {(*exec.Cmd).Run},
+		"error: direct Start": {(*exec.Cmd).Start},
+		"error: direct CombinedOutput": {func(cmd *exec.Cmd) error {
+			_, err := cmd.CombinedOutput()
+			return err
+		}},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			env := gatewaytest.NewEnv(t.TempDir(), nil, nil, nil)
+			cmd, err := env.HelperCommand(t, "wait-for-deadline")
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = tt.start(cmd)
+			if cmd.Process != nil && cmd.ProcessState == nil {
+				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
+			}
+			if !errors.Is(err, gatewaytest.ErrFixtureNotValidated) || cmd.Process != nil {
+				t.Fatalf("raw start: process=%v err=%v, want ErrFixtureNotValidated before exec", cmd.Process, err)
+			}
+			wantAbsent(t, filepath.Join(cmd.Dir, blockingHelperMarker))
+		})
+	}
+}
+
+func TestPreparedHelperRetryAfterRefusal(t *testing.T) {
+	tests := map[string]struct{ stoppedCollector bool }{
+		"success: retry after invalid limit":      {},
+		"success: retry after collector shutdown": {stoppedCollector: true},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			env := gatewaytest.NewEnv(t.TempDir(), nil, nil, nil)
+			cmd, err := env.HelperCommand(t, "report-args9", "retried")
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir := cmd.Dir
+			wantErr := gatewaytest.ErrInvalidFixtureLimit
+			if tt.stoppedCollector {
+				var stopped *gatewaytest.UsageCollector
+				t.Run("start then stop collector", func(t *testing.T) { stopped = env.StartUsageCollector(t) })
+				env[fixtureUsageKey] = stopped.URL
+				err = stopped.RunFixture(env, cmd)
+				wantErr = gatewaytest.ErrUsageEndpoint
+				env[fixtureUsageKey] = "0"
+			} else {
+				err = env.RunFixtureWithin(cmd, 0)
+			}
+			if !errors.Is(err, wantErr) || !errors.Is(cmd.Err, gatewaytest.ErrFixtureNotValidated) || cmd.Process != nil {
+				t.Fatalf("refusal: err=%v command err=%v process=%v, want %v and unused command", err, cmd.Err, cmd.Process, wantErr)
+			}
+			var output bytes.Buffer
+			cmd.Stdout = &output
+			if err := env.RunFixture(cmd); err != nil {
+				t.Fatalf("retry: %v", err)
+			}
+			line, _, _ := strings.Cut(output.String(), "\n")
+			var got namedHelperReport
+			if err := json.Unmarshal([]byte(line), &got); err != nil {
+				t.Fatalf("decode retried helper output %q: %v", line, err)
+			}
+			if diff := gocmp.Diff(namedHelperReport{Directory: dir, Args: []string{"retried"}}, got); diff != "" {
+				t.Errorf("retried helper output (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
 func TestFixtureLaunchDeadline(t *testing.T) {
 	tests := map[string]struct {
-		collector, prepared     bool
-		limit, delay, wantDelay time.Duration
+		collector, prepared, finishes        bool
+		limit, delay, wantDelay, preparedFor time.Duration
 	}{
-		"error: usage disabled without caller context":          {wantDelay: time.Second},
-		"error: active collector caps wait delay":               {collector: true, delay: 2 * time.Second, wantDelay: time.Second},
-		"error: active collector preserves shorter wait":        {collector: true, delay: 100 * time.Millisecond, wantDelay: 100 * time.Millisecond},
-		"error: default stops a prepared helper":                {prepared: true, wantDelay: time.Second},
-		"success: extended limit lets a prepared helper finish": {prepared: true, limit: 10 * time.Second, wantDelay: time.Second},
-		"success: extended limit with collector authority":      {prepared: true, collector: true, limit: 10 * time.Second, wantDelay: time.Second},
+		"error: usage disabled without caller context":         {wantDelay: time.Second},
+		"error: active collector caps wait delay":              {collector: true, delay: 2 * time.Second, wantDelay: time.Second},
+		"error: active collector preserves shorter wait":       {collector: true, delay: 100 * time.Millisecond, wantDelay: 100 * time.Millisecond},
+		"error: default stops a prepared helper":               {prepared: true, wantDelay: time.Second},
+		"error: explicit short limit stops a prepared helper":  {prepared: true, limit: 2 * time.Second, wantDelay: time.Second},
+		"error: explicit short limit with collector authority": {prepared: true, collector: true, limit: 2 * time.Second, wantDelay: time.Second},
+		"success: delayed launch gets the full explicit limit": {prepared: true, finishes: true, preparedFor: 5500 * time.Millisecond, limit: 10 * time.Second, wantDelay: time.Second},
+		"success: extended limit with collector authority":     {prepared: true, finishes: true, collector: true, limit: 10 * time.Second, wantDelay: time.Second},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -472,22 +547,28 @@ func TestFixtureLaunchDeadline(t *testing.T) {
 				launch = func(cmd *exec.Cmd) error { return collector.RunFixture(env, cmd) }
 				launchWithin = func(cmd *exec.Cmd, limit time.Duration) error { return collector.RunFixtureWithin(env, cmd, limit) }
 			}
+			deadline := 5 * time.Second
 			if tt.limit > 0 {
-				if err := launchWithin(cmd, tt.limit); err != nil {
+				deadline = tt.limit
+				launch = func(cmd *exec.Cmd) error { return launchWithin(cmd, tt.limit) }
+			}
+			time.Sleep(tt.preparedFor)
+			started := time.Now()
+			err := launch(cmd)
+			if tt.finishes {
+				if err != nil {
 					t.Fatalf("extended fixture launch: %v", err)
 				}
 				if _, err := os.Stat(filepath.Join(dir, completedHelperMarker)); err != nil {
 					t.Errorf("helper did not finish under the extended limit: %v", err)
 				}
 			} else {
-				started := time.Now()
-				err := launch(cmd)
 				exitErr, exited := errors.AsType[*exec.ExitError](err)
 				if !errors.Is(err, context.DeadlineExceeded) || !exited || exitErr.ProcessState != cmd.ProcessState || cmd.ProcessState == nil || cmd.ProcessState.Success() {
-					t.Fatalf("RunFixture: error=%v exitError=%v state=%v, want deadline exceeded and the reaped child's exit error", err, exitErr, cmd.ProcessState)
+					t.Fatalf("fixture launch: error=%v exitError=%v state=%v, want deadline exceeded and the reaped child's exit error", err, exitErr, cmd.ProcessState)
 				}
-				if elapsed := time.Since(started); elapsed < 5*time.Second || elapsed > 9*time.Second {
-					t.Errorf("RunFixture took %v, want the five-second deadline", elapsed)
+				if elapsed := time.Since(started); elapsed < deadline || elapsed > deadline+4*time.Second {
+					t.Errorf("fixture launch took %v, want the %v deadline", elapsed, deadline)
 				}
 				wantAbsent(t, filepath.Join(dir, completedHelperMarker))
 			}

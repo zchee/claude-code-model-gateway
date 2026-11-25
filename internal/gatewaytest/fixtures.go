@@ -186,6 +186,7 @@ func (env Environment) StartUsageCollector(t testing.TB) *UsageCollector {
 // A consuming package must declare exactly one TestGatewayFixtureHelper that calls DispatchHelper under the process build tag.
 // That entry is a caller contract, not an enforced check. Assert on helper-produced output or a file, not exit status alone.
 // Custom names match [a-z][a-z0-9-]{0,63}. RunFixture or RunFixtureWithin sets the deadline at launch.
+// Starting the prepared command directly returns ErrFixtureNotValidated and consumes it as an exec.Cmd.
 func (env Environment) HelperCommand(t testing.TB, helper string, args ...string) (*exec.Cmd, error) {
 	t.Helper()
 	dispatch := append([]string{helperSelector, "--", helperDispatchPrefix + helper}, args...)
@@ -215,6 +216,7 @@ func (env Environment) HelperCommand(t testing.TB, helper string, args ...string
 	})
 	cmd := exec.CommandContext(t.Context(), exe, dispatch...)
 	cmd.Dir, cmd.Env, cmd.WaitDelay = dir, []string{}, fixtureWaitDelay
+	cmd.Err = ErrFixtureNotValidated
 	return cmd, nil
 }
 
