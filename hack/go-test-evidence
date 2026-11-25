@@ -17,6 +17,14 @@ set -euC
 
 fail() { printf 'go-test-evidence: %s\n' "$*" >&2; exit 1; }
 
+case $0 in
+    */*) script_dir=${0%/*} ;;
+    *)
+        [ -f "./$0" ] || fail 'bare script path is not a regular file in the current directory'
+        script_dir=.
+        ;;
+esac
+
 [ "$#" -eq 3 ] || fail 'usage: hack/go-test-evidence {plain|process} RUN_ID OUTPUT'
 case $1 in
     plain) target=test-json ;;
@@ -29,10 +37,6 @@ esac
 [ -n "$3" ] || fail 'missing output path'
 
 [ ! -L "$0" ] || fail 'script must not be a symbolic link'
-case $0 in
-    */*) script_dir=${0%/*} ;;
-    *) script_dir=. ;;
-esac
 # A sentinel keeps command substitution from trimming newlines in the root name.
 root=$(CDPATH='' cd -P -- "$script_dir/.." && pwd -P && printf .) || fail 'cannot resolve checkout root'
 root=${root%??}
