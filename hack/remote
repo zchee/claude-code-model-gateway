@@ -56,9 +56,14 @@ archive_tree() {
     local root=$1
     (cd "$root" && git ls-files -t --cached --others --exclude-standard -z | perl -0ne '
         chomp; my $untracked = s/^\? //; s/^[A-Z] // unless $untracked;
-        next if m{(?:^|/)(?:\.claude|\.cache|\.git|\.omc)(?:/|$)|(?:^|/)\.env[^/]*(?:/|$)|token|credential|secret}i;
-        # Untracked inputs are source, fixtures, build scripts, or module metadata.
-        next if $untracked && !m{^(?:(?:cmd|internal|pkg|testdata|hack)/|[^/]+[.]go$|(?:go[.]mod|go[.]sum|Makefile)$)};
+        if ($untracked) {
+            if (m{(?:^|/)(?:\.claude|\.cache|\.git|\.omc)(?:/|$)|(?:^|/)\.env[^/]*(?:/|$)|token|credential|secret}i) {
+                (my $display = $_) =~ s/([[:cntrl:]])/sprintf("\\x%02x",ord($1))/ge;
+                warn "not sending untracked path: $display\n"; next;
+            }
+            # Include untracked build inputs, but not unrelated local files.
+            next unless m{^(?:(?:cmd|internal|pkg|test|testdata|hack)/|[^/]+[.]go$|(?:go[.]mod|go[.]sum|Makefile)$)};
+        }
         my $p = ""; my @c = split m{/}; pop @c;
         for my $c (@c) { $p .= "$c/"; die "symlink ancestor: $p\n" if -l substr($p,0,-1); }
         next unless -e || -l;
@@ -112,8 +117,8 @@ install_tools() (
 
 negative_control() (
     local fixture=${1:-./internal/venue/testdata/control} sentinel_var=${2:-MODEL_GATEWAY_VENUE_SENTINEL} tag variant rc target tool failed=0
-    local -a flags entries
-    local control=$run/control sentinel=$run/control/sentinel
+    local -a flags entries meta counters
+    local coverdir control=$run/control sentinel=$run/control/sentinel
     [[ ${GITHUB_ACTIONS:-} != true ]] || fail 'negative control requires a non-CI venue'
     [[ -d $fixture ]] || fail "negative-control fixture package missing from copied tree: $fixture"
     mkdir -p "$control/bin" "$control/positive-coverage" "$control/negative-coverage"
@@ -123,13 +128,23 @@ negative_control() (
         if [[ $tag == process ]]; then flags+=(-tags process); fi
         if [[ $variant == *-cover ]]; then flags+=(-cover -coverpkg=./internal/venue); fi
         go test -c "${flags[@]}" -o "$control/$variant" "$fixture"
-        env "$sentinel_var=$sentinel" GOCOVERDIR="$control/positive-coverage" "$control/$variant"
+        coverdir=$control/positive-coverage/$variant
+        mkdir "$coverdir"
+        # testing uses its own output flag on normal teardown; the runtime exit
+        # hook uses GOCOVERDIR. Point both at this binary's fresh directory.
+        flags=()
+        if [[ $variant == *-cover ]]; then flags+=("-test.gocoverdir=$coverdir"); fi
+        env "$sentinel_var=$sentinel" GOCOVERDIR="$coverdir" "$control/$variant" "${flags[@]}"
         printf '%s\n' "$tag" >| "$control/expected"
         if [[ ! -f $sentinel || -L $sentinel ]] || ! cmp -s "$control/expected" "$sentinel"; then
             fail "$tag did not write its expected sentinel"
         fi
         rm -- "$sentinel"
-        printf '%-24s %-16s %s\n' "$variant" present PASS
+        if [[ $variant == *-cover ]]; then
+            meta=("$coverdir"/covmeta.*); counters=("$coverdir"/covcounters.*)
+            [[ -f ${meta[0]} && -s ${meta[0]} && -f ${counters[0]} && -s ${counters[0]} ]] || fail "$variant produced no usable coverage data"
+            printf '%-24s %-16s PASS (%s metadata, %s counters)\n' "$variant" present "${#meta[@]}" "${#counters[@]}"
+        else printf '%-24s %-16s %s\n' "$variant" present PASS; fi
     done
     for tool in go node npm; do
         printf '#!/bin/sh\nprintf "%%s\\n" "%s" >> "%s"\nexit 70\n' "$tool" "$control/dispatched" > "$control/bin/$tool"
@@ -204,7 +219,10 @@ remote_main() {
         else printf 'venue toolchains and lock: unavailable\n'; fi
         return
     fi
-    if [[ $op == provision || $op == deprovision || ( $op == negative-control && -f $saved && ! -L $saved ) ]]; then
+    if [[ ( $op == run || $op == negative-control ) && ( -e $saved || -L $saved ) ]]; then
+        fail 'attestation withdrawn; provision is required before running'
+    fi
+    if [[ $op == provision || $op == deprovision ]]; then
         venue_state_clear "$home"; venue_ports_clear
     else venue_require "$home"; fi
     umask 077
@@ -227,7 +245,8 @@ remote_main() {
     mkdir -p "$HOME" "$TMPDIR" "$GOBIN" "$base/runs"
     if command -v claude >/dev/null; then fail 'claude must not resolve on the venue PATH'; fi
     if [[ -e $saved || -L $saved ]]; then
-        [[ ( $op == provision || $op == negative-control ) && -f $saved && ! -L $saved && ! -e $marker && ! -L $marker ]] || fail 'ambiguous or interrupted attestation; reprovision before running'
+        [[ $op == provision ]] || fail 'attestation withdrawn; provision is required before running'
+        [[ -f $saved && ! -L $saved && ! -e $marker && ! -L $marker ]] || fail 'ambiguous attestation; cannot recover'
         venue_state_clear "$home"; venue_ports_clear; mv -T "$saved" "$marker"; venue_require "$home"
         printf 'recovered withdrawn attestation\n'
     fi
