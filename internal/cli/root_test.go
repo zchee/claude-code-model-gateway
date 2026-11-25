@@ -12,18 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package cli_test
+package cli
 
 import (
 	"bytes"
 	"errors"
+	"io"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
 	gocmp "github.com/google/go-cmp/cmp"
 
-	"github.com/zchee/claude-code-model-gateway/internal/cli"
+	"github.com/zchee/claude-code-model-gateway/internal/cli/argscan"
 )
 
 const sandboxHome = "sandbox-home"
@@ -63,7 +65,7 @@ func TestRunStubs(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			var stdin, stdout, stderr bytes.Buffer
 			args := []string{"claude-code-model-gateway", tt.command, "--help", "--unknown", "value"}
-			got := cli.Run(args, &stdin, &stdout, &stderr, testEnv(nil).lookup, testHome)
+			got := Run(args, &stdin, &stdout, &stderr, testEnv(nil).lookup, testHome)
 			if diff := gocmp.Diff(1, got); diff != "" {
 				t.Errorf("exit status mismatch (-want +got):\n%s", diff)
 			}
@@ -71,6 +73,131 @@ func TestRunStubs(t *testing.T) {
 				t.Errorf("stdout mismatch (-want +got):\n%s", diff)
 			}
 			if diff := gocmp.Diff("model-gateway: "+tt.command+": not implemented\n", stderr.String()); diff != "" {
+				t.Errorf("stderr mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestSourceInvocations(t *testing.T) {
+	commonArgs := []string{
+		"--unknown-before", "enable", "--unknown-after", "--", "--preserve-wiring", "--device",
+		"--quiet", "--json", "--refresh=true", "--write-project", "--mode", "--remove=", "--confirm", "--show-mode",
+	}
+	tests := map[string]struct {
+		command  string
+		args     []string
+		wantScan *commandScan
+	}{
+		"success: setup": {command: "setup", wantScan: &commandScan{present: map[string]bool{"--preserve-wiring": true}}},
+		"success: login": {command: "login", wantScan: &commandScan{present: map[string]bool{"--device": true}}},
+		"success: start": {command: "start", wantScan: &commandScan{}},
+		"success: stop":  {command: "stop", wantScan: &commandScan{}},
+		"success: ensure": {
+			command: "ensure", wantScan: &commandScan{present: map[string]bool{"--quiet": true}},
+		},
+		"success: recover":        {command: "recover", wantScan: &commandScan{}},
+		"success: readiness-gate": {command: "readiness-gate"},
+		"success: status":         {command: "status", wantScan: &commandScan{}},
+		"success: models":         {command: "models", wantScan: &commandScan{}},
+		"success: catalog": {
+			command: "catalog", wantScan: &commandScan{present: map[string]bool{"--json": true, "--refresh": false}},
+		},
+		"success: pin": {
+			command: "pin", args: []string{"--unknown-before", "start", "--opus", "--json", "--unknown-after", "end", "--fable"},
+			wantScan: &commandScan{
+				pairOptions: []string{"--opus", "--sonnet", "--fable"},
+				pairs: []argscan.Pair{
+					{Option: "--unknown-before", Value: "start", HasValue: true},
+					{Option: "--opus", Value: "--json", HasValue: true},
+					{Option: "--unknown-after", Value: "end", HasValue: true},
+					{Option: "--fable"},
+				},
+			},
+		},
+		"success: context-window": {
+			command: "context-window",
+			args:    []string{"--unknown-before", "", "--codex", "--json", "--grok-compact-at", "cap", "--unknown-after", "end", "--claude"},
+			wantScan: &commandScan{
+				pairOptions: []string{"--claude", "--codex", "--grok", "--codex-compact-at", "--grok-compact-at"},
+				pairs: []argscan.Pair{
+					{Option: "--unknown-before", HasValue: true},
+					{Option: "--codex", Value: "--json", HasValue: true},
+					{Option: "--grok-compact-at", Value: "cap", HasValue: true},
+					{Option: "--unknown-after", Value: "end", HasValue: true},
+					{Option: "--claude"},
+				},
+			},
+		},
+		"success: env": {
+			command: "env", wantScan: &commandScan{present: map[string]bool{
+				"--reconcile": false, "--remove": false, "--write-project": true, "--write-user": false, "--mode": true, "--show-mode": true,
+			}},
+		},
+		"success: doctor": {command: "doctor", wantScan: &commandScan{}},
+		"success: remote-control": {
+			command:  "remote-control",
+			wantScan: &commandScan{first: "--unknown-before", hasFirst: true, present: map[string]bool{"--confirm": true}},
+		},
+		"success: serve-shim":   {command: "serve-shim", wantScan: &commandScan{}},
+		"success: serve-worker": {command: "serve-worker", wantScan: &commandScan{}},
+	}
+	if got := len(sourceCommands()); got != len(tests) {
+		t.Fatalf("command count: got %d, want %d", got, len(tests))
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			args := tt.args
+			if args == nil {
+				args = commonArgs
+			}
+			const input = `{"hook_event_name":"UserPromptSubmit"}`
+			stdin := strings.NewReader(input)
+			var stdout, stderr bytes.Buffer
+			commands := sourceCommands()
+			var calls int
+			for i := range commands {
+				if commands[i].name != tt.command {
+					continue
+				}
+				commands[i].handle = func(call invocation) error {
+					calls++
+					if call.name != tt.command {
+						t.Errorf("name: got %q, want %q", call.name, tt.command)
+					}
+					if diff := gocmp.Diff(tt.wantScan, call.scan, gocmp.AllowUnexported(commandScan{})); diff != "" {
+						t.Errorf("scan mismatch (-want +got):\n%s", diff)
+					}
+					if call.stdin != stdin {
+						t.Fatal("handler did not receive the input reader")
+					}
+					if got, err := io.ReadAll(call.stdin); err != nil || string(got) != input {
+						t.Errorf("input: got %q, err %v; want %q", got, err, input)
+					}
+					if got, ok := call.lookup("fixture"); !ok || got != "value" {
+						t.Errorf("lookup: got %q, %t; want value, true", got, ok)
+					}
+					if got, err := call.home(); err != nil || got != sandboxHome {
+						t.Errorf("home: got %q, err %v; want %q", got, err, sandboxHome)
+					}
+					_, _ = io.WriteString(call.streams.Log, "report\n")
+					_, _ = io.WriteString(call.streams.Output, "{}\n")
+					_, _ = io.WriteString(call.streams.Error, "diagnostic\n")
+					return nil
+				}
+			}
+			argv := slices.Concat([]string{"model-gateway", tt.command}, args)
+			if status := run(argv, stdin, &stdout, &stderr, testEnv{"fixture": "value"}.lookup, testHome, commands); status != 0 || calls != 1 {
+				t.Fatalf("dispatch: got status %d, %d calls; want status 0, one call; stderr %q", status, calls, stderr.String())
+			}
+			wantOut, wantErr := "{}\n", "report\ndiagnostic\n"
+			if tt.wantScan == nil {
+				wantOut, wantErr = "report\n{}\n", "diagnostic\n"
+			}
+			if diff := gocmp.Diff(wantOut, stdout.String()); diff != "" {
+				t.Errorf("stdout mismatch (-want +got):\n%s", diff)
+			}
+			if diff := gocmp.Diff(wantErr, stderr.String()); diff != "" {
 				t.Errorf("stderr mismatch (-want +got):\n%s", diff)
 			}
 		})
@@ -130,7 +257,7 @@ func TestRunCompletions(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			var stdin, stdout, stderr bytes.Buffer
-			got := cli.Run(tt.args, &stdin, &stdout, &stderr, testEnv(nil).lookup, testHome)
+			got := Run(tt.args, &stdin, &stdout, &stderr, testEnv(nil).lookup, testHome)
 			if diff := gocmp.Diff(tt.wantStatus, got); diff != "" {
 				t.Errorf("exit status mismatch (-want +got):\n%s", diff)
 			}
@@ -146,6 +273,32 @@ func TestRunCompletions(t *testing.T) {
 				t.Errorf("stdout does not contain the registration line %q", tt.wantLine)
 			} else if diff := gocmp.Diff("", stdout.String()); diff != "" {
 				t.Errorf("stdout mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestRunCompletionRequests(t *testing.T) {
+	tests := map[string]struct {
+		command       string
+		noDescription bool
+	}{
+		"success: Cobra completion with optional descriptions": {command: "__complete"},
+		"success: Cobra completion without descriptions":       {command: "__completeNoDesc", noDescription: true},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			args := []string{"model-gateway", tt.command, "set"}
+			if status := Run(args, strings.NewReader(""), &stdout, &stderr, testEnv(nil).lookup, testHome); status != 0 {
+				t.Fatalf("completion status: got %d, want 0; stderr %q", status, stderr.String())
+			}
+			line, directive, _ := strings.Cut(stdout.String(), "\n")
+			if choice, _, described := strings.Cut(line, "\t"); choice != "setup" || (tt.noDescription && described) {
+				t.Errorf("unexpected completion candidate %q", line)
+			}
+			if diff := gocmp.Diff(":4\n", directive); diff != "" {
+				t.Errorf("completion directive mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}
@@ -168,7 +321,7 @@ func TestRunVersion(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			var stdin, stdout, stderr bytes.Buffer
-			if diff := gocmp.Diff(1, cli.Run([]string{tt.program, "version", "extra"}, &stdin, &stdout, &stderr, testEnv(nil).lookup, testHome)); diff != "" {
+			if diff := gocmp.Diff(1, Run([]string{tt.program, "version", "extra"}, &stdin, &stdout, &stderr, testEnv(nil).lookup, testHome)); diff != "" {
 				t.Errorf("exit status mismatch (-want +got):\n%s", diff)
 			}
 			if diff := gocmp.Diff("", stdout.String()); diff != "" {
@@ -188,7 +341,7 @@ func TestInheritedObjectNamesAreUnknownCommands(t *testing.T) {
 	}
 	run := func(command string) result {
 		var stdin, stdout, stderr bytes.Buffer
-		status := cli.Run([]string{"model-gateway", command}, &stdin, &stdout, &stderr, testEnv(nil).lookup, testHome)
+		status := Run([]string{"model-gateway", command}, &stdin, &stdout, &stderr, testEnv(nil).lookup, testHome)
 		return result{Status: status, Stdout: stdout.String(), Stderr: stderr.String()}
 	}
 	// bin/model-gateway.js:4-10,13-16 and lib/commands.js:2935-3041:
@@ -221,6 +374,7 @@ func TestRunUsage(t *testing.T) {
 		name       string
 		env        testEnv
 		homeErr    error
+		forbidHome bool
 		wantStatus int
 		wantStderr string
 	}{
@@ -246,6 +400,22 @@ func TestRunUsage(t *testing.T) {
 		"error: short help switch": {
 			args: []string{"model-gateway", "-h"}, name: "model-gateway", wantStatus: 1,
 		},
+		// bin/model-gateway.js:4-10 and lib/commands.js:2935-3041: these are not command names.
+		"error: top-level version switch": {
+			args: []string{"model-gateway", "--version"}, name: "model-gateway", wantStatus: 1,
+		},
+		"error: top-level unknown short switch": {
+			args: []string{"model-gateway", "-x"}, name: "model-gateway", wantStatus: 1,
+		},
+		"error: similar to Cobra completion request": {
+			args: []string{"model-gateway", "__complete-extra", "set"}, name: "model-gateway", wantStatus: 1,
+		},
+		"error: similar to Cobra completion request without descriptions": {
+			args: []string{"model-gateway", "__completeNoDesc-extra", "set"}, name: "model-gateway", wantStatus: 1,
+		},
+		"error: arbitrary double underscore command": {
+			args: []string{"model-gateway", "__unknown", "set"}, name: "model-gateway", wantStatus: 1,
+		},
 		// bin/model-gateway.js:4-10 and lib/commands.js:199-201: a leading flag or -- is not skipped.
 		"error: flag before command": {
 			args: []string{"model-gateway", "--unknown=value", "version"}, name: "model-gateway", wantStatus: 1,
@@ -261,7 +431,7 @@ func TestRunUsage(t *testing.T) {
 		// lib/commands.js:127,153-197: paths in usage follow the active state directory.
 		"success: overridden state does not need home": {
 			args: []string{"model-gateway"}, name: "model-gateway", env: testEnv{"MODEL_GATEWAY_STATE_DIR": "other-state"},
-			homeErr: errors.New("lookup unavailable"),
+			forbidHome: true,
 		},
 		// lib/runtime.js:16 and bin/model-gateway.js:13-16: usage cannot resolve default paths on a home lookup failure.
 		"error: home lookup failure": {
@@ -291,9 +461,14 @@ func TestRunUsage(t *testing.T) {
 			if tt.wantStderr != "" {
 				wantStdout = ""
 			}
-			home := func() (string, error) { return sandboxHome, tt.homeErr }
+			home := func() (string, error) {
+				if tt.forbidHome {
+					t.Fatal("home lookup called despite explicit state directory")
+				}
+				return sandboxHome, tt.homeErr
+			}
 			var stdin, stdout, stderr bytes.Buffer
-			if diff := gocmp.Diff(tt.wantStatus, cli.Run(tt.args, &stdin, &stdout, &stderr, tt.env.lookup, home)); diff != "" {
+			if diff := gocmp.Diff(tt.wantStatus, Run(tt.args, &stdin, &stdout, &stderr, tt.env.lookup, home)); diff != "" {
 				t.Errorf("exit status mismatch (-want +got):\n%s", diff)
 			}
 			if diff := gocmp.Diff(wantStdout, stdout.String()); diff != "" {
