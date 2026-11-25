@@ -185,7 +185,7 @@ func (env Environment) StartUsageCollector(t testing.TB) *UsageCollector {
 // HelperCommand prepares a subprocess helper in its own private sandbox directory.
 // A consuming package must declare exactly one TestGatewayFixtureHelper that calls DispatchHelper under the process build tag.
 // That entry is a caller contract, not an enforced check. Assert on helper-produced output or a file, not exit status alone.
-// Custom names match [a-z][a-z0-9-]{0,63}. Use RunFixture on the sandbox environment to launch the helper.
+// Custom names match [a-z][a-z0-9-]{0,63}. RunFixture or RunFixtureWithin sets the deadline at launch.
 func (env Environment) HelperCommand(t testing.TB, helper string, args ...string) (*exec.Cmd, error) {
 	t.Helper()
 	dispatch := append([]string{helperSelector, "--", helperDispatchPrefix + helper}, args...)
@@ -213,9 +213,7 @@ func (env Environment) HelperCommand(t testing.TB, helper string, args ...string
 			t.Error(err)
 		}
 	})
-	ctx, cancel := context.WithTimeout(t.Context(), fixtureTimeout)
-	t.Cleanup(cancel)
-	cmd := exec.CommandContext(ctx, exe, dispatch...)
+	cmd := exec.CommandContext(t.Context(), exe, dispatch...)
 	cmd.Dir, cmd.Env, cmd.WaitDelay = dir, []string{}, fixtureWaitDelay
 	return cmd, nil
 }

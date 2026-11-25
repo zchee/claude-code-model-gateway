@@ -188,16 +188,20 @@ func TestFixtureDispatch(t *testing.T) {
 	}
 }
 
-func TestHelperDeadline(t *testing.T) {
+func TestHelperCallerDeadline(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		env := gatewaytest.NewEnv(t.TempDir(), nil, nil, nil)
-		cmd, err := env.HelperCommand(t, "claude", "--version")
+		prepared, err := env.HelperCommand(t, "claude", "--version")
 		if err != nil {
 			t.Fatal(err)
 		}
-		time.Sleep(6 * time.Second)
-		if err := env.RunFixture(cmd); !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("expired helper: %v", err)
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, prepared.Path, prepared.Args[1:]...)
+		cmd.Dir = prepared.Dir
+		time.Sleep(2 * time.Second)
+		if err := env.RunFixtureWithin(cmd, 10*time.Second); !errors.Is(err, context.DeadlineExceeded) || cmd.Process != nil {
+			t.Fatalf("earlier caller deadline: process=%v err=%v", cmd.Process, err)
 		}
 	})
 }
@@ -367,6 +371,7 @@ func TestEmptyFixtureRun(t *testing.T) {
 const (
 	fixtureBuiltinOverride = "GATEWAYTEST_ATTEMPT_BUILTIN_OVERRIDE"
 	blockingHelperMarker   = "fixture-blocking-ready"
+	completedHelperMarker  = "fixture-blocking-completed"
 )
 
 type namedHelperReport struct {
@@ -392,8 +397,11 @@ func TestGatewayFixtureHelper(t *testing.T) {
 		if err := os.WriteFile(blockingHelperMarker, nil, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		// Keep the child alive past the fixture deadline but let a broken test finish.
-		time.Sleep(30 * time.Second)
+		// Finish after the default deadline but within the extended limit.
+		time.Sleep(6 * time.Second)
+		if err := os.WriteFile(completedHelperMarker, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if name := os.Getenv(fixtureBuiltinOverride); name != "" {
 		helpers[name] = func(t testing.TB, _ []string) { t.Fatal("replacement built-in helper was called") }
@@ -417,46 +425,71 @@ func TestGatewayFixtureHelper(t *testing.T) {
 	}
 }
 
-func TestDirectHelperLaunchDeadline(t *testing.T) {
+func TestFixtureLaunchDeadline(t *testing.T) {
 	tests := map[string]struct {
-		collector        bool
-		delay, wantDelay time.Duration
+		collector, prepared     bool
+		limit, delay, wantDelay time.Duration
 	}{
-		"error: usage disabled without caller context":   {wantDelay: time.Second},
-		"error: active collector caps wait delay":        {collector: true, delay: 2 * time.Second, wantDelay: time.Second},
-		"error: active collector preserves shorter wait": {collector: true, delay: 100 * time.Millisecond, wantDelay: 100 * time.Millisecond},
+		"error: usage disabled without caller context":          {wantDelay: time.Second},
+		"error: active collector caps wait delay":               {collector: true, delay: 2 * time.Second, wantDelay: time.Second},
+		"error: active collector preserves shorter wait":        {collector: true, delay: 100 * time.Millisecond, wantDelay: 100 * time.Millisecond},
+		"error: default stops a prepared helper":                {prepared: true, wantDelay: time.Second},
+		"success: extended limit lets a prepared helper finish": {prepared: true, limit: 10 * time.Second, wantDelay: time.Second},
+		"success: extended limit with collector authority":      {prepared: true, collector: true, limit: 10 * time.Second, wantDelay: time.Second},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			home := t.TempDir()
-			dir := filepath.Join(home, "fixture-helper")
-			if err := os.Mkdir(dir, 0o700); err != nil {
-				t.Fatal(err)
-			}
-			self, err := os.Executable()
-			if err != nil {
-				t.Fatal(err)
-			}
-			cmd := &exec.Cmd{
-				Path: self,
-				Args: []string{self, "-test.run=^TestGatewayFixtureHelper$", "--", helperPrefix + "wait-for-deadline"},
-				Dir:  dir, WaitDelay: tt.delay,
-			}
 			env := gatewaytest.NewEnv(home, nil, nil, nil)
-			launch := env.RunFixture
+			var cmd *exec.Cmd
+			if tt.prepared {
+				var err error
+				cmd, err = env.HelperCommand(t, "wait-for-deadline")
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				dir := filepath.Join(home, "fixture-helper")
+				if err := os.Mkdir(dir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				self, err := os.Executable()
+				if err != nil {
+					t.Fatal(err)
+				}
+				cmd = &exec.Cmd{
+					Path: self,
+					Args: []string{self, "-test.run=^TestGatewayFixtureHelper$", "--", helperPrefix + "wait-for-deadline"},
+					Dir:  dir, WaitDelay: tt.delay,
+				}
+			}
+			dir := cmd.Dir
+			launch, launchWithin := env.RunFixture, env.RunFixtureWithin
 			if tt.collector {
 				collector := env.StartUsageCollector(t)
 				env[fixtureUsageKey] = collector.URL
 				launch = func(cmd *exec.Cmd) error { return collector.RunFixture(env, cmd) }
+				launchWithin = func(cmd *exec.Cmd, limit time.Duration) error { return collector.RunFixtureWithin(env, cmd, limit) }
 			}
-			started := time.Now()
-			err = launch(cmd)
-			if !errors.Is(err, context.DeadlineExceeded) || cmd.ProcessState == nil || cmd.ProcessState.Success() {
-				t.Fatalf("RunFixture: error=%v state=%v, want deadline exceeded and reaped child", err, cmd.ProcessState)
-			}
-			if elapsed := time.Since(started); elapsed < 5*time.Second || elapsed > 9*time.Second {
-				t.Errorf("RunFixture took %v, want the five-second deadline", elapsed)
+			if tt.limit > 0 {
+				if err := launchWithin(cmd, tt.limit); err != nil {
+					t.Fatalf("extended fixture launch: %v", err)
+				}
+				if _, err := os.Stat(filepath.Join(dir, completedHelperMarker)); err != nil {
+					t.Errorf("helper did not finish under the extended limit: %v", err)
+				}
+			} else {
+				started := time.Now()
+				err := launch(cmd)
+				exitErr, exited := errors.AsType[*exec.ExitError](err)
+				if !errors.Is(err, context.DeadlineExceeded) || !exited || exitErr.ProcessState != cmd.ProcessState || cmd.ProcessState == nil || cmd.ProcessState.Success() {
+					t.Fatalf("RunFixture: error=%v exitError=%v state=%v, want deadline exceeded and the reaped child's exit error", err, exitErr, cmd.ProcessState)
+				}
+				if elapsed := time.Since(started); elapsed < 5*time.Second || elapsed > 9*time.Second {
+					t.Errorf("RunFixture took %v, want the five-second deadline", elapsed)
+				}
+				wantAbsent(t, filepath.Join(dir, completedHelperMarker))
 			}
 			if cmd.WaitDelay != tt.wantDelay {
 				t.Errorf("WaitDelay=%v, want %v", cmd.WaitDelay, tt.wantDelay)
@@ -464,6 +497,28 @@ func TestDirectHelperLaunchDeadline(t *testing.T) {
 			if _, err := os.Stat(filepath.Join(dir, blockingHelperMarker)); err != nil {
 				t.Errorf("blocking helper did not enter the checked directory: %v", err)
 			}
+		})
+	}
+}
+
+func TestFixtureRejectsInvalidLimits(t *testing.T) {
+	tests := map[string]struct{ limit time.Duration }{
+		"error: zero limit":      {0},
+		"error: negative limit":  {-time.Second},
+		"error: over 30 seconds": {31 * time.Second},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			env := gatewaytest.NewEnv(t.TempDir(), nil, nil, nil)
+			cmd, err := env.HelperCommand(t, "wait-for-deadline")
+			if err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(cmd.Dir, blockingHelperMarker)
+			if err := env.RunFixtureWithin(cmd, tt.limit); !errors.Is(err, gatewaytest.ErrInvalidFixtureLimit) || cmd.Process != nil {
+				t.Fatalf("RunFixtureWithin: limit=%v process=%v err=%v; want refusal before launch", tt.limit, cmd.Process, err)
+			}
+			wantAbsent(t, marker)
 		})
 	}
 }

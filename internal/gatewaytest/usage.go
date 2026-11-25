@@ -24,9 +24,13 @@ import (
 )
 
 const (
-	fixtureTimeout   = 5 * time.Second
-	fixtureWaitDelay = time.Second
+	fixtureTimeout    = 5 * time.Second
+	maxFixtureTimeout = 30 * time.Second
+	fixtureWaitDelay  = time.Second
 )
+
+// ErrInvalidFixtureLimit identifies a fixture launch limit outside (0, 30s].
+var ErrInvalidFixtureLimit = errors.New("fixture limit must be positive and at most 30 seconds")
 
 // UsageRequest records the parts of a request observed by a fixture collector.
 type UsageRequest struct {
@@ -40,10 +44,15 @@ type UsageCollector struct {
 	state *usageCollectorState
 }
 
-// RunFixture authorizes a fixture to send usage to this collector while it is running.
-// The caller must set the collector URL in env. The fixture bounds the child lifetime without extending any caller deadline.
+// RunFixture authorizes a fixture to send usage to this collector with a five-second limit.
 func (c *UsageCollector) RunFixture(env Environment, cmd *exec.Cmd) error {
-	return env.runFixture(cmd, c.state)
+	return c.RunFixtureWithin(env, cmd, fixtureTimeout)
+}
+
+// RunFixtureWithin authorizes a fixture with a positive limit of at most 30 seconds.
+// The caller must set the collector URL in env. Earlier caller deadlines and collector cancellation still apply.
+func (c *UsageCollector) RunFixtureWithin(env Environment, cmd *exec.Cmd, limit time.Duration) error {
+	return env.runFixture(cmd, c.state, limit)
 }
 
 // Requests returns a snapshot of the requests recorded by the collector.
@@ -67,7 +76,7 @@ type usageCollectorState struct {
 	requests []UsageRequest
 }
 
-func (s *usageCollectorState) run(cmd *exec.Cmd) error {
+func (s *usageCollectorState) run(cmd *exec.Cmd, limit time.Duration) error {
 	s.mu.Lock()
 	if s.ctx.Err() != nil {
 		s.mu.Unlock()
@@ -92,12 +101,12 @@ func (s *usageCollectorState) run(cmd *exec.Cmd) error {
 		}
 		s.mu.Unlock()
 	}()
-	return runBoundedFixture(s.ctx, cmd)
+	return runBoundedFixture(s.ctx, cmd, limit)
 }
 
-func runBoundedFixture(parent context.Context, cmd *exec.Cmd) error {
+func runBoundedFixture(parent context.Context, cmd *exec.Cmd, limit time.Duration) error {
 	// Cmd retains its original, private context. Enforce the fixture deadline separately.
-	ctx, cancel := context.WithTimeout(parent, fixtureTimeout)
+	ctx, cancel := context.WithTimeout(parent, limit)
 	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return err

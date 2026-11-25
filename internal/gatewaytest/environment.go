@@ -31,6 +31,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/zchee/claude-code-model-gateway/internal/config"
 	"github.com/zchee/claude-code-model-gateway/internal/paths"
@@ -265,11 +266,22 @@ func validHelperDispatch(args []string) bool {
 	}
 }
 
-// RunFixture runs a sandbox executable or a registered helper dispatch with exactly env.
+// RunFixture runs a sandbox executable or a registered helper dispatch with exactly env and a five-second limit.
 // Usage reporting must be disabled; only the zero-entry legacy helper may omit the setting.
-func (env Environment) RunFixture(cmd *exec.Cmd) error { return env.runFixture(cmd, nil) }
+func (env Environment) RunFixture(cmd *exec.Cmd) error {
+	return env.RunFixtureWithin(cmd, fixtureTimeout)
+}
 
-func (env Environment) runFixture(cmd *exec.Cmd, collector *usageCollectorState) error {
+// RunFixtureWithin runs a fixture like RunFixture with a positive limit of at most 30 seconds.
+// An earlier deadline or cancellation on cmd still applies.
+func (env Environment) RunFixtureWithin(cmd *exec.Cmd, limit time.Duration) error {
+	return env.runFixture(cmd, nil, limit)
+}
+
+func (env Environment) runFixture(cmd *exec.Cmd, collector *usageCollectorState, limit time.Duration) error {
+	if limit <= 0 || limit > maxFixtureTimeout {
+		return ErrInvalidFixtureLimit
+	}
 	entries := make([]string, 0, len(env)) // A nil slice inherits the ambient environment.
 	for name, value := range env {
 		hasNUL := strings.IndexByte(value, 0) >= 0
@@ -308,16 +320,13 @@ func (env Environment) runFixture(cmd *exec.Cmd, collector *usageCollectorState)
 		return ErrUsageEndpoint
 	}
 	modernHelper := len(dispatch) > 0 && dispatch[0] == helperSelector
-	run := cmd.Run
-	if modernHelper {
-		run = func() error { return runBoundedFixture(context.Background(), cmd) }
-	}
+	run := func() error { return runBoundedFixture(context.Background(), cmd, limit) }
 	legacyEmpty := len(env) == 0 && slices.Equal(dispatch, []string{legacyHelperSelector, "--", emptyLegacyDispatch})
 	if endpoint != "0" && !legacyEmpty {
 		if collector == nil || endpoint != collector.endpoint || !validUsageEndpoint(endpoint) {
 			return ErrUsageEndpoint
 		}
-		run = func() error { return collector.run(cmd) }
+		run = func() error { return collector.run(cmd, limit) }
 	}
 
 	if modernHelper {
