@@ -19,7 +19,6 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
-	"path/filepath"
 	"slices"
 	"strconv"
 	"time"
@@ -141,16 +140,12 @@ func nativeIdentity(ctx context.Context, pid int) (Identity, error) {
 	}
 	id.Argv = argv
 	p := process.Process{Pid: int32(pid)}
-	path, err := p.ExeWithContext(ctx)
-	if err != nil || path == "" {
-		path = launchPath
+	kernelPath, err := p.ExeWithContext(ctx)
+	if err != nil {
+		kernelPath = ""
 	}
-	if !filepath.IsAbs(path) {
-		return Identity{}, fmt.Errorf("proc_pidpath and launch path did not identify an absolute executable: %w", ErrUnknown)
-	}
-	// lsof's txt records contain device and inode from the mapped vnode, not
-	// from stat(path), which could already identify a replacement executable.
-	id.Image, err = mappedImage(pid, path, func() ([]byte, error) {
+	// lsof supplies the mapped vnode, never a stat of a potentially replaced leaf.
+	id.Image, err = darwinImageEvidence(pid, kernelPath, launchPath, func() ([]byte, error) {
 		return darwinCommand(ctx, "/usr/sbin/lsof", "+w", "-nP", "-a", "-p", strconv.Itoa(pid), "-d", "txt", "-F0pDfni")
 	})
 	if err != nil {

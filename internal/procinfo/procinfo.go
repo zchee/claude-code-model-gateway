@@ -46,7 +46,7 @@ const ErrGroupCleanup = probeError("command process group could not be cleaned u
 // ErrUnsupported means the operating system has no native process probe.
 const ErrUnsupported = probeError("native process inspection unsupported on this platform")
 
-// Image identifies an executable by device and inode. On Linux Path is raw kernel
+// Image identifies a file by device and inode. On Linux Path is raw kernel
 // link text, including the " (deleted)" suffix after unlink, not a relaunch path.
 type Image struct {
 	Path   string `json:"path"`
@@ -54,7 +54,21 @@ type Image struct {
 	Inode  uint64 `json:"inode"`
 }
 
+// ImageEvidence describes a mapped file observed in a live process. KernelNamed
+// means the kernel named the process's executable. When false, a nonempty Image
+// is only correlated: its device and inode were mapped under the launch leaf in
+// the directory the saved launch path resolves to now. It may not be the main image.
+// For deletion, relaunch and signaling, a correlated match does not prove sameness
+// and a mismatch does not prove difference. Never create or update the recorded
+// launch identifier from correlated evidence.
+// The returned path is not authority to act, regardless of provenance.
+type ImageEvidence struct {
+	Image
+	KernelNamed bool
+}
+
 // Identity describes a running process. ParentPID zero denotes a proven root.
+// PID and birth survive exec and cannot prove that the executable is unchanged.
 // Linux Birth adds start ticks to the boot wall clock; a clock step can change
 // that computed birth for the same process. LegacyStart retains whole seconds.
 type Identity struct {
@@ -62,7 +76,7 @@ type Identity struct {
 	ParentPID int
 	Argv      []string
 	Birth     time.Time
-	Image     Image
+	Image     ImageEvidence
 }
 
 // socketEvidence represents one TCP socket, not one endpoint. All visible holders
@@ -89,7 +103,11 @@ type Probe struct {
 func New(lookup config.LookupEnv) Probe { return Probe{lookup: lookup, listenerBusy: new(atomic.Bool)} }
 
 // Identity returns the live identity, os.ErrNotExist for confirmed absence, or ErrUnknown for inconclusive inspection.
-// A pending kernel read may not return when the context expires.
+// PID and birth survive exec. If Image.KernelNamed is false, neither a match nor a mismatch
+// establishes executable identity for deletion, relaunch, signaling or recording a launch.
+// The path alone is never authority. On macOS the fallback opens and stats the saved launch
+// parent and stats candidate mapped parents; the command deadline cannot interrupt these
+// filesystem operations. A pending kernel read may also outlast the context.
 func (p Probe) Identity(ctx context.Context, pid int) (Identity, error) {
 	if pid <= 0 || pid > math.MaxInt32 {
 		return Identity{}, os.ErrNotExist
@@ -326,6 +344,7 @@ func (p Probe) timeout(goos string) time.Duration {
 func LegacyStart(birth time.Time) string { return birth.Format(time.ANSIC) }
 
 // Record is the authoritative on-disk process identity for one instance and role.
+// Its Image is the identifier established at launch, never a correlated observation.
 // The file is requested with mode 0600; the creation mask may only remove bits.
 // StartedAt is legacy local wall time at whole-second precision. On Linux a
 // clock step can change the boot wall clock from which it is computed.

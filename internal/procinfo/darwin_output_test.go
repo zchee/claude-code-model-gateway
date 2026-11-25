@@ -87,9 +87,60 @@ func TestUnlinkedMappedVnode(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			got, err := mappedImage(701, filepath.Join(tt.parent, leaf), func() ([]byte, error) { return []byte("p701\x00\n" + tt.rows), nil })
+			got, err := darwinImageEvidence(701, "", filepath.Join(tt.parent, leaf), func() ([]byte, error) { return []byte("p701\x00\n" + tt.rows), nil })
 			if !errors.Is(err, tt.err) {
 				t.Fatalf("mapped image error=%v want %v", err, tt.err)
+			}
+			if d := gocmp.Diff(ImageEvidence{Image: tt.want, KernelNamed: false}, got); d != "" {
+				t.Fatal(d)
+			}
+		})
+	}
+}
+
+func TestRetargetedImageAlias(t *testing.T) {
+	original, replacement := t.TempDir(), t.TempDir()
+	linkRoot := t.TempDir()
+	alias := filepath.Join(linkRoot, "install")
+	if err := os.Symlink(original, alias); err != nil {
+		t.Fatal(err)
+	}
+	launch := filepath.Join(alias, "tool")
+	renamed := filepath.Join(original, "renamed")
+	putFile(t, launch, "original")
+	if err := os.Rename(launch, renamed); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(replacement, alias+".new"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(alias+".new", alias); err != nil {
+		t.Fatal(err)
+	}
+	putFile(t, launch, "different mapping")
+	newPath := filepath.Join(replacement, "tool")
+	newImage := Image{Path: newPath, Device: 12, Inode: 42}
+	row := func(path string, inode int) string {
+		return fmt.Sprintf("ftxt\x00D0xc\x00i%d\x00n%s\x00\n", inode, path)
+	}
+	oldRow := row(filepath.Join(original, "tool"), 41)
+	newRow := row(newPath, 42)
+	tests := map[string]struct {
+		rows string
+		want ImageEvidence
+		err  error
+	}{
+		"error: two launch leaves with old parent first":                       {rows: oldRow + newRow, err: ErrUnknown},
+		"error: two launch leaves with current parent first":                   {rows: newRow + oldRow, err: ErrUnknown},
+		"success: only replacement row visible is still correlated":            {rows: newRow, want: ImageEvidence{Image: newImage, KernelNamed: false}},
+		"success: sole launch leaf in retargeted directory is only correlated": {rows: row(renamed, 41) + newRow, want: ImageEvidence{Image: newImage, KernelNamed: false}},
+		"error: incomplete unrelated row cannot be ruled out":                  {rows: newRow + "ftxt\x00D0xc\x00n/usr/lib/dyld\x00\n", err: ErrUnknown},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			got, err := darwinImageEvidence(701, "", launch, func() ([]byte, error) { return []byte("p701\x00\n" + tt.rows), nil })
+			if !errors.Is(err, tt.err) {
+				t.Fatalf("error=%v want %v", err, tt.err)
 			}
 			if d := gocmp.Diff(tt.want, got); d != "" {
 				t.Fatal(d)

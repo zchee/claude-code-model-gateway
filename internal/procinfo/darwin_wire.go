@@ -81,6 +81,18 @@ func checkedTableRow(before, after Identity, argv []string) (Identity, bool) {
 	return before, true
 }
 
+func darwinImageEvidence(pid int, kernelPath, launchPath string, list func() ([]byte, error)) (ImageEvidence, error) {
+	path := kernelPath
+	if path == "" {
+		path = launchPath
+	}
+	img, err := mappedImage(pid, path, list)
+	if err != nil {
+		return ImageEvidence{}, err
+	}
+	return ImageEvidence{Image: img, KernelNamed: kernelPath != ""}, nil
+}
+
 // mappedImage holds the executable's parent directory across the vnode query.
 // Match only an exact leaf name whose parent resolves to that same directory;
 // neither spelling of the executable leaf is statted or opened.
@@ -112,6 +124,7 @@ func mappedImage(pid int, path string, list func() ([]byte, error)) (Image, erro
 	}
 	var match Image
 	for row := range strings.SplitSeq(rows, "\x00\n") {
+		// An incomplete row cannot be ruled out, even if another row matches.
 		item, err := parseTextVnode(row)
 		if err != nil {
 			return Image{}, err
@@ -125,7 +138,9 @@ func mappedImage(pid int, path string, list func() ([]byte, error)) (Image, erro
 			return Image{}, fmt.Errorf("inspect mapped vnode parent: %w", ErrUnknown)
 		}
 		if !os.SameFile(info, other) {
-			continue
+			// The launch alias may now point at a different mapped file. Do not
+			// discard this same-leaf candidate in favor of the current directory.
+			return Image{}, fmt.Errorf("txt leaf in a different parent: %w", ErrUnknown)
 		}
 		if match.Inode != 0 {
 			return Image{}, fmt.Errorf("multiple matching txt vnodes: %w", ErrUnknown)
