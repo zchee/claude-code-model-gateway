@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Exercise extraction independently of Node, using a complete venue frame.
+set -euo pipefail
+[[ $# == 1 ]] || { printf 'usage: test-extraction <venue log>\n' >&2; exit 2; }
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd -P)
+work=$(mktemp -d)
+trap 'rm -rf -- "$work"' EXIT
+mkdir -p "$work/hack/assertions" "$work/test/conformance/baseline"
+cp "$root"/hack/{assertion-sites,assertion-extract} "$work/hack/"
+cp "$root"/hack/assertions/{*.cjs,*.json,call-dispositions.tsv} "$work/hack/assertions/"
+cp "$root"/test/conformance/baseline/{census.tsv,run.json} "$work/test/conformance/baseline/"
+cp "$root/test/conformance/assertion-overrides.tsv" "$work/test/conformance/"
+extract=$work/hack/assertion-extract
+# No classification exists here: evidence must be validated against the census.
+"$extract" "$1"
+evidence=$work/test/conformance/assertion-pairs.tsv
+cmp "$root/test/conformance/assertion-pairs.tsv" "$evidence"
+reject() {
+    if "$extract" "$1" > "$work/rejection" 2>&1; then printf 'accepted invalid %s input\n' "$2" >&2; exit 1; fi
+    grep -Fq "$2" "$work/rejection"
+    cmp "$root/test/conformance/assertion-pairs.tsv" "$evidence"
+}
+# Keep both the positive witnesses for another case and the generated pairs;
+# deleting just this case's witnesses must invalidate its attribution claim.
+python3 -I - "$1" "$work/mixed" <<'PY'
+import base64, collections, gzip, hashlib, json, sys
+from pathlib import Path
+frame, = [l.split() for l in Path(sys.argv[1]).read_bytes().splitlines() if l.startswith(b'ASSERTION-SITES-V1 ')]
+r = json.loads(gzip.decompress(base64.b64decode(frame[2], validate=True)))
+by_site = collections.defaultdict(set)
+for row in r['callbackAssertions']:
+    by_site[tuple(row[4:8])].add(tuple(row[:4]))
+site, cases = next((s,c) for s,c in by_site.items() if len(c) > 1)
+case = sorted(cases)[0]
+r['callbackAssertions'] = [row for row in r['callbackAssertions'] if (tuple(row[4:8]),tuple(row[:4])) != (site,case)]
+payload = gzip.compress(json.dumps(r).encode(),mtime=0)
+Path(sys.argv[2]).write_bytes(b' '.join([frame[0],hashlib.sha256(payload).hexdigest().encode(),base64.b64encode(payload)])+b'\n')
+PY
+reject "$work/mixed" 'missing same-case callback assertion evidence'
+printf '\n' >> "$work/hack/assertions/analyze.cjs"
+reject "$1" 'stale generator fingerprint'
+printf 'Extraction checks passed: census only, mixed case binding, stale generator.\n'

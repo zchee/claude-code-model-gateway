@@ -21,7 +21,7 @@ function rows(text) {
 const cases = rows(census);
 const baseline = JSON.parse(input('baseline/run.json'));
 assert.equal(pin,key([baseline.commit,baseline.root_tree,baseline.plugin_tree]),'baseline and export pins differ');
-const {pairs, sites, unresolved, resolvedCalls, productFiles, embeddedInputs} = analyze(plugin, cases);
+const {pairs, sites, unresolved, resolvedCalls, callbackAssertions, productFiles, embeddedInputs} = analyze(plugin, cases);
 const caseKeys = new Set(cases.map(r => key(columns.slice(0,4).map(c => r[c]))));
 const applied = new Set();
 for (const row of rows(overrides)) {
@@ -60,7 +60,7 @@ const unmatched = [];
 for (const f of fs.readdirSync(path.join(plugin,'test'),{recursive:true}).filter(f => /\.[cm]?js$/.test(f))) {
   const file = 'test/'+f;
   for (const [i,line] of fs.readFileSync(path.join(plugin,file),'utf8').split('\n').entries()) {
-    for (const m of line.matchAll(/\b(?:assert(?:\.\w+)?|require\(['"](?:node:)?assert(?:\/strict)?['"]\)\.\w+)\s*\(/g)) {
+    for (const m of line.matchAll(/\b(?:(?:\w+\.)?assert\.\w+\b|require\(['"](?:node:)?assert(?:\/strict)?['"]\)\.\w+\b|assert\s*\()/g)) {
       const id = key([file,i+1,m.index+1]);
       if (!sites.has(id)) unmatched.push(id);
     }
@@ -68,8 +68,10 @@ for (const f of fs.readdirSync(path.join(plugin,'test'),{recursive:true}).filter
 }
 const openKeys = new Set(unresolved.map(row=>key(row.slice(4))));
 const resolvedAtOpenSites = resolvedCalls.filter(row=>openKeys.has(key(row.slice(4,8))));
-const payload = gzipSync(JSON.stringify({pin,census:digest(census),overrides:digest(overrides),
-  pairs:text,unresolved,resolvedAtOpenSites,rules,productFiles,unreached,unmatched,embeddedInputs}));
+const generatorFiles = ['../assertion-sites', ...fs.readdirSync(__dirname).filter(f => /\.(?:cjs|json)$/.test(f)).sort()];
+const generator = digest(generatorFiles.map(f=>`${f}\0${digest(fs.readFileSync(path.join(__dirname,f)))}\n`).join(''));
+const payload = gzipSync(JSON.stringify({pin,generator,census:digest(census),overrides:digest(overrides),
+  pairs:text,unresolved,resolvedAtOpenSites,callbackAssertions:callbackAssertions.filter(r=>openKeys.has(key(r.slice(4,8)))),rules,productFiles,unreached,unmatched,embeddedInputs}));
 process.stdout.write(`ASSERTION-SITES-V1 ${digest(payload)} ${payload.toString('base64')}\n`);
 if (unreached.length || unmatched.length) {
   process.stderr.write(`incomplete attribution: ${unreached.length} unowned sites, ${unmatched.length} unmatched tokens; inspect the diagnostic frame\n`);

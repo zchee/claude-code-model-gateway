@@ -22,27 +22,28 @@ _, checksum, encoded = frames[0]
 payload = base64.b64decode(encoded, validate=True)
 if hashlib.sha256(payload).hexdigest().encode() != checksum: sys.exit('damaged assertion frame')
 record = json.loads(gzip.decompress(payload))
+tools = root/'hack/assertions'
+files = ['../assertion-sites', *sorted(p.name for p in tools.iterdir() if p.suffix in ('.json','.cjs'))]
+manifest = ''.join(f'{f}\0{hashlib.sha256((tools/f).read_bytes()).hexdigest()}\n' for f in files)
+if record.get('generator') != hashlib.sha256(manifest.encode()).hexdigest(): sys.exit('stale generator fingerprint')
 for field, name in [('census','baseline/census.tsv'),('overrides','assertion-overrides.tsv')]:
     if record[field] != hashlib.sha256((out/name).read_bytes()).hexdigest(): sys.exit('stale input: '+name)
 rows = [line.split('\t') for line in record['pairs'].splitlines()]
 keys = 'path line column name site_path site_line site_column'.split()
 if rows[0] != keys + ['call','via']: sys.exit('unexpected pair header')
-source = args.classification.read_text().splitlines()
-columns = source[0].split('\t')
-phases = {}
-for line in source[1:]:
-    row = dict(zip(columns, line.split('\t'), strict=True))
-    due = row['class'] in ('go-port','conformance') or row['class'].startswith('difference:')
-    if due != bool(row['phase']): sys.exit('classification phase does not match obligation class: '+row['name'])
-    phases[tuple(row[k] for k in keys[:4])] = row['phase']
+def records(path):
+    header, *lines = path.read_text().splitlines()
+    return [dict(zip(header.split('\t'),line.split('\t'),strict=True)) for line in lines]
+case_key = lambda row: tuple(row[k] for k in keys[:4])
+census = {case_key(row) for row in records(out/'baseline/census.tsv')}
 seen = set()
 for row in rows[1:]:
     pair = tuple(row[:7])
-    if len(row) != 9 or pair[:4] not in phases or pair in seen: sys.exit(f'invalid pair: {pair}')
+    if len(row) != 9 or pair[:4] not in census or pair in seen: sys.exit(f'invalid pair: {pair}')
     seen.add(pair)
 if args.audit:
     with args.audit.open('x') as f:
-        json.dump({k: record[k] for k in ('unresolved','resolvedAtOpenSites','rules','productFiles','unreached','unmatched','embeddedInputs')}, f)
+        json.dump({k: record[k] for k in ('unresolved','resolvedAtOpenSites','callbackAssertions','rules','productFiles','unreached','unmatched','embeddedInputs')}, f)
 for field in ('unreached','unmatched'):
     if record[field]: sys.exit(f'{len(record[field])} {field}; inventory withheld (use --audit for details)')
 call_cases = defaultdict(set)
@@ -53,28 +54,51 @@ for row in record['resolvedAtOpenSites']:
     site = tuple(map(str,row[4:8]))
     if site not in call_cases: sys.exit('call-site reachability mismatch in frame')
     call_cases[site].add(tuple(map(str,row[:4])))
-review_rows = (out/'assertion-unresolved.tsv').read_text().splitlines()
-if not review_rows or review_rows[0].split('\t') != 'path line column callee cases disposition reason'.split(): sys.exit('invalid unresolved header')
-adds = defaultdict(set)
-for line in (out/'assertion-overrides.tsv').read_text().splitlines()[1:]:
-    parts = line.split('\t')
-    if parts[7] == 'add': adds[':'.join(parts[4:7])].add(tuple(parts[:4]))
-seen_calls = set()
-for line in review_rows[1:]:
-    fields = line.split('\t')
-    if len(fields) != 7: sys.exit('invalid unresolved record')
-    site, count, disposition, reason = tuple(fields[:4]), *fields[4:]
-    if site in seen_calls or site not in call_cases: sys.exit(f'stale or duplicate unresolved record: {site}')
-    if count != str(len(call_cases[site])) or not reason.strip(): sys.exit(f'invalid affected case count or reason: {site}')
-    if disposition == 'resolved-by-override':
-        linked = re.findall(r'(?:^|\s)override-site:(\S+)(?=\s|$)',reason)
-        if not linked or any(not (adds[k] & call_cases[site]) for k in linked): sys.exit(f'no applicable override: {site}')
-    elif disposition != 'no-assertion-reachable': sys.exit(f'invalid call disposition: {site}')
-    seen_calls.add(site)
-if missing := call_cases.keys()-seen_calls: sys.exit(f'{len(missing)} unresolved calls lack reviews; use --audit')
 baseline = json.loads((out/'baseline/run.json').read_bytes())
 if record['pin'] != '\t'.join(baseline[k] for k in ('commit','root_tree','plugin_tree')): sys.exit('stale source pin')
+review_rows = (root/'hack/assertions/call-dispositions.tsv').read_text().splitlines()
+if len(review_rows) < 2 or review_rows[0] != '# plugin-tree '+baseline['plugin_tree']: sys.exit('stale or missing disposition tree pin')
+if review_rows[1].split('\t') != 'path positions callee scope disposition assertions reason'.split(): sys.exit('invalid disposition header')
+allowed = {'data-method','node-io','staged-module','fixture-operation','product-result','historical-adapter','callback-attributed','child-entry-reviewed','child-attributed'}
+witnesses = defaultdict(set)
+for row in record['callbackAssertions']:
+    site = tuple(map(str,row[4:8]))
+    pair = tuple(map(str,[*row[:4],*row[8:]]))
+    if site not in call_cases or pair[:4] not in call_cases[site]: sys.exit('orphan callback witness in frame')
+    witnesses[site,pair[:4]].add(pair)
+seen_calls = set()
+for line in review_rows[2:]:
+    fields = line.split('\t')
+    if len(fields) != 7: sys.exit('invalid disposition record')
+    path, positions, callee, scope, disposition, assertions, reason = fields
+    referenced = json.loads(assertions) if assertions else []
+    if bool(referenced) != (disposition == 'child-attributed'): sys.exit('invalid child assertion references')
+    if disposition not in allowed or not reason.strip(): sys.exit(f'invalid disposition or reason: {disposition}')
+    for position in positions.split(','):
+        if not re.fullmatch(r'[1-9][0-9]*:[1-9][0-9]*',position): sys.exit(f'invalid position: {position}')
+        site = (path,*position.split(':'),callee)
+        if site not in call_cases: sys.exit(f'stale disposition: {site}')
+        affected = call_cases[site] if scope == '*' else [tuple(k) for k in json.loads(scope)]
+        if not affected: sys.exit(f'empty disposition scope: {site}')
+        for case in affected:
+            edge = (site,case)
+            if case not in call_cases[site] or edge in seen_calls: sys.exit(f'stale or duplicate case disposition: {edge}')
+            checks = witnesses[edge]
+            if any(case+tuple(site_ref) not in seen for site_ref in referenced): sys.exit(f'missing same-case child assertion evidence: {edge}')
+            if disposition == 'callback-attributed' and (not checks or checks-seen): sys.exit(f'missing same-case callback assertion evidence: {edge}')
+            if disposition != 'callback-attributed' and checks: sys.exit(f'assertion-bearing callback needs attribution review: {edge}')
+            seen_calls.add(edge)
+expected_calls = {(s,c) for s,cs in call_cases.items() for c in cs}
+if missing := expected_calls-seen_calls: sys.exit(f'{len(missing)} case/call edges lack dispositions; use --audit')
 if args.initialize_mapping:
+    phases = {}
+    for row in records(args.classification):
+        k = case_key(row)
+        if k in phases: sys.exit('duplicate classification: '+row['name'])
+        due = row['class'] in ('go-port','conformance') or row['class'].startswith('difference:')
+        if due != bool(row['phase']): sys.exit('classification phase does not match obligation class: '+row['name'])
+        phases[k] = row['phase']
+    if phases.keys() != census: sys.exit('classification does not match the census')
     with (out/'assertion-sites.tsv').open('x') as f:
         f.write('\t'.join(keys + ['target','review','due'])+'\n')
         for row in rows[1:]:

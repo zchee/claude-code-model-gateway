@@ -6,6 +6,7 @@ const path = require('node:path');
 const assert = require('node:assert/strict');
 const {isBuiltin} = require('node:module');
 const {childPrograms} = require('./child-programs.cjs');
+const {launches} = require('./launches.cjs');
 
 function descendants(node, visit) {
   if (visit(node) !== false) ts.forEachChild(node, child => { descendants(child, visit); });
@@ -16,6 +17,7 @@ const isRequire = n => ts.isCallExpression(n) && n.expression.getText() === 'req
 const isAssertModule = n => isRequire(n) && n.arguments.length === 1 && literal(n.arguments[0]) && /^(?:node:)?assert(?:\/strict)?$/.test(n.arguments[0].text);
 const key = values => values.join('\t');
 const flat = text => text.replace(/\s+/g, ' ');
+const assertionMethods = new Set('deepEqual deepStrictEqual doesNotMatch doesNotReject doesNotThrow equal fail ifError match notDeepEqual notDeepStrictEqual notEqual notStrictEqual ok partialDeepStrictEqual rejects strict strictEqual throws'.split(' '));
 
 function analyze(plugin, cases) {
   const root = path.join(plugin, 'test');
@@ -45,28 +47,62 @@ function analyze(plugin, cases) {
   };
   const sites = new Map(), assertions = new Map(), registrations = new Map(), hooks = new Map();
   const checked = new Set();
+  // A TestContext also exposes assertion methods. Distinguish its `assert`
+  // property from arbitrary project objects with the same property name.
+  function contextAssert(n) {
+    if (!ts.isPropertyAccessExpression(n) || n.name.text !== 'assert') return false;
+    const member = checker.getSymbolAtLocation(n.name)?.declarations || [];
+    if (member.some(d => d.getSourceFile().fileName.endsWith('/@types/node/test.d.ts'))) return true;
+    const d = checker.getSymbolAtLocation(n.expression)?.valueDeclaration;
+    if (!d || !ts.isParameter(d) || d.parent.parameters[0] !== d) return false;
+    const registration = d.parent.parent;
+    return ts.isCallExpression(registration) && registration.arguments.at(-1) === d.parent && /^(?:test|\w+\.test)$/.test(registration.expression.getText());
+  }
+  function handoff(n) {
+    const p = n.parent;
+    if (ts.isPropertyAssignment(p) && p.initializer === n || ts.isShorthandPropertyAssignment(p) && p.name === n) return p.name.getText();
+    if (ts.isVariableDeclaration(p) && p.initializer === n && ts.isIdentifier(p.name)) return p.name.text;
+    if (ts.isBinaryExpression(p) && p.right === n && p.operatorToken.kind === ts.SyntaxKind.EqualsToken) return p.left.getText();
+    if ((ts.isCallExpression(p) || ts.isNewExpression(p)) && p.arguments?.includes(n)) return p.expression.getText();
+    if (ts.isReturnStatement(p) || ts.isArrowFunction(p) && p.body === n) return 'return';
+    if (ts.isArrayLiteralExpression(p)) return 'array element';
+    if (ts.isParenthesizedExpression(p) || ts.isConditionalExpression(p) && p.condition !== n) return handoff(p);
+    return null;
+  }
   function assertionValue(n, seen = new Set()) {
     if (!n || seen.has(n)) return false;
     seen.add(n);
-    if (isAssertModule(n)) return true;
-    if (ts.isPropertyAccessExpression(n)) return assertionValue(n.expression,seen);
+    if (isAssertModule(n) || contextAssert(n)) return true;
+    if (ts.isPropertyAccessExpression(n)) return contextAssert(n.expression) || assertionMethods.has(n.name.text) && assertionValue(n.expression,seen);
+    if (ts.isElementAccessExpression(n)) {
+      const method=value(n.argumentExpression);
+      return (method===null || assertionMethods.has(method)) && assertionValue(n.expression,seen);
+    }
     if (!ts.isIdentifier(n)) return false;
-    const sym = checker.getSymbolAtLocation(n);
+    const sym = ts.isShorthandPropertyAssignment(n.parent) ? checker.getShorthandAssignmentValueSymbol(n.parent) : checker.getSymbolAtLocation(n);
     const d = sym?.valueDeclaration ?? sym?.declarations?.[0];
     if (!d) return false;
-    if (ts.isBindingElement(d) && ts.isVariableDeclaration(d.parent.parent)) return assertionValue(d.parent.parent.initializer,seen);
+    if (ts.isImportSpecifier(d) || ts.isNamespaceImport(d) || ts.isImportClause(d)) {
+      const imp=ts.findAncestor(d,ts.isImportDeclaration);
+      if (imp && /^(?:node:)?assert(?:\/strict)?$/.test(imp.moduleSpecifier.text)) return !ts.isImportSpecifier(d) || assertionMethods.has((d.propertyName || d.name).text);
+    }
+    if (ts.isBindingElement(d) && ts.isVariableDeclaration(d.parent.parent)) {
+      const owner = d.parent.parent.initializer;
+      return owner && (contextAssert(owner) || assertionMethods.has((d.propertyName || d.name).getText()) && assertionValue(owner,seen));
+    }
     return ts.isVariableDeclaration(d) && assertionValue(d.initializer,seen);
   }
   for (const sf of program.getSourceFiles().filter(local)) {
     assert(!sf.parseDiagnostics.length, `malformed JavaScript: ${sf.fileName}`);
     descendants(sf, n => {
-      if (!ts.isCallExpression(n)) return;
-      if (assertionValue(n.expression)) {
-        const coords = position(sf,n.getStart()), id = key(coords), call = n.expression.getText();
+      const called = ts.isCallExpression(n) && assertionValue(n.expression);
+      const receiver = !called && (ts.isIdentifier(n) || ts.isPropertyAccessExpression(n) || ts.isElementAccessExpression(n)) && handoff(n);
+      if (called || receiver && assertionValue(n)) {
+        const coords = position(sf,n.getStart()), id = key(coords), call = (called ? n.expression : n).getText();
         assert(!sites.has(id) || sites.get(id).call === call, `conflicting assertion at ${id}`);
-        sites.set(id,{coords,call}); assertions.set(n,id);
+        sites.set(id,{coords,call,receiver}); assertions.set(n,id);
       }
-      if (children.has(sf.fileName)) return;
+      if (!ts.isCallExpression(n) || children.has(sf.fileName)) return;
       const e = n.expression.getText();
       if (e === 'test' || e === 't.test') {
         const loc = position(sf,ts.isPropertyAccessExpression(n.expression) ? n.expression.name.getStart() : n.getStart());
@@ -78,7 +114,7 @@ function analyze(plugin, cases) {
       }
     });
   }
-  const pairs = new Map(), unresolved = new Map(), reached = new Set();
+  const pairs = new Map(), unresolved = new Map(), reached = new Set(), callbackAssertions = new Map();
   for (const row of cases) {
     const caseKey = [row.path,row.line,row.column,row.name];
     const registration = registrations.get(key(caseKey.slice(0,3)));
@@ -91,10 +127,14 @@ function analyze(plugin, cases) {
         bound.get(param).add(args?.[i] || param.initializer);
       }
     }
+    function functionBody(fn,via) {
+      for (const parameter of fn.parameters) scan(parameter,via);
+      scan(fn.body,via);
+    }
     function follow(decl, via) {
       if (!decl || !local(decl.getSourceFile()) || visited.has(decl)) return;
       visited.add(decl);
-      if (isFunction(decl)) scan(decl.body,via);
+      if (isFunction(decl)) functionBody(decl,via);
       else if (ts.isVariableDeclaration(decl) && decl.initializer) scan(decl.initializer,via);
     }
     let childLaunch = null;
@@ -110,7 +150,8 @@ function analyze(plugin, cases) {
       const id = assertions.get(n);
       if (id) {
         const site = sites.get(id), values = [...caseKey,...site.coords], k = key(values);
-        if (!pairs.has(k) || via === 'direct') pairs.set(k,[...values,site.call,projected ? `embedded:${projected.how}` : childLaunch || via]);
+        const route = site.receiver ? `callback:${flat(site.receiver)}` : projected ? `embedded:${projected.how}` : childLaunch || via;
+        if (!pairs.has(k) || via === 'direct') pairs.set(k,[...values,site.call,route]);
         reached.add(id);
       }
       const anchor = `${sf.fileName}:${n.getStart()}`;
@@ -123,7 +164,7 @@ function analyze(plugin, cases) {
       if (ts.isCallExpression(n) || ts.isNewExpression(n)) {
         const callee = n.expression, text = callee.getText();
         const d = checker.getResolvedSignature(n)?.declaration;
-        if (d && isFunction(d) && local(d.getSourceFile())) { bind(d,n.arguments); follow(d,`helper:${flat(d.name?.getText() || text)}`); }
+        if (d && isFunction(d) && local(d.getSourceFile())) bind(d,n.arguments);
         const spec = isRequire(n) ? n.arguments[0] : null;
         const unknownImport = isRequire(n) && (!spec || !literal(spec) || (!isBuiltin(spec.text) && !ts.resolveModuleName(spec.text,sf.fileName,options,host).resolvedModule));
         if ((!d || unknownImport) && !id) {
@@ -137,20 +178,17 @@ function analyze(plugin, cases) {
           if (rule) opaque(n,spelling,typeof rule !== 'string' ? 'resolved-function' : rule);
           else pending.set(n,spelling);
         }
-        if (/^(?:(?:\w+\.)?spawn(?:Sync)?|spawnGatewayProcess(?:Sync)?)$/.test(text)) {
-          const binary = n.arguments?.findIndex(arg => arg.getText()==='process.execPath');
-          const argv = binary >= 0 && n.arguments[binary+1];
-          if (argv && ts.isArrayLiteralExpression(argv)) {
-            const entry = argv.elements[0], file = entry && value(entry);
-            const script = file && path.isAbsolute(file) && program.getSourceFile(file);
-            if (script && local(script) && !visited.has(script)) {
-              visited.add(script);
-              const prior = childLaunch;
-              childLaunch = `embedded:node-entry:${position(sf,n.getStart()).join(':')}`;
-              scan(script,childLaunch); childLaunch=prior;
-            }
+        const launch = launches(n,checker,program,plugin,value,bound,programs);
+        if (launch) {
+          if (launch.unknown) opaque(n,`child-launch:${launch.api}`);
+          for (const script of launch.entries) if (local(script) && !visited.has(script)) {
+            visited.add(script);
+            const prior = childLaunch;
+            childLaunch = `embedded:node-entry:${position(sf,n.getStart()).join(':')}`;
+            scan(script,childLaunch); childLaunch=prior;
           }
         }
+        if (d && isFunction(d)) follow(d,`helper:${flat(d.name?.getText() || text)}`);
       }
       if (ts.isIdentifier(n) && !(ts.isPropertyAccessExpression(n.parent) && n.parent.name === n)) {
         const sym = ts.isShorthandPropertyAssignment(n.parent) ? checker.getShorthandAssignmentValueSymbol(n.parent) : checker.getSymbolAtLocation(n);
@@ -163,22 +201,32 @@ function analyze(plugin, cases) {
           follow(d,`${kind}:${n.text}`);
         }
       }
-      if (isFunction(n)) scan(n.body, `callback:${flat(ts.isCallExpression(n.parent) ? n.parent.expression.getText() : n.name?.getText() || 'function')}`);
+      if (isFunction(n)) functionBody(n, `callback:${flat(ts.isCallExpression(n.parent) ? n.parent.expression.getText() : n.name?.getText() || 'function')}`);
       else ts.forEachChild(n, child => { scan(child,via); });
     }
     const body = registration.arguments.at(-1);
     assert(isFunction(body), `unrecognized test callback: ${key(caseKey)}`);
-    visited.add(body); scan(body.body,'direct');
+    visited.add(body); functionBody(body,'direct');
     for (const hook of hooks.get(registration.getSourceFile()) || []) scan(hook,`callback:${hook.expression.getText()}`);
     for (const [n,spelling] of pending) {
       // Knowing that require itself is native does not resolve its module.
       const targets = isRequire(n) ? null : boundFunctions(n.expression,bound);
-      if (targets) for (const target of targets) { bind(target,n.arguments); follow(target,`callback:${flat(spelling)}`); }
+      if (targets) for (const target of targets) {
+        bind(target,n.arguments); follow(target,`callback:${flat(spelling)}`);
+        if (target.body && local(target.getSourceFile())) descendants(target.body,child => {
+          if (isFunction(child)) return false;
+          const site=sites.get(assertions.get(child));
+          if (site) {
+            const witness=[...caseKey,...position(n.getSourceFile(),n.getStart()),spelling,...site.coords];
+            callbackAssertions.set(key(witness),witness);
+          }
+        });
+      }
       opaque(n,spelling,targets ? 'case-bound-callback' : null);
     }
   }
   assert.equal(checked.size,registrations.size,'registration absent from census');
-  return {pairs,unresolved:[...unresolved.values()],resolvedCalls:[...resolvedCalls.values()],productFiles,sites,
+  return {pairs,unresolved:[...unresolved.values()],resolvedCalls:[...resolvedCalls.values()],callbackAssertions:[...callbackAssertions.values()],productFiles,sites,
     embeddedInputs:[...programs].map(([anchor,c]) => [...position(c.sf,Number(anchor.slice(anchor.lastIndexOf(':')+1))),c.how]),
     unreached:[...sites.keys()].filter(k => !reached.has(k))};
 }
