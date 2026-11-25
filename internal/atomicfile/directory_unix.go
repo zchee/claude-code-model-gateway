@@ -75,20 +75,32 @@ func (d *directory) Readlink(base string) (string, error) {
 	if !validBase(base) {
 		return "", &DestinationError{base}
 	}
-	for capacity := 128; ; capacity *= 2 {
+	target, err := readlinkTarget(func(buf []byte) (int, error) { return unix.Readlinkat(int(d.handle.Fd()), base, buf) })
+	runtime.KeepAlive(d)
+	if err != nil {
+		return "", &os.PathError{Op: "readlink", Path: d.path(base), Err: err}
+	}
+	return target, nil
+}
+
+// Twice the Linux path limit also covers Darwin paths, without trusting a filesystem to stop returning ERANGE.
+const maxReadlinkBuffer = 8192
+
+func readlinkTarget(read func([]byte) (int, error)) (string, error) {
+	for capacity := 128; capacity <= maxReadlinkBuffer; capacity *= 2 {
 		buf := make([]byte, capacity)
-		n, err := retryEINTR(func() (int, error) { return unix.Readlinkat(int(d.handle.Fd()), base, buf) })
-		runtime.KeepAlive(d)
+		n, err := retryEINTR(func() (int, error) { return read(buf) })
 		if errors.Is(err, unix.ERANGE) {
 			continue
 		}
 		if err != nil {
-			return "", &os.PathError{Op: "readlink", Path: d.path(base), Err: err}
+			return "", err
 		}
 		if n < len(buf) {
 			return string(buf[:n]), nil
 		}
 	}
+	return "", unix.ENAMETOOLONG
 }
 
 func (d *directory) Rename(from, to string) error {
@@ -126,6 +138,14 @@ func (d *directory) Remove(base string) error {
 	}
 	_, err := retryEINTR(func() (int, error) { return 0, unix.Unlinkat(int(d.handle.Fd()), base, 0) })
 	runtime.KeepAlive(d.handle)
+	return err
+}
+
+func (d *directory) removeIfPresent(base string) error {
+	err := d.Remove(base)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
 	return err
 }
 

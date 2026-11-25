@@ -60,6 +60,23 @@ func TestRetryEINTR(t *testing.T) {
 	}
 }
 
+func TestReadlinkGrowthBound(t *testing.T) {
+	var sizes []int
+	_, err := readlinkTarget(func(buf []byte) (int, error) {
+		if len(buf) > maxReadlinkBuffer || len(sizes) >= 7 {
+			t.Fatalf("unbounded growth: %v followed by %d", sizes, len(buf))
+		}
+		sizes = append(sizes, len(buf))
+		return -1, unix.ERANGE
+	})
+	if !errors.Is(err, unix.ENAMETOOLONG) {
+		t.Fatalf("want ENAMETOOLONG, got %v", err)
+	}
+	if diff := gocmp.Diff([]int{128, 256, 512, 1024, 2048, 4096, 8192}, sizes); diff != "" {
+		t.Errorf("readlink buffer sizes (-want +got):\n%s", diff)
+	}
+}
+
 func TestStageCleanupErrors(t *testing.T) {
 	t.Run("missing stage preserves rename error", func(t *testing.T) {
 		path := stateFile(t)
@@ -74,7 +91,7 @@ func TestStageCleanupErrors(t *testing.T) {
 			return renameErr
 		}
 		err := w.writeFile(path, []byte(newState), 0o600)
-		if !errors.Is(renameErr, fs.ErrNotExist) || !errors.Is(err, renameErr) || err.Error() != renameErr.Error() {
+		if !errors.Is(renameErr, fs.ErrNotExist) || err != renameErr { //nolint:errorlint // A joined error would mask a redundant cleanup diagnostic.
 			t.Fatalf("returned %v; want only the original rename error %v", err, renameErr)
 		}
 		checkContents(t, path, oldState)
@@ -102,7 +119,7 @@ func TestStageCleanupErrors(t *testing.T) {
 		if !errors.Is(err, unix.EISDIR) && !errors.Is(err, unix.EPERM) {
 			t.Fatalf("missing unlink failure: %v", err)
 		}
-		if !strings.Contains(err.Error(), "settings changed before replacement") {
+		if conflict, ok := errors.AsType[*settingsConflict](err); !ok || conflict.path != path {
 			t.Fatalf("missing conflict: %v", err)
 		}
 		checkContents(t, path, editor)

@@ -103,7 +103,7 @@ func creationMode(root *directory, base string, mode fs.FileMode, stage fs.FileI
 		return 0, err
 	}
 	info, statErr := probe.Stat()
-	if err := errors.Join(root.Remove(name), probe.Close(), statErr); err != nil {
+	if err := errors.Join(root.removeIfPresent(name), probe.Close(), statErr); err != nil {
 		return 0, err
 	}
 	return info.Mode().Perm(), nil
@@ -149,7 +149,7 @@ func (w writer) replace(root *directory, base string, data []byte, mode fs.FileM
 	published := false
 	defer func() {
 		if !published {
-			if cleanupErr := root.Remove(name); cleanupErr != nil && !errors.Is(cleanupErr, fs.ErrNotExist) {
+			if cleanupErr := root.removeIfPresent(name); cleanupErr != nil {
 				err = errors.Join(err, cleanupErr)
 			}
 		}
@@ -219,6 +219,10 @@ func (w writer) writeFile(path string, data []byte, mode fs.FileMode) error {
 	return w.replace(root, base, data, mode, owner, false, nil)
 }
 
+type settingsConflict struct{ path string }
+
+func (e *settingsConflict) Error() string { return e.path + ": settings changed before replacement" }
+
 type snapshot struct {
 	info fs.FileInfo
 	data []byte
@@ -276,7 +280,7 @@ func (w writer) replaceSettings(path string, edit func([]byte) ([]byte, error), 
 		return err
 	}
 	target := root.path(base)
-	conflict := fmt.Errorf("%s: settings changed before replacement", path)
+	conflict := &settingsConflict{path}
 	for range 3 {
 		before, err := readSettings(root, base, conflict, nil)
 		if errors.Is(err, conflict) {
