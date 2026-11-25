@@ -105,6 +105,9 @@ func TestVerifiedMode(t *testing.T) {
 			}
 			if tt.ignore {
 				f.Replace = func(file string, edit func([]byte) ([]byte, error)) error {
+					if file != f.local && file != f.shared && file != f.user {
+						t.Fatalf("unexpected settings write path: %q", file)
+					}
 					return atomicfile.ReplaceSettings(file, func(old []byte) ([]byte, error) {
 						next, err := edit(old)
 						if err == nil && file == f.local && bytes.Contains(next, []byte(compat)) {
@@ -114,7 +117,8 @@ func TestVerifiedMode(t *testing.T) {
 					})
 				}
 			}
-			got, err := f.SyncMode(tt.health, tt.required)
+			observations := *tt.health
+			got, err := f.SyncMode(&observations, tt.required)
 			if tt.ignore {
 				if err == nil || !strings.Contains(err.Error(), "Could not verify gateway settings") {
 					t.Fatalf("expected verification failure, got %v", err)
@@ -159,9 +163,10 @@ func TestEnvironmentOnlyMode(t *testing.T) {
 			f := sandbox(t)
 			f.env[base] = tt.url
 			health := wiring.Health{HostsDetected: true, Port80Bound: true}
+			want := wiring.ModeResult{Mode: tt.mode, Compat: health}
 			got, err := f.SyncMode(&health, "compat")
 			check(t, err)
-			equal(t, wiring.ModeResult{Mode: tt.mode, Compat: health}, got)
+			equal(t, want, got)
 			absent(t, f.local)
 			absent(t, f.registry)
 			absent(t, filepath.Join(filepath.Dir(f.registry), "wiring.json"))

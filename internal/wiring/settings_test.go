@@ -31,30 +31,37 @@ func decode(t *testing.T, raw string, out any) {
 	check(t, json.Unmarshal([]byte(raw), out))
 }
 
+func shippedEntries() []wiring.Entry {
+	return []wiring.Entry{
+		{Key: opus, Value: "claude-opus-5-5[1m]"},
+		{Key: sonnet, Value: "claude-sonnet-5-5[1m]"},
+		{Key: fable, Value: "claude-fable-5-1[1m]"},
+		{Key: option, Value: "claude-fable-5-1[1m]"},
+		{Key: optionName, Value: "Fable"},
+		{Key: description, Value: "Fable 5.1 · current Fable, through the gateway"},
+	}
+}
+
 func TestEnvBlock(t *testing.T) {
 	f := sandbox(t)
-	f.Pins.Current = map[string]string{opus: "claude-opus-5-5[1m]"}
-	a, b := f.EnvBlock("default"), f.EnvBlock("compat")
-	equal(t, direct, a[base])
-	equal(t, compat, b[base])
-	delete(a, base)
-	delete(b, base)
-	equal(t, a, b)
-	equal(t, map[string]string{discovery: "1", "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK": "1", "ENABLE_TOOL_SEARCH": "true", "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "64000", opus: "claude-opus-5-5[1m]"}, a)
+	f.Pins.Current = shippedEntries()
+	want := []wiring.Entry{{Key: base, Value: direct}, {Key: discovery, Value: "1"}, {Key: "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK", Value: "1"}, {Key: "ENABLE_TOOL_SEARCH", Value: "true"}, {Key: "CLAUDE_CODE_MAX_OUTPUT_TOKENS", Value: "64000"}}
+	want = append(want, shippedEntries()...)
+	equal(t, want, f.EnvBlock("default"))
+	want[0].Value = compat
+	equal(t, want, f.EnvBlock("compat"))
 }
 
 func TestWriteEnvironment(t *testing.T) {
-	f := sandbox(t)
-	putEnv(t, f.user, map[string]any{"USER_SETTING": "keep-me"})
-	for _, mode := range []string{"default", "compat", "remove"} {
+	tests := map[string]struct{ start string }{"default": {}, "compat": {direct}, "remove": {compat}}
+	for mode, tt := range tests {
 		t.Run(mode, func(t *testing.T) {
-			if mode == "compat" {
-				doc := object(t, text(t, f.user))
-				env := envAt(t, f.user)
-				env["ANTHROPIC_UNIX_SOCKET"] = "retired-socket-value"
-				doc["env"] = env
-				put(t, f.user, encoded(t, doc))
+			f := sandbox(t)
+			initial := map[string]any{"USER_SETTING": "keep-me", "ANTHROPIC_UNIX_SOCKET": "retired-socket-value"}
+			if tt.start != "" {
+				initial[base] = tt.start
 			}
+			putEnv(t, f.user, initial)
 			check(t, f.WriteEnv("user", mode, mode == "remove"))
 			env := envAt(t, f.user)
 			_, socket := env["ANTHROPIC_UNIX_SOCKET"]
@@ -77,7 +84,7 @@ func TestWriteEnvironment(t *testing.T) {
 
 func TestRemovePins(t *testing.T) {
 	f := sandbox(t)
-	f.Pins = wiring.Pins{Current: map[string]string{opus: "claude-opus-5-5[1m]", sonnet: "claude-sonnet-5-5[1m]"}, Owned: map[string][]string{opus: {"claude-opus-5-5[1m]"}, sonnet: {"claude-sonnet-5-5[1m]"}}}
+	f.Pins = wiring.Pins{Current: shippedEntries()[:2], Owned: map[string][]string{opus: {"claude-opus-5-5[1m]"}, sonnet: {"claude-sonnet-5-5[1m]"}}}
 	check(t, f.WriteEnv("user", "default", false))
 	env := envAt(t, f.user)
 	equal(t, "claude-opus-5-5[1m]", env[opus])
@@ -91,18 +98,23 @@ func TestSyncRegisteredPins(t *testing.T) {
 	f := sandbox(t)
 	old, newID := "claude-fable-5-1[1m]", "claude-fable-5-3[1m]"
 	oldDesc, newDesc := "Fable 5.1 · current Fable, through the gateway", "Fable 5.3 · current Fable, through the gateway"
-	f.Pins = wiring.Pins{Current: map[string]string{fable: old, option: old, optionName: "Fable", description: oldDesc}, Owned: map[string][]string{fable: {old, newID}, option: {old, newID}, optionName: {"Fable"}, description: {oldDesc, newDesc}}}
-	initial := map[string]string{base: direct, discovery: "1", "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK": "1", "ENABLE_TOOL_SEARCH": "true", "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "64000", fable: old}
+	f.Pins = wiring.Pins{Current: shippedEntries(), Owned: map[string][]string{opus: {"claude-opus-5-5[1m]"}, sonnet: {"claude-sonnet-5-5[1m]"}, fable: {old, newID}, option: {old, newID}, optionName: {"Fable"}, description: {oldDesc, newDesc}}}
+	initial := map[string]string{base: direct, discovery: "1", "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK": "1", "ENABLE_TOOL_SEARCH": "true", "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "64000", opus: "claude-opus-5-5[1m]", sonnet: "claude-sonnet-5-5[1m]", fable: old}
 	put(t, f.local, encoded(t, map[string]any{"env": initial}))
 	check(t, f.RecordProject())
 	_, err := f.SyncPins()
 	check(t, err)
 	want := maps.Clone(initial)
-	maps.Copy(want, f.Pins.Current)
+	want[option], want[optionName], want[description] = old, "Fable", oldDesc
 	equal(t, object(t, encoded(t, want)), envAt(t, f.local))
-	f.Pins.Current[fable] = newID
-	f.Pins.Current[option] = newID
-	f.Pins.Current[description] = newDesc
+	for i, entry := range f.Pins.Current {
+		switch entry.Key {
+		case fable, option:
+			f.Pins.Current[i].Value = newID
+		case description:
+			f.Pins.Current[i].Value = newDesc
+		}
+	}
 	_, err = f.SyncPins()
 	check(t, err)
 	env := envAt(t, f.local)
@@ -122,6 +134,7 @@ func TestSyncRegisteredPins(t *testing.T) {
 
 func TestRepairOrphan(t *testing.T) {
 	f := sandbox(t)
+	f.Pins.Current = shippedEntries()
 	f.Pins.Owned = map[string][]string{opus: {"claude-opus-5[1m]"}, fable: {"claude-fable-5-1[1m]"}}
 	log := filepath.Join(f.home, "claude-called")
 	probe := filepath.Join(f.home, "claude")
@@ -147,13 +160,15 @@ func TestRepairOrphan(t *testing.T) {
 }
 
 func TestSyncWindow(t *testing.T) {
-	root := t.TempDir()
+	f := sandbox(t)
+	root := f.Project
 	owned, user, unset, broken := filepath.Join(root, "owned"), filepath.Join(root, "user"), filepath.Join(root, "unset"), filepath.Join(root, "broken")
 	original := "{\r\n\t\"env\" : { \"A\" : \"1\" },\r\n\t\"autoCompactWindow\" : 400000\r\n}"
 	put(t, owned, original)
 	put(t, user, `{"autoCompactWindow":325000}`)
 	put(t, broken, "{")
-	r := wiring.SyncWindow([]string{owned, user, unset, broken}, new(400000), new(500000))
+	r, err := f.SyncWindow([]string{owned, user, unset, broken}, new(400000), new(500000))
+	check(t, err)
 	equal(t, []string{owned, unset}, r.Changed)
 	if len(r.Skipped) != 2 {
 		t.Fatalf("skipped: %+v", r.Skipped)
@@ -167,11 +182,16 @@ func TestSyncWindow(t *testing.T) {
 	equal(t, strings.Replace(original, "400000", "500000", 1), text(t, owned))
 	equal(t, float64(500000), object(t, text(t, unset))["autoCompactWindow"])
 	equal(t, `{"autoCompactWindow":325000}`, text(t, user))
-	equal(t, 0, len(wiring.SyncWindow([]string{owned}, new(500000), new(500000)).Changed))
-	r = wiring.SyncWindow([]string{owned, unset}, new(500000), nil)
+	r, err = f.SyncWindow([]string{owned}, new(500000), new(500000))
+	check(t, err)
+	equal(t, 0, len(r.Changed))
+	r, err = f.SyncWindow([]string{owned, unset}, new(500000), nil)
+	check(t, err)
 	equal(t, []string{owned, unset}, r.Changed)
-	equal(t, object(t, `{"env":{"A":"1"}}`), object(t, text(t, owned)))
-	equal(t, 0, len(wiring.SyncWindow([]string{owned}, nil, nil).Changed))
+	equal(t, "{\r\n\t\"env\" : { \"A\" : \"1\" }\r\n}", text(t, owned))
+	r, err = f.SyncWindow([]string{owned}, nil, nil)
+	check(t, err)
+	equal(t, 0, len(r.Changed))
 }
 
 func TestCleanModelCache(t *testing.T) {
@@ -186,13 +206,14 @@ func TestCleanModelCache(t *testing.T) {
 		input, want, canonicalID string
 		changed                  bool
 	}{
-		"success: upgrade":   {mixed, strings.Replace(mixed, bare, full, 1), full, true},
-		"success: canonical": {canonical, canonical, full, false},
-		"success: foreign":   {input: strings.Replace(original, direct, "http://other-gateway.example", 1), canonicalID: full},
-		"success: missing":   {},
-		"success: malformed": {input: "not json"},
-		"success: non-array": {input: `{"baseUrl":"` + direct + `","fetchedAt":1,"models":"not-an-array"}`},
-		"success: downgrade": {canonical, original, bare, true},
+		"success: upgrade":                           {mixed, strings.Replace(mixed, bare, full, 1), full, true},
+		"success: canonical":                         {canonical, canonical, full, false},
+		"success: foreign":                           {input: strings.Replace(original, direct, "http://other-gateway.example", 1), canonicalID: full},
+		"success: missing":                           {},
+		"success: malformed":                         {input: "not json"},
+		"success: non-array":                         {input: `{"baseUrl":"` + direct + `","fetchedAt":1,"models":"not-an-array"}`},
+		"success: downgrade":                         {canonical, original, bare, true},
+		"success: production adapter above boundary": {original, canonical, full, true},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -203,18 +224,51 @@ func TestCleanModelCache(t *testing.T) {
 				put(t, file, tt.input)
 				check(t, os.Chtimes(file, mtime, mtime))
 			}
-			got := f.CleanModelCache(file, func(id string) (string, bool) {
+			canonicalize := func(id string) (string, bool) {
 				if id == bare || id == full {
 					return tt.canonicalID, true
 				}
+				if id == "anthropic-custom" {
+					return "never-rewrite-an-unowned-row", false
+				}
 				return id, id == "claude-grok-4.5[1m]"
-			})
+			}
+			if tt.changed && tt.canonicalID == bare {
+				f.env["CODEX_GATEWAY_CONTEXT_WINDOW"] = "200000"
+				canonicalize = nil
+			}
+			if tt.changed && tt.input == original {
+				f.env["CODEX_GATEWAY_CONTEXT_WINDOW"] = "272000"
+				canonicalize = nil
+			}
+			got, err := f.CleanModelCache(file, canonicalize)
+			check(t, err)
 			equal(t, tt.changed, got)
 			switch {
 			case tt.input == "":
 				absent(t, file)
 			case tt.changed:
 				equal(t, object(t, tt.want), object(t, text(t, file)))
+				golden := `{
+  "baseUrl": "` + direct + `",
+  "fetchedAt": 1,
+  "models": [
+    {
+      "id": "` + tt.canonicalID + `",
+      "display_name": "GPT-6 Astra (Codex)"
+    }`
+				if tt.input == mixed {
+					golden += `,
+    {
+      "id": "claude-grok-4.5[1m]",
+      "display_name": "Grok 4.5"
+    },
+    {
+      "id": "anthropic-custom",
+      "display_name": "Anthropic Custom"
+    }`
+				}
+				equal(t, golden+"\n  ]\n}\n", text(t, file))
 			default:
 				equal(t, tt.input, text(t, file))
 				stat, err := os.Stat(file)

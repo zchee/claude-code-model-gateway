@@ -22,9 +22,13 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/paths"
 )
 
-// Pins supplies the current pin and picker entries and all values the gateway owns for each key.
+// Entry is one environment entry in gateway settings order.
+type Entry struct{ Key, Value string }
+
+// Pins supplies alias and picker entries in source order, with their historical owned values.
+// Current determines traversal order; Owned is only used for per-key lookup.
 type Pins struct {
-	Current map[string]string
+	Current []Entry
 	Owned   map[string][]string
 }
 
@@ -68,7 +72,7 @@ func (s Store) WiredMode() (*Wiring, error) { return nil, errors.New("wiring mod
 func (s Store) IsWired() (bool, error) { return false, errors.New("wiring check not implemented") }
 
 // EnvBlock returns the static and pin entries for the selected transport.
-func (s Store) EnvBlock(mode string) map[string]string { return nil }
+func (s Store) EnvBlock(mode string) []Entry { return nil }
 
 // WriteEnv writes or removes gateway-owned settings in the specified scope and verifies the result.
 func (s Store) WriteEnv(scope, mode string, remove bool) error {
@@ -93,10 +97,16 @@ func (s Store) MigrateLegacy() (bool, error) {
 	return false, errors.New("legacy migration not implemented")
 }
 
+// CleanLegacyEnv migrates legacy wiring and removes the stale compact-window key from gateway settings.
+func (s Store) CleanLegacyEnv() error { return errors.New("legacy cleanup not implemented") }
+
+// RetireModeConfig removes the obsolete scope selection file, returning whether it was removed.
+func (s Store) RetireModeConfig() bool { return false }
+
 // Health describes the compatibility observations supplied by the gateway health check.
 type Health struct {
 	HostsDetected, Port80Bound bool
-	HostsLine                  string
+	HostsLine, Reason          string
 }
 
 // ModeResult records the verified mode, health observations and whether settings changed.
@@ -122,11 +132,12 @@ func (s Store) Projects(readOnly bool) ([]Registration, []Pruned, error) {
 	return nil, nil, errors.New("registry scan not implemented")
 }
 
-// Disagreement describes a missing or stale registered pin. Stale is nil for an absent value.
+// Disagreement describes a registered pin. Present differentiates JSON null from an absent key.
 type Disagreement struct {
 	Registration
 	Key, Expected string
 	Stale         any
+	Present       bool
 }
 
 // PinDisagreements compares even missing pin keys without rewriting the registry or settings.
@@ -143,12 +154,16 @@ func (s Store) Reconcile(target string, confirm bool) (conflicting, reconciled [
 func (s Store) RecordProject() error { return errors.New("project registration not implemented") }
 
 // Skipped identifies a settings file or key a synchronization could not update.
-type Skipped struct{ File, Key, Reason string }
+type Skipped struct {
+	File, Key, Reason string
+	Value             any
+}
 
-// Changes lists updated settings files and files skipped by a sync in input order.
+// Changes lists updated settings files, skipped files and missing registered projects in input order.
 type Changes struct {
 	Changed []string
 	Skipped []Skipped
+	Pruned  []Pruned
 }
 
 // SyncPins updates registered projects without replacing user-owned pins or choices.
@@ -160,7 +175,12 @@ func (s Store) Repair(report func(string)) error {
 }
 
 // SyncWindow updates only a missing or previously owned cap. Nil next selects the full window.
-func SyncWindow(files []string, owned, next *int) Changes { return Changes{} }
+func (s Store) SyncWindow(files []string, owned, next *int) (Changes, error) {
+	return Changes{}, errors.New("window synchronization not implemented")
+}
 
-// CleanModelCache normalizes owned model IDs only in valid gateway caches. The function returns the canonical ID and whether it is gateway-owned.
-func (s Store) CleanModelCache(file string, canonical func(string) (string, bool)) bool { return false }
+// CleanModelCache normalizes owned model IDs in valid gateway caches. A nil canonical function
+// selects the production policy adapter configured by Lookup and Paths.
+func (s Store) CleanModelCache(file string, canonical func(string) (string, bool)) (bool, error) {
+	return false, errors.New("cache cleanup not implemented")
+}
