@@ -39,6 +39,9 @@ func (e probeError) Error() string { return string(e) }
 // ErrUnknown means that the inspection did not establish a process identity.
 const ErrUnknown = probeError("process identity unknown")
 
+// ErrGroupCleanup means the command's process group could not be cleaned up.
+const ErrGroupCleanup = probeError("command process group could not be cleaned up")
+
 // ErrUnsupported means the operating system has no native process probe.
 const ErrUnsupported = probeError("native process inspection unsupported on this platform")
 

@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os/exec"
 	"syscall"
 	"time"
@@ -27,6 +28,16 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+type commandGroup struct {
+	observe func(pid int) (exited bool, err error)
+	signal  func(int, unix.Signal) error
+}
+
+// darwinCommand is the sole waiter for its direct child. The process must not
+// ignore SIGCHLD or run a wait-for-any-child reaper. Under those invariants,
+// observing the unreaped child pins both its PID and its process group ID until
+// this goroutine calls Wait. Descendants that leave the group are not covered.
+// WaitDelay bounds pipe draining, not the wait for a child stuck in the kernel.
 func darwinCommand(ctx context.Context, path string, args ...string) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -42,23 +53,14 @@ func darwinCommand(ctx context.Context, path string, args ...string) ([]byte, er
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
-	pid := cmd.Process.Pid
-	observeErr := waitForLeader(ctx, pid)
-	// The leader (even as a zombie) pins its numeric process group until Wait.
-	// ECHILD means we no longer own a waitable child; never signal that number.
-	var killErr error
-	if !errors.Is(observeErr, unix.ECHILD) {
-		killErr = unix.Kill(-pid, unix.SIGKILL)
+	group := commandGroup{observe: leaderExited, signal: unix.Kill}
+	cleanupErr := group.stop(ctx, cmd.Process.Pid)
+	waitErr := cmd.Wait()
+	if cleanupErr != nil {
+		return nil, cleanupErr
 	}
-	waitErr := cmd.Wait() // Reap first, then drain both output pipes under WaitDelay.
 	if err := ctx.Err(); err != nil {
 		return nil, err
-	}
-	if observeErr != nil {
-		return nil, observeErr
-	}
-	if killErr != nil && !errors.Is(killErr, unix.ESRCH) {
-		return nil, killErr
 	}
 	if stderr.Len() != 0 {
 		return nil, ErrUnknown
@@ -66,18 +68,29 @@ func darwinCommand(ctx context.Context, path string, args ...string) ([]byte, er
 	return stdout.Bytes(), waitErr
 }
 
-func waitForLeader(ctx context.Context, pid int) error {
+func (g commandGroup) stop(ctx context.Context, pid int) error {
 	tick := time.NewTicker(5 * time.Millisecond)
 	defer tick.Stop()
-	for {
-		exited, err := leaderExited(pid)
-		if !errors.Is(err, unix.EINTR) && (err != nil || exited) {
-			return err
+	for ctx.Err() == nil {
+		exited, err := g.observe(pid)
+		if err != nil {
+			return fmt.Errorf("%w: observe child %d: %w", ErrGroupCleanup, pid, err)
+		}
+		if exited {
+			break
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
 		case <-tick.C:
 		}
 	}
+	// Neither a previously observed exit nor cancellation establishes current
+	// ownership. An empty, short or otherwise failed observation is a refusal.
+	if _, err := g.observe(pid); err != nil {
+		return fmt.Errorf("%w: verify child %d: %w", ErrGroupCleanup, pid, err)
+	}
+	if err := g.signal(-pid, unix.SIGKILL); err != nil && !errors.Is(err, unix.ESRCH) {
+		return fmt.Errorf("%w: signal group %d: %w", ErrGroupCleanup, pid, err)
+	}
+	return nil
 }

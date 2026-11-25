@@ -18,7 +18,10 @@ package procinfo
 
 import (
 	"context"
+	"errors"
+	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -44,7 +47,59 @@ func TestProbeLeaderExitsBeforeChild(t *testing.T) {
 		t.Fatalf("leader exit: output=%q err=%v", out, err)
 	}
 	var buf [1]byte
-	if n, err := unix.Read(fd, buf[:]); err != nil || n != 0 {
-		t.Fatalf("descendant still has FIFO on return: n=%d err=%v", n, err)
+	limit := time.Now().Add(time.Second)
+	for {
+		n, err := unix.Read(fd, buf[:])
+		if err == nil && n == 0 {
+			break
+		}
+		if !errors.Is(err, unix.EAGAIN) || time.Now().After(limit) {
+			t.Fatalf("descendant retained FIFO or read failed: n=%d err=%v", n, err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestGroupLostAfterExternalReap(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	cmd := exec.CommandContext(t.Context(), "/bin/cat")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = stdin.Close()
+		if cmd.ProcessState == nil {
+			_ = cmd.Wait()
+		}
+	})
+	var observations, signals int
+	group := commandGroup{observe: func(pid int) (bool, error) {
+		observations++
+		exited, err := leaderExited(pid)
+		if observations == 1 {
+			if err != nil || exited {
+				t.Fatalf("child was not running: exited=%t err=%v", exited, err)
+			}
+			// Simulate another waiter violating the sole-waiter invariant between the
+			// last successful observation and cancellation. No PID reuse is necessary.
+			if err := stdin.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := cmd.Wait(); err != nil {
+				t.Fatal(err)
+			}
+			cancel()
+		}
+		return exited, err
+	}, signal: func(int, unix.Signal) error { signals++; return nil }}
+	err = group.stop(ctx, cmd.Process.Pid)
+	if !errors.Is(err, ErrGroupCleanup) || signals != 0 || observations != 2 {
+		t.Errorf("externally reaped child: err=%v signals=%d observations=%d", err, signals, observations)
 	}
 }

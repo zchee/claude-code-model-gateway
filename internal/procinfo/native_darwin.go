@@ -31,7 +31,7 @@ import (
 // Darwin's kern.proc.pid includes zombies. Reading SZOMB observes exit without
 // consuming the wait status or releasing the leader's process group identity.
 func leaderExited(pid int) (bool, error) {
-	const zombie = 5 // SZOMB in sys/proc.h.
+	// SysctlKinfoProc also rejects an empty or short kernel result with EIO.
 	p, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
 	if err != nil {
 		return false, err
@@ -39,7 +39,14 @@ func leaderExited(pid int) (bool, error) {
 	if int(p.Proc.P_pid) != pid || int(p.Eproc.Ppid) != unix.Getpid() {
 		return false, unix.ECHILD
 	}
-	return p.Proc.P_stat == zombie, nil
+	switch p.Proc.P_stat { // sys/proc.h.
+	case 1, 2, 3, 4: // SIDL, SRUN, SSLEEP, SSTOP.
+		return false, nil
+	case 5: // SZOMB.
+		return true, nil
+	default:
+		return false, ErrUnknown
+	}
 }
 
 func procArgs(pid int) (string, []string, error) {
