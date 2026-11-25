@@ -71,10 +71,15 @@ require(run.get('ajv') == '8.20.0', 'missing or incorrect installed ajv version'
 processes = run.get('processes', {})
 require(processes.get('leftovers') == [] and isinstance(processes.get('excluded'), list),
         'process evidence contradicts clean verdict')
+uid = processes.get('uid')
+installed = processes.get('installed_bus', {})
+require(type(uid) is int and uid >= 0 and installed.get('path') == '/usr/bin/dbus-daemon' and
+        type(installed.get('device')) is int and installed['device'] >= 0 and
+        type(installed.get('inode')) is int and installed['inode'] > 0, 'missing session bus identity')
+unit = f'/user.slice/user-{uid}.slice/user@{uid}.service/session.slice/dbus.service'
 for proc in processes['excluded']:
-    require(proc.get('name') == 'dbus-daemon' and re.fullmatch(
-        r'/user\.slice/user-(\d+)\.slice/user@\1\.service/(?:[^/]+/)*dbus\.service', proc.get('cgroup', '')),
-        'unrecognized process exclusion')
+    require(proc.get('name') == 'dbus-daemon' and proc.get('cgroup') == unit and
+            proc.get('executable') == installed, 'unrecognized process exclusion')
 tools = run.get('tools', {})
 for name in ('lsof', 'ps', 'tar', 'gzip', 'which', 'sh', 'env', 'touch', 'git', 'node', 'npm'):
     info = tools.get(name, {})

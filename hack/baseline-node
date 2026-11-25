@@ -84,6 +84,17 @@ import json, os, re, sys
 mode, before = sys.argv[1:]
 uid = os.getuid()
 user_slice = f'/user.slice/user-{uid}.slice/'
+bus_unit = f'{user_slice}user@{uid}.service/session.slice/dbus.service'
+def executable(path):
+    # Pin one kernel file object for both the resolved path and stat identity.
+    fd = os.open(path, os.O_PATH)
+    try:
+        st = os.fstat(fd)
+        return dict(path=os.readlink(f'/proc/self/fd/{fd}'), device=st.st_dev, inode=st.st_ino)
+    finally: os.close(fd)
+
+installed = executable('/usr/bin/dbus-daemon')
+if installed['path'] != '/usr/bin/dbus-daemon': sys.exit('unexpected installed session bus executable')
 def cgroup(p):
     paths = [s[3:] for s in (p / 'cgroup').read_text().splitlines() if s.startswith('0::/')]
     if len(paths) != 1: raise ValueError(f'{p}: expected one unified cgroup v2 path')
@@ -98,7 +109,12 @@ def identity(p):
 session = cgroup(Path('/proc/self'))
 if not re.fullmatch(re.escape(user_slice) + r'session-[^/]+\.scope(?:/.*)?', session):
     sys.exit(f'expected a systemd login session scope in cgroup v2, got {session!r}')
-old = set(map(tuple, json.loads(Path(before).read_text()))) if mode == 'after' else set()
+old = set()
+if mode == 'after':
+    prior = json.loads(Path(before).read_text())
+    if prior['uid'] != uid or prior['installed_bus'] != installed:
+        sys.exit('account or installed session bus identity changed during run')
+    old = set(map(tuple, prior['live']))
 current, excluded, leftovers = [], [], []
 for p in sorted(Path('/proc').glob('[0-9]*')):
     try:
@@ -111,15 +127,15 @@ for p in sorted(Path('/proc').glob('[0-9]*')):
     pid, start, name = item
     try:
         group = cgroup(p)
-        bus = (name == 'dbus-daemon' and group.startswith(f'{user_slice}user@{uid}.service/')
-               and group.endswith('/dbus.service') and Path(os.readlink(p / 'exe')).name == 'dbus-daemon')
+        exe = executable(p / 'exe') if group == bus_unit and name == 'dbus-daemon' else None
     except (OSError, ValueError) as err:
         if (identity(p) or ())[:2] != item[:2]: continue
         raise SystemExit(f'cannot attribute live PID {pid} (start tick {start}): {err}')
     if (identity(p) or ())[:2] != item[:2]: continue
-    dest = excluded if bus else leftovers
-    dest.append(dict(pid=pid, start_tick=start, name=name, cgroup=group))
-print(json.dumps(current if mode == 'before' else dict(excluded=excluded, leftovers=leftovers)))
+    dest = excluded if exe == installed else leftovers
+    dest.append(dict(pid=pid, start_tick=start, name=name, cgroup=group, executable=exe))
+record = dict(live=current) if mode == 'before' else dict(excluded=excluded, leftovers=leftovers)
+print(json.dumps(dict(record, uid=uid, installed_bus=installed)))
 PY
 }
 "$root/hack/pinned-source" --print-pin > "$work/pin"
@@ -133,14 +149,26 @@ suite_pid=''
 # shellcheck disable=SC2329
 on_interrupt() {
     trap '' HUP INT TERM
-    printf 'baseline-node: interrupted; no publishable evidence; post-run process check:\n' >&2
-    if [[ -n $suite_pid && $(jobs -pr) == "$suite_pid" ]]; then
-        kill -TERM -- "-$suite_pid" 2>/dev/null || :
-    fi
+    local sig deadline
+    printf 'baseline-node: interrupted; no publishable evidence\n' >&2
+    # The job leader may already have exited. Its group still exists while a
+    # grandchild remains in it. Never target processes outside our job group.
+    for sig in TERM KILL; do
+        kill -0 -- "-$suite_pid" 2>/dev/null || break
+        printf 'baseline-node: sending %s to suite group %s\n' "$sig" "$suite_pid" >&2
+        kill -"$sig" -- "-$suite_pid" 2>/dev/null || :
+        deadline=$((SECONDS + 3))
+        while kill -0 -- "-$suite_pid" 2>/dev/null && (( SECONDS < deadline )); do sleep 0.1; done
+    done
+    if kill -0 -- "-$suite_pid" 2>/dev/null; then printf 'baseline-node: suite group still present: %s\n' "$suite_pid" >&2; fi
+    # Scan the whole account, including descendants that made a new group.
     snapshot after >&2 || printf 'baseline-node: interrupted process check failed\n' >&2
+    if "$root/hack/venue-check" >&2; then printf 'baseline-node: interrupted venue check passed\n' >&2
+    else printf 'baseline-node: interrupted venue check failed\n' >&2; fi
     exit 1
 }
-trap on_interrupt HUP INT TERM
+interrupted=0
+trap 'interrupted=1' HUP INT TERM
 date -u '+%Y-%m-%dT%H:%M:%SZ' > "$work/start"
 # A separate job group lets a signal interrupt wait immediately, and lets us
 # terminate that group without signalling other processes in the login session.
@@ -148,8 +176,11 @@ set -m
 "${clean[@]}" npm --prefix "$plugin" test &
 suite_pid=$!
 set +m
+# Deliver a signal received between fork and recording the group only after
+# the handler can address that group. Keep the ID even after its leader exits.
+trap on_interrupt HUP INT TERM
+(( interrupted == 0 )) || on_interrupt
 rc=0; wait "$suite_pid" || rc=$?
-suite_pid=''
 printf '%d\n' "$rc" > "$work/exit"
 date -u '+%Y-%m-%dT%H:%M:%SZ' > "$work/end"
 # The command, dates, exit and raw events are durable before these checks.
