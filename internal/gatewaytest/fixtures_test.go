@@ -22,6 +22,7 @@ import (
 	json "encoding/json/v2"
 	"errors"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/url"
@@ -257,12 +258,21 @@ func TestHelperDirectory(t *testing.T) {
 	if err := os.Symlink(outside, link); err != nil {
 		t.Fatal(err)
 	}
+	inside := filepath.Join(home, "inside", "child")
+	if err := os.MkdirAll(inside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	localLink := filepath.Join(home, "local-link")
+	if err := os.Symlink(inside, localLink); err != nil {
+		t.Fatal(err)
+	}
 	tests := map[string]struct{ path string }{
-		"error: relative home":           {"relative"},
-		"error: unclean home":            {home + "/."},
-		"error: parent segment":          {home + "/unused/.."},
-		"error: external directory":      {outside},
-		"error: external directory link": {link},
+		"error: in-sandbox symlink followed by parent segment": {localLink + "/.."},
+		"error: relative home":                                 {"relative"},
+		"error: unclean home":                                  {home + "/."},
+		"error: parent segment":                                {home + "/unused/.."},
+		"error: external directory":                            {outside},
+		"error: external directory link":                       {link},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -271,9 +281,17 @@ func TestHelperDirectory(t *testing.T) {
 			if cmd, err := env.HelperCommand(t, "claude", "--version"); cmd != nil || !errors.Is(err, gatewaytest.ErrOutsideSandbox) {
 				t.Fatalf("HelperCommand: cmd=%v err=%v", cmd, err)
 			}
-			entries, err := os.ReadDir(outside)
-			if err != nil || len(entries) != 0 {
-				t.Fatalf("outside directory changed: entries=%v err=%v", entries, err)
+			for root, want := range map[string][]string{home: {".", "inside", "inside/child", "local-link", "other"}, outside: {"."}} {
+				var got []string
+				if err := fs.WalkDir(os.DirFS(root), ".", func(path string, _ fs.DirEntry, err error) error {
+					got = append(got, path)
+					return err
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if diff := gocmp.Diff(want, got); diff != "" {
+					t.Errorf("entries in %s (-want +got):\n%s", root, diff)
+				}
 			}
 		})
 	}
