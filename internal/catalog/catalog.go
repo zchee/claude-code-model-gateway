@@ -78,7 +78,8 @@ type Catalog struct {
 	UpdatedAt     string `json:"updatedAt"`
 	// WrittenBy is the port's non-empty writer version, never JSON null.
 	WrittenBy string `json:"writtenBy"`
-	// Providers is published in order of each provider's first retained row in Models.
+	// Providers publishes canonical JavaScript array-index keys first in ascending numeric order.
+	// Other provider names follow in the order of their first retained row in Models.
 	Providers      map[string]Readiness `json:"providers"`
 	CodexReadiness *Readiness           `json:"codexReadiness"`
 	Models         []Model              `json:"models"`
