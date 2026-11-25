@@ -21,7 +21,6 @@ package dependencies
 import (
 	_ "github.com/andybalholm/brotli"
 	_ "github.com/dlclark/regexp2"
-	_ "github.com/google/renameio/v2/maybe"
 	_ "github.com/miekg/dns"
 	_ "github.com/rogpeppe/go-internal/testscript"
 	_ "github.com/shirou/gopsutil/v4/process"

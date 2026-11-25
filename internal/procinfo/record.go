@@ -20,8 +20,8 @@ import (
 	"fmt"
 	"io/fs"
 	"math"
-	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"time"
 
@@ -38,14 +38,18 @@ const (
 	ErrMirrorPublish = probeError("record published but process ID mirror not updated")
 )
 
-func mirrorPath(root, name string) (string, error) {
+func openRecordDir(root, name string) (*atomicfile.Dir, string, error) {
 	if !filepath.IsAbs(root) || filepath.Clean(root) != root {
-		return "", ErrStateRoot
+		return nil, "", ErrStateRoot
 	}
 	if !filepath.IsLocal(name) || name == "." || filepath.Base(name) != name {
-		return "", fs.ErrInvalid
+		return nil, "", fs.ErrInvalid
 	}
-	return filepath.Join(root, name+".pid"), nil
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		return nil, "", ErrUnsupported
+	}
+	dir, err := atomicfile.OpenDir(root)
+	return dir, name + ".pid", err
 }
 
 func (r Record) validate(root string) error {
@@ -59,30 +63,38 @@ func (r Record) validate(root string) error {
 	return nil
 }
 
-func replaceRecordFile(path string, data []byte) error {
-	return atomicfile.WriteFile(path, data, 0o600)
+type recordIO struct{ beforeMirror func() }
+
+func readRecordEntry(dir *atomicfile.Dir, name string) ([]byte, error) {
+	data, err := dir.ReadFile(name)
+	if _, ok := errors.AsType[*atomicfile.NonRegularError](err); ok {
+		return nil, fmt.Errorf("%w: %w", ErrRecordEntry, err)
+	}
+	return data, err
+}
+
+func replaceRecordEntry(dir *atomicfile.Dir, name string, data []byte) error {
+	// Dir.WriteFile replaces a symlink rather than following it. Records refuse
+	// such entries altogether, including when replacing an existing record.
+	if _, err := readRecordEntry(dir, name); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return dir.WriteFile(name, data, 0o600)
 }
 
 // WriteRecord atomically publishes name.pid.json before updating its decimal mirror.
 // ErrMirrorPublish means the JSON was committed and the mirror was not.
 func WriteRecord(root, name string, record Record) error {
-	return writeRecord(root, name, record, replaceRecordFile)
+	return (recordIO{}).write(root, name, record, replaceRecordEntry)
 }
 
-func writeRecord(root, name string, record Record, replace func(string, []byte) error) error {
-	mirror, err := mirrorPath(root, name)
-	if err != nil {
-		return err
-	}
-	if err := record.validate(root); err != nil {
-		return err
-	}
-	dir, err := openRecordRoot(root)
+func (r recordIO) write(root, name string, record Record, replace func(*atomicfile.Dir, string, []byte) error) error {
+	dir, mirror, err := openRecordDir(root, name)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = dir.Close() }()
-	if err := checkRecordEntry(dir, filepath.Base(mirror)+".json"); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := record.validate(root); err != nil {
 		return err
 	}
 	// Encode the typed record directly: a JavaScript number cannot represent every inode.
@@ -90,13 +102,13 @@ func writeRecord(root, name string, record Record, replace func(string, []byte) 
 	if err != nil {
 		return err
 	}
-	if err := replace(mirror+".json", data); err != nil {
+	if err := replace(dir, mirror+".json", data); err != nil {
 		return err
 	}
-	if err := checkRecordEntry(dir, filepath.Base(mirror)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("%w: %w", ErrMirrorPublish, err)
+	if r.beforeMirror != nil {
+		r.beforeMirror()
 	}
-	if err := replace(mirror, []byte(strconv.Itoa(record.PID))); err != nil {
+	if err := replace(dir, mirror, []byte(strconv.Itoa(record.PID))); err != nil {
 		return fmt.Errorf("%w: %w", ErrMirrorPublish, err)
 	}
 	return nil
@@ -108,16 +120,16 @@ func writeRecord(root, name string, record Record, replace func(string, []byte) 
 // It returns the valid record alongside ErrMirrorRepair if repair is impossible.
 // Symlinks and special files in either position are refused with ErrRecordEntry.
 func ReadRecord(root, name string) (Record, error) {
-	mirror, err := mirrorPath(root, name)
-	if err != nil {
-		return Record{}, err
-	}
-	dir, err := openRecordRoot(root)
+	return (recordIO{}).read(root, name)
+}
+
+func (r recordIO) read(root, name string) (Record, error) {
+	dir, mirror, err := openRecordDir(root, name)
 	if err != nil {
 		return Record{}, err
 	}
 	defer func() { _ = dir.Close() }()
-	data, err := readRecordEntry(dir, filepath.Base(mirror)+".json")
+	data, err := readRecordEntry(dir, mirror+".json")
 	if err != nil {
 		return Record{}, err
 	}
@@ -128,12 +140,15 @@ func ReadRecord(root, name string) (Record, error) {
 	if err := record.validate(root); err != nil {
 		return Record{}, err
 	}
-	old, err := readRecordEntry(dir, filepath.Base(mirror))
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
+	if r.beforeMirror != nil {
+		r.beforeMirror()
+	}
+	old, err := readRecordEntry(dir, mirror)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return record, fmt.Errorf("%w: %w", ErrMirrorRepair, err)
 	}
 	if want := strconv.Itoa(record.PID); string(old) != want {
-		if err := replaceRecordFile(mirror, []byte(want)); err != nil {
+		if err := dir.WriteFile(mirror, []byte(want), 0o600); err != nil {
 			return record, fmt.Errorf("%w: %w", ErrMirrorRepair, err)
 		}
 	}

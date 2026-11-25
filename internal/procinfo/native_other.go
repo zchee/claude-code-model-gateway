@@ -16,15 +16,7 @@
 
 package procinfo
 
-import (
-	"context"
-	"os"
-)
-
-func openRecordRoot(string) (*os.File, error) { return nil, ErrUnsupported }
-
-func checkRecordEntry(*os.File, string) error          { return ErrUnsupported }
-func readRecordEntry(*os.File, string) ([]byte, error) { return nil, ErrUnsupported }
+import "context"
 
 func nativeExistence(context.Context, int) error            { return ErrUnsupported }
 func nativeIdentity(context.Context, int) (Identity, error) { return Identity{}, ErrUnsupported }

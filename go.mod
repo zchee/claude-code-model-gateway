@@ -6,7 +6,6 @@ require (
 	github.com/andybalholm/brotli v1.3.0
 	github.com/dlclark/regexp2 v1.12.0
 	github.com/google/go-cmp v0.7.0
-	github.com/google/renameio/v2 v2.0.2
 	github.com/miekg/dns v1.1.73
 	github.com/rogpeppe/go-internal v1.16.0
 	github.com/shirou/gopsutil/v4 v4.26.10

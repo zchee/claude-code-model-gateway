@@ -34,10 +34,13 @@ type commandGroup struct {
 }
 
 // darwinCommand is the sole waiter for its direct child. The process must not
-// ignore SIGCHLD or run a wait-for-any-child reaper. Under those invariants,
-// observing the unreaped child pins both its PID and its process group ID until
-// this goroutine calls Wait. Descendants that leave the group are not covered.
-// WaitDelay bounds pipe draining, not the wait for a child stuck in the kernel.
+// run a wait-for-any-child reaper or enable automatic reaping in any form,
+// including ignoring SIGCHLD or setting SA_NOCLDWAIT. Under those invariants
+// the unreaped child pins its PID and process group ID until this goroutine
+// calls Wait. Descendants that leave the group are not covered. Refused cleanup
+// sends no signal and waits for the child's natural exit. WaitDelay bounds only
+// pipe draining, not natural exit or a kernel-stuck child: Listener still returns
+// at its budget, but macOS Identity can return late.
 func darwinCommand(ctx context.Context, path string, args ...string) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
