@@ -16,15 +16,18 @@ package catalog_test
 
 import (
 	"context"
+	"encoding/json/jsontext"
 	json "encoding/json/v2"
 	"os"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf16"
 
 	gocmp "github.com/google/go-cmp/cmp"
 
 	"github.com/zchee/claude-code-model-gateway/internal/catalog"
+	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
 	"github.com/zchee/claude-code-model-gateway/internal/venue"
 )
 
@@ -88,9 +91,20 @@ func checkJSON(t *testing.T, want string, got any) {
 	}
 }
 
+func checkCodexMirror(t *testing.T, got catalog.Catalog) {
+	t.Helper()
+	provider, exists := got.Providers["codex"]
+	if !exists || got.CodexReadiness == nil {
+		t.Fatalf("missing Codex summary: provider present=%t, mirror present=%t", exists, got.CodexReadiness != nil)
+	}
+	if diff := gocmp.Diff(provider, *got.CodexReadiness); diff != "" {
+		t.Errorf("Codex readiness (-provider +mirror):\n%s", diff)
+	}
+}
+
 func TestCatalogContract(t *testing.T) {
 	inputs := catalog.Inputs{
-		Policy: modelPolicy, UpdatedAt: time.UnixMilli(1234), Version: "0.56.3",
+		Policy: modelPolicy, UpdatedAt: time.Date(1970, 1, 1, 9, 0, 1, 120000000, time.FixedZone("JST", 9*60*60)), Version: "0.56.3",
 		Providers: map[string]catalog.Readiness{
 			"codex": {Ready: true, State: "ready", Message: "Codex is ready."},
 			"grok":  {State: "auth-missing", Message: "Grok CLI auth is missing. Run `grok` and log in again."},
@@ -98,14 +112,14 @@ func TestCatalogContract(t *testing.T) {
 	}
 	ids := []string{"claude-codex-auto", "claude-gpt-5.6-sol", "claude-gpt-5.6-terra", "claude-gpt-5.6-luna", "claude-gpt-5.6-sol-fast", "claude-gpt-5.6-terra-fast", "claude-gpt-5.6-luna-fast", "claude-grok-4.5", "claude-grok-build"}
 	got := catalog.Build(t.Context(), ids, inputs)
+	t.Run("codex_mirror", func(t *testing.T) { checkCodexMirror(t, got) })
 	tests := map[string]struct{ want, got any }{
 		"schema": {4, got.SchemaVersion}, "source": {"model-gateway", got.Source},
-		"writer": {"0.56.3", got.WrittenBy}, "timestamp": {"1970-01-01T00:00:01.234Z", got.UpdatedAt},
+		"writer": {"0.56.3", got.WrittenBy}, "timestamp": {"1970-01-01T00:00:01.120Z", got.UpdatedAt},
 		"providers": {map[string]catalog.Readiness{
 			"codex": {Ready: true, State: "ready", Message: "Codex is ready."},
 			"grok":  {State: "auth-missing", Message: "Grok CLI auth is missing. Run `grok` and log in again."},
 		}, got.Providers},
-		"codex_mirror": {new(catalog.Readiness{Ready: true, State: "ready", Message: "Codex is ready."}), got.CodexReadiness},
 		"models": {[]catalog.Model{
 			{Slug: "codex-gpt-5-6-sol", ID: "claude-gpt-5.6-sol[1m]", Label: "GPT-5.6 Sol", Provider: "codex", ContextWindow: 272000, ContextWindowNote: billingNote},
 			{Slug: "codex-gpt-5-6-terra", ID: "claude-gpt-5.6-terra[1m]", Label: "GPT-5.6 Terra", Provider: "codex", ContextWindow: 272000, ContextWindowNote: billingNote},
@@ -137,16 +151,13 @@ func TestFlatCodexReadiness(t *testing.T) {
 	})
 	const summary = `{"ready":false,"state":"auth-missing","message":"sign in"}`
 	t.Run("public_fields", func(t *testing.T) { checkJSON(t, `{"codex":`+summary+`}`, got.Providers) })
-	t.Run("codex_mirror", func(t *testing.T) { checkJSON(t, summary, got.CodexReadiness) })
+	t.Run("codex_mirror", func(t *testing.T) { checkCodexMirror(t, got) })
 }
 
-// Only Grok has independent readiness when the shared proxy binary is missing.
-type observations struct{ t *testing.T }
+type observations struct{ probes []string }
 
-func (s observations) Probe(_ context.Context, provider string) catalog.Readiness {
-	if provider != "grok" {
-		s.t.Errorf("attempted %s readiness probe despite missing binary", provider)
-	}
+func (s *observations) Probe(_ context.Context, provider string) catalog.Readiness {
+	s.probes = append(s.probes, provider)
 	return catalog.Readiness{State: "auth-missing", Message: "not signed in"}
 }
 
@@ -154,16 +165,45 @@ func (observations) SharedFailureMessage(state string) string { return state }
 
 func TestProxyCatalog(t *testing.T) {
 	ids := []string{"claude-gpt-6-sol[1m]", "claude-kimi-k3", "claude-glm-5.3", "claude-opencode-go/kimi-k2.6", "claude-cursor-agent", "claude-grok-composer-2.5-fast", "claude-muse-spark-1.3[1m]", "claude-gemini-4-argon[1m]", "claude-vertex/anthropic/claude-opus-5-5[1m]", "claude-vertex/anthropic/claude-sonnet-5-5[1m]", "claude-vertex/mistralai/codestral-2", "claude-vertex/endpoint/my-llm", "claude-opus-5-5"}
-	got := catalog.Build(t.Context(), ids, catalog.Inputs{Policy: modelPolicy, Codex: &catalog.Readiness{State: "binary-missing", Message: "Codex dispatch refused: claude-code-proxy is missing."}, SharedChecks: &catalog.Checks{}, Fallback: observations{t}})
+	probe := new(observations)
+	inputs := catalog.Inputs{Policy: modelPolicy, Codex: &catalog.Readiness{State: "binary-missing", Message: "Codex dispatch refused: claude-code-proxy is missing."}, SharedChecks: &catalog.Checks{}, Fallback: probe}
+	got := catalog.Build(t.Context(), ids, inputs)
 	t.Run("windows", func(t *testing.T) {
-		var windows []int
-		for _, m := range got.Models {
-			windows = append(windows, m.ContextWindow)
+		want := map[string]int{
+			"claude-gpt-6-sol[1m]": 272000, "claude-kimi-k3": 200000, "claude-glm-5.3": 200000,
+			"claude-opencode-go/kimi-k2.6": 200000, "claude-cursor-agent": 200000, "claude-grok-composer-2.5-fast": 200000,
+			"claude-muse-spark-1.3[1m]": 1000000, "claude-gemini-4-argon[1m]": 1000000, "claude-vertex/anthropic/claude-opus-5-5[1m]": 1000000,
+			"claude-vertex/anthropic/claude-sonnet-5-5[1m]": 1000000, "claude-vertex/mistralai/codestral-2": 200000, "claude-vertex/endpoint/my-llm": 200000,
 		}
-		want := []int{272000, 200000, 200000, 200000, 200000, 200000, 1000000, 1000000, 1000000, 1000000, 200000, 200000}
-		if diff := gocmp.Diff(want, windows); diff != "" {
-			t.Error(diff)
+		check := func(rows []catalog.Model) {
+			t.Helper()
+			windows := make(map[string]int, len(rows))
+			for _, row := range rows {
+				if _, duplicate := windows[row.ID]; duplicate {
+					t.Errorf("duplicate model ID %q", row.ID)
+				}
+				windows[row.ID] = row.ContextWindow
+			}
+			if diff := gocmp.Diff(want, windows); diff != "" {
+				t.Errorf("windows by model ID (-want +got):\n%s", diff)
+			}
 		}
+		check(got.Models)
+		capped := inputs
+		capped.Fallback = new(observations)
+		capped.Policy = func(id string) catalog.Policy {
+			p := modelPolicy(id)
+			switch p.Provider {
+			case "codex":
+				p.Window, p.WindowNote, p.ClientID = 200000, strings.Replace(billingNote, "187000", "115000", 1), strings.TrimSuffix(p.ClientID, "[1m]")
+			case "grok":
+				p.Window, p.WindowNote = 190000, "compacts past 105000"
+			}
+			return p
+		}
+		delete(want, "claude-gpt-6-sol[1m]")
+		want["claude-gpt-6-sol"], want["claude-grok-composer-2.5-fast"] = 200000, 190000
+		check(catalog.Build(t.Context(), ids, capped).Models)
 	})
 	t.Run("codex_note", func(t *testing.T) {
 		if len(got.Models) == 0 {
@@ -197,6 +237,12 @@ func TestProxyCatalog(t *testing.T) {
 		}
 	})
 	t.Run("readiness", func(t *testing.T) {
+		if diff := gocmp.Diff([]string{"grok"}, probe.probes); diff != "" {
+			t.Errorf("provider probes (-want +got):\n%s", diff)
+		}
+		if diff := gocmp.Diff(catalog.Readiness{State: "auth-missing", Message: "not signed in"}, got.Providers["grok"]); diff != "" {
+			t.Errorf("independent Grok readiness (-want +got):\n%s", diff)
+		}
 		for _, p := range []string{"kimi", "opencode", "cursor", "muse", "vertex", "codex"} {
 			r, ok := got.Providers[p]
 			if !ok {
@@ -230,7 +276,76 @@ func TestSlugCollisions(t *testing.T) {
 	}
 }
 
+func TestSharedReadinessPrecedence(t *testing.T) {
+	tests := map[string]struct {
+		checks catalog.Checks
+		want   string
+	}{
+		"error: binary before proxy":   {catalog.Checks{}, "binary-missing"},
+		"error: proxy before shim":     {catalog.Checks{ProxyBinary: true}, "proxy-down"},
+		"error: shim before version":   {catalog.Checks{ProxyBinary: true, ProxyModels: true}, "shim-down"},
+		"error: stale serving version": {catalog.Checks{ProxyBinary: true, ProxyModels: true, ShimRunning: true}, "serving-version-mismatch"},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			probe := new(observations)
+			got := catalog.Build(t.Context(), []string{"claude-kimi-k3", "claude-grok-4.5", "claude-grok-build"}, catalog.Inputs{Policy: modelPolicy, SharedChecks: &tc.checks, Fallback: probe})
+			want := map[string]catalog.Readiness{"kimi": {State: tc.want, Message: tc.want}, "grok": {State: "auth-missing", Message: "not signed in"}}
+			if diff := gocmp.Diff(want, got.Providers); diff != "" {
+				t.Error(diff)
+			}
+			if diff := gocmp.Diff([]string{"grok"}, probe.probes); diff != "" {
+				t.Errorf("provider probes (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestCatalogMembershipWithoutProxyPolicy(t *testing.T) {
+	tests := map[string]struct {
+		id     string
+		policy catalog.Policy
+		want   string
+	}{
+		"success: unresolved legacy Codex":           {"claude-codex-gpt-5.6-sol", catalog.Policy{}, `[{"slug":"codex-gpt-5-6-sol","id":"claude-codex-gpt-5.6-sol","label":"GPT-5.6 Sol","provider":"codex"}]`},
+		"success: Grok prefix despite native policy": {"claude-grok-build", catalog.Policy{BackendID: "grok-build", Provider: "anthropic", Transport: "anthropic", ClientID: "claude-grok-build"}, `[{"slug":"grok-build","id":"claude-grok-build","label":"Grok build","provider":"grok"}]`},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			got := catalog.Build(t.Context(), []string{tc.id}, catalog.Inputs{Policy: func(string) catalog.Policy { return tc.policy }})
+			checkJSON(t, tc.want, got.Models)
+		})
+	}
+}
+
+func TestProviderPublicationOrder(t *testing.T) {
+	// Native and dispatch rows are ignored; the repeated Grok row must not move its provider.
+	ids := []string{"claude-codex-auto", "claude-opus-5-5", "claude-muse-spark-1.3[1m]", "claude-grok-4.5", "claude-cursor-agent", "claude-grok-build", "claude-gpt-5.6-sol"}
+	got := catalog.Build(t.Context(), ids, catalog.Inputs{Policy: modelPolicy})
+	data, err := jsonx.EncodeState(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document struct {
+		Providers jsontext.Value `json:"providers"`
+	}
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	providers, err := jsonx.DecodeWire(document.Providers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, member := range providers.Members {
+		names = append(names, string(utf16.Decode(member.Name)))
+	}
+	if diff := gocmp.Diff([]string{"muse", "grok", "cursor", "codex"}, names); diff != "" {
+		t.Errorf("published provider keys (-want +got):\n%s", diff)
+	}
+}
+
 func TestEmptyCatalog(t *testing.T) {
-	got := catalog.Build(t.Context(), nil, catalog.Inputs{Policy: modelPolicy, Version: "custom-build", UpdatedAt: time.UnixMilli(1234)})
-	checkJSON(t, `{"schemaVersion":4,"source":"model-gateway","updatedAt":"1970-01-01T00:00:01.234Z","writtenBy":"custom-build","providers":{},"codexReadiness":null,"models":[]}`, got)
+	got := catalog.Build(t.Context(), nil, catalog.Inputs{Policy: modelPolicy, Version: "custom-build", UpdatedAt: time.Unix(1, 999999)})
+	checkJSON(t, `{"schemaVersion":4,"source":"model-gateway","updatedAt":"1970-01-01T00:00:01.000Z","writtenBy":"custom-build","providers":{},"codexReadiness":null,"models":[]}`, got)
 }

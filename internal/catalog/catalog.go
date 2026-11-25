@@ -21,7 +21,8 @@ import (
 )
 
 // Policy describes how the gateway serves and advertises an input model ID.
-// A zero window means no window is advertised.
+// A zero window means no window is advertised. An unresolved policy is the zero
+// value: an eligible legacy ID keeps its original client spelling.
 type Policy struct {
 	BackendID, Provider, Transport, ClientID string
 	Window                                   int
@@ -72,10 +73,12 @@ type Model struct {
 
 // Catalog is the provider-generic document read by Sidequest.
 type Catalog struct {
-	SchemaVersion  int                  `json:"schemaVersion"`
-	Source         string               `json:"source"`
-	UpdatedAt      string               `json:"updatedAt"`
-	WrittenBy      string               `json:"writtenBy"`
+	SchemaVersion int    `json:"schemaVersion"`
+	Source        string `json:"source"`
+	UpdatedAt     string `json:"updatedAt"`
+	// WrittenBy is the port's non-empty writer version, never JSON null.
+	WrittenBy string `json:"writtenBy"`
+	// Providers is published in order of each provider's first retained row in Models.
 	Providers      map[string]Readiness `json:"providers"`
 	CodexReadiness *Readiness           `json:"codexReadiness"`
 	Models         []Model              `json:"models"`
