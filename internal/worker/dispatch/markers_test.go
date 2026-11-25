@@ -51,13 +51,19 @@ func TestFromMessages(t *testing.T) {
 		want     *dispatch.Route
 		count    int
 	}{
+		"error: messages not an array":       {briefing, nil, 0},
+		"error: content not string or array": {`[{"role":"user","content":{"type":"text","text":"[sidequest-route model=x]"}}]`, nil, 0},
+		"error: text not a string":           {`[{"role":"user","content":[{"type":"text","text":["[sidequest-route model=x]"]}]}]`, nil, 0},
+		"success: last content member wins":  {`[{"role":"user","content":"[sidequest-route model=first]","content":"[sidequest-route model=last]"}]`, &dispatch.Route{Model: "last"}, 1},
+		"error: three markers in one text":   {`[{"role":"user","content":"[sidequest-route model=x][sidequest-route model=y][sidequest-route model=z]"}]`, nil, 3},
+		"error: three markers across blocks": {`[{"role":"user","content":[{"type":"text","text":"[sidequest-route model=x][sidequest-route model=y]"},{"type":"text","text":"[sidequest-route model=z]"}]}]`, nil, 3},
 		"success: no ticket":                 {`[{"role":"user","content":"[sidequest-route model=gpt-5.6-terra effort=high] work the ticket"}]`, &dispatch.Route{Model: "gpt-5.6-terra", Effort: new("high")}, 1},
 		"success: with ticket":               {`[{"role":"user","content":"[sidequest-route model=gpt-5.6-terra effort=high ticket=SQ-1234] work the ticket"}]`, &dispatch.Route{Model: "gpt-5.6-terra", Effort: new("high"), Ticket: new("SQ-1234")}, 1},
 		"success: text block":                {`[{"role":"user","content":[{"type":"text","text":"[sidequest-route model=gpt-5.6-sol]"}]}]`, &dispatch.Route{Model: "gpt-5.6-sol"}, 1},
 		"success: ignore later tool result":  {`[` + briefing + `,{"role":"assistant","content":[{"type":"text","text":"reading the diff"}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"echoed [sidequest-route model=codex-gpt-5-6-terra] fixture"}]}]`, terra, 1},
 		"success: ignore nested tool result": {`[` + briefing + `,{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":[{"type":"text","text":"[sidequest-route model=codex-gpt-5-6-luna]"}]}]}]`, terra, 1},
 		"error: assistant only":              {`[{"role":"assistant","content":[{"type":"text","text":"[sidequest-route model=gpt-5.6-sol]"}]},{"role":"assistant","content":"[sidequest-route model=gpt-5.6-luna]"}]`, nil, 0},
-		"error: only echoes":                 {`[{"role":"user","content":[{"type":"tool_result","content":"[sidequest-route model=codex-gpt-5-6-terra]"}]},{"role":"assistant","content":"[sidequest-route model=gpt-5.6-sol]"}]`, nil, 0},
+		"error: only echoes":                 {`[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t3","content":"[sidequest-route model=codex-gpt-5-6-terra]"}]},{"role":"assistant","content":"[sidequest-route model=gpt-5.6-sol]"}]`, nil, 0},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) { checkMarkers(t, tt.messages, tt.want, tt.count) })

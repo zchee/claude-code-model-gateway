@@ -30,17 +30,24 @@ type Route struct {
 // FromMessages returns the sole user-authored route, or nil, and the number of qualifying markers.
 func FromMessages(messages jsontext.Value) (*Route, int) { return nil, 0 }
 
+// CachedRoute preserves the difference between an omitted effort and a null effort.
+// A route from a marker has EffortMissing false, even when its Effort is nil.
+type CachedRoute struct {
+	Route
+	EffortMissing bool
+}
+
 // Cache remembers session routes in least-recently-used order.
 type Cache struct{}
 
-// NewCache loads a cache using the supplied clock, idle lifetime and session limit.
+// NewCache loads a cache using the supplied clock, idle lifetime in milliseconds and session limit.
 // An empty path disables persistence.
-func NewCache(path string, ttl time.Duration, maxSessions int, now func() time.Time) *Cache {
+func NewCache(path string, ttlMillis float64, maxSessions int, now func() time.Time) *Cache {
 	return &Cache{}
 }
 
 // Set remembers a valid route for a nonempty identity; disk writes are best effort.
-func (c *Cache) Set(key string, route Route) {}
+func (c *Cache) Set(key string, route CachedRoute) {}
 
 // Get returns and refreshes a live route, or returns nil for a missing or expired route.
-func (c *Cache) Get(key string) *Route { return nil }
+func (c *Cache) Get(key string) *CachedRoute { return nil }
