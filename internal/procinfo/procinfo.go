@@ -18,7 +18,10 @@ package procinfo
 import (
 	"context"
 	"errors"
+	"runtime"
 	"time"
+
+	"github.com/google/renameio/v2/maybe"
 )
 
 var errNotImplemented = errors.New("procinfo: not implemented")
@@ -112,7 +115,15 @@ type Record struct {
 }
 
 // WriteRecord atomically publishes name.pid.json before updating its decimal mirror.
-func WriteRecord(root, name string, record Record) error { return writeRecord(root, name, record, nil) }
+func WriteRecord(root, name string, record Record) error {
+	return writeRecord(root, name, record, func(path string, data []byte) error {
+		// The Windows fallback writes in place, which is not a safe publication.
+		if runtime.GOOS == "windows" {
+			return errors.ErrUnsupported
+		}
+		return maybe.WriteFile(path, data, 0o600)
+	})
+}
 
 func writeRecord(root, name string, record Record, replace func(string, []byte) error) error {
 	return errNotImplemented

@@ -18,7 +18,9 @@ package procinfo
 
 import (
 	"context"
+	rand "math/rand/v2"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -58,9 +60,15 @@ func TestLinuxListenerWithoutLsof(t *testing.T) {
 		return sockErr
 	}}
 	p := Probe{}
-	first := listenerOn(t, lc, "127.0.0.1", 0)
+	host := netip.AddrFrom4([4]byte{127, byte(1 + rand.IntN(254)), byte(rand.Uint32()), byte(1 + rand.IntN(254))}).String()
+	// A plain bind cannot join another process's existing reuse-port group.
+	reservation := listenerOn(t, net.ListenConfig{}, host, 0)
+	port := uint16(reservation.Addr().(*net.TCPAddr).Port)
+	if err := reservation.Close(); err != nil {
+		t.Fatal(err)
+	}
+	first := listenerOn(t, lc, host, int(port))
 	t.Cleanup(func() { _ = first.Close() })
-	port := uint16(first.Addr().(*net.TCPAddr).Port)
 	t.Run("identifiable", func(t *testing.T) {
 		if got, want := p.Listener(t.Context(), port), (Listener{ListenerIdentified, os.Getpid()}); got != want {
 			t.Errorf("listener without lsof = %+v, want %+v", got, want)
@@ -86,7 +94,7 @@ func TestLinuxListenerWithoutLsof(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			// Two sockets have exactly the same local and remote endpoints, but distinct inodes.
-			second := listenerOn(t, lc, "127.0.0.1", int(port))
+			second := listenerOn(t, lc, host, int(port))
 			t.Cleanup(func() { _ = second.Close() })
 			fd, err := second.File()
 			if err != nil {

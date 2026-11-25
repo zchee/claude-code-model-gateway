@@ -121,7 +121,8 @@ func TestNativeIdentity(t *testing.T) {
 func TestNativeTable(t *testing.T) {
 	pid := startChild(t, "/bin/cat")
 	parent := os.Getppid()
-	table, err := (Probe{}).Table(t.Context())
+	probe := Probe{}
+	table, err := probe.Table(t.Context())
 	if err != nil {
 		t.Fatalf("enumerate native processes: %v", err)
 	}
@@ -131,6 +132,13 @@ func TestNativeTable(t *testing.T) {
 	row, ok := table[pid]
 	if !ok || row.PID != pid || row.ParentPID != os.Getpid() || row.Birth.IsZero() || !slices.Equal(row.Argv, []string{"/bin/cat", "-"}) {
 		t.Errorf("own child pid %d missing or incomplete in the same snapshot: %+v", pid, row)
+	}
+	id, err := probe.Identity(t.Context(), pid)
+	if err != nil {
+		t.Fatalf("inspect table child %d: %v", pid, err)
+	}
+	if id.PID != pid || !row.Birth.Equal(id.Birth) {
+		t.Errorf("table birth for pid %d = %v, identity for pid %d reports %v", pid, row.Birth, id.PID, id.Birth)
 	}
 }
 
@@ -151,7 +159,7 @@ func TestNativeBirthInLocalZone(t *testing.T) {
 	if _, offset := time.Now().Zone(); offset != 9*3600 {
 		t.Fatalf("child has local offset %d, want Tokyo", offset)
 	}
-	pid := os.Getpid()
+	pid := os.Getppid()
 	cmd := exec.CommandContext(t.Context(), "ps", "-p", strconv.Itoa(pid), "-o", "lstart=")
 	out, err := cmd.Output()
 	if err != nil {
@@ -161,6 +169,11 @@ func TestNativeBirthInLocalZone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("native ps birth %q: %v", out, err)
 	}
+	// ps reports whole seconds. A timestamp manufactured at inspection must not match it.
+	if want.After(time.Now()) {
+		t.Fatalf("ps reported a future parent birth: %s", want)
+	}
+	time.Sleep(time.Until(want.Add(time.Second)))
 	id, err := (Probe{}).Identity(t.Context(), pid)
 	if err != nil {
 		t.Fatalf("native birth in %s: %v", zone, err)

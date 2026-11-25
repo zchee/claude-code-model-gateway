@@ -147,6 +147,41 @@ func TestRecordPublicationOrder(t *testing.T) {
 	}
 }
 
+func TestFailedJSONPreservesMirror(t *testing.T) {
+	root := t.TempDir()
+	record, _ := recordFixture(root)
+	mirror := filepath.Join(root, "guardian.pid")
+	putFile(t, mirror, "701")
+	jsonPath := filepath.Join(root, "guardian.pid.json")
+	if err := os.Mkdir(jsonPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteRecord(root, "guardian", record); err == nil {
+		t.Error("JSON publication over a directory succeeded")
+	}
+	if got := readFile(t, mirror); got != "701" {
+		t.Errorf("failed JSON publication changed the writable mirror to %q, want original bytes 701", got)
+	}
+
+	// Removing only the JSON obstruction should allow the same public writer to publish both files.
+	if err := os.Remove(jsonPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteRecord(root, "guardian", record); err != nil {
+		t.Fatalf("retry after removing JSON obstruction: %v", err)
+	}
+	if got := strings.TrimSpace(readFile(t, mirror)); got != "702" {
+		t.Errorf("mirror after retry = %q, want 702", got)
+	}
+	var published Record
+	if err := json.Unmarshal([]byte(readFile(t, jsonPath)), &published); err != nil {
+		t.Fatal(err)
+	}
+	if diff := gocmp.Diff(record, published); diff != "" {
+		t.Errorf("JSON after retry (-want +got): %s", diff)
+	}
+}
+
 func TestPublicationBoundaries(t *testing.T) {
 	const jsonName, pidName = "guardian.pid.json", "guardian.pid"
 	tests := map[string]struct {
