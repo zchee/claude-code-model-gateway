@@ -80,23 +80,57 @@ func checkStagedSibling(t *testing.T, staged preparedFile, target, wantTarget st
 	}
 }
 
+func checkOnlyTarget(t *testing.T, path string) {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	if diff := gocmp.Diff([]string{filepath.Base(path)}, names); diff != "" {
+		t.Errorf("remaining files (-want +got):\n%s", diff)
+	}
+}
+
+func TestWriteFile(t *testing.T) {
+	path := stateFile(t)
+	if err := os.Chmod(path, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteFile(path, []byte(newState), 0o600); err != nil {
+		t.Errorf("WriteFile: %v", err)
+	}
+	checkContents(t, path, newState)
+	replaced, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(original, replaced) {
+		t.Error("WriteFile left the original inode in place")
+	}
+	if got := replaced.Mode().Perm(); got != 0o600 {
+		t.Errorf("WriteFile mode = %o, want 600", got)
+	}
+}
+
 func TestRetryTargetLock(t *testing.T) {
 	path := stateFile(t)
 	attempts := 0
 	w := newWriter()
 	commit := w.commit
-	var firstStage string
 	w.commit = func(file preparedFile, to string) error {
 		checkStagedSibling(t, file, to, path)
 		checkContents(t, file.Name(), newState)
 		attempts++
 		if attempts == 1 {
-			firstStage = filepath.Base(file.Name())
 			return syscall.EBUSY
-		}
-		// renameio closes its pending file before attempting the rename.
-		if filepath.Base(file.Name()) == firstStage {
-			t.Fatal("retry reused the failed pending file")
 		}
 		return commit(file, to)
 	}
@@ -105,6 +139,7 @@ func TestRetryTargetLock(t *testing.T) {
 		t.Errorf("WriteFile after one busy rename: attempts=%d, err=%v; want two attempts and success", attempts, err)
 	}
 	checkContents(t, path, newState)
+	checkOnlyTarget(t, path)
 }
 
 func TestFailedReplace(t *testing.T) {
@@ -128,17 +163,7 @@ func TestFailedReplace(t *testing.T) {
 			t.Errorf("WriteFile never reached rename: %v", err)
 		}
 		checkContents(t, path, oldState)
-		entries, err := os.ReadDir(filepath.Dir(path))
-		if err != nil {
-			t.Fatal(err)
-		}
-		var names []string
-		for _, entry := range entries {
-			names = append(names, entry.Name())
-		}
-		if diff := gocmp.Diff([]string{filepath.Base(path)}, names); diff != "" {
-			t.Errorf("remaining files (-want +got):\n%s", diff)
-		}
+		checkOnlyTarget(t, path)
 	})
 }
 

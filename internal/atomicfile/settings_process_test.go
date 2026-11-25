@@ -34,9 +34,13 @@ func TestSettingsReplacement(t *testing.T) {
 	const crashArg = "--crash-before-settings-rename"
 	const fifoArg = "--replace-settings-fifo"
 	const crashStatus = 42
+	const fifoTimeoutStatus = 43
 	newContents := func([]byte) ([]byte, error) { return []byte(newState), nil }
 	switch os.Args[len(os.Args)-1] {
 	case fifoArg:
+		// Only the FIFO operation is on this deadline; TestMain has finished its venue checks.
+		deadline := time.AfterFunc(5*time.Second, func() { os.Exit(fifoTimeoutStatus) })
+		defer deadline.Stop()
 		if err := ReplaceSettings("settings.fifo", func([]byte) ([]byte, error) {
 			t.Fatal("edit callback received a FIFO")
 			return nil, nil
@@ -89,8 +93,16 @@ func TestSettingsReplacement(t *testing.T) {
 		if err := os.Symlink(filepath.Base(path), link); err != nil {
 			t.Fatal(err)
 		}
-		if err := ReplaceSettings(link, newContents); err != nil {
-			t.Fatal(err)
+		edits := 0
+		err = ReplaceSettings(link, func(current []byte) ([]byte, error) {
+			edits++
+			if edits == 1 {
+				writeFixture(t, path, "{\"old\":true,\"user\":7}\n")
+			}
+			return bytes.Replace(current, []byte(`"old"`), []byte(`"new"`), 1), nil
+		})
+		if err != nil || edits != 2 {
+			t.Errorf("ReplaceSettings through symlink: edits=%d err=%v, want successful merge on retry", edits, err)
 		}
 		dest, err := os.Readlink(link)
 		if err != nil || dest != filepath.Base(path) {
@@ -103,7 +115,7 @@ func TestSettingsReplacement(t *testing.T) {
 		if os.SameFile(original, replaced) || replaced.Mode().Perm() != 0o640 {
 			t.Errorf("want replacement inode with mode 0640; same inode=%t mode=%v", os.SameFile(original, replaced), replaced.Mode())
 		}
-		checkContents(t, path, newState)
+		checkContents(t, path, "{\"new\":true,\"user\":7}\n")
 	})
 
 	t.Run("ConcurrentEdit", func(t *testing.T) {
@@ -171,12 +183,15 @@ func TestSettingsReplacement(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 		defer cancel()
 		cmd := exec.CommandContext(ctx, exe, "-test.run=^TestSettingsReplacement$", "--", fifoArg)
 		cmd.Dir = filepath.Dir(path)
 		if output, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("FIFO writer failed to refuse before opening: %v (context: %v): %s", err, ctx.Err(), output)
+			if exit, ok := errors.AsType[*exec.ExitError](err); ok && exit.ExitCode() == fifoTimeoutStatus {
+				t.Fatal("ReplaceSettings blocked on FIFO after the venue guard passed")
+			}
+			t.Fatalf("FIFO helper: %v (context: %v): %s", err, ctx.Err(), output)
 		}
 		info, err := os.Lstat(path)
 		if err != nil || info.Mode()&os.ModeNamedPipe == 0 || !os.SameFile(original, info) {
