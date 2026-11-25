@@ -71,6 +71,49 @@ func TestAppendFileLongName(t *testing.T) {
 	checkContents(t, path, oldState)
 }
 
+func TestAppendFileOpenRetry(t *testing.T) {
+	tests := map[string]struct {
+		failures      []error
+		opens, writes int
+		wantErr       error
+	}{
+		"success: transient missing entry":  {[]error{unix.ENOENT}, 2, 1, nil},
+		"error: persistently missing entry": {[]error{unix.ENOENT, unix.ENOENT}, 2, 0, unix.ENOENT},
+		"error: permission denied":          {[]error{unix.EACCES}, 1, 0, unix.EACCES},
+		"error: different error on retry":   {[]error{unix.ENOENT, unix.EACCES}, 2, 0, unix.EACCES},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			d := openTestDir(t, dir)
+			opens, writes := 0, 0
+			open := func(name string, flags int, mode fs.FileMode) (*os.File, error) {
+				opens++
+				if opens > tt.opens || name != "journal" || flags&unix.O_CREAT == 0 || mode != 0o600 {
+					t.Fatalf("unexpected open %d: %q, flags=%#x, mode=%o", opens, name, flags, mode)
+				}
+				if opens <= len(tt.failures) {
+					return nil, &os.PathError{Op: "open", Path: name, Err: tt.failures[opens-1]}
+				}
+				return d.root.OpenFile(name, flags, mode)
+			}
+			err := d.root.openAndAppend("journal", []byte(newState), 0o600, open, func(fd int, data []byte) (int, error) {
+				writes++
+				return unix.Write(fd, data)
+			})
+			if opens != tt.opens || writes != tt.writes || !errors.Is(err, tt.wantErr) {
+				t.Fatalf("got (%d opens, %d writes, %v), want (%d, %d, %v)", opens, writes, err, tt.opens, tt.writes, tt.wantErr)
+			}
+			path := filepath.Join(dir, "journal")
+			if tt.wantErr == nil {
+				checkContents(t, path, newState)
+			} else if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("expected no journal after open failure: %v", err)
+			}
+		})
+	}
+}
+
 func TestAppendFileWriteCalls(t *testing.T) {
 	const record = "data"
 	tests := map[string]struct {
@@ -89,7 +132,7 @@ func TestAppendFileWriteCalls(t *testing.T) {
 			dir := t.TempDir()
 			d := openTestDir(t, dir)
 			calls := 0
-			err := d.root.openAndAppend("journal", []byte(record), 0o600, func(fd int, data []byte) (int, error) {
+			err := d.root.openAndAppend("journal", []byte(record), 0o600, d.root.OpenFile, func(fd int, data []byte) (int, error) {
 				calls++
 				if calls > tt.calls || string(data) != record {
 					t.Fatalf("unexpected write call %d: %q", calls, data)

@@ -242,7 +242,7 @@ func testAppendOpenedLeaf(t *testing.T) {
 		if err := os.Symlink(target, link); err != nil {
 			t.Fatal(err)
 		}
-		if err := d.root.openAndAppend(link, []byte(newState), 0o600, unix.Write); err == nil {
+		if err := d.root.openAndAppend(link, []byte(newState), 0o600, d.root.OpenFile, unix.Write); err == nil {
 			t.Fatalf("opened symlink %q", link)
 		} else if _, ok := errors.AsType[*NonRegularError](err); !ok {
 			t.Fatal(err)
@@ -254,7 +254,7 @@ func testAppendOpenedLeaf(t *testing.T) {
 	}
 	refuseFIFO := func() {
 		t.Helper()
-		err := d.root.openAndAppend("fifo", []byte(newState), 0o600, unix.Write)
+		err := d.root.openAndAppend("fifo", []byte(newState), 0o600, d.root.OpenFile, unix.Write)
 		if _, ok := errors.AsType[*NonRegularError](err); !ok {
 			t.Fatalf("FIFO: want NonRegularError, got %v", err)
 		}

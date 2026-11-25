@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"os"
 	"path/filepath"
 
 	"golang.org/x/sys/unix"
@@ -64,13 +65,19 @@ func (d *directory) appendFile(name string, data []byte, mode fs.FileMode) error
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
-	return d.openAndAppend(name, data, mode, unix.Write)
+	return d.openAndAppend(name, data, mode, d.OpenFile, unix.Write)
 }
 
 // openAndAppend requires an append-valid basename and a preliminary type check.
 // Production callers must use appendFile rather than calling this step directly.
-func (d *directory) openAndAppend(name string, data []byte, mode fs.FileMode, write func(int, []byte) (int, error)) (err error) {
-	f, err := d.OpenFile(name, unix.O_APPEND|unix.O_WRONLY|unix.O_CREAT|unix.O_NONBLOCK|unix.O_NOCTTY, mode)
+func (d *directory) openAndAppend(name string, data []byte, mode fs.FileMode, open func(string, int, fs.FileMode) (*os.File, error), write func(int, []byte) (int, error)) (err error) {
+	const flags = unix.O_APPEND | unix.O_WRONLY | unix.O_CREAT | unix.O_NONBLOCK | unix.O_NOCTTY
+	f, err := open(name, flags, mode)
+	if errors.Is(err, unix.ENOENT) {
+		// A concurrent first append on macOS can report ENOENT despite O_CREAT.
+		// Retry once on the same directory; a removed directory stays missing.
+		f, err = open(name, flags, mode)
+	}
 	if errors.Is(err, unix.ELOOP) || errors.Is(err, unix.EISDIR) || errors.Is(err, unix.ENXIO) {
 		return &NonRegularError{d.path(name)}
 	}
