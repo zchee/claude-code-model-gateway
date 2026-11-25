@@ -22,9 +22,11 @@ func LlamaWindow(body []byte) int64 { return 0 }
 
 // Model describes a downloaded LM Studio model. A zero window means no context was measured.
 type Model struct {
+	Key           string
 	Loaded        bool
 	ContextWindow int64
 }
 
-// StudioModels parses the LM Studio model list, returning an error when the response has no list.
-func StudioModels(body []byte) (map[string]Model, error) { return nil, errors.New("not implemented") }
+// StudioModels returns models in catalog order, or an error when the response has no list.
+// A repeated key updates the model at its first position.
+func StudioModels(body []byte) ([]Model, error) { return nil, errors.New("not implemented") }

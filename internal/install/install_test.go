@@ -185,9 +185,10 @@ func TestCacheIdentity(t *testing.T) {
 		dirs   []string
 		known  bool
 	}{
-		"success: configured cache":  {cache, []string{cache, legacy}, true},
-		"success: config plugins":    {legacy, []string{legacy}, true},
-		"error: unrelated directory": {filepath.Join(root, "unrelated"), []string{cache, legacy}, false},
+		"success: configured cache":                  {cache, []string{cache, legacy}, true},
+		"success: config plugins":                    {legacy, []string{legacy}, true},
+		"success: legacy home after cache migration": {filepath.Join(root, "home", ".claude", "Plugins"), []string{cache}, true},
+		"error: unrelated directory":                 {filepath.Join(root, "unrelated"), []string{cache, legacy}, false},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -201,6 +202,13 @@ func TestCacheIdentity(t *testing.T) {
 				t.Errorf("known identity (-want +got):\n%s", diff)
 			}
 			if tt.known {
+				other := filepath.Join(tt.parent, "cache", "another-marketplace", "model-gateway", "0.51.2")
+				if err := os.MkdirAll(other, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if otherID := install.CacheIdentity(other, tt.dirs); otherID == "" || otherID == id {
+					t.Errorf("different marketplaces must have distinct nonempty identities, got %q and %q", id, otherID)
+				}
 				if diff := gocmp.Diff(id, install.CacheIdentity(filepath.Join(plugin, "0.52.0"), tt.dirs)); diff != "" {
 					t.Errorf("sibling identity (-want +got):\n%s", diff)
 				}
@@ -212,23 +220,51 @@ func TestCacheIdentity(t *testing.T) {
 	}
 }
 
-func TestCompareEntries(t *testing.T) {
+func registryEntry(version string, updated any) map[string]any {
+	return map[string]any{"version": version, "lastUpdated": updated}
+}
+
+func TestRegistryRootCollation(t *testing.T) {
+	// Swedish sorts ä after z; registry updates use root order regardless of the host locale.
+	t.Setenv("LC_ALL", "sv_SE.UTF-8")
+	t.Setenv("LANG", "sv_SE.UTF-8")
 	tests := map[string]struct {
-		leftVersion, rightVersion, leftUpdated, rightUpdated string
-		want                                                 int
+		left, right string
+		want        int
 	}{
-		"success: numeric before timestamp":                         {"1.10", "1.9.9", "a", "z", -1},
-		"success: later numeric part":                               {"1-2-0", "1.2.1", "z", "a", 1},
-		"success: missing parts are zero":                           {"1.2", "1.2.0", "same", "same", 0},
-		"success: punctuation before digits in ascending collation": {"1.02", "1.2.0", "a_b", "a1b", 1},
-		"success: letters compare before case":                      {"1", "1", "a", "B", 1},
-		"success: update text breaks numeric tie":                   {"1.0", "1", "2025-11", "2025-09", -1},
+		"success: root order rather than Swedish":     {"ä", "z", 1},
+		"success: punctuation rather than byte order": {"a1b", "a_b", -1},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			left := map[string]any{"version": tt.leftVersion, "lastUpdated": tt.leftUpdated}
-			right := map[string]any{"version": tt.rightVersion, "lastUpdated": tt.rightUpdated}
-			if diff := gocmp.Diff(tt.want, cmp.Compare(install.CompareEntries(left, right), 0)); diff != "" {
+			got := install.CompareEntries(registryEntry("1", tt.left), registryEntry("1", tt.right))
+			if diff := gocmp.Diff(tt.want, cmp.Compare(got, 0)); diff != "" {
+				t.Errorf("descending update order (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestCompareEntries(t *testing.T) {
+	missing := map[string]any{"version": "1"}
+	tests := map[string]struct {
+		left, right map[string]any
+		want        int
+	}{
+		"success: numeric before timestamp":                         {registryEntry("1.10", "a"), registryEntry("1.9.9", "z"), -1},
+		"success: later numeric part":                               {registryEntry("1-2-0", "z"), registryEntry("1.2.1", "a"), 1},
+		"success: missing parts are zero":                           {registryEntry("1.2", "same"), registryEntry("1.2.0", "same"), 0},
+		"success: extra trailing component":                         {registryEntry("1.2.0.4", "a"), registryEntry("1.2.0", "z"), -1},
+		"success: punctuation before digits in ascending collation": {registryEntry("1.02", "a_b"), registryEntry("1.2.0", "a1b"), 1},
+		"success: letters compare before case":                      {registryEntry("1", "a"), registryEntry("1", "B"), 1},
+		"success: update text breaks numeric tie":                   {registryEntry("1.0", "2025-11"), registryEntry("1", "2025-09"), -1},
+		"success: false and absent timestamps tie":                  {registryEntry("1", false), missing, 0},
+		"success: zero and absent timestamps tie":                   {registryEntry("1", float64(0)), missing, 0},
+		"success: null and absent timestamps tie":                   {registryEntry("1", nil), missing, 0},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			if diff := gocmp.Diff(tt.want, cmp.Compare(install.CompareEntries(tt.left, tt.right), 0)); diff != "" {
 				t.Errorf("comparison sign (-want +got):\n%s", diff)
 			}
 		})

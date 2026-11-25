@@ -57,7 +57,7 @@ func TestStudioModels(t *testing.T) {
 	const noList = "GET /api/v1/models returned no model list"
 	tests := map[string]struct {
 		body      string
-		want      map[string]localprov.Model
+		want      []localprov.Model
 		wantError string
 	}{
 		"success: loaded instances": {
@@ -67,14 +67,20 @@ func TestStudioModels(t *testing.T) {
 			{"type":"llm","key":"unknown","loaded_instances":[{"id":"copy","config":{"context_length":65536}},{"id":"unknown","config":{"context_length":0}}]},
 			{"type":"llm","key":"unloaded","max_context_length":131072},
 			{"type":"embedding","key":"embedding"},{"type":"llm","key":""},{"type":"llm","key":1},null]}`,
-			want: map[string]localprov.Model{"named": {Loaded: true, ContextWindow: 131072}, "renamed": {Loaded: true, ContextWindow: 16384}, "unknown": {Loaded: true}, "unloaded": {}},
+			want: []localprov.Model{{Key: "named", Loaded: true, ContextWindow: 131072}, {Key: "renamed", Loaded: true, ContextWindow: 16384}, {Key: "unknown", Loaded: true}, {Key: "unloaded"}},
 		},
-		"success: unsafe and nonnumeric windows": {body: `{"models":[{"type":"llm","key":"x","loaded_instances":[{"config":{"context_length":"5"}},{"config":{"context_length":1.5}},{"config":{"context_length":9007199254740992}}]}]}`, want: map[string]localprov.Model{"x": {Loaded: true}}},
-		"success: last duplicate key wins":       {body: `{"models":[{"type":"llm","key":"x","loaded_instances":[{"config":{"context_length":40960}}]},{"type":"llm","key":"x","loaded_instances":{}}]}`, want: map[string]localprov.Model{"x": {}}},
-		"success: empty catalog":                 {body: `{"models":[]}`, want: map[string]localprov.Model{}},
-		"error: missing list":                    {body: `{}`, wantError: noList},
-		"error: list is an object":               {body: `{"models":{}}`, wantError: noList},
-		"error: non-JSON response":               {body: `<html>`, wantError: noList},
+		"success: unsafe and nonnumeric windows": {body: `{"models":[{"type":"llm","key":"x","loaded_instances":[{"config":{"context_length":"5"}},{"config":{"context_length":1.5}},{"config":{"context_length":9007199254740992}}]}]}`, want: []localprov.Model{{Key: "x", Loaded: true}}},
+		"success: last duplicate key wins": {
+			body: `{"models":[
+			{"type":"llm","key":"zeta","loaded_instances":[{"config":{"context_length":40960}}]},
+			{"type":"llm","key":"alpha","loaded_instances":[{"config":{"context_length":16384}}]},
+			{"type":"llm","key":"zeta","loaded_instances":[{"config":{"context_length":8192}}]}]}`,
+			want: []localprov.Model{{Key: "zeta", Loaded: true, ContextWindow: 8192}, {Key: "alpha", Loaded: true, ContextWindow: 16384}},
+		},
+		"success: empty catalog":   {body: `{"models":[]}`, want: []localprov.Model{}},
+		"error: missing list":      {body: `{}`, wantError: noList},
+		"error: list is an object": {body: `{"models":{}}`, wantError: noList},
+		"error: non-JSON response": {body: `<html>`, wantError: noList},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {

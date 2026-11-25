@@ -62,6 +62,8 @@ func TestStudioSettings(t *testing.T) {
 		"success: trim origin":                            {env: map[string]string{baseURL: " http://127.0.0.1:9999 "}, want: valid("http://127.0.0.1:9999", "")},
 		"success: fully qualified localhost":              {env: map[string]string{baseURL: "http://LOCALHOST.:1234"}, want: valid("http://localhost.:1234", "")},
 		"success: loopback range":                         {env: map[string]string{baseURL: "http://127.8.9.10:1234/"}, want: valid("http://127.8.9.10:1234", "")},
+		"success: abbreviated loopback":                   {env: map[string]string{baseURL: "http://127.1:1234"}, file: fromFile, want: valid("http://127.0.0.1:1234", "from-file")},
+		"success: default HTTPS port":                     {env: map[string]string{baseURL: "https://EXAMPLE.org:443"}, want: valid("https://example.org", "")},
 		"success: remote HTTPS":                           {env: map[string]string{baseURL: "https://lmstudio.example:8443"}, want: valid("https://lmstudio.example:8443", "")},
 		"success: unknown enabled value":                  {env: map[string]string{enabled: "maybe"}, want: valid(defaultURL, "")},
 		"success: override disabled file":                 {map[string]string{enabled: " ON "}, off, valid(defaultURL, "")},

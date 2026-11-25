@@ -31,5 +31,7 @@ type StudioSettings struct {
 	Invalid *InvalidSetting
 }
 
-// ReadStudio resolves LM Studio settings from the environment and config.json in the given directory.
+// ReadStudio resolves LM Studio settings from the environment and config.json in configDir.
+// configDir must be a resolved absolute path. The caller resolves a relative directory override
+// against its injected working directory.
 func ReadStudio(env config.LookupEnv, configDir string) StudioSettings { return StudioSettings{} }
