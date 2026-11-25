@@ -204,6 +204,58 @@ func TestSourceInvocations(t *testing.T) {
 	}
 }
 
+func TestRoutingUnknownCliOption(t *testing.T) {
+	for command, flag := range map[string]string{
+		"setup": "--preserve-wiring", "login": "--device", "ensure": "--quiet", "catalog": "--refresh", "env": "--write-project",
+	} {
+		t.Run(command, func(t *testing.T) {
+			scan := func(t *testing.T, args []string) *commandScan {
+				t.Helper()
+				commands := sourceCommands()
+				var got *commandScan
+				var calls int
+				for i := range commands {
+					if commands[i].name == command {
+						commands[i].handle = func(call invocation) error {
+							calls++
+							got = call.scan
+							return nil
+						}
+						break
+					}
+				}
+				argv := slices.Concat([]string{"model-gateway", command}, args)
+				var stderr bytes.Buffer
+				if status := run(argv, strings.NewReader(""), io.Discard, &stderr, testEnv(nil).lookup, testHome, commands); status != 0 || calls != 1 || got == nil {
+					t.Fatalf("dispatch %q: got status %d, %d calls, scan %+v; want status 0, one call and a scan; stderr %q", argv, status, calls, got, stderr.String())
+				}
+				return got
+			}
+			tests := map[string]struct {
+				args    []string
+				control []string
+			}{
+				"success: unknown flag alone":      {args: []string{"--unknown"}},
+				"success: before known flag":       {args: []string{"--unknown", flag}, control: []string{flag}},
+				"success: after known flag":        {args: []string{flag, "--unknown"}, control: []string{flag}},
+				"success: unknown flag with value": {args: []string{"--unknown=value", flag}, control: []string{flag}},
+				"success: after double dash":       {args: []string{"--", "--unknown", flag}, control: []string{"--", flag}},
+			}
+			for name, tt := range tests {
+				t.Run(name, func(t *testing.T) {
+					want := scan(t, tt.control)
+					if wantKnown := slices.Contains(tt.control, flag); want.present[flag] != wantKnown {
+						t.Fatalf("control scan for %q: got %t, want %t", flag, want.present[flag], wantKnown)
+					}
+					if diff := gocmp.Diff(want, scan(t, tt.args), gocmp.AllowUnexported(commandScan{})); diff != "" {
+						t.Errorf("scan mismatch (-control +unknown flag):\n%s", diff)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestRunCompletions(t *testing.T) {
 	tests := map[string]struct {
 		args       []string
