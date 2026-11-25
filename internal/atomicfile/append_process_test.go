@@ -61,21 +61,12 @@ func TestGatewayFixtureHelper(t *testing.T) {
 
 func TestAppendFileIndependentWriters(t *testing.T) {
 	env := gatewaytest.NewEnv(t.TempDir(), nil, nil, nil)
-	pipe := func() (*os.File, *os.File) {
-		t.Helper()
-		r, w, err := os.Pipe()
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = r.Close(); _ = w.Close() })
-		return r, w
-	}
-	ready, output := pipe()
-	input, start := pipe()
-	const limit = 30 * time.Second
-	if err := ready.SetReadDeadline(time.Now().Add(limit)); err != nil {
+	input, start, err := os.Pipe()
+	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = input.Close(); _ = start.Close() })
+	const limit = 30 * time.Second
 	var dir string
 	commands := make(map[string]*exec.Cmd)
 	want := map[string]int{}
@@ -88,18 +79,38 @@ func TestAppendFileIndependentWriters(t *testing.T) {
 			dir = cmd.Dir
 		}
 		cmd.Dir, cmd.Stdin = dir, input
-		cmd.ExtraFiles = []*os.File{output}
 		commands[id] = cmd
 		for i := range processRecords {
 			want[fmt.Sprintf("%s:%d\n", id, i)]++
 		}
 	}
+	ready, output, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
 	var workers sync.WaitGroup
+	var barrierErr error
+	done := make(chan error, len(commands))
 	// Test cleanup cancels the helpers' t.Context before this join. Register it
 	// after preparing both commands so their fixture directories are removed last.
-	t.Cleanup(func() { _ = ready.Close(); workers.Wait() })
-	done := make(chan error, len(commands))
+	t.Cleanup(func() {
+		_ = ready.Close()
+		workers.Wait()
+		_ = output.Close()
+		close(done)
+		errs := []error{barrierErr}
+		for err := range done {
+			errs = append(errs, err)
+		}
+		if err := errors.Join(errs...); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := ready.SetReadDeadline(time.Now().Add(limit)); err != nil {
+		t.Fatal(err)
+	}
 	for id, cmd := range commands {
+		cmd.ExtraFiles = []*os.File{output}
 		workers.Go(func() {
 			var log strings.Builder
 			cmd.Stdout, cmd.Stderr = &log, &log
@@ -128,7 +139,8 @@ func TestAppendFileIndependentWriters(t *testing.T) {
 		t.Fatal("writer exited successfully before barrier release")
 	case err := <-barrier:
 		if err != nil {
-			t.Fatalf("writers did not reach the barrier: %v", err)
+			barrierErr = fmt.Errorf("writers did not reach the barrier: %w", err)
+			t.FailNow() // Cleanup reports the read error together with all worker failures.
 		}
 	}
 	if _, err := start.Write([]byte("++")); err != nil {
