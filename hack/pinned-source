@@ -34,24 +34,64 @@ fi
 root=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 cache=$root/.cache
 export_dir=$cache/model-gateway-js
+lock=$cache/model-gateway-js.lock
 [[ ! -L $cache ]] || fail "cache directory is a symlink: $cache"
 mkdir -p -- "$cache" || fail "cannot create cache directory: $cache"
 tmp=$(mktemp -d "$cache/pinned-source.XXXXXXXX") || fail 'cannot create staging directory'
-trap 'rm -rf -- "$tmp"' EXIT
+locked=0
+cleanup() {
+    if (( locked )); then
+        mv -- "$lock" "$tmp/released-lock" || printf 'pinned-source: cannot release cache lock: %s\n' "$lock" >&2
+    fi
+    rm -rf -- "$tmp"
+}
+trap cleanup EXIT
+
+# Defer signals until the owner marker and the cleanup flag have both been set.
+interrupted=0
+trap 'interrupted=1' HUP INT TERM
+host=$(hostname) || fail 'cannot determine lock hostname'
+for (( attempt = 0; attempt < 60; attempt++ )); do
+    (( ! interrupted )) || exit 1
+    if mkdir -- "$lock" 2>/dev/null; then
+        locked=1
+        printf '%s\n' "$host" > "$lock/owner.$$" || fail 'cannot record cache lock owner'
+        break
+    fi
+    [[ ! -L $lock ]] || fail "cache lock is a symlink: $lock"
+    [[ ! -e $lock || -d $lock ]] || fail "cannot acquire cache lock: $lock"
+    for owner in "$lock"/owner.*; do
+        [[ -f $owner && ! -L $owner ]] || continue
+        pid=${owner##*.}
+        case $pid in ''|*[!0-9]*|0) continue ;; esac
+        IFS= read -r owner_host 2>/dev/null < "$owner" || continue
+        [[ $owner_host == "$host" ]] || continue
+        if ! ps -p "$pid" -o pid= >/dev/null 2>&1; then
+            # Transfer the specific dead PID's marker, not the lock directory:
+            # concurrent waiters cannot move the same marker twice.
+            if mv -- "$owner" "$lock/owner.$$" 2>/dev/null; then
+                locked=1
+                break 2
+            fi
+        fi
+    done
+    sleep 1
+done
+(( locked )) || fail "timed out waiting for cache lock: $lock"
 trap 'exit 1' HUP INT TERM
+(( ! interrupted )) || exit 1
 
 git_dir=$tmp/source.git
 staging=$tmp/model-gateway-js
 
-# Isolate the temporary repository from the caller's Git configuration and objects.
-unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
-    GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_ATTR_SOURCE
-export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_ATTR_NOSYSTEM=1 \
-    GIT_NO_REPLACE_OBJECTS=1 GIT_TERMINAL_PROMPT=0
-
-git init --quiet --bare --template= --object-format=sha1 -- "$git_dir" || fail 'cannot initialize temporary repository'
+# Start Git without the caller's config, object paths, or pathspec settings.
+git_env() {
+    env -i PATH="$PATH" HOME="$tmp" TMPDIR="$tmp" LC_ALL=C \
+        GIT_CONFIG_NOSYSTEM=1 GIT_ATTR_NOSYSTEM=1 GIT_NO_REPLACE_OBJECTS=1 GIT_TERMINAL_PROMPT=0 "$@"
+}
+git_env git init --quiet --bare --template= --object-format=sha1 -- "$git_dir" || fail 'cannot initialize temporary repository'
 repo_git() {
-    git --git-dir="$git_dir" -c core.autocrlf=false -c core.filemode=true -c core.symlinks=true "$@"
+    git_env git --git-dir="$git_dir" -c core.autocrlf=false -c core.filemode=true -c core.symlinks=true "$@"
 }
 
 check_trees() {
@@ -73,17 +113,56 @@ mkdir -- "$git_dir/info"
 printf '%s\n' '* -text -crlf -ident -filter -working-tree-encoding' > "$git_dir/info/attributes"
 
 verify_export() (
-    local dir=$1
+    local dir=$1 path kind invalid=0 tree entry
+    cd -- "$dir" || return 2
+    # Git may skip both unreadable directories and entries it cannot index. Walk
+    # the whole directory and read every regular file before judging validity.
+    find -P . -print0 -type f -exec sh -c 'cat "$@" >/dev/null' sh {} + > "$tmp/paths" || return 2
+    while IFS= read -r -d '' path; do
+        case $path in
+            .) continue ;;
+            */.[gG][iI][tT]|*/.[gG][iI][tT]/*) invalid=1 ;;
+        esac
+        if [[ -L $path ]]; then
+            readlink -- "$path" >/dev/null || return 2
+            kind=l
+        elif [[ -d $path ]]; then
+            [[ -r $path && -x $path ]] || return 2
+            kind=d
+        elif [[ -f $path ]]; then
+            kind=f
+        elif [[ -e $path ]]; then
+            invalid=1
+            continue
+        else
+            return 2
+        fi
+        printf '%s %s\0' "$kind" "${path#./}" || return 2
+    done < "$tmp/paths" > "$tmp/disk-entries" || return 2
+    if (( invalid )); then
+        printf 'pinned-source: unexpected filesystem entries in %s\n' "$dir" >&2
+        return 1
+    fi
+
     # A fresh index makes Git hash the filesystem contents rather than reuse entries.
-    export GIT_INDEX_FILE=$tmp/verify-index
-    rm -f -- "$GIT_INDEX_FILE" || return 2
-    (
-        cd -- "$dir" || return 2
-        repo_git --work-tree="$dir" add --force --all -- .
-    ) || return 2
-    local tree
+    rm -f -- "$git_dir/index" || return 2
+    repo_git --work-tree="$dir" add --force --all -- . || return 2
     tree=$(repo_git write-tree) || return 2
-    check_trees "$tree" "$dir"
+    check_trees "$tree" "$dir" || return "$?"
+
+    repo_git ls-tree -rtz --format='%(objectmode) %(path)' "$tree" > "$tmp/tree-paths" || return 2
+    while IFS= read -r -d '' entry; do
+        case ${entry%% *} in
+            040000) kind=d ;;
+            100644|100755) kind=f ;;
+            120000) kind=l ;;
+            *) return 1 ;;
+        esac
+        printf '%s %s\0' "$kind" "${entry#* }" || return 2
+    done < "$tmp/tree-paths" > "$tmp/tree-entries" || return 2
+    LC_ALL=C sort -z "$tmp/disk-entries" > "$tmp/disk-sorted" || return 2
+    LC_ALL=C sort -z "$tmp/tree-entries" > "$tmp/tree-sorted" || return 2
+    cmp -s "$tmp/disk-sorted" "$tmp/tree-sorted"
 )
 
 if [[ -d $export_dir && ! -L $export_dir ]]; then
@@ -97,10 +176,14 @@ if [[ -d $export_dir && ! -L $export_dir ]]; then
 fi
 if [[ -e $export_dir || -L $export_dir ]]; then
     printf 'pinned-source: replacing invalid export: %s\n' "$export_dir" >&2
-    rm -rf -- "$export_dir" || fail "cannot remove invalid export: $export_dir"
+    mv -- "$export_dir" "$tmp/invalid-export" || fail "cannot move invalid export: $export_dir"
 fi
 
-repo_git fetch --quiet --depth=1 --no-tags --no-recurse-submodules -- "$source_repo" "$commit" ||
+# Only the fetch gets transport settings from the caller.
+git_env http_proxy="${http_proxy-}" https_proxy="${https_proxy-}" all_proxy="${all_proxy-}" no_proxy="${no_proxy-}" \
+    HTTP_PROXY="${HTTP_PROXY-}" HTTPS_PROXY="${HTTPS_PROXY-}" ALL_PROXY="${ALL_PROXY-}" NO_PROXY="${NO_PROXY-}" \
+    SSH_AUTH_SOCK="${SSH_AUTH_SOCK-}" git --git-dir="$git_dir" \
+    fetch --quiet --depth=1 --no-tags --no-recurse-submodules -- "$source_repo" "$commit" ||
     fail "cannot fetch pinned commit $commit from $source_repo"
 object_tree=$(repo_git rev-parse --verify "$commit^{tree}") || fail 'cannot resolve pinned commit tree'
 check_trees "$object_tree" 'pinned commit' || exit 1
