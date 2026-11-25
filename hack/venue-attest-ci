@@ -16,8 +16,10 @@
 set -euo pipefail
 # shellcheck source-path=SCRIPTDIR source=venue-check
 source "$(dirname "$0")/venue-check"
+# These workflow variables prevent accidental use; the state and listener checks
+# below protect a gateway machine before an attestation is created.
 [[ $# == 0 && ${GITHUB_ACTIONS:-} == true && ${RUNNER_ENVIRONMENT:-} == github-hosted ]] || venue_refuse 'not a GitHub-hosted runner'
-home=$(venue_home) || venue_refuse 'cannot determine account home'
+home=$(venue_home) || exit $?
 venue_state_clear "$home"
 venue_ports_clear
 venue_attest "$home" ci
