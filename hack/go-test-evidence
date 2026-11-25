@@ -19,10 +19,7 @@ fail() { printf 'go-test-evidence: %s\n' "$*" >&2; exit 1; }
 
 case $0 in
     */*) script_dir=${0%/*} ;;
-    *)
-        [ -f "./$0" ] || fail 'bare script path is not a regular file in the current directory'
-        script_dir=.
-        ;;
+    *) fail 'invoke the script with a path such as ./hack/go-test-evidence' ;;
 esac
 
 [ "$#" -eq 3 ] || fail 'usage: hack/go-test-evidence {plain|process} RUN_ID OUTPUT'

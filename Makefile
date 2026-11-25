@@ -70,7 +70,7 @@ fmt:
 	$(fmt_process_flags) modernize -fix -test -- $(fmt_packages) && \
 	goimports-rereviser $(imports_flags) -- $(fmt_paths)
 
-# Analyze the requested target, but build envdoc for the host without saved target overrides.
+# Analyze the requested target, but build the pure-Go envdoc tool for the host.
 fmt-check:
 	@$(validate_fmt_paths); \
 	export $(fmt_environment); \
@@ -84,11 +84,9 @@ fmt-check:
 	check modernize -fix -diff -test -- $(fmt_packages); \
 	check env $(fmt_process_flags) modernize -fix -diff -test -- $(fmt_packages); \
 	check goimports-rereviser $(imports_flags) -list-diff -- $(fmt_paths); \
-	check env $(foreach key,GOOS GOARCH GO386 GOAMD64 GOARM GOARM64 GOMIPS GOMIPS64 GOPPC64 GORISCV64 GOWASM,-u $(key)) \
-		-u GOEXPERIMENT -u GOFIPS140 -u GO_EXTLINK_ENABLED \
-		-u CGO_ENABLED -u AR -u CC -u CXX -u FC -u PKG_CONFIG \
-		$(foreach flags,CGO_CFLAGS CGO_CPPFLAGS CGO_CXXFLAGS CGO_FFLAGS CGO_LDFLAGS,-u $(flags) -u $(flags)_ALLOW -u $(flags)_DISALLOW) \
-		GOENV=off go run ./internal/tools/envdoc -check docs/env.md; \
+	host_os=$$(go env GOHOSTOS) && host_arch=$$(go env GOHOSTARCH) || exit 1; \
+	check env GOOS="$$host_os" GOARCH="$$host_arch" GOAMD64=v1 GOARM64=v8.0 CGO_ENABLED=0 \
+		go run ./internal/tools/envdoc -check docs/env.md; \
 	exit "$$status"
 
 env-doc:
