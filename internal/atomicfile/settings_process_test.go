@@ -12,41 +12,53 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build process
+//go:build process && unix
 
 package atomicfile
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestSettingsReplacement(t *testing.T) {
 	const crashArg = "--crash-before-settings-rename"
+	const fifoArg = "--replace-settings-fifo"
 	const crashStatus = 42
 	newContents := func([]byte) ([]byte, error) { return []byte(newState), nil }
-	if os.Args[len(os.Args)-1] == crashArg {
+	switch os.Args[len(os.Args)-1] {
+	case fifoArg:
+		if err := ReplaceSettings("settings.fifo", func([]byte) ([]byte, error) {
+			t.Fatal("edit callback received a FIFO")
+			return nil, nil
+		}); err == nil {
+			t.Fatal("accepted FIFO as a settings file")
+		}
+		return
+	case crashArg:
 		path, err := filepath.Abs("state.json")
 		if err != nil {
 			t.Fatal(err)
 		}
-		interceptRename(t, func(from, to string) error {
-			if to != path || from == path || filepath.Dir(from) != filepath.Dir(path) {
-				t.Fatalf("replacement is not a sibling rename: %s -> %s", from, to)
-			}
-			checkContents(t, from, newState)
+		w := newWriter()
+		w.commit = func(file preparedFile, to string) error {
+			checkStagedSibling(t, file, to, path)
+			checkContents(t, file.Name(), newState)
 			if !t.Failed() {
 				os.Exit(crashStatus)
 			}
 			return errors.New("staged settings incomplete")
-		})
-		t.Fatalf("ReplaceSettings returned before simulated crash: %v", ReplaceSettings(path, newContents))
+		}
+		t.Fatalf("ReplaceSettings returned before simulated crash: %v", w.replaceSettings(path, newContents, nil))
 	}
 
 	t.Run("CrashBeforeRename", func(t *testing.T) {
@@ -96,17 +108,35 @@ func TestSettingsReplacement(t *testing.T) {
 
 	t.Run("ConcurrentEdit", func(t *testing.T) {
 		path := stateFile(t)
+		const before = "{\"old\":true,\"user\":1}\n"
 		const concurrent = "{\"old\":true,\"user\":7}\n"
-		calls := 0
-		err := ReplaceSettings(path, func(current []byte) ([]byte, error) {
-			calls++
-			if calls == 1 {
+		writeFixture(t, path, before)
+		stamp := time.Now().Truncate(time.Second)
+		if err := os.Chtimes(path, stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+		w := newWriter()
+		stages := 0
+		// An editor racing after the final read can still win or lose by design.
+		// Here the edit is already on disk before that read, so it must survive.
+		afterStage := func(file preparedFile, target string) {
+			stages++
+			checkStagedSibling(t, file, target, path)
+			if stages == 1 {
+				checkContents(t, file.Name(), "{\"new\":true,\"user\":1}\n")
 				writeFixture(t, path, concurrent)
+				if err := os.Chtimes(path, stamp, stamp); err != nil {
+					t.Fatal(err)
+				}
 			}
+		}
+		calls := 0
+		err := w.replaceSettings(path, func(current []byte) ([]byte, error) {
+			calls++
 			return bytes.Replace(current, []byte(`"old"`), []byte(`"new"`), 1), nil
-		})
-		if err != nil || calls != 2 {
-			t.Errorf("concurrent edit: calls=%d err=%v, want two calls and success", calls, err)
+		}, afterStage)
+		if err != nil || calls != 2 || stages != 2 {
+			t.Errorf("concurrent edit: calls=%d stages=%d err=%v, want two merged and staged versions and success", calls, stages, err)
 		}
 		checkContents(t, path, "{\"new\":true,\"user\":7}\n")
 	})
@@ -129,16 +159,28 @@ func TestSettingsReplacement(t *testing.T) {
 	})
 
 	t.Run("NonregularTarget", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "settings.json")
-		if err := os.Mkdir(path, 0o700); err != nil {
+		path := filepath.Join(t.TempDir(), "settings.fifo")
+		if err := syscall.Mkfifo(path, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := ReplaceSettings(path, newContents); err == nil {
-			t.Fatal("replaced a directory as if it were a settings file")
+		original, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
 		}
-		info, err := os.Stat(path)
-		if err != nil || !info.IsDir() {
-			t.Fatalf("refused directory changed: stat=%v err=%v", info, err)
+		exe, err := os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, exe, "-test.run=^TestSettingsReplacement$", "--", fifoArg)
+		cmd.Dir = filepath.Dir(path)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("FIFO writer failed to refuse before opening: %v (context: %v): %s", err, ctx.Err(), output)
+		}
+		info, err := os.Lstat(path)
+		if err != nil || info.Mode()&os.ModeNamedPipe == 0 || !os.SameFile(original, info) {
+			t.Fatalf("refused FIFO changed: stat=%v err=%v", info, err)
 		}
 		if err := os.Remove(path); err != nil {
 			t.Fatal(err)

@@ -1,0 +1,13 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "command":"user\u002done", "type" : "command" },
+          {"type":"command","command":"node \"/fixture/model-gateway.js\" readiness-gate","timeout":22},
+          {"timeout":1.00e+1, "command":"user-two", "type":"command"}
+        ]
+      }
+    ]
+  }
+}

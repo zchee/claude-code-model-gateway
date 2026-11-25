@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher" : "\u0073tartup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "gateway readiness-gate",
+            "timeout": 35
+          }
+        ]
+      }
+    ]
+  }
+}

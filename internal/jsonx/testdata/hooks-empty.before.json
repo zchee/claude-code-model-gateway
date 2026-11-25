@@ -1,0 +1,10 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher" : "\u0073tartup",
+        "hooks": []
+      }
+    ]
+  }
+}

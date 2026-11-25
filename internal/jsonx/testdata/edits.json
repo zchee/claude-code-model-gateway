@@ -1,5 +1,8 @@
 {
-  "spelling": [{"Path": ["env", "ANTHROPIC_BASE_URL"], "Value": "after"}],
-  "removal": [{"Path": ["env", "ANTHROPIC_BASE_URL"]}],
-  "insertion": [{"Path": ["env", "ANTHROPIC_BASE_URL"], "Value": "after"}]
+  "spelling": [{"Path": "/env/ANTHROPIC_BASE_URL", "Value": "after"}],
+  "removal": [{"Path": "/env/ANTHROPIC_BASE_URL"}],
+  "insertion": [{"Path": "/env/ANTHROPIC_BASE_URL", "Value": "after"}],
+  "removeHook": [{"Path": "/hooks/SessionStart/0/hooks/1"}],
+  "replaceHook": [{"Path": "/hooks/SessionStart/0/hooks/1", "Value": {"type":"command","command":"gateway readiness-gate","timeout":35}}],
+  "appendHook": [{"Path": "/hooks/SessionStart/0/hooks/-", "Value": {"type":"command","command":"gateway readiness-gate","timeout":35}}]
 }

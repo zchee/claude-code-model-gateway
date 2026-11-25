@@ -18,16 +18,33 @@ package atomicfile
 import (
 	"errors"
 	"io/fs"
-	"os"
+	"time"
 )
 
 var errNotImplemented = errors.New("atomic file replacement not implemented")
 
-// renameFile is the commit point shared by state and settings replacements.
-var renameFile = os.Rename
+// preparedFile is the commit surface of a renameio.PendingFile on POSIX.
+// The interface keeps the error-only Windows build independent of renameio.
+type preparedFile interface {
+	Name() string
+	CloseAtomicallyReplace() error
+}
+
+type writer struct {
+	now    func() time.Time
+	commit func(preparedFile, string) error
+}
+
+func newWriter() writer {
+	return writer{now: time.Now, commit: func(file preparedFile, _ string) error { return file.CloseAtomicallyReplace() }}
+}
 
 // WriteFile replaces path with data using mode for the temporary sibling.
 func WriteFile(path string, data []byte, mode fs.FileMode) error {
+	return newWriter().writeFile(path, data, mode)
+}
+
+func (w writer) writeFile(path string, data []byte, mode fs.FileMode) error {
 	return errNotImplemented
 }
 
@@ -35,5 +52,10 @@ func WriteFile(path string, data []byte, mode fs.FileMode) error {
 // If another writer changes the file before commit, it calls edit on the new contents,
 // failing with the filename after three conflicting attempts.
 func ReplaceSettings(path string, edit func([]byte) ([]byte, error)) error {
+	return newWriter().replaceSettings(path, edit, nil)
+}
+
+// afterStage, when set, runs after staging and before the final read of path.
+func (w writer) replaceSettings(path string, edit func([]byte) ([]byte, error), afterStage func(preparedFile, string)) error {
 	return errNotImplemented
 }

@@ -16,9 +16,11 @@ package atomicfile
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -63,26 +65,42 @@ func checkContents(t *testing.T, path, want string) {
 	}
 }
 
-func interceptRename(t *testing.T, rename func(string, string) error) {
+func checkStagedSibling(t *testing.T, staged preparedFile, target, wantTarget string) {
 	t.Helper()
-	original := renameFile
-	renameFile = rename
-	t.Cleanup(func() { renameFile = original })
+	directory := func(path string) os.FileInfo {
+		info, err := os.Stat(filepath.Dir(path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return info
+	}
+	parent := directory(wantTarget)
+	if filepath.Base(target) != filepath.Base(wantTarget) || !os.SameFile(directory(target), parent) || filepath.Base(staged.Name()) == filepath.Base(target) || !os.SameFile(directory(staged.Name()), parent) {
+		t.Fatalf("staged %q for %q; want a sibling of %q", staged.Name(), target, wantTarget)
+	}
 }
 
 func TestRetryTargetLock(t *testing.T) {
 	path := stateFile(t)
 	attempts := 0
-	interceptRename(t, func(from, to string) error {
-		if to == path {
-			attempts++
-			if attempts == 1 {
-				return syscall.EBUSY
-			}
+	w := newWriter()
+	commit := w.commit
+	var firstStage string
+	w.commit = func(file preparedFile, to string) error {
+		checkStagedSibling(t, file, to, path)
+		checkContents(t, file.Name(), newState)
+		attempts++
+		if attempts == 1 {
+			firstStage = filepath.Base(file.Name())
+			return syscall.EBUSY
 		}
-		return os.Rename(from, to)
-	})
-	err := WriteFile(path, []byte(newState), 0o600)
+		// renameio closes its pending file before attempting the rename.
+		if filepath.Base(file.Name()) == firstStage {
+			t.Fatal("retry reused the failed pending file")
+		}
+		return commit(file, to)
+	}
+	err := w.writeFile(path, []byte(newState), 0o600)
 	if err != nil || attempts != 2 {
 		t.Errorf("WriteFile after one busy rename: attempts=%d, err=%v; want two attempts and success", attempts, err)
 	}
@@ -92,24 +110,24 @@ func TestRetryTargetLock(t *testing.T) {
 func TestFailedReplace(t *testing.T) {
 	path := stateFile(t)
 	attempts := 0
-	interceptRename(t, func(from, to string) error {
-		if to != path || from == to || filepath.Dir(from) != filepath.Dir(path) {
-			t.Fatalf("unexpected rename: %q -> %q", from, to)
-		}
-		checkContents(t, from, newState)
+	w := newWriter()
+	w.commit = func(file preparedFile, to string) error {
+		checkStagedSibling(t, file, to, path)
+		checkContents(t, file.Name(), newState)
 		attempts++
-		return syscall.EPERM
-	})
-	err := WriteFile(path, []byte(newState), 0o600)
+		return fmt.Errorf("permission denied: %w", syscall.EPERM)
+	}
+	err := w.writeFile(path, []byte(newState), 0o600)
 	t.Run("PermissionError", func(t *testing.T) {
-		if !errors.Is(err, syscall.EPERM) {
-			t.Errorf("WriteFile error = %v, want rename permission error", err)
+		if !errors.Is(err, syscall.EPERM) || !strings.Contains(err.Error(), "permission denied") {
+			t.Errorf("WriteFile error = %v, want EPERM with original permission denied diagnostic", err)
 		}
 	})
 	t.Run("NoTemporarySibling", func(t *testing.T) {
 		if attempts == 0 {
 			t.Errorf("WriteFile never reached rename: %v", err)
 		}
+		checkContents(t, path, oldState)
 		entries, err := os.ReadDir(filepath.Dir(path))
 		if err != nil {
 			t.Fatal(err)
@@ -126,29 +144,37 @@ func TestFailedReplace(t *testing.T) {
 
 func TestSweepTemporarySiblings(t *testing.T) {
 	path := stateFile(t)
-	stale, live := path+".4242.abandoned.tmp", path+".4243.in-flight.tmp"
-	writeFixture(t, stale, "stale")
-	old := time.Now().Add(-2 * time.Hour)
-	if err := os.Chtimes(stale, old, old); err != nil {
-		t.Fatal(err)
-	}
-	writeFixture(t, live, "live")
-	err := WriteFile(path, []byte(newState), 0o600)
+	instant := time.Unix(1_600_000_000, 0)
+	w := newWriter()
+	w.now = func() time.Time { return instant }
 	tests := map[string]struct {
-		path   string
+		suffix string
+		age    time.Duration
 		exists bool
 	}{
-		"RemovesStale": {stale, false},
-		"RetainsLive":  {live, true},
+		"RemovesStale":          {".4242.abandoned.tmp", 2 * time.Hour, false},
+		"RetainsLive":           {".4243.in-flight.tmp", 0, true},
+		"RemovesAtThreshold":    {".4244.threshold.tmp", time.Hour, false},
+		"RetainsBelowThreshold": {".4245.recent.tmp", time.Hour - time.Second, true},
 	}
+	for _, tt := range tests {
+		sibling := path + tt.suffix
+		writeFixture(t, sibling, "temporary")
+		stamp := w.now().Add(-tt.age)
+		if err := os.Chtimes(sibling, stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	err := w.writeFile(path, []byte(newState), 0o600)
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			if err != nil {
 				t.Errorf("WriteFile: %v", err)
 			}
-			_, statErr := os.Stat(tt.path)
+			sibling := path + tt.suffix
+			_, statErr := os.Stat(sibling)
 			if tt.exists && statErr != nil || !tt.exists && !errors.Is(statErr, fs.ErrNotExist) {
-				t.Errorf("stat %q = %v; want exists=%v", tt.path, statErr, tt.exists)
+				t.Errorf("stat %q = %v; want exists=%v", sibling, statErr, tt.exists)
 			}
 		})
 	}

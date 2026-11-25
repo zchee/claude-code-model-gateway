@@ -22,9 +22,10 @@ import (
 
 var errNotImplemented = errors.New("authored settings editing not implemented")
 
-// Edit addresses an object member by decoded key names. A nil value removes it.
+// Edit addresses an object member or array element by JSON Pointer. A nil value
+// removes it. A final "-" token on an array appends Value instead.
 type Edit struct {
-	Path  []string
+	Path  jsontext.Pointer
 	Value jsontext.Value
 }
 

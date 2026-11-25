@@ -49,10 +49,15 @@ func TestAuthoredSettingsCorpus(t *testing.T) {
 	tests := map[string]struct {
 		before, after, edit string
 	}{
-		"Replace": {"spelling.before.json", "spelling.after.json", "spelling"},
-		"Insert":  {"insertion.before.json", "insertion.after.json", "insertion"},
-		"Remove":  {"removal.before.json", "removal.after.json", "removal"},
-		"NoEdit":  {"spelling.before.json", "spelling.before.json", ""},
+		"Replace":             {"spelling.before.json", "spelling.after.json", "spelling"},
+		"Insert":              {"insertion.before.json", "insertion.after.json", "insertion"},
+		"Remove":              {"removal.before.json", "removal.after.json", "removal"},
+		"NoEdit":              {"spelling.before.json", "spelling.before.json", ""},
+		"RemoveMiddleHook":    {"hooks.before.json", "hooks-removed.after.json", "removeHook"},
+		"ReplaceMiddleHook":   {"hooks.before.json", "hooks-replaced.after.json", "replaceHook"},
+		"AppendHook":          {"hooks-removed.after.json", "hooks-appended.after.json", "appendHook"},
+		"AppendToEmptyArray":  {"hooks-empty.before.json", "hooks-empty.after.json", "appendHook"},
+		"DuplicateUnownedKey": {"duplicate-user.before.json", "duplicate-user.after.json", "spelling"},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -70,11 +75,16 @@ func TestAuthoredSettingsCorpus(t *testing.T) {
 			}
 		})
 	}
-	t.Run("DuplicateOwnedKey", func(t *testing.T) {
-		const duplicate = `{"env":{"ANTHROPIC_BASE_URL":"before","ANTHROPIC_BASE_URL":"other"}}`
-		got, err := jsonx.EditSettings([]byte(duplicate), edits["spelling"]...)
-		if err == nil || !strings.Contains(err.Error(), "ANTHROPIC_BASE_URL") {
-			t.Errorf("duplicate owned name: got %q, err=%v; want error naming ANTHROPIC_BASE_URL", got, err)
-		}
-	})
+	for name, secondKey := range map[string]string{
+		"DuplicateOwnedKey":        `ANTHROPIC_BASE_URL`,
+		"EscapedDuplicateOwnedKey": `\u0041NTHROPIC_BASE_URL`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			duplicate := `{"env":{"ANTHROPIC_BASE_URL":"before","` + secondKey + `":"other"}}`
+			got, err := jsonx.EditSettings([]byte(duplicate), edits["spelling"]...)
+			if err == nil || !strings.Contains(err.Error(), "ANTHROPIC_BASE_URL") {
+				t.Errorf("duplicate owned name: got %q, err=%v; want error naming ANTHROPIC_BASE_URL", got, err)
+			}
+		})
+	}
 }
