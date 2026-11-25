@@ -87,6 +87,7 @@ fmt-check:
 
 lint:
 	./hack/lint-venue
+	./hack/parity-check structure
 	golangci-lint run
 	golangci-lint run --build-tags process
 

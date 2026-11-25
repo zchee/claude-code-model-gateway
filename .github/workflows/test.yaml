@@ -55,6 +55,8 @@ jobs:
         run: GOOS=windows GOARCH=amd64 go build ./...
       - name: Check test guards
         run: ./hack/lint-venue
+      - name: Check test obligations
+        run: ./hack/parity-check structure
       - name: Attest hosted runner
         run: ./hack/venue-attest-ci
       - name: Run tests
