@@ -4,7 +4,7 @@ Both TSV files use UTF-8, literal tabs and one record per line, without CSV quot
 
 ## Case obligations
 
-`classification.tsv` keys each case by `path`, `line`, `column`, and `name`. Locations identify registrations, not assertions. A table can register multiple names at one position. A parent is itself a case; its children have names of the form `parent > child`. Join these four columns to `baseline/census.tsv` to distinguish what was registered from what passed, failed or skipped.
+`classification.tsv` has nine columns: `path`, `line`, `column`, `name`, `class`, `phase`, `package`, `gate`, `note`. Read columns by header name, not by position. The first four fields identify each case. Locations identify registrations, not assertions. A table can register multiple names at one position. A parent is itself a case; its children have names of the form `parent > child`. Join these four columns to `baseline/census.tsv` to distinguish what was registered from what passed, failed or skipped.
 
 | `class` | Obligation |
 |---|---|
@@ -14,7 +14,9 @@ Both TSV files use UTF-8, literal tabs and one record per line, without CSV quot
 | `js-only:<reason>` | No Go case. A JS implementation detail is a case-level exemption only when no assertion protects observable gateway behavior. Reasons: `node-harness-self-test`, `js-source-lint`, `out-of-root-dependency`, `developer-probe`. |
 | `unsupported:<reason>` | Outside the port milestone. Reasons: `windows-only`, `dormant-code`. |
 
-`phase` (`phase-0` through `phase-5`) is the gate for the complete case; `package` names the Go owner of the asserted behavior, not necessarily the harness, command, or all dependencies. Join these columns to the [test ownership table](../../docs/port/test-ownership.md) to identify the implementing task. Both are empty for exemptions. `note` explains ownership, a replacement expectation, or the concrete reason for an exemption. A skipped source case is not automatically exempt and is not passing evidence.
+`phase` (`phase-0` through `phase-5`) is the implementation phase; `package` owns the behavior under test. `gate` says **when the entire case must pass**. `task` means the owning task, its transitive prerequisites and earlier phases supply every required runtime behavior. A black-box case is due no earlier than the gate at which the launch adapter is proven. `phase` means another independent task in that phase is also needed; for example, checking that `doctor` leaves a file unchanged before `ensure` repairs it requires both commands. Use the [test ownership table](../../docs/port/test-ownership.md) to resolve a `task` row by `(phase, package)` or a `phase` row by its phase gate. Exempt rows leave all three fields empty.
+
+`note` explains a replacement expectation, a cross-task dependency or the concrete reason for an exemption. A runtime case can also check documentation: assertions about a shipped skill or manifest are due with packaging (phase-5), without moving the runtime case. Wording in unshipped source documentation is a candidate for a separately reviewed assertion exemption. A skipped source case is not automatically exempt and is not passing evidence.
 
 The 57 test files have 693 text lines beginning with optional indentation and `test(`. One, `test/gateway-process-isolation.test.js:1150`, is inside a string written to an intentionally failing child suite by the case at line 1143. It is not a registration in the outer suite. The inventory therefore covers 692 outer registration sites and five nested `t.test` sites. No test is added for the string.
 
