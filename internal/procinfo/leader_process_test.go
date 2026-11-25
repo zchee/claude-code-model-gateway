@@ -21,12 +21,30 @@ import (
 	"errors"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+func TestCommandWarningRefusal(t *testing.T) {
+	tests := map[string]struct{ status int }{"error: warning with otherwise successful output": {0}, "error: warning with partial listing": {1}}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			out, err := darwinCommand(t.Context(), "/bin/sh", "-c", `printf 'partial stdout'; printf 'lsof: WARNING: cannot stat volume\nsecond line\n' >&2; exit "$1"`, "fixture", strconv.Itoa(tt.status))
+			if !errors.Is(err, ErrUnknown) || len(out) != 0 {
+				t.Fatalf("accepted partial command: %q %v", out, err)
+			}
+			s := err.Error()
+			if !strings.Contains(s, "status "+strconv.Itoa(tt.status)) || !strings.Contains(s, "cannot stat volume") || strings.Contains(s, "second line") || strings.Contains(s, "partial stdout") {
+				t.Fatalf("unexpected diagnostic: %s", s)
+			}
+		})
+	}
+}
 
 func TestProbeLeaderExitsBeforeChild(t *testing.T) {
 	fifo := filepath.Join(t.TempDir(), "held")

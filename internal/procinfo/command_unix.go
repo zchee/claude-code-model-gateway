@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build linux || darwin
+//go:build darwin || (linux && process)
 
 package procinfo
 
@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -53,22 +54,28 @@ func darwinCommand(ctx context.Context, path string, args ...string) ([]byte, er
 	cmd.Env = []string{"LC_ALL=C", "PATH=/usr/bin:/bin:/usr/sbin:/sbin"}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	tool := filepath.Base(path)
 	if err := cmd.Start(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("start %s: %w", tool, err)
 	}
-	group := commandGroup{observe: leaderExited, signal: unix.Kill}
+	group := commandGroup{observe: leaderExited, signal: signalCommandGroup}
 	cleanupErr := group.stop(ctx, cmd.Process.Pid)
 	waitErr := cmd.Wait()
+	status := cmd.ProcessState.ExitCode()
+	diagnostic := commandDiagnostic(stderr.Bytes())
 	if cleanupErr != nil {
-		return nil, cleanupErr
+		return nil, fmt.Errorf("%s cleanup (status %d%s): %w", tool, status, diagnostic, cleanupErr)
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s (status %d%s): %w", tool, status, diagnostic, err)
 	}
-	if stderr.Len() != 0 {
-		return nil, ErrUnknown
+	if diagnostic != "" {
+		return nil, fmt.Errorf("%s (status %d%s): %w", tool, status, diagnostic, ErrUnknown)
 	}
-	return stdout.Bytes(), waitErr
+	if waitErr != nil {
+		return stdout.Bytes(), fmt.Errorf("%s (status %d): %w", tool, status, waitErr)
+	}
+	return stdout.Bytes(), nil
 }
 
 func (g commandGroup) stop(ctx context.Context, pid int) error {

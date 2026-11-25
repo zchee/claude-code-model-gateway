@@ -15,9 +15,9 @@
 package procinfo
 
 import (
-	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os/exec"
 	"path/filepath"
 	"slices"
@@ -49,12 +49,38 @@ func leaderExited(pid int) (bool, error) {
 	}
 }
 
+func signalCommandGroup(group int, signal unix.Signal) error {
+	err := unix.Kill(group, signal)
+	if !errors.Is(err, unix.EPERM) {
+		return err
+	}
+	// XNU killpg1 skips SZOMB members and returns EPERM when none can be
+	// signaled. Accept that only if the complete group is our unreaped zombie.
+	pid := -group
+	members, queryErr := unix.SysctlKinfoProcSlice("kern.proc.pgrp", pid)
+	if queryErr != nil {
+		// Only the signal errno classifies cleanup; a failed recheck is not ESRCH from kill.
+		return fmt.Errorf("%w; kern.proc.pgrp recheck: %s", err, queryErr.Error())
+	}
+	if len(members) == 1 {
+		p := members[0]
+		if int(p.Proc.P_pid) == pid && int(p.Eproc.Ppid) == unix.Getpid() && int(p.Eproc.Pgid) == pid && p.Proc.P_stat == 5 {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w; kern.proc.pgrp did not confirm a lone zombie leader (%d records)", err, len(members))
+}
+
 func procArgs(pid int) (string, []string, error) {
 	raw, err := unix.SysctlRaw("kern.procargs2", pid)
 	if err != nil {
-		return "", nil, err
+		return "", nil, fmt.Errorf("kern.procargs2: %w", err)
 	}
-	return decodeProcArgs(raw)
+	path, argv, err := decodeProcArgs(raw)
+	if err != nil {
+		return "", nil, fmt.Errorf("decode kern.procargs2 (%d bytes): %w", len(raw), err)
+	}
+	return path, argv, nil
 }
 
 func darwinRow(info *unix.KinfoProc) Identity {
@@ -94,7 +120,7 @@ func nativeTable(ctx context.Context) ([]Identity, error) {
 func nativeIdentity(ctx context.Context, pid int) (Identity, error) {
 	info, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
 	if err != nil {
-		return Identity{}, err
+		return Identity{}, fmt.Errorf("kern.proc.pid: %w", err)
 	}
 	id := darwinRow(info)
 	launchPath, argv, err := procArgs(pid)
@@ -108,7 +134,7 @@ func nativeIdentity(ctx context.Context, pid int) (Identity, error) {
 		path = launchPath
 	}
 	if !filepath.IsAbs(path) {
-		return Identity{}, ErrUnknown
+		return Identity{}, fmt.Errorf("proc_pidpath and launch path did not identify an absolute executable: %w", ErrUnknown)
 	}
 	// lsof's txt records contain device and inode from the mapped vnode, not
 	// from stat(path), which could already identify a replacement executable.
@@ -118,81 +144,23 @@ func nativeIdentity(ctx context.Context, pid int) (Identity, error) {
 	}
 	id.Image, err = mappedImage(out, pid, path)
 	if err != nil {
-		return Identity{}, err
+		return Identity{}, fmt.Errorf("correlate lsof txt vnode with executable: %w", err)
 	}
 	secondPath, secondArgs, err := procArgs(pid)
-	if err != nil || launchPath != secondPath || !slices.Equal(argv, secondArgs) {
-		return Identity{}, ErrUnknown
+	if err != nil {
+		return Identity{}, fmt.Errorf("reread argv: %w", err)
+	}
+	if launchPath != secondPath || !slices.Equal(argv, secondArgs) {
+		return Identity{}, fmt.Errorf("argv changed during inspection: %w", ErrUnknown)
 	}
 	after, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
-	if err != nil || after.Proc.P_pid != info.Proc.P_pid || after.Proc.P_starttime != info.Proc.P_starttime {
-		return Identity{}, ErrUnknown
+	if err != nil {
+		return Identity{}, fmt.Errorf("reread kern.proc.pid: %w", err)
+	}
+	if after.Proc.P_pid != info.Proc.P_pid || after.Proc.P_starttime != info.Proc.P_starttime {
+		return Identity{}, fmt.Errorf("birth changed during inspection: %w", ErrUnknown)
 	}
 	return id, nil
-}
-
-func mappedImage(out []byte, pid int, path string) (Image, error) {
-	if !bytes.HasSuffix(out, []byte{0, '\n'}) {
-		return Image{}, ErrUnknown
-	}
-	var match Image
-	var current Image
-	var seenPID, text, device bool
-	finish := func() error {
-		if !text || current.Path != path {
-			return nil
-		}
-		if !device || current.Inode == 0 || match.Inode != 0 && current != match {
-			return ErrUnknown
-		}
-		match = current
-		return nil
-	}
-	for field := range bytes.SplitSeq(out, []byte{0}) {
-		field = bytes.TrimPrefix(field, []byte{'\n'})
-		if len(field) == 0 {
-			continue
-		}
-		value := string(field[1:])
-		switch field[0] {
-		case 'p':
-			if seenPID || value != strconv.Itoa(pid) {
-				return Image{}, ErrUnknown
-			}
-			seenPID = true
-		case 'f':
-			if err := finish(); err != nil {
-				return Image{}, err
-			}
-			current = Image{}
-			text = value == "txt"
-			device = false
-		case 'D':
-			n, err := strconv.ParseUint(value, 0, 64)
-			if err != nil {
-				return Image{}, err
-			}
-			current.Device = n
-			device = true
-		case 'i':
-			n, err := strconv.ParseUint(value, 10, 64)
-			if err != nil {
-				return Image{}, err
-			}
-			current.Inode = n
-		case 'n':
-			current.Path = value
-		default:
-			return Image{}, ErrUnknown
-		}
-	}
-	if err := finish(); err != nil {
-		return Image{}, err
-	}
-	if !seenPID || match.Inode == 0 {
-		return Image{}, ErrUnknown
-	}
-	return match, nil
 }
 
 func nativeSockets(ctx context.Context, port uint16) ([]socketEvidence, error) {
@@ -204,7 +172,7 @@ func nativeSockets(ctx context.Context, port uint16) ([]socketEvidence, error) {
 	}
 	count, err := countTCPListeners(out, port)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("decode netstat TCP table (status 0, %d bytes): %w", len(out), err)
 	}
 	if count == 0 {
 		return nil, nil
@@ -215,5 +183,9 @@ func nativeSockets(ctx context.Context, port uint16) ([]socketEvidence, error) {
 			return nil, err
 		}
 	}
-	return listenerFiles(out, port, count)
+	rows, err := listenerFiles(out, port, count)
+	if err != nil {
+		return nil, fmt.Errorf("decode lsof listener fields (%d bytes, %d kernel sockets): %w", len(out), count, err)
+	}
+	return rows, nil
 }

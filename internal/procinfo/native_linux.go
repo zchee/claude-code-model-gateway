@@ -31,12 +31,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func leaderExited(pid int) (bool, error) {
-	var status unix.Siginfo
-	err := unix.Waitid(unix.P_PID, pid, &status, unix.WEXITED|unix.WNOWAIT|unix.WNOHANG, nil)
-	return status.Signo != 0, err
-}
-
 func procRoot(ctx context.Context) string {
 	if env, ok := ctx.Value(common.EnvKey).(common.EnvMap); ok && env[common.HostProcEnvKey] != "" {
 		return env[common.HostProcEnvKey]

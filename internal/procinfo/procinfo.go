@@ -109,7 +109,15 @@ func (p Probe) Identity(ctx context.Context, pid int) (Identity, error) {
 	if alive, checkErr := p.Alive(ctx, pid); checkErr == nil && !alive {
 		return Identity{}, os.ErrNotExist
 	}
-	return Identity{}, fmt.Errorf("%w: pid %d", ErrUnknown, pid)
+	if err != nil {
+		// Inspection can fail with ENOENT for a still-live process. Keep the
+		// diagnostic, but do not expose it as proof that the PID is absent.
+		return Identity{}, fmt.Errorf("%w: pid %d: %s", ErrUnknown, pid, err.Error())
+	}
+	if err := ctx.Err(); err != nil {
+		return Identity{}, fmt.Errorf("%w: pid %d: %w", ErrUnknown, pid, err)
+	}
+	return Identity{}, fmt.Errorf("%w: pid %d: incomplete process sample", ErrUnknown, pid)
 }
 
 // Table returns a snapshot keyed by pid, or no table when the query fails.
@@ -188,20 +196,30 @@ const (
 // value has no admission limit. On macOS the kernel count and visible holders are
 // separate observations, so their combination is best-effort evidence.
 func (p Probe) Listener(ctx context.Context, port uint16) Listener {
+	result, _ := p.ListenerEvidence(ctx, port)
+	return result
+}
+
+// ListenerEvidence returns the same evidence as Listener, plus the reason a query failed.
+func (p Probe) ListenerEvidence(ctx context.Context, port uint16) (Listener, error) {
 	if port == 0 {
-		return Listener{State: ListenerAbsent}
+		return Listener{State: ListenerAbsent}, nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, p.timeout(runtime.GOOS))
 	defer cancel()
 	// Some kernel reads cannot be canceled. Let the caller leave at the deadline
 	// without leaving the query waiting on a receiver when it eventually returns.
 	if err := ctx.Err(); err != nil {
-		return classifyListener(nil, err, port)
+		return classifyListener(nil, err, port), err
 	}
 	if p.listenerBusy != nil && !p.listenerBusy.CompareAndSwap(false, true) {
-		return Listener{State: ListenerUnknown}
+		return Listener{State: ListenerUnknown}, fmt.Errorf("listener query already running: %w", ErrUnknown)
 	}
-	done := make(chan Listener, 1)
+	type observation struct {
+		listener Listener
+		err      error
+	}
+	done := make(chan observation, 1)
 	go func() {
 		var rows []socketEvidence
 		var err error
@@ -214,16 +232,16 @@ func (p Probe) Listener(ctx context.Context, port uint16) Listener {
 		if p.listenerBusy != nil {
 			p.listenerBusy.Store(false)
 		}
-		done <- result
+		done <- observation{result, err}
 	}()
 	select {
 	case result := <-done:
 		if ctx.Err() == nil {
-			return result
+			return result.listener, result.err
 		}
 	case <-ctx.Done():
 	}
-	return classifyListener(nil, ctx.Err(), port)
+	return classifyListener(nil, ctx.Err(), port), ctx.Err()
 }
 
 func classifyListener(rows []socketEvidence, err error, port uint16) Listener {
