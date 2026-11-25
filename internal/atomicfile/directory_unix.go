@@ -165,7 +165,11 @@ func (d *directory) path(base string) string {
 const maxDestinationBase = 255 - len(".2147483647.0123456789ab.tmp")
 
 func validWriteBase(base string) bool {
-	if !validBase(base) || len(base) > maxDestinationBase {
+	return len(base) <= maxDestinationBase && validAppendBase(base)
+}
+
+func validAppendBase(base string) bool {
+	if !validBase(base) {
 		return false
 	}
 	stem, ok := strings.CutSuffix(base, ".tmp")

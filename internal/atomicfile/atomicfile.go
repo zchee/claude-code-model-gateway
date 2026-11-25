@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package atomicfile replaces state and settings files without truncating the destination.
-// Writers accept destination names of at most 227 bytes, leaving room for the
+// Package atomicfile replaces state and settings files and appends journal records.
+// Writers that stage a sibling accept destination names of at most 227 bytes, leaving room for the
 // staging suffix within a 255-byte directory entry. Names of the form
 // <destination>.<positive decimal pid>.<12 lowercase hex digits>.tmp are
 // reserved by exact spelling and must not be used as destinations: a successful

@@ -42,7 +42,7 @@ func (d *Dir) Close() error {
 	return f.Close()
 }
 
-// NonRegularError reports a Dir.ReadFile refusal to read a nonregular entry.
+// NonRegularError reports a refusal to read or append to a nonregular entry.
 type NonRegularError struct{ Path string }
 
 func (e *NonRegularError) Error() string { return e.Path + ": not a regular file" }
