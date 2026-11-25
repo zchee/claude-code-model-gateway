@@ -141,7 +141,7 @@ func (env Environment) StartCountingProxy(t testing.TB) *CountingProxy {
 
 // HelperCommand prepares a registered helper in its own private sandbox directory.
 // The caller's test binary must define TestGatewayFixtureHelper(t *testing.T) calling
-// DispatchHelper(t). RunFixture supplies the child environment, which may be empty.
+// DispatchHelper(t). Use RunFixture on the sandbox environment to launch the helper.
 func (env Environment) HelperCommand(t testing.TB, helper string, args ...string) (*exec.Cmd, error) {
 	t.Helper()
 	dispatch := append([]string{helperSelector, "--", "--gatewaytest-helper=" + helper}, args...)
@@ -152,15 +152,12 @@ func (env Environment) HelperCommand(t testing.TB, helper string, args ...string
 	if err != nil {
 		return nil, err
 	}
-	name := "gatewaytest-helper-" + rand.Text()
-	dir := filepath.Join(env["HOME"], name)
-	if !env.guarded() || !env.contains(dir) {
-		return nil, ErrOutsideSandbox
-	}
-	root, err := os.OpenRoot(env["HOME"])
+	root, err := env.openSandboxDir(env["HOME"], true)
 	if err != nil {
 		return nil, err
 	}
+	name := "gatewaytest-helper-" + rand.Text()
+	dir := filepath.Join(root.Name(), name)
 	if err := root.Mkdir(name, 0o700); err != nil {
 		return nil, errors.Join(err, root.Close())
 	}
@@ -180,6 +177,14 @@ func (env Environment) HelperCommand(t testing.TB, helper string, args ...string
 func DispatchHelper(t testing.TB) {
 	t.Helper()
 	if len(os.Args) >= 4 && os.Args[1] == helperSelector && registeredDispatch(os.Args[1:]) {
+		// The parent passes the checked working directory as the first ExtraFiles descriptor.
+		dir := os.NewFile(3, "fixture working directory")
+		if dir == nil {
+			t.Fatal("missing fixture working directory")
+		}
+		if err := errors.Join(dir.Chdir(), dir.Close()); err != nil {
+			t.Fatal(err)
+		}
 		if err := FakeClaude(os.Args[4:], os.Stdout); err != nil {
 			t.Fatal(err)
 		}

@@ -36,6 +36,8 @@ var ErrProbeEndpoint = errors.New("fixture probe requires an HTTP loopback IP wi
 
 // ProbeAlias reads the init event from an explicitly named sandbox fixture. A refused,
 // missing, timed-out or unsuccessful fixture produces no model. It never falls back to PATH.
+// Only the initial HTTP authority is checked. Built-in responses neither redirect nor forward;
+// the venue, not this check, must contain network activity by a misbehaving fixture.
 func (env Environment) ProbeAlias(ctx context.Context, alias, endpoint string) (*string, error) {
 	u, err := url.Parse(endpoint)
 	if err != nil || u.Scheme != "http" || u.User != nil {

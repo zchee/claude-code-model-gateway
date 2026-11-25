@@ -15,6 +15,8 @@
 // Package gatewaytest isolates gateway fixtures and guards product operations under test.
 // Child environments are exact on the Linux and macOS test venues. Windows is compile-only:
 // environment names there are case-insensitive and os/exec may supply SYSTEMROOT.
+// The built-in fixture responses do not forward requests or redirect them. The probe checks
+// its initial endpoint, not subsequent child traffic; the venue must contain misbehaving fixtures.
 package gatewaytest
 
 import (
@@ -41,6 +43,8 @@ var (
 	ErrRealClaude = errors.New("refusing to launch real claude")
 	// ErrOutsideSandbox identifies settings access outside the test sandbox.
 	ErrOutsideSandbox = errors.New("refusing to touch settings outside the sandbox")
+	// ErrInvalidEnvironment identifies a child environment entry os/exec cannot represent exactly.
+	ErrInvalidEnvironment = errors.New("invalid fixture environment entry")
 )
 
 // Environment is the environment of a gateway process, not its parent's live environment.
@@ -113,11 +117,15 @@ func (env Environment) guarded() bool {
 	return sandbox || runner
 }
 
-func (env Environment) contains(path string) bool {
-	root, explicit := env[sandboxKey]
-	if !explicit {
-		root = paths.New(env.lookup, nil, nil).TempDir()
+func (env Environment) sandboxRoot() string {
+	if root, explicit := env[sandboxKey]; explicit {
+		return root
 	}
+	return paths.New(env.lookup, nil, nil).TempDir()
+}
+
+func (env Environment) contains(path string) bool {
+	root := env.sandboxRoot()
 	if !filepath.IsAbs(root) || !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return false
 	}
@@ -150,6 +158,42 @@ func (env Environment) contains(path string) bool {
 	return err == nil && rel != "." && filepath.IsLocal(rel)
 }
 
+// openSandboxDir opens an existing, clean absolute directory relative to the sandbox handle.
+// The returned handle, not the original path, anchors subsequent filesystem operations.
+func (env Environment) openSandboxDir(path string, allowRoot bool) (*os.Root, error) {
+	base := env.sandboxRoot()
+	if !env.guarded() || !filepath.IsAbs(base) || filepath.Clean(base) != base || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return nil, ErrOutsideSandbox
+	}
+	base, err := filepath.EvalSymlinks(base)
+	if err != nil || base == filepath.Dir(base) {
+		return nil, ErrOutsideSandbox
+	}
+	dir, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return nil, errors.Join(ErrOutsideSandbox, err)
+	}
+	rel, err := filepath.Rel(base, dir)
+	if err != nil || !filepath.IsLocal(rel) || (!allowRoot && rel == ".") {
+		return nil, ErrOutsideSandbox
+	}
+	root, err := os.OpenRoot(base)
+	if err != nil {
+		return nil, err
+	}
+	if rel == "." {
+		return root, nil
+	}
+	child, openErr := root.OpenRoot(rel)
+	if err := errors.Join(openErr, root.Close()); err != nil {
+		if child != nil {
+			err = errors.Join(err, child.Close())
+		}
+		return nil, errors.Join(ErrOutsideSandbox, err)
+	}
+	return child, nil
+}
+
 const helperSelector = "-test.run=^TestGatewayFixtureHelper$"
 
 func registeredDispatch(args []string) bool {
@@ -168,8 +212,15 @@ func registeredDispatch(args []string) bool {
 }
 
 // RunFixture runs a sandbox executable or a registered helper dispatch with exactly env.
-// Only a registered dispatch of the current test executable may run without a sandbox.
+// Only the legacy isolation check may run without a sandbox.
 func (env Environment) RunFixture(cmd *exec.Cmd) error {
+	entries := make([]string, 0, len(env)) // A nil slice inherits the ambient environment.
+	for name, value := range env {
+		if name == "" || strings.ContainsAny(name, "=\x00") || strings.IndexByte(value, 0) >= 0 {
+			return ErrInvalidEnvironment
+		}
+		entries = append(entries, name+"="+value)
+	}
 	if cmd == nil || len(cmd.Args) == 0 || !filepath.IsAbs(cmd.Path) || cmd.Args[0] != cmd.Path {
 		return ErrRealClaude
 	}
@@ -183,16 +234,29 @@ func (env Environment) RunFixture(cmd *exec.Cmd) error {
 	}
 	program, err := os.Stat(cmd.Path)
 	if cmd.Path == self || (err == nil && os.SameFile(program, selfInfo)) {
-		if !registeredDispatch(cmd.Args[1:]) || !filepath.IsAbs(cmd.Dir) {
+		if !registeredDispatch(cmd.Args[1:]) || (cmd.Args[1] != helperSelector && !filepath.IsAbs(cmd.Dir)) {
 			return ErrRealClaude
+		}
+		if cmd.Args[1] == helperSelector {
+			root, err := env.openSandboxDir(cmd.Dir, false)
+			if err != nil {
+				return err
+			}
+			dir, err := root.Open(".")
+			if err != nil {
+				return errors.Join(err, root.Close())
+			}
+			// Bootstrap in the trusted sandbox root, not a second lookup of the requested
+			// directory. DispatchHelper enters the checked handle before doing fixture work.
+			cmd.Dir = env.sandboxRoot()
+			cmd.ExtraFiles = append([]*os.File{dir}, cmd.ExtraFiles...)
+			cmd.Env = entries
+			return errors.Join(cmd.Run(), dir.Close(), root.Close())
 		}
 	} else if !env.guarded() || !env.contains(cmd.Path) {
 		return ErrRealClaude
 	}
-	cmd.Env = make([]string, 0, len(env)) // A nil slice inherits the ambient environment.
-	for name, value := range env {
-		cmd.Env = append(cmd.Env, name+"="+value)
-	}
+	cmd.Env = entries
 	return cmd.Run()
 }
 

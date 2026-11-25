@@ -251,18 +251,123 @@ func TestProbeProxyEnvironment(t *testing.T) {
 	}
 }
 
-func TestGatewayFixtureHelper(t *testing.T) { gatewaytest.DispatchHelper(t) }
+func TestHelperDirectory(t *testing.T) {
+	home, outside := t.TempDir(), t.TempDir()
+	link := filepath.Join(home, "other")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	tests := map[string]struct{ path string }{
+		"error: relative home":           {"relative"},
+		"error: unclean home":            {home + "/."},
+		"error: parent segment":          {home + "/unused/.."},
+		"error: external directory":      {outside},
+		"error: external directory link": {link},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			env := gatewaytest.NewEnv(home, nil, nil, nil)
+			env["HOME"] = tt.path
+			if cmd, err := env.HelperCommand(t, "claude", "--version"); cmd != nil || !errors.Is(err, gatewaytest.ErrOutsideSandbox) {
+				t.Fatalf("HelperCommand: cmd=%v err=%v", cmd, err)
+			}
+			entries, err := os.ReadDir(outside)
+			if err != nil || len(entries) != 0 {
+				t.Fatalf("outside directory changed: entries=%v err=%v", entries, err)
+			}
+		})
+	}
+}
+
+func TestHelperChangedWorkdir(t *testing.T) {
+	env := gatewaytest.NewEnv(t.TempDir(), nil, nil, nil)
+	outside := t.TempDir()
+	link := filepath.Join(env["HOME"], "other")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	tests := map[string]struct{ path string }{
+		"error: relative working directory":            {"."},
+		"error: external working directory":            {outside},
+		"error: symlink to external working directory": {link},
+		"error: noncanonical working directory":        {env["HOME"] + "/."},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			cmd, err := env.HelperCommand(t, "claude", "--version")
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmd.Dir = tt.path
+			if err := env.RunFixture(cmd); !errors.Is(err, gatewaytest.ErrOutsideSandbox) || cmd.Process != nil {
+				t.Fatalf("RunFixture: process=%v err=%v", cmd.Process, err)
+			}
+		})
+	}
+}
+
+func TestUnrepresentableEnvironment(t *testing.T) {
+	tests := map[string]struct{ key, value string }{
+		"error: empty key":     {"", "value"},
+		"error: equals in key": {"NAME=extra", "value"},
+		"error: NUL in key":    {"NA\x00ME", "value"},
+		"error: NUL in value":  {"NAME", "v\x00alue"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			env := gatewaytest.NewEnv(t.TempDir(), nil, nil, nil)
+			env["NAME"] = "original"
+			env[tt.key] = tt.value
+			cmd, err := env.HelperCommand(t, "claude", "--version")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := env.RunFixture(cmd); !errors.Is(err, gatewaytest.ErrInvalidEnvironment) || cmd.Process != nil {
+				t.Fatalf("RunFixture: process=%v err=%v", cmd.Process, err)
+			}
+		})
+	}
+}
+
+func TestEmptyFixtureRun(t *testing.T) {
+	dir := privateWorkdir(t)
+	cmd := helperCommand(t, dir, "empty")
+	if err := (gatewaytest.Environment{}).RunFixture(cmd); err != nil {
+		t.Fatal(err)
+	}
+	var checked bool
+	readReport(t, dir, &checked)
+	if !checked {
+		t.Fatal("empty-environment helper did not report success")
+	}
+}
+
+func TestGatewayFixtureHelper(t *testing.T) {
+	gatewaytest.DispatchHelper(t)
+	if want, ok := os.LookupEnv("GATEWAYTEST_EXPECTED_CWD"); ok {
+		current, err := os.Stat(".")
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected, err := os.Stat(want)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !os.SameFile(current, expected) {
+			t.Fatal("child did not enter the prepared working directory")
+		}
+	}
+}
 
 func TestFakeClaudeProcess(t *testing.T) {
 	env := gatewaytest.NewEnv(t.TempDir(), nil, nil, nil)
 	tests := map[string]struct {
-		args  []string
-		want  string
-		child gatewaytest.Environment
+		args []string
+		want string
 	}{
-		"success: version with empty environment": {[]string{"--version"}, "fake-claude 2.0.0", nil},
-		"success: opus init":                      {[]string{"--model", "opus"}, "claude-opus-5-5", env},
-		"success: sonnet init":                    {[]string{"--model", "sonnet"}, "claude-sonnet-5", env},
+		"success: version":     {[]string{"--version"}, "fake-claude 2.0.0"},
+		"success: opus init":   {[]string{"--model", "opus"}, "claude-opus-5-5"},
+		"success: sonnet init": {[]string{"--model", "sonnet"}, "claude-sonnet-5"},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -277,7 +382,8 @@ func TestFakeClaudeProcess(t *testing.T) {
 			}
 			var out bytes.Buffer
 			cmd.Stdout, cmd.Stderr = &out, &out
-			if err := tt.child.RunFixture(cmd); err != nil {
+			env["GATEWAYTEST_EXPECTED_CWD"] = cmd.Dir
+			if err := env.RunFixture(cmd); err != nil {
 				t.Fatalf("fixture: %v: %s", err, &out)
 			}
 			line, _, _ := strings.Cut(out.String(), "\n")
