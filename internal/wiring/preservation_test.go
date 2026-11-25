@@ -79,9 +79,12 @@ func TestWindowWriteContract(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			f := sandbox(t)
-			var doc string
+			var doc, wantWired string
 			if tt.wired {
-				doc = authoredPrefix + `"env":{"ANTHROPIC_BASE_URL":"` + direct + `"}, "autoCompactWindow":400000` + authoredSuffix
+				var installed string
+				doc, installed = firstHookSettings(t, f)
+				const hooks = ",\r\n  \"hooks\":"
+				wantWired = strings.Replace(installed, hooks, ",\r\n  \"autoCompactWindow\": 500000"+hooks, 1)
 			} else {
 				doc = authoredPrefix + `"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":` + encoded(t, f.bin) + `,"args":["readiness-gate"]}]}]}, "autoCompactWindow":400000` + authoredSuffix
 			}
@@ -103,6 +106,7 @@ func TestWindowWriteContract(t *testing.T) {
 			equal(t, []string{f.local}, r.Changed)
 			got := text(t, f.local)
 			if tt.wired {
+				equal(t, wantWired, got)
 				equal(t, true, f.ReadinessHookPresent([]byte(got)))
 				equal(t, float64(500000), object(t, got)["autoCompactWindow"])
 			} else {

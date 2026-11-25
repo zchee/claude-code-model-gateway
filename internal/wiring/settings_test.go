@@ -53,27 +53,40 @@ func TestEnvBlock(t *testing.T) {
 }
 
 func TestWriteEnvironment(t *testing.T) {
-	tests := map[string]struct{ start string }{"default": {}, "compat": {direct}, "remove": {compat}}
-	for mode, tt := range tests {
-		t.Run(mode, func(t *testing.T) {
+	tests := map[string]struct {
+		start, mode string
+		remove      bool
+	}{
+		"default": {mode: "default"},
+		"compat":  {start: direct, mode: "compat"},
+		"remove":  {start: compat, mode: "default", remove: true},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
 			f := sandbox(t)
 			initial := map[string]any{"USER_SETTING": "keep-me", "ANTHROPIC_UNIX_SOCKET": "retired-socket-value"}
 			if tt.start != "" {
 				initial[base] = tt.start
 			}
-			putEnv(t, f.user, initial)
-			check(t, f.WriteEnv("user", mode, mode == "remove"))
+			if tt.remove {
+				const entries = `"ANTHROPIC_BASE_URL":"` + compat + `", "ANTHROPIC_UNIX_SOCKET":"retired-socket-value", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY":"1", `
+				put(t, f.user, envPrefix+entries+userPair+envSuffix)
+			} else {
+				putEnv(t, f.user, initial)
+			}
+			check(t, f.WriteEnv("user", tt.mode, tt.remove))
 			env := envAt(t, f.user)
 			_, socket := env["ANTHROPIC_UNIX_SOCKET"]
 			equal(t, false, socket)
 			equal(t, "keep-me", env["USER_SETTING"])
 			var want *wiring.Wiring
-			if mode == "remove" {
+			if tt.remove {
+				equal(t, envPrefix+userPair+envSuffix, text(t, f.user))
 				_, present := env[base]
 				equal(t, false, present)
 			} else {
-				equal(t, map[string]string{"default": direct, "compat": compat}[mode], env[base])
-				want = &wiring.Wiring{Scope: "user", Mode: mode, Source: "user", File: f.user}
+				equal(t, map[string]string{"default": direct, "compat": compat}[tt.mode], env[base])
+				want = &wiring.Wiring{Scope: "user", Mode: tt.mode, Source: "user", File: f.user}
 			}
 			actual, err := f.WiredMode()
 			check(t, err)

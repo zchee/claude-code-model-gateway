@@ -61,7 +61,13 @@ func TestAtomicProjectRegistry(t *testing.T) {
 		t.Fatalf("writer did not encounter the interruption: %v: %s", err, output)
 	}
 	equal(t, old, text(t, f.registry))
+	prior, err := os.Open(f.registry)
+	check(t, err)
+	t.Cleanup(func() { check(t, prior.Close()) })
 	check(t, f.RecordProject())
+	witness, err := io.ReadAll(prior)
+	check(t, err)
+	equal(t, old, string(witness))
 	equal(t, "{\n  \"projects\": [\n    "+encoded(t, f.Project)+"\n  ]\n}\n", text(t, f.registry))
 	st, err := os.Stat(f.registry)
 	check(t, err)

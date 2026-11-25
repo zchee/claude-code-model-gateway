@@ -101,6 +101,23 @@ func TestReadinessHookForms(t *testing.T) {
 	}
 }
 
+func TestRefreshPreservesMixedGroupBytes(t *testing.T) {
+	f := sandbox(t)
+	_, installed := firstHookSettings(t, f)
+	const group = `{ "matcher" : "custom|resume", "hooks" : [ { "command" : "echo \u0041", "type" : "command", "metadata" : [ 1e+01, 2E-02 ] }`
+	const end = ` ] }`
+	const event = `"SessionStart": [` + "\r\n      "
+	stale := encoded(t, map[string]any{"type": "command", "command": f.bin, "args": []string{"readiness-gate"}, "onFailure": "block"})
+	before := strings.Replace(installed, event, event+group+",\r\n\t\t"+stale+end+",\r\n      ", 1)
+	want := strings.Replace(installed, event, event+group+end+",\r\n      ", 1)
+	if before == want {
+		t.Fatal("fixture did not insert the stale hook")
+	}
+	got, err := f.SyncReadinessHooks([]byte(before), true)
+	check(t, err)
+	equal(t, want, string(got))
+}
+
 func TestUnwirePreservesUserHookBytes(t *testing.T) {
 	f := sandbox(t)
 	user := `{ "type" : "command", "command" : "user hook", "metadata": [ 1e+01, "A" ] }`
