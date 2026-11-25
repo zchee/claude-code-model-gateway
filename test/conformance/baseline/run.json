@@ -1,0 +1,319 @@
+{
+  "commit": "a8501f25175572071a0d085d34346dcf67e49b23",
+  "root_tree": "22be5dae8859c7307906f938fa364b7ffadf006c",
+  "plugin_tree": "aaf4f26b527c2ff08dbc47707a5f69e6ec2cf40a",
+  "node": "v24.11.1",
+  "npm": "11.6.2",
+  "ajv": "8.20.0",
+  "tools": {
+    "lsof": {
+      "path": "/usr/bin/lsof",
+      "version": "lsof 4.99.4+dfsg-2"
+    },
+    "ps": {
+      "path": "/usr/bin/ps",
+      "version": "procps 2:4.0.4-9"
+    },
+    "tar": {
+      "path": "/usr/bin/tar",
+      "version": "tar 1.35+dfsg-3.1"
+    },
+    "gzip": {
+      "path": "/usr/bin/gzip",
+      "version": "gzip 1.13-1+deb13u1"
+    },
+    "which": {
+      "path": "/usr/bin/which",
+      "version": "debianutils 5.23.2"
+    },
+    "sh": {
+      "path": "/usr/bin/sh",
+      "version": "dash 0.5.12-12"
+    },
+    "env": {
+      "path": "/usr/bin/env",
+      "version": "coreutils 9.7-3"
+    },
+    "touch": {
+      "path": "/usr/bin/touch",
+      "version": "coreutils 9.7-3"
+    },
+    "git": {
+      "path": "/usr/bin/git",
+      "version": "git 1:2.47.3-0+deb13u1"
+    },
+    "node": {
+      "path": "/tmp/model-gateway-venue/node-v24.11.1-linux-x64.tar.xz.toolchain/bin/node",
+      "version": "v24.11.1"
+    },
+    "npm": {
+      "path": "/tmp/model-gateway-venue/node-v24.11.1-linux-x64.tar.xz.toolchain/bin/npm",
+      "version": "11.6.2"
+    }
+  },
+  "command": "node --require ./test/isolate-home.js --test --test-concurrency=2 --test-timeout=300000 \"test/*.test.js\"",
+  "invocation": "npm test",
+  "started": "2026-11-25T16:34:55Z",
+  "ended": "2026-11-25T16:36:33Z",
+  "exit": 0,
+  "bus_environment_present": {
+    "XDG_RUNTIME_DIR": false,
+    "DBUS_SESSION_BUS_ADDRESS": false
+  },
+  "processes": {
+    "excluded": [
+      {
+        "pid": 89687,
+        "start_tick": 9571014,
+        "name": "dbus-daemon",
+        "cgroup": "/user.slice/user-1000.slice/user@1000.service/session.slice/dbus.service"
+      }
+    ],
+    "leftovers": []
+  },
+  "verdicts": {
+    "suite_exit": 0,
+    "files_complete": true,
+    "processes_clean": true,
+    "venue_clean": true,
+    "errors": []
+  },
+  "files": {
+    "test/anthropic-catalog.test.js": {
+      "success": true,
+      "tests": 10
+    },
+    "test/atomic-file.test.js": {
+      "success": true,
+      "tests": 3
+    },
+    "test/catalog-refresh.test.js": {
+      "success": true,
+      "tests": 7
+    },
+    "test/codex-upstream-cases.test.js": {
+      "success": true,
+      "tests": 7
+    },
+    "test/compact-stream.test.js": {
+      "success": true,
+      "tests": 22
+    },
+    "test/context-sentry-lifecycle.test.js": {
+      "success": true,
+      "tests": 17
+    },
+    "test/context-window-setting.test.js": {
+      "success": true,
+      "tests": 13
+    },
+    "test/context-window.test.js": {
+      "success": true,
+      "tests": 47
+    },
+    "test/control-auth.test.js": {
+      "success": true,
+      "tests": 3
+    },
+    "test/discovery-cache.test.js": {
+      "success": true,
+      "tests": 14
+    },
+    "test/dispatch-model.test.js": {
+      "success": true,
+      "tests": 15
+    },
+    "test/gateway-drain.test.js": {
+      "success": true,
+      "tests": 29
+    },
+    "test/gateway-process-isolation.test.js": {
+      "success": true,
+      "tests": 73
+    },
+    "test/gateway-ps-locale.test.js": {
+      "success": true,
+      "tests": 3
+    },
+    "test/gateway-ps-width.test.js": {
+      "success": true,
+      "tests": 6
+    },
+    "test/gateway-readiness.test.js": {
+      "success": true,
+      "tests": 11
+    },
+    "test/gateway-telemetry.test.js": {
+      "success": true,
+      "tests": 7
+    },
+    "test/gateway-usage.test.js": {
+      "success": true,
+      "tests": 6
+    },
+    "test/github-release.test.js": {
+      "success": true,
+      "tests": 10
+    },
+    "test/grok-backend.test.js": {
+      "success": true,
+      "tests": 13
+    },
+    "test/hook-ensure-delegation.test.js": {
+      "success": true,
+      "tests": 9
+    },
+    "test/hook-startup-budget.test.js": {
+      "success": true,
+      "tests": 2
+    },
+    "test/keep-alive-listener-leak.test.js": {
+      "success": true,
+      "tests": 1
+    },
+    "test/lifecycle-lock.test.js": {
+      "success": true,
+      "tests": 8
+    },
+    "test/lmstudio.test.js": {
+      "success": true,
+      "tests": 29
+    },
+    "test/local-llama.test.js": {
+      "success": true,
+      "tests": 15
+    },
+    "test/native-budget-probe.test.js": {
+      "success": true,
+      "tests": 22
+    },
+    "test/owned-worker-cleanup.test.js": {
+      "success": true,
+      "tests": 79
+    },
+    "test/picker-guard.test.js": {
+      "success": true,
+      "tests": 7
+    },
+    "test/plugin-registry.test.js": {
+      "success": true,
+      "tests": 8
+    },
+    "test/proxy-models.test.js": {
+      "success": true,
+      "tests": 8
+    },
+    "test/proxy-providers.test.js": {
+      "success": true,
+      "tests": 22
+    },
+    "test/proxy-upgrade.test.js": {
+      "success": true,
+      "tests": 9
+    },
+    "test/rc-compat-mode.test.js": {
+      "success": true,
+      "tests": 28
+    },
+    "test/readiness-fast-path.test.js": {
+      "success": true,
+      "tests": 7
+    },
+    "test/readiness-gate.test.js": {
+      "success": true,
+      "tests": 29
+    },
+    "test/recovery-lifecycle.test.js": {
+      "success": true,
+      "tests": 2
+    },
+    "test/registry.test.js": {
+      "success": true,
+      "tests": 3
+    },
+    "test/relay-stream-abort.test.js": {
+      "success": true,
+      "tests": 6
+    },
+    "test/release-verification.test.js": {
+      "success": true,
+      "tests": 11
+    },
+    "test/request-worker.test.js": {
+      "success": true,
+      "tests": 7
+    },
+    "test/session-route-cache.test.js": {
+      "success": true,
+      "tests": 7
+    },
+    "test/settings-write-guard.test.js": {
+      "success": true,
+      "tests": 10
+    },
+    "test/shim-lifecycle.test.js": {
+      "success": true,
+      "tests": 24
+    },
+    "test/shim-request.test.js": {
+      "success": true,
+      "tests": 22
+    },
+    "test/shim-upload-abort.test.js": {
+      "success": true,
+      "tests": 5
+    },
+    "test/stable-command-path.test.js": {
+      "success": true,
+      "tests": 5
+    },
+    "test/start-gateway-timeout.test.js": {
+      "success": true,
+      "tests": 17
+    },
+    "test/supervisor-security.test.js": {
+      "success": true,
+      "tests": 6
+    },
+    "test/support.test.js": {
+      "success": true,
+      "tests": 8
+    },
+    "test/thread-negotiation.test.js": {
+      "success": true,
+      "tests": 11
+    },
+    "test/tool-schema-compat.test.js": {
+      "success": true,
+      "tests": 13
+    },
+    "test/tool-search.test.js": {
+      "success": true,
+      "tests": 2
+    },
+    "test/usage-observability.test.js": {
+      "success": true,
+      "tests": 21
+    },
+    "test/windows-detached.test.js": {
+      "success": true,
+      "tests": 2
+    },
+    "test/windows-hide.test.js": {
+      "success": true,
+      "tests": 2
+    },
+    "test/wiring-mode.test.js": {
+      "success": true,
+      "tests": 49
+    }
+  },
+  "totals": {
+    "pass": 825,
+    "fail": 0,
+    "skip": 7,
+    "todo": 0,
+    "cancelled": 0
+  },
+  "duration_seconds": 98
+}
