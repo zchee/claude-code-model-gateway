@@ -72,6 +72,21 @@ func TestParseListing(t *testing.T) {
 		"success: first attributed duplicate wins":            {rows: `[{"id":"k3","display_name":"k3 (kimi)"},{"id":"k3","display_name":"k3 (opencode)"}]`, want: []proxymodels.Route{{ID: "k3", Provider: "kimi"}}},
 		"success: unattributed duplicate does not reserve id": {rows: `[{"id":"k3"},{"id":"k3","display_name":"k3 (new-provider)"}]`, want: []proxymodels.Route{{ID: "k3", Provider: "new-provider"}}},
 		"error: invalid ids and native aliases":               {rows: `[null,7,{"id":1},{"id":""},{"id":"sonnet","display_name":"sonnet (kimi)"},{"id":"opus","display_name":"opus (kimi)"},{"id":"anthropic-alias","display_name":"anthropic-alias (kimi)"}]`, want: []proxymodels.Route{}},
+		"success: malformed rows do not discard valid neighbors": {
+			rows: `[
+				{"id":"k3","display_name":"k3 (kimi)"},
+				null, 7, "x", {"id":42}, {"id":false},
+				{"id":"gpt-legacy"}, {"id":"gpt-other","display_name":42},
+				{"id":"untagged","display_name":42},
+				{"id":"glm-5","display_name":"glm-5 (opencode)"}
+			]`,
+			want: []proxymodels.Route{
+				{ID: "k3", Provider: "kimi"},
+				{ID: "gpt-legacy", Provider: "codex"},
+				{ID: "gpt-other", Provider: "codex"},
+				{ID: "glm-5", Provider: "opencode"},
+			},
+		},
 		"success: only a well-formed suffix attributes a provider": {
 			rows: `[{"id":"a","display_name":"a (MixedCase)"},{"id":"b","display_name":"b (-x)"},{"id":"c","display_name":"c (x.y)"},{"id":"d","display_name":"d (x) trailing"},{"id":"gpt-other","display_name":"gpt-other (7-new)"}]`,
 			want: []proxymodels.Route{{ID: "gpt-other", Provider: "7-new"}},
@@ -110,6 +125,7 @@ func TestProviderLabel(t *testing.T) {
 		"success: codex": {"codex", "Codex"}, "success: cursor": {"cursor", "Cursor"}, "success: grok": {"grok", "Grok"},
 		"success: lmstudio": {"lmstudio", "LM Studio"}, "success: local": {"local", "Local GGUF"}, "success: muse": {"muse", "Muse"},
 		"success: vertex": {"vertex", "Vertex AI"}, "success: empty": {"", "Proxy"},
+		"success: capitalize constructor provider": {"constructor", "Constructor"},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {

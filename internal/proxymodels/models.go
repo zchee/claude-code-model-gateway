@@ -44,7 +44,8 @@ func NewTable(routes []Route) Table { return Table{} }
 // Routes returns the listed backend IDs with their current providers.
 func (Table) Routes() []Route { return nil }
 
-// Provider returns the provider of a backend ID, or the empty string if unknown.
+// Provider returns Codex ("codex") for any gpt-* ID, even if unlisted or listed under another provider.
+// For other IDs it returns the listed provider, or the empty string if unknown.
 func (Table) Provider(id string) string { return "" }
 
 // AdvertisedPart returns the picker spelling of a backend ID, without the gateway prefix.

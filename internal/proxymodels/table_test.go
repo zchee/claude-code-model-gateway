@@ -95,8 +95,6 @@ func TestAdvertisedPart(t *testing.T) {
 	}{
 		"success: listed Fable":                                 {[]proxymodels.Route{route}, original, renamed, original},
 		"success: unlisted Fable spelling has no reverse route": {nil, original, renamed, ""},
-		"success: collision after original":                     {[]proxymodels.Route{route, collision}, original, original, ""},
-		"success: collision before original":                    {[]proxymodels.Route{collision, route}, renamed, renamed, ""},
 		"success: replace every occurrence":                     {[]proxymodels.Route{{ID: "x/claude-fable-1/claude-fable-2", Provider: "x"}}, "x/claude-fable-1/claude-fable-2", "x/fable-1/fable-2", "x/claude-fable-1/claude-fable-2"},
 		"success: not a Fable":                                  {nil, "vertex/anthropic/claude-opus-5-5", "vertex/anthropic/claude-opus-5-5", ""},
 	}
@@ -112,6 +110,94 @@ func TestAdvertisedPart(t *testing.T) {
 			}
 			if _, ok := table.RouteIDForAdvertisedPart(tt.id); ok {
 				t.Errorf("backend ID %q unexpectedly resolved as an alias", tt.id)
+			}
+		})
+	}
+
+	collisions := map[string]struct{ routes []proxymodels.Route }{
+		"success: collision after original":  {[]proxymodels.Route{route, collision}},
+		"success: collision before original": {[]proxymodels.Route{collision, route}},
+	}
+	for name, tt := range collisions {
+		t.Run(name, func(t *testing.T) {
+			table := proxymodels.NewTable(tt.routes)
+			for _, id := range []string{original, renamed} {
+				if diff := gocmp.Diff(id, table.AdvertisedPart(id)); diff != "" {
+					t.Errorf("AdvertisedPart(%q) (-want +got):\n%s", id, diff)
+				}
+				if got, ok := table.RouteIDForAdvertisedPart(id); ok || got != "" {
+					t.Errorf("RouteIDForAdvertisedPart(%q) = (%q, %t), want no alias", id, got, ok)
+				}
+			}
+			if diff := gocmp.Diff("vertex", table.Provider(original)); diff != "" {
+				t.Errorf("Provider(%q) (-want +got):\n%s", original, diff)
+			}
+		})
+	}
+}
+
+func TestSharedAdvertisedPart(t *testing.T) {
+	first := proxymodels.Route{ID: "x/claude-fable-a/fable-b", Provider: "x"}
+	second := proxymodels.Route{ID: "x/fable-a/claude-fable-b", Provider: "x"}
+	const part = "x/fable-a/fable-b"
+	tests := map[string]struct {
+		routes []proxymodels.Route
+		wantID string
+	}{
+		"success: last distinct id wins":    {[]proxymodels.Route{first, second, first}, second.ID},
+		"success: reversed insertion order": {[]proxymodels.Route{second, first, second}, first.ID},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			table := proxymodels.NewTable(tt.routes)
+			for _, id := range []string{first.ID, second.ID} {
+				if diff := gocmp.Diff(part, table.AdvertisedPart(id)); diff != "" {
+					t.Errorf("AdvertisedPart(%q) (-want +got):\n%s", id, diff)
+				}
+			}
+			if id, ok := table.RouteIDForAdvertisedPart(part); id != tt.wantID || !ok {
+				t.Errorf("RouteIDForAdvertisedPart(%q) = (%q, %t), want (%q, true)", part, id, ok, tt.wantID)
+			}
+		})
+	}
+}
+
+func TestTableSnapshots(t *testing.T) {
+	oldRoute := proxymodels.Route{ID: "x/claude-fable-a", Provider: "x"}
+	newRoute := proxymodels.Route{ID: "k3", Provider: "kimi"}
+	const alias = "x/fable-a"
+	input := []proxymodels.Route{oldRoute}
+	first := proxymodels.NewTable(input)
+	input[0] = newRoute
+	second := proxymodels.NewTable(input)
+	input[0] = proxymodels.Route{}
+
+	tests := map[string]struct {
+		table              proxymodels.Table
+		want               proxymodels.Route
+		missingID, aliasID string
+	}{
+		"success: old snapshot unchanged":                     {first, oldRoute, newRoute.ID, oldRoute.ID},
+		"success: replacement has no stale routes or aliases": {second, newRoute, oldRoute.ID, ""},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			if got := tt.table.Provider(tt.missingID); got != "" {
+				t.Errorf("Provider(%q) = %q, want no provider", tt.missingID, got)
+			}
+			if diff := gocmp.Diff(tt.want.Provider, tt.table.Provider(tt.want.ID)); diff != "" {
+				t.Errorf("Provider(%q) (-want +got):\n%s", tt.want.ID, diff)
+			}
+			if id, ok := tt.table.RouteIDForAdvertisedPart(alias); id != tt.aliasID || ok != (tt.aliasID != "") {
+				t.Errorf("RouteIDForAdvertisedPart(%q) = (%q, %t), want (%q, %t)", alias, id, ok, tt.aliasID, tt.aliasID != "")
+			}
+			routes := tt.table.Routes()
+			if diff := gocmp.Diff([]proxymodels.Route{tt.want}, routes); diff != "" {
+				t.Fatalf("Routes after changing input (-want +got):\n%s", diff)
+			}
+			routes[0] = proxymodels.Route{}
+			if diff := gocmp.Diff([]proxymodels.Route{tt.want}, tt.table.Routes()); diff != "" {
+				t.Errorf("Routes after changing result (-want +got):\n%s", diff)
 			}
 		})
 	}
