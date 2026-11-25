@@ -209,6 +209,26 @@ func TestCacheTTLInMilliseconds(t *testing.T) {
 	}
 }
 
+func TestCacheExpiresFractionalStoredAge(t *testing.T) {
+	const live = `{"version":1,"routes":[["session",{"model":"m","effort":null,"ticket":null,"lastUsedAt":0.5}]]}`
+	path := storedCache(t, live)
+	ms := int64(1)
+	cache := dispatch.NewCache(path, 1.25, 1, func() time.Time { return time.UnixMilli(ms) })
+	checkFile(t, path, live)
+	ms = 2
+	checkGet(t, cache, "session", nil)
+	checkFile(t, path, `{"version":1,"routes":[]}`)
+}
+
+func TestCacheSetCopiesInput(t *testing.T) {
+	cache := dispatch.NewCache("", 100, 1, func() time.Time { return time.UnixMilli(0) })
+	input := dispatch.CachedRoute{Model: "m", Effort: new("high"), Ticket: new("Ticket")}
+	cache.Set("session", input)
+	*input.Effort = "low"
+	*input.Ticket = "Other"
+	checkGet(t, cache, "session", &dispatch.CachedRoute{Model: "m", Effort: new("high"), Ticket: new("Ticket")})
+}
+
 func TestCacheGetReturnsIndependentRoute(t *testing.T) {
 	cache := dispatch.NewCache("", 100, 1, func() time.Time { return time.UnixMilli(0) })
 	cache.Set("session", dispatch.CachedRoute{Model: "m", Effort: new("high"), Ticket: new("Ticket")})
