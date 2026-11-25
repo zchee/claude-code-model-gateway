@@ -22,21 +22,94 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 
 	"golang.org/x/sys/unix"
 )
 
-type directory struct {
-	*os.Root
-	handle *os.File
+type directory struct{ handle *os.File }
+
+func (d *directory) Close() error { return d.handle.Close() }
+
+func validBase(base string) bool {
+	return base != "" && base != "." && base != ".." && !strings.Contains(base, "/")
 }
 
-func (d *directory) Close() error { return errors.Join(d.Root.Close(), d.handle.Close()) }
+func (d *directory) Lstat(base string) (*unix.Stat_t, error) {
+	if !validBase(base) {
+		return nil, &DestinationError{base}
+	}
+	var st unix.Stat_t
+	err := unix.Fstatat(int(d.handle.Fd()), base, &st, unix.AT_SYMLINK_NOFOLLOW)
+	runtime.KeepAlive(d)
+	if err != nil {
+		return nil, &os.PathError{Op: "lstat", Path: d.path(base), Err: err}
+	}
+	return &st, nil
+}
 
-// Remove only unlinks files. Unlike os.Root.Remove, it never retries as rmdir.
+func (d *directory) OpenFile(base string, flags int, mode fs.FileMode) (*os.File, error) {
+	if !validBase(base) {
+		return nil, &DestinationError{base}
+	}
+	fd, err := unix.Openat(int(d.handle.Fd()), base, flags|unix.O_NOFOLLOW|unix.O_CLOEXEC, uint32(mode.Perm()))
+	runtime.KeepAlive(d)
+	if err != nil {
+		return nil, &os.PathError{Op: "open", Path: d.path(base), Err: err}
+	}
+	return os.NewFile(uintptr(fd), d.path(base)), nil
+}
+
+func (d *directory) Readlink(base string) (string, error) {
+	if !validBase(base) {
+		return "", &DestinationError{base}
+	}
+	for capacity := 128; ; capacity *= 2 {
+		buf := make([]byte, capacity)
+		n, err := unix.Readlinkat(int(d.handle.Fd()), base, buf)
+		runtime.KeepAlive(d)
+		if err != nil {
+			return "", &os.PathError{Op: "readlink", Path: d.path(base), Err: err}
+		}
+		if n < len(buf) {
+			return string(buf[:n]), nil
+		}
+	}
+}
+
+func (d *directory) Rename(from, to string) error {
+	if !validBase(from) {
+		return &DestinationError{from}
+	}
+	if !validBase(to) {
+		return &DestinationError{to}
+	}
+	dirfd := int(d.handle.Fd())
+	err := unix.Renameat(dirfd, from, dirfd, to)
+	runtime.KeepAlive(d)
+	if err != nil {
+		return &os.LinkError{Op: "rename", Old: d.path(from), New: d.path(to), Err: err}
+	}
+	return nil
+}
+
+func (d *directory) entryNames() ([]string, error) {
+	// A plain dup shares its directory offset. Reopen dot relative to the pinned fd so each sweep starts at the beginning.
+	fd, err := unix.Openat(int(d.handle.Fd()), ".", directoryFlags, 0)
+	runtime.KeepAlive(d)
+	if err != nil {
+		return nil, err
+	}
+	f := os.NewFile(uintptr(fd), d.handle.Name())
+	defer func() { _ = f.Close() }()
+	return f.Readdirnames(-1)
+}
+
+// Remove only unlinks files; it never retries as rmdir.
 func (d *directory) Remove(base string) error {
+	if !validBase(base) {
+		return &DestinationError{base}
+	}
 	err := unix.Unlinkat(int(d.handle.Fd()), base, 0)
 	runtime.KeepAlive(d.handle)
 	return err
@@ -48,7 +121,7 @@ func (d *directory) path(base string) string {
 
 func splitDestination(path string) (string, string, error) {
 	parent, base := filepath.Split(path)
-	if base == "" || base == "." || base == ".." {
+	if !validBase(base) {
 		return "", "", &DestinationError{path}
 	}
 	if parent == "" {
@@ -111,14 +184,7 @@ func openParent(parent *directory, path string, create bool) (*directory, string
 	if err != nil {
 		return nil, "", err
 	}
-	f := os.NewFile(uintptr(fd), display)
-	// Go has no os.Root constructor from an fd. Open the directory descriptor, not the caller's path a second time.
-	root, err := os.OpenRoot("/dev/fd/" + strconv.Itoa(fd))
-	if err != nil {
-		_ = f.Close()
-		return nil, "", err
-	}
-	return &directory{root, f}, base, nil
+	return &directory{os.NewFile(uintptr(fd), display)}, base, nil
 }
 
 func openSettingsParent(path string, create bool) (*directory, string, error) {
@@ -131,7 +197,7 @@ func openSettingsParent(path string, create bool) (*directory, string, error) {
 		if errors.Is(err, fs.ErrNotExist) && hops == 0 {
 			return d, base, nil
 		}
-		if err == nil && info.Mode()&os.ModeSymlink == 0 {
+		if err == nil && info.Mode&unix.S_IFMT != unix.S_IFLNK {
 			return d, base, nil
 		}
 		if err != nil {

@@ -17,11 +17,14 @@
 package atomicfile
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -35,7 +38,7 @@ func TestDestinationSpelling(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
-			for _, p := range []string{"", dir + "/"} {
+			for _, p := range []string{"", dir + "/", dir + "/.", dir + "/.."} {
 				err := tt.write(p)
 				if _, ok := errors.AsType[*DestinationError](err); !ok {
 					t.Fatalf("%q: got %v, want destination error", p, err)
@@ -65,6 +68,105 @@ func TestDestinationSpelling(t *testing.T) {
 	}
 }
 
+func TestDirectoryDescriptor(t *testing.T) {
+	path := stateFile(t)
+	d, base, err := openParent(nil, path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.Close() }()
+	long := strings.Repeat("x", 160)
+	if err := os.Symlink(long, filepath.Join(filepath.Dir(path), "link")); err != nil {
+		t.Fatal(err)
+	}
+	moved := filepath.Join(t.TempDir(), "moved")
+	if err := os.Rename(filepath.Dir(path), moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		names, err := d.entryNames()
+		if err != nil {
+			t.Fatal(err)
+		}
+		slices.Sort(names)
+		if diff := gocmp.Diff([]string{"link", base}, names); diff != "" {
+			t.Fatal(diff)
+		}
+	}
+	if got, err := d.Readlink("link"); err != nil || got != long {
+		t.Fatalf("readlink: %q, %v", got, err)
+	}
+	if err := newWriter().replace(d, base, []byte(newState), 0o600, nil, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	checkContents(t, filepath.Join(moved, base), newState)
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("new parent: %v, %v", entries, err)
+	}
+}
+
+func TestAtomicEditorSave(t *testing.T) {
+	tests := map[string]struct {
+		saves, calls int
+		want         string
+		conflict     bool
+	}{
+		"success: reapply edit to editor's replacement": {1, 2, `{"new":true,"editor":1}`, false},
+		"error: editor replaces file on every attempt":  {3, 3, `{"old":true,"editor":3}`, true},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			path := stateFile(t)
+			calls, saves := 0, 0
+			err := newWriter().replaceSettings(path, func(current []byte) ([]byte, error) {
+				calls++
+				if calls > tt.calls {
+					t.Fatal("edit retried beyond expected bound")
+				}
+				return bytes.Replace(current, []byte(`"old"`), []byte(`"new"`), 1), nil
+			}, func(preparedFile, string) {
+				if saves == tt.saves {
+					return
+				}
+				saves++
+				draft := filepath.Join(filepath.Dir(path), "editor-save")
+				writeFixture(t, draft, fmt.Sprintf(`{"old":true,"editor":%d}`, saves))
+				if err := os.Rename(draft, path); err != nil {
+					t.Fatal(err)
+				}
+			})
+			if calls != tt.calls || saves != tt.saves || (err != nil) != tt.conflict || tt.conflict && !strings.Contains(err.Error(), path) {
+				t.Fatalf("calls=%d saves=%d err=%v", calls, saves, err)
+			}
+			checkContents(t, path, tt.want)
+			checkOnlyTarget(t, path)
+		})
+	}
+}
+
+func TestSaveTemporarilyAbsent(t *testing.T) {
+	path := stateFile(t)
+	d, base, err := openParent(nil, path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.Close() }()
+	conflict := errors.New("settings changed")
+	_, err = readSettings(d, base, conflict, func() {
+		if err := os.Rename(path, path+".previous"); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !errors.Is(err, conflict) {
+		t.Fatalf("expected retryable conflict, got %v", err)
+	}
+	checkContents(t, path+".previous", oldState)
+}
+
 func TestFileOnlyUnlink(t *testing.T) {
 	path := stateFile(t)
 	root, _, err := openParent(nil, path, false)
@@ -73,13 +175,13 @@ func TestFileOnlyUnlink(t *testing.T) {
 	}
 	defer func() { _ = root.Close() }()
 	const name = "state.json.1.abcdef012345.tmp"
-	if err := root.Mkdir(name, 0o700); err != nil {
+	if err := os.Mkdir(root.path(name), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := root.Remove(name); err == nil {
 		t.Fatal("file-only unlink removed a directory")
 	}
-	info, err := root.Lstat(name)
+	info, err := os.Lstat(root.path(name))
 	if err != nil || !info.IsDir() {
 		t.Fatalf("directory not preserved: %v", err)
 	}
