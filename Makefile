@@ -101,6 +101,14 @@ test:
 test-process:
 	@$(require_test_venue) && go test -count=1 -tags process ./...
 
+.PHONY: json-goldens fuzz-settings
+
+json-goldens:
+	@$(require_test_venue) && node hack/json-goldens.mjs
+
+fuzz-settings:
+	@$(require_test_venue) && go test -run='^$$' -fuzz='^FuzzSettingsNoEdit$$' -parallel=4 -fuzztime=60s ./internal/jsonx
+
 conformance baseline-node assertion-sites bench:
 	@$(require_test_venue) && $(run_script)
 

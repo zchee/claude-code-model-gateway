@@ -16,12 +16,9 @@
 package atomicfile
 
 import (
-	"errors"
 	"io/fs"
 	"time"
 )
-
-var errNotImplemented = errors.New("atomic file replacement not implemented")
 
 // preparedFile is the commit surface of a renameio.PendingFile on POSIX.
 // The interface keeps the error-only Windows build independent of renameio.
@@ -44,18 +41,9 @@ func WriteFile(path string, data []byte, mode fs.FileMode) error {
 	return newWriter().writeFile(path, data, mode)
 }
 
-func (w writer) writeFile(path string, data []byte, mode fs.FileMode) error {
-	return errNotImplemented
-}
-
 // ReplaceSettings follows a settings symlink and preserves the target's permissions.
 // If another writer changes the file before commit, it calls edit on the new contents,
 // failing with the filename after three conflicting attempts.
 func ReplaceSettings(path string, edit func([]byte) ([]byte, error)) error {
 	return newWriter().replaceSettings(path, edit, nil)
-}
-
-// afterStage, when set, runs after staging and before the final read of path.
-func (w writer) replaceSettings(path string, edit func([]byte) ([]byte, error), afterStage func(preparedFile, string)) error {
-	return errNotImplemented
 }
