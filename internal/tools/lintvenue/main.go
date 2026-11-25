@@ -12,10 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Command lintvenue checks test entry points without loading or running packages.
+// Command lintvenue checks test entry points without loading or running the
+// packages it inspects. The TestMain parameter must be written as *testing.M
+// (through any import name for testing), not a locally declared type alias.
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -24,6 +27,7 @@ import (
 	"go/token"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -36,13 +40,41 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: lintvenue directory")
 		os.Exit(2)
 	}
-	if err := checkTree(os.Args[1]); err != nil {
+	targets, err := targetContexts(context.Background())
+	if err == nil {
+		err = checkTree(os.Args[1], targets)
+	}
+	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
 
-func checkTree(root string) error {
+// targetContexts asks the installed toolchain about a standard package only.
+// Both architecture feature tags and enabled experiments can differ by target.
+func targetContexts(ctx context.Context) ([]build.Context, error) {
+	var targets []build.Context
+	for _, p := range [][2]string{{"linux", "amd64"}, {"darwin", "arm64"}, {"darwin", "amd64"}, {"windows", "amd64"}} {
+		target := build.Default
+		target.GOOS, target.GOARCH = p[0], p[1]
+		cmd := exec.CommandContext(ctx, filepath.Join(target.GOROOT, "bin", "go"), "list", "-f", `{{join context.ToolTags " "}}{{"\n"}}{{join context.ReleaseTags " "}}`, "unsafe")
+		cmd.Dir = filepath.Join(target.GOROOT, "src")
+		cmd.Env = append(cmd.Environ(), "GOOS="+target.GOOS, "GOARCH="+target.GOARCH, "GOAMD64=v1", "GOARM64=v8.0", "CGO_ENABLED=0", "GOEXPERIMENT=", "GOFLAGS=", "GOENV=off", "GOWORK=off", "GOTOOLCHAIN=local", "GO111MODULE=off")
+		out, err := cmd.Output()
+		if err != nil {
+			return nil, fmt.Errorf("%s/%s build tags: %w", target.GOOS, target.GOARCH, err)
+		}
+		tool, release, ok := strings.Cut(strings.TrimSuffix(string(out), "\n"), "\n")
+		if !ok || tool == "" || release == "" {
+			return nil, fmt.Errorf("%s/%s: missing toolchain tags", target.GOOS, target.GOARCH)
+		}
+		target.ToolTags, target.ReleaseTags = strings.Fields(tool), strings.Fields(release)
+		targets = append(targets, target)
+	}
+	return targets, nil
+}
+
+func checkTree(root string, targets []build.Context) error {
 	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -59,6 +91,9 @@ func checkTree(root string) error {
 		}
 		var names []string
 		for _, e := range entries {
+			if path != root && e.Name() == "go.mod" && !e.IsDir() {
+				return filepath.SkipDir
+			}
 			if !e.IsDir() && strings.HasSuffix(e.Name(), "_test.go") {
 				names = append(names, e.Name())
 			}
@@ -73,9 +108,8 @@ func checkTree(root string) error {
 				label = "process"
 			}
 		platforms:
-			for _, platform := range [][2]string{{"linux", "amd64"}, {"darwin", "arm64"}, {"darwin", "amd64"}, {"windows", "amd64"}} {
-				ctx := build.Default
-				ctx.GOOS, ctx.GOARCH, ctx.BuildTags = platform[0], platform[1], tags
+			for _, ctx := range targets {
+				ctx.BuildTags = tags
 				for _, cgo := range []bool{false, true} {
 					ctx.CgoEnabled = cgo
 					if err := checkPackage(ctx, path, names); err != nil {

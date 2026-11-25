@@ -15,6 +15,7 @@
 package main
 
 import (
+	"go/build"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -28,6 +29,9 @@ func TestCheckTree(t *testing.T) {
 		defaultFail, processFail bool
 	}{
 		"success: shared guard includes tagged tests": {dir: "shared"},
+		"success: nested module excluded":             {dir: "nested"},
+		"error: nested module scanned as root":        {filepath.Join("nested", "child"), "sample_test.go: missing guarded TestMain", true, true},
+		"error: architecture feature guard missing":   {"feature", "sample_test.go: missing guarded TestMain", true, true},
 		"success: aliased venue import":               {dir: "alias"},
 		"error: missing guard":                        {"missing", "sample_test.go: missing guarded TestMain", true, true},
 		"error: late guard":                           {"late", "main_test.go: TestMain must begin with venue.Require()", true, true},
@@ -36,7 +40,9 @@ func TestCheckTree(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			dir := filepath.Join("testdata", tc.dir)
-			err := checkTree(dir)
+			target := build.Default
+			target.GOOS, target.GOARCH, target.ToolTags = "linux", "amd64", []string{"amd64.v1"}
+			err := checkTree(dir, []build.Context{target})
 			var msg string
 			if err != nil {
 				msg = err.Error()
