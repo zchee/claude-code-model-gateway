@@ -166,7 +166,7 @@ negative_control() (
             printf '%-24s %-16s FAIL (exit %s, coverage files %s)\n' "$variant" withdrawn "$rc" "${#entries[@]}"; failed=1
         else printf '%-24s %-16s %s\n' "$variant" withdrawn 'PASS (97)'; fi
     done
-    for target in test test-process test-json test-process-json conformance baseline-node assertion-sites bench json-goldens fuzz-settings; do
+    for target in test test-process test-json test-process-json conformance baseline-node assertion-sites bench json-goldens toolschema-goldens fuzz-settings; do
         rc=0; PATH="$control/bin:$PATH" make "$target" > "$control/make.log" 2>&1 || rc=$?
         if [[ $rc != 2 || -e $control/dispatched ]] || ! grep -Fxq 'not a test venue: attestation missing' "$control/make.log"; then
             fail "$target did not refuse before dispatch"

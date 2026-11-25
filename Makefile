@@ -113,10 +113,16 @@ test-json:
 test-process-json:
 	@$(require_test_venue) && go test -json -count=1 -tags process ./...
 
-.PHONY: json-goldens fuzz-settings
+.PHONY: json-goldens toolschema-goldens fuzz-settings
 
 json-goldens:
 	@$(require_test_venue) && node hack/json-goldens.mjs
+
+toolschema-goldens:
+	@$(require_test_venue) && source_root=$$(./hack/pinned-source) && \
+		plugin="$$source_root/plugins/model-gateway" && \
+		npm --prefix "$$plugin" ci --ignore-scripts --no-audit --no-fund >&2 && \
+		node hack/toolschema-goldens.mjs "$$plugin"
 
 fuzz-settings:
 	@$(require_test_venue) && go test -run='^$$' -fuzz='^FuzzSettingsNoEdit$$' -parallel=4 -fuzztime=60s -fuzzminimizetime=1s ./internal/jsonx

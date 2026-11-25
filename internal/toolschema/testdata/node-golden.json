@@ -1,0 +1,1151 @@
+{
+  "node": "v24.11.1",
+  "ajv": "8.20.0",
+  "cases": {
+    "artifact-name": {
+      "before": [
+        true,
+        false,
+        false,
+        false,
+        false
+      ],
+      "same": false,
+      "wire": "{\"type\":\"string\",\"pattern\":\"^(?!__.*__$)[^\\\"\\\\\\\\./[\\\\]]{1,200}$\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "^(?!__.*__$)[^\"\\\\./[\\]]{1,200}$"
+        }
+      ],
+      "after": [
+        true,
+        false,
+        true,
+        false,
+        false
+      ]
+    },
+    "positive-root": {
+      "same": false,
+      "wire": "{\"type\":\"string\",\"pattern\":\"[^a]\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "[^a]"
+        }
+      ]
+    },
+    "positive-properties": {
+      "same": false,
+      "wire": "{\"properties\":{\"value\":{\"type\":\"string\",\"pattern\":\"[^a]\"}}}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/properties/value/pattern",
+          "replacement": "[^a]"
+        }
+      ]
+    },
+    "positive-pattern-properties": {
+      "same": false,
+      "wire": "{\"patternProperties\":{\"^x-\":{\"type\":\"string\",\"pattern\":\"[^a]\"}}}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/patternProperties/^x-/pattern",
+          "replacement": "[^a]"
+        }
+      ]
+    },
+    "positive-additional-properties": {
+      "same": false,
+      "wire": "{\"additionalProperties\":{\"type\":\"string\",\"pattern\":\"[^a]\"}}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/additionalProperties/pattern",
+          "replacement": "[^a]"
+        }
+      ]
+    },
+    "positive-items": {
+      "same": false,
+      "wire": "{\"items\":{\"type\":\"string\",\"pattern\":\"[^a]\"}}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/items/pattern",
+          "replacement": "[^a]"
+        }
+      ]
+    },
+    "positive-prefix-items": {
+      "same": false,
+      "wire": "{\"prefixItems\":[{\"type\":\"string\",\"pattern\":\"[^a]\"}]}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/prefixItems/0/pattern",
+          "replacement": "[^a]"
+        }
+      ]
+    },
+    "positive-all-of": {
+      "same": false,
+      "wire": "{\"allOf\":[{\"type\":\"string\",\"pattern\":\"[^a]\"}]}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/allOf/0/pattern",
+          "replacement": "[^a]"
+        }
+      ]
+    },
+    "positive-any-of": {
+      "same": false,
+      "wire": "{\"anyOf\":[{\"type\":\"string\",\"pattern\":\"[^a]\"}]}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/anyOf/0/pattern",
+          "replacement": "[^a]"
+        }
+      ]
+    },
+    "positive-dependent-schemas": {
+      "same": false,
+      "wire": "{\"dependentSchemas\":{\"enabled\":{\"type\":\"string\",\"pattern\":\"[^a]\"}}}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/dependentSchemas/enabled/pattern",
+          "replacement": "[^a]"
+        }
+      ]
+    },
+    "positive-property-names": {
+      "same": false,
+      "wire": "{\"propertyNames\":{\"type\":\"string\",\"pattern\":\"[^a]\"}}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/propertyNames/pattern",
+          "replacement": "[^a]"
+        }
+      ]
+    },
+    "positive-unevaluated-properties": {
+      "same": false,
+      "wire": "{\"unevaluatedProperties\":{\"type\":\"string\",\"pattern\":\"[^a]\"}}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/unevaluatedProperties/pattern",
+          "replacement": "[^a]"
+        }
+      ]
+    },
+    "positive-unevaluated-items": {
+      "same": false,
+      "wire": "{\"unevaluatedItems\":{\"type\":\"string\",\"pattern\":\"[^a]\"}}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/unevaluatedItems/pattern",
+          "replacement": "[^a]"
+        }
+      ]
+    },
+    "unevaluated-object": {
+      "before": [
+        true,
+        false
+      ],
+      "same": false,
+      "wire": "{\"type\":\"object\",\"allOf\":[{\"properties\":{\"filename\":{\"type\":\"string\",\"pattern\":\"^(?!__.*__$)[^\\\"\\\\\\\\./[\\\\]]{1,200}$\"}}}],\"unevaluatedProperties\":false}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/allOf/0/properties/filename/pattern",
+          "replacement": "^(?!__.*__$)[^\"\\\\./[\\]]{1,200}$"
+        }
+      ],
+      "after": [
+        true,
+        false
+      ]
+    },
+    "unevaluated-array": {
+      "before": [
+        true,
+        false
+      ],
+      "same": false,
+      "wire": "{\"type\":\"array\",\"prefixItems\":[{\"type\":\"string\",\"pattern\":\"^(?!__.*__$)[^\\\"\\\\\\\\./[\\\\]]{1,200}$\"}],\"unevaluatedItems\":false}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/prefixItems/0/pattern",
+          "replacement": "^(?!__.*__$)[^\"\\\\./[\\]]{1,200}$"
+        }
+      ],
+      "after": [
+        true,
+        false
+      ]
+    },
+    "untouched-annotations": {
+      "same": true,
+      "wire": "{\"type\":\"object\",\"description\":\"data says \\\\p{Cc}\",\"default\":{\"pattern\":\"\\\\p{Cc}\"},\"examples\":[{\"pattern\":\"\\\\P{Cf}\"}],\"properties\":{\"literal\":{\"type\":\"string\",\"pattern\":\"^\\\\\\\\p{Cc}$\"}}}",
+      "edits": []
+    },
+    "untouched-data-keywords": {
+      "same": true,
+      "wire": "{\"const\":{\"pattern\":\"\\\\p\"},\"enum\":[{\"pattern\":\"\\\\p\"}],\"description\":{\"patternProperties\":{\"\\\\p\":{}}}}",
+      "edits": []
+    },
+    "untouched-self-cycle": {
+      "same": true,
+      "selfCycle": true,
+      "edits": []
+    },
+    "untouched-reference-cycle": {
+      "same": true,
+      "wire": "{\"$defs\":{\"node\":{\"$ref\":\"#/$defs/node\"}},\"$ref\":\"#/$defs/node\"}",
+      "edits": []
+    },
+    "parity-one-slash": {
+      "same": false,
+      "wire": "{\"type\":\"string\",\"pattern\":\"[^a]\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "[^a]"
+        }
+      ]
+    },
+    "parity-two-slashes": {
+      "same": true,
+      "wire": "{\"type\":\"string\",\"pattern\":\"[^\\\\\\\\p{Cc}a]\"}",
+      "edits": []
+    },
+    "parity-three-slashes": {
+      "same": false,
+      "wire": "{\"type\":\"string\",\"pattern\":\"[^\\\\\\\\a]\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "[^\\\\a]"
+        }
+      ]
+    },
+    "parity-four-slashes": {
+      "same": true,
+      "wire": "{\"type\":\"string\",\"pattern\":\"[^\\\\\\\\\\\\\\\\p{Cc}a]\"}",
+      "edits": []
+    },
+    "applicator-not": {
+      "error": {
+        "reasonCode": "forbidden-schema-applicator",
+        "pointer": "/tools/0/input_schema/not",
+        "toolName": "artifact_tool"
+      }
+    },
+    "applicator-if": {
+      "error": {
+        "reasonCode": "forbidden-schema-applicator",
+        "pointer": "/tools/0/input_schema/if",
+        "toolName": "artifact_tool"
+      }
+    },
+    "applicator-then": {
+      "error": {
+        "reasonCode": "forbidden-schema-applicator",
+        "pointer": "/tools/0/input_schema/then",
+        "toolName": "artifact_tool"
+      }
+    },
+    "applicator-else": {
+      "error": {
+        "reasonCode": "forbidden-schema-applicator",
+        "pointer": "/tools/0/input_schema/else",
+        "toolName": "artifact_tool"
+      }
+    },
+    "applicator-one-of": {
+      "error": {
+        "reasonCode": "forbidden-schema-applicator",
+        "pointer": "/tools/0/input_schema/oneOf",
+        "toolName": "artifact_tool"
+      }
+    },
+    "applicator-contains": {
+      "error": {
+        "reasonCode": "forbidden-schema-applicator",
+        "pointer": "/tools/0/input_schema/contains",
+        "toolName": "artifact_tool"
+      }
+    },
+    "applicator-defs": {
+      "error": {
+        "reasonCode": "forbidden-schema-applicator",
+        "pointer": "/tools/0/input_schema/$defs",
+        "toolName": "artifact_tool"
+      }
+    },
+    "applicator-definitions": {
+      "error": {
+        "reasonCode": "forbidden-schema-applicator",
+        "pointer": "/tools/0/input_schema/definitions",
+        "toolName": "artifact_tool"
+      }
+    },
+    "applicator-content-schema": {
+      "error": {
+        "reasonCode": "forbidden-schema-applicator",
+        "pointer": "/tools/0/input_schema/contentSchema",
+        "toolName": "artifact_tool"
+      }
+    },
+    "applicator-unknown": {
+      "error": {
+        "reasonCode": "unknown-schema-container",
+        "pointer": "/tools/0/input_schema/customApplicator",
+        "toolName": "artifact_tool"
+      }
+    },
+    "schema-ref": {
+      "error": {
+        "reasonCode": "reference-or-anchor-keyword",
+        "pointer": "/tools/0/input_schema/$ref",
+        "toolName": "artifact_tool"
+      }
+    },
+    "schema-anchor": {
+      "error": {
+        "reasonCode": "reference-or-anchor-keyword",
+        "pointer": "/tools/0/input_schema/$anchor",
+        "toolName": "artifact_tool"
+      }
+    },
+    "schema-id": {
+      "error": {
+        "reasonCode": "reference-or-anchor-keyword",
+        "pointer": "/tools/0/input_schema/$id",
+        "toolName": "artifact_tool"
+      }
+    },
+    "schema-dynamic-ref": {
+      "error": {
+        "reasonCode": "reference-or-anchor-keyword",
+        "pointer": "/tools/0/input_schema/$dynamicRef",
+        "toolName": "artifact_tool"
+      }
+    },
+    "schema-recursive-ref": {
+      "error": {
+        "reasonCode": "reference-or-anchor-keyword",
+        "pointer": "/tools/0/input_schema/$recursiveRef",
+        "toolName": "artifact_tool"
+      }
+    },
+    "schema-dynamic-anchor": {
+      "error": {
+        "reasonCode": "reference-or-anchor-keyword",
+        "pointer": "/tools/0/input_schema/$dynamicAnchor",
+        "toolName": "artifact_tool"
+      }
+    },
+    "schema-recursive-anchor": {
+      "error": {
+        "reasonCode": "reference-or-anchor-keyword",
+        "pointer": "/tools/0/input_schema/$recursiveAnchor",
+        "toolName": "artifact_tool"
+      }
+    },
+    "schema-dialect-older": {
+      "error": {
+        "reasonCode": "unsupported-dialect",
+        "pointer": "/tools/0/input_schema/$schema",
+        "toolName": "artifact_tool"
+      }
+    },
+    "schema-dialect-current": {
+      "same": false,
+      "wire": "{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"pattern\":\"[^a]\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "[^a]"
+        }
+      ]
+    },
+    "schema-dialect-current-fragment": {
+      "same": false,
+      "wire": "{\"$schema\":\"https://json-schema.org/draft/2020-12/schema#\",\"pattern\":\"[^a]\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "[^a]"
+        }
+      ]
+    },
+    "schema-vocabulary": {
+      "error": {
+        "reasonCode": "custom-vocabulary",
+        "pointer": "/tools/0/input_schema/$vocabulary",
+        "toolName": "artifact_tool"
+      }
+    },
+    "counterexample-conditional-properties": {
+      "before": [
+        true
+      ],
+      "error": {
+        "reasonCode": "forbidden-schema-applicator",
+        "pointer": "/tools/0/input_schema/if",
+        "toolName": "artifact_tool"
+      }
+    },
+    "counterexample-all-of-properties": {
+      "before": [
+        true
+      ],
+      "same": false,
+      "wire": "{\"allOf\":[{\"patternProperties\":{\"^x-\":{\"type\":\"string\",\"pattern\":\"[^a]\"}}}],\"unevaluatedProperties\":false}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/allOf/0/patternProperties/^x-/pattern",
+          "replacement": "[^a]"
+        }
+      ],
+      "after": [
+        true
+      ]
+    },
+    "counterexample-ref-conditional": {
+      "before": [
+        true
+      ],
+      "error": {
+        "reasonCode": "forbidden-schema-applicator",
+        "pointer": "/tools/0/input_schema/$defs",
+        "toolName": "artifact_tool"
+      }
+    },
+    "counterexample-pattern-key": {
+      "before": [
+        true
+      ],
+      "error": {
+        "reasonCode": "affected-pattern-properties-key",
+        "pointer": "/tools/0/input_schema/patternProperties",
+        "toolName": "artifact_tool"
+      }
+    },
+    "counterexample-conditional-items": {
+      "before": [
+        true
+      ],
+      "error": {
+        "reasonCode": "forbidden-schema-applicator",
+        "pointer": "/tools/0/input_schema/if",
+        "toolName": "artifact_tool"
+      }
+    },
+    "counterexample-prior-not": {
+      "before": [
+        true
+      ],
+      "error": {
+        "reasonCode": "forbidden-schema-applicator",
+        "pointer": "/tools/0/input_schema/not",
+        "toolName": "artifact_tool"
+      }
+    },
+    "counterexample-prior-if": {
+      "before": [
+        true
+      ],
+      "error": {
+        "reasonCode": "forbidden-schema-applicator",
+        "pointer": "/tools/0/input_schema/if",
+        "toolName": "artifact_tool"
+      }
+    },
+    "counterexample-prior-one-of": {
+      "before": [
+        true
+      ],
+      "error": {
+        "reasonCode": "forbidden-schema-applicator",
+        "pointer": "/tools/0/input_schema/oneOf",
+        "toolName": "artifact_tool"
+      }
+    },
+    "counterexample-prior-all-of-key": {
+      "before": [
+        true
+      ],
+      "error": {
+        "reasonCode": "affected-pattern-properties-key",
+        "pointer": "/tools/0/input_schema/allOf/0/patternProperties",
+        "toolName": "artifact_tool"
+      }
+    },
+    "lexical-escaped-parens": {
+      "same": false,
+      "wire": "{\"type\":\"string\",\"pattern\":\"^(?:\\\\([^\\\\(\\\\)\\\\[\\\\]\\\\\\\\a]\\\\))$\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "^(?:\\([^\\(\\)\\[\\]\\\\a]\\))$"
+        }
+      ]
+    },
+    "lexical-lookahead": {
+      "same": false,
+      "wire": "{\"type\":\"string\",\"pattern\":\"^(?=\\\\[[^\\\\[\\\\]a]\\\\]$).*$\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "^(?=\\[[^\\[\\]a]\\]$).*$"
+        }
+      ]
+    },
+    "lexical-lookbehind": {
+      "same": false,
+      "wire": "{\"type\":\"string\",\"pattern\":\"^(?<=\\\\)[^a]).*$\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "^(?<=\\)[^a]).*$"
+        }
+      ]
+    },
+    "lexical-nested-noncapture": {
+      "same": false,
+      "wire": "{\"type\":\"string\",\"pattern\":\"^(?:(?:[^\\\\\\\\a]))$\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "^(?:(?:[^\\\\a]))$"
+        }
+      ]
+    },
+    "lexical-negative-lookahead-paren": {
+      "before": [
+        true
+      ],
+      "error": {
+        "reasonCode": "negative-regex-context",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "lexical-negative-lookahead-bracket": {
+      "error": {
+        "reasonCode": "negative-regex-context",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "lexical-negative-lookahead-class": {
+      "error": {
+        "reasonCode": "negative-regex-context",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "lexical-negative-lookbehind": {
+      "error": {
+        "reasonCode": "negative-regex-context",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "lexical-negative-nested": {
+      "error": {
+        "reasonCode": "negative-regex-context",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "lexical-even-noncapture": {
+      "same": true,
+      "wire": "{\"type\":\"string\",\"pattern\":\"(?:[^\\\\\\\\p{Cc}a])\"}",
+      "edits": []
+    },
+    "lexical-even-negative": {
+      "same": true,
+      "wire": "{\"type\":\"string\",\"pattern\":\"(?!(?:[^\\\\\\\\p{Cc}a]))\"}",
+      "edits": []
+    },
+    "regex-outside-class": {
+      "error": {
+        "reasonCode": "property-outside-negated-character-class",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "regex-positive-class": {
+      "error": {
+        "reasonCode": "positive-character-class",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "regex-empty-class": {
+      "error": {
+        "reasonCode": "empty-negated-character-class",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "regex-range": {
+      "error": {
+        "reasonCode": "range-or-set-character-class",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "regex-negative-context": {
+      "error": {
+        "reasonCode": "negative-regex-context",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "regex-capture": {
+      "error": {
+        "reasonCode": "capture-or-unsupported-group",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "regex-backreference": {
+      "error": {
+        "reasonCode": "backreference-or-unsupported-escape",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "regex-unsupported-escape": {
+      "error": {
+        "reasonCode": "unsupported-regex-escape",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "regex-incomplete-unicode": {
+      "error": {
+        "reasonCode": "invalid-regex",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "regex-property-no-braces": {
+      "error": {
+        "reasonCode": "malformed-unicode-property",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "regex-property-empty": {
+      "error": {
+        "reasonCode": "malformed-unicode-property",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "regex-property-unclosed": {
+      "error": {
+        "reasonCode": "malformed-unicode-property",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "regex-set-intersection": {
+      "error": {
+        "reasonCode": "range-or-set-character-class",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "regex-set-subtraction": {
+      "error": {
+        "reasonCode": "range-or-set-character-class",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "regex-unclosed-class": {
+      "error": {
+        "reasonCode": "invalid-regex",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "regex-trailing-escape": {
+      "error": {
+        "reasonCode": "invalid-regex",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "regex-named-capture": {
+      "error": {
+        "reasonCode": "capture-or-unsupported-group",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "regex-named-backreference": {
+      "error": {
+        "reasonCode": "backreference-or-unsupported-escape",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "regex-incomplete-hex": {
+      "error": {
+        "reasonCode": "invalid-regex",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "regex-incomplete-control": {
+      "error": {
+        "reasonCode": "invalid-regex",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "regex-control-and-shortcuts": {
+      "same": false,
+      "wire": "{\"pattern\":\"\\\\b[^\\\\0\\\\cA\\\\x61\\\\u0062\\\\d\\\\D\\\\s\\\\S\\\\w\\\\W\\\\b\\\\f\\\\n\\\\r\\\\t\\\\v\\\\-]\\\\B\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "\\b[^\\0\\cA\\x61\\u0062\\d\\D\\s\\S\\w\\W\\b\\f\\n\\r\\t\\v\\-]\\B"
+        }
+      ]
+    },
+    "regex-multiple-classes": {
+      "before": [
+        true,
+        false,
+        false
+      ],
+      "same": false,
+      "wire": "{\"pattern\":\"[^0][0-9][^😀]\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "[^0][0-9][^😀]"
+        }
+      ],
+      "after": [
+        true,
+        false,
+        false
+      ]
+    },
+    "engine-qualified-script": {
+      "before": [
+        false,
+        true,
+        false
+      ],
+      "same": false,
+      "wire": "{\"pattern\":\"^[^x]$\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "^[^x]$"
+        }
+      ],
+      "after": [
+        true,
+        true,
+        false
+      ]
+    },
+    "engine-script-extensions": {
+      "before": [
+        true,
+        false,
+        false
+      ],
+      "same": false,
+      "wire": "{\"pattern\":\"^[^x]$\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "^[^x]$"
+        }
+      ],
+      "after": [
+        true,
+        true,
+        false
+      ]
+    },
+    "engine-category-long-name": {
+      "before": [
+        false,
+        true,
+        false
+      ],
+      "same": false,
+      "wire": "{\"pattern\":\"^[^x]$\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "^[^x]$"
+        }
+      ],
+      "after": [
+        true,
+        true,
+        false
+      ]
+    },
+    "engine-binary-property": {
+      "before": [
+        false,
+        true,
+        false
+      ],
+      "same": false,
+      "wire": "{\"pattern\":\"^[^x]$\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "^[^x]$"
+        }
+      ],
+      "after": [
+        true,
+        true,
+        false
+      ]
+    },
+    "matrix-property-positive-category": {
+      "before": [
+        false,
+        true,
+        false,
+        true
+      ],
+      "same": false,
+      "wire": "{\"pattern\":\"^(?=[^x])\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "^(?=[^x])"
+        }
+      ],
+      "after": [
+        false,
+        true,
+        true,
+        true
+      ]
+    },
+    "matrix-property-positive-script": {
+      "before": [
+        false,
+        false,
+        true,
+        true
+      ],
+      "same": false,
+      "wire": "{\"pattern\":\"^(?=[^x])\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "^(?=[^x])"
+        }
+      ],
+      "after": [
+        false,
+        true,
+        true,
+        true
+      ]
+    },
+    "matrix-property-negative-category": {
+      "before": [
+        true,
+        false,
+        true,
+        false
+      ],
+      "error": {
+        "reasonCode": "negative-regex-context",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "matrix-property-negative-script": {
+      "before": [
+        true,
+        true,
+        false,
+        false
+      ],
+      "error": {
+        "reasonCode": "negative-regex-context",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "matrix-complement-positive-category": {
+      "before": [
+        false,
+        false,
+        true,
+        false
+      ],
+      "same": false,
+      "wire": "{\"pattern\":\"^(?=[^x])\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "^(?=[^x])"
+        }
+      ],
+      "after": [
+        false,
+        true,
+        true,
+        true
+      ]
+    },
+    "matrix-complement-positive-script": {
+      "before": [
+        false,
+        true,
+        false,
+        false
+      ],
+      "same": false,
+      "wire": "{\"pattern\":\"^(?=[^x])\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "^(?=[^x])"
+        }
+      ],
+      "after": [
+        false,
+        true,
+        true,
+        true
+      ]
+    },
+    "matrix-complement-negative-category": {
+      "before": [
+        true,
+        true,
+        false,
+        true
+      ],
+      "error": {
+        "reasonCode": "negative-regex-context",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "matrix-complement-negative-script": {
+      "before": [
+        true,
+        false,
+        true,
+        true
+      ],
+      "error": {
+        "reasonCode": "negative-regex-context",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "engine-bare-script": {
+      "error": {
+        "reasonCode": "invalid-regex",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "engine-invalid-property-name": {
+      "error": {
+        "reasonCode": "invalid-regex",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "engine-braced-astral": {
+      "before": [
+        false,
+        true,
+        false
+      ],
+      "same": false,
+      "wire": "{\"pattern\":\"[^\\\\u{1F600}]\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "[^\\u{1F600}]"
+        }
+      ],
+      "after": [
+        false,
+        true,
+        true
+      ]
+    },
+    "engine-out-of-range-codepoint": {
+      "error": {
+        "reasonCode": "invalid-regex",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "engine-hyphen-outside-class": {
+      "error": {
+        "reasonCode": "invalid-regex",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "engine-reversed-range-sibling": {
+      "error": {
+        "reasonCode": "invalid-regex",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "sibling-regex": {
+      "same": false,
+      "wire": "{\"type\":\"object\",\"properties\":{\"filename\":{\"type\":\"string\",\"pattern\":\"^(?!__.*__$)[^\\\"\\\\\\\\./[\\\\]]{1,200}$\"},\"repeated\":{\"type\":\"string\",\"pattern\":\"([a-z])\\\\1\"}}}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/properties/filename/pattern",
+          "replacement": "^(?!__.*__$)[^\"\\\\./[\\]]{1,200}$"
+        }
+      ]
+    },
+    "tools-siblings": {
+      "same": false,
+      "wire": "[{\"name\":\"unaffected\",\"description\":\"synthetic fixture\",\"input_schema\":{\"type\":\"string\",\"pattern\":\"^[a-z]+$\"}},{\"name\":\"affected\",\"description\":\"synthetic fixture\",\"input_schema\":{\"type\":\"string\",\"pattern\":\"^(?!__.*__$)[^\\\"\\\\\\\\./[\\\\]]{1,200}$\"}}]",
+      "sameTools": [
+        true,
+        false
+      ],
+      "edits": [
+        {
+          "pointer": "/tools/1/input_schema/pattern",
+          "replacement": "^(?!__.*__$)[^\"\\\\./[\\]]{1,200}$"
+        }
+      ]
+    },
+    "tools-later-refusal": {
+      "error": {
+        "reasonCode": "forbidden-schema-applicator",
+        "pointer": "/tools/1/input_schema/not",
+        "toolName": "unsafe"
+      }
+    },
+    "tools-no-op": {
+      "same": true,
+      "wire": "[false,null,{},[],{\"input_schema\":true},{\"input_schema\":false},{\"input_schema\":null}]",
+      "sameTools": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "edits": []
+    },
+    "tools-not-array": {
+      "same": true,
+      "wire": "{\"input_schema\":{\"pattern\":\"\\\\p\"}}",
+      "edits": []
+    },
+    "tools-unnamed-refusal": {
+      "error": {
+        "reasonCode": "property-outside-negated-character-class",
+        "pointer": "/tools/1/input_schema/properties/a~0~1b/pattern",
+        "toolName": "<unnamed tool>"
+      }
+    },
+    "pointer-nested-edits": {
+      "same": false,
+      "wire": "{\"properties\":{\"a/b~c\":{\"anyOf\":[true,{\"properties\":{\"\":{\"pattern\":\"[^a]\"}}}]},\"~1\":{\"pattern\":\"[^x]\"}}}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/properties/a~1b~0c/anyOf/1/properties//pattern",
+          "replacement": "[^a]"
+        },
+        {
+          "pointer": "/tools/0/input_schema/properties/~01/pattern",
+          "replacement": "[^x]"
+        }
+      ]
+    },
+    "pointer-nested-refusal": {
+      "error": {
+        "reasonCode": "affected-pattern-properties-key",
+        "pointer": "/tools/0/input_schema/allOf/1/properties/a~01~1b/patternProperties",
+        "toolName": "artifact_tool"
+      }
+    },
+    "container-invalid-root": {
+      "error": {
+        "reasonCode": "invalid-schema",
+        "pointer": "/tools/0/input_schema",
+        "toolName": "artifact_tool"
+      }
+    },
+    "container-invalid-child": {
+      "error": {
+        "reasonCode": "invalid-schema-container",
+        "pointer": "/tools/0/input_schema/items",
+        "toolName": "artifact_tool"
+      }
+    },
+    "container-invalid-map": {
+      "error": {
+        "reasonCode": "invalid-schema-container",
+        "pointer": "/tools/0/input_schema/properties",
+        "toolName": "artifact_tool"
+      }
+    },
+    "container-invalid-pattern-map": {
+      "error": {
+        "reasonCode": "invalid-schema-container",
+        "pointer": "/tools/0/input_schema/patternProperties",
+        "toolName": "artifact_tool"
+      }
+    },
+    "container-invalid-array": {
+      "error": {
+        "reasonCode": "invalid-schema-container",
+        "pointer": "/tools/0/input_schema/allOf",
+        "toolName": "artifact_tool"
+      }
+    },
+    "container-unaffected-malformed-siblings": {
+      "same": false,
+      "wire": "{\"pattern\":\"[^a]\",\"properties\":null,\"allOf\":{},\"patternProperties\":false,\"customApplicator\":{\"note\":\"kept\"}}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "[^a]"
+        }
+      ]
+    },
+    "untouched-malformed-unaffected": {
+      "same": true,
+      "wire": "{\"$schema\":42,\"$ref\":\"#absent\",\"pattern\":\"[\",\"oneOf\":\"invalid\"}",
+      "edits": []
+    },
+    "untouched-known-scalar-value": {
+      "same": true,
+      "wire": "{\"title\":{\"pattern\":\"[^\\\\p{Cc}a]\"},\"pattern\":42}",
+      "edits": []
+    }
+  }
+}
