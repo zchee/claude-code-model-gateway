@@ -125,6 +125,7 @@ lifecycle-lock-mutual-exclusion
 lifecycle-lock-reentrancy
 lifecycle-lock-stale-generation
 lifecycle-login-next-request-message
+lifecycle-login-preserves-listener
 lifecycle-maintenance-retains-stop
 lifecycle-marketplace-install-scope
 lifecycle-matching-proxy-version
@@ -221,6 +222,7 @@ ownership-fixture-refuses-settings-escape
 ownership-foreign-junction
 ownership-foreign-listener
 ownership-foreign-proxy
+ownership-foreign-refusal-identifies-install
 ownership-full-argv-at-narrow-width
 ownership-healthy-hidden-owner
 ownership-hidden-argv-retains-birth
@@ -259,6 +261,7 @@ ownership-setup-refuses-foreign
 ownership-stale-guardian-discarded
 ownership-stale-guardian-no-signal
 ownership-table-unknown
+ownership-unidentified-no-mutation
 ownership-unknown-listener
 ownership-unresolved-birth-retained
 ownership-unset-real-probe
@@ -479,6 +482,8 @@ sentry-billing-note
 sentry-cap-update-preserves-compact-at
 sentry-codex-auth-mapping
 sentry-codex-default-cap
+sentry-codex-overflow-status
+sentry-codex-overflow-type
 sentry-compaction-bypass
 sentry-compaction-overflow-guidance
 sentry-concurrent-retry-completes
@@ -498,6 +503,8 @@ sentry-explicit-trigger
 sentry-fill-missing-counts
 sentry-first-turn-guidance
 sentry-grok-fast-trigger
+sentry-grok-overflow-status
+sentry-grok-overflow-type
 sentry-guard-off
 sentry-health-buffer-limit
 sentry-health-guard-retries
@@ -535,9 +542,7 @@ sentry-overflow-phase
 sentry-overflow-phase-suffix
 sentry-overflow-request-bytes
 sentry-overflow-source
-sentry-overflow-status
 sentry-overflow-tokens
-sentry-overflow-type
 sentry-policy-row-headroom
 sentry-preserve-upstream-counts
 sentry-provider-context-error
@@ -549,6 +554,7 @@ sentry-safe-terminal-observation
 sentry-saved-cap-over-env
 sentry-semantic-failure-keeps-auth
 sentry-session-isolation
+sentry-sse-below-trigger-forwarded
 sentry-sse-sum-input
 sentry-state-retention
 sentry-trigger-ceiling
@@ -625,6 +631,7 @@ telemetry-exact-tool-delta
 telemetry-export-failure-independent
 telemetry-failed-route-span
 telemetry-final-usage-wins
+telemetry-independent-session-high-water
 telemetry-invalid-trace-context
 telemetry-json-counts-only
 telemetry-legacy-overflow-classification
@@ -689,7 +696,7 @@ wiring-reconcile-names-user-pins
 wiring-reconcile-owned-only
 wiring-recorded-project-notice
 wiring-refresh-nonoverridden
-wiring-registered-only-hooks
+wiring-registered-project-hook
 wiring-registry-dedup
 wiring-registry-prune-missing
 wiring-registry-prune-unowned
@@ -714,6 +721,7 @@ wiring-skip-project-with-user-pin
 wiring-skip-unusable-settings
 wiring-unknown-health-before-migration
 wiring-unknown-window-warning
+wiring-unregistered-project-hook-untouched
 wiring-unrelated-cache-preserved
 wiring-unwired-cleanup-no-guardian
 wiring-unwired-committed-unchanged
@@ -721,5 +729,6 @@ wiring-unwired-gate-cleanup
 wiring-unwired-no-probe
 wiring-updater-no-cwd
 wiring-user-fallback
+wiring-user-readiness-hook
 wiring-user-values-preserved
 wiring-verified-settings-authority
