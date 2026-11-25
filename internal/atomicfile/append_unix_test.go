@@ -72,6 +72,7 @@ func TestAppendFileLongName(t *testing.T) {
 }
 
 func TestAppendFileOpenRetry(t *testing.T) {
+	const wantFlags = unix.O_WRONLY | unix.O_CREAT | unix.O_APPEND | unix.O_NONBLOCK | unix.O_NOCTTY
 	tests := map[string]struct {
 		failures      []error
 		opens, writes int
@@ -81,6 +82,7 @@ func TestAppendFileOpenRetry(t *testing.T) {
 		"error: persistently missing entry": {[]error{unix.ENOENT, unix.ENOENT}, 2, 0, unix.ENOENT},
 		"error: permission denied":          {[]error{unix.EACCES}, 1, 0, unix.EACCES},
 		"error: different error on retry":   {[]error{unix.ENOENT, unix.EACCES}, 2, 0, unix.EACCES},
+		"error: symlink on retry":           {[]error{unix.ENOENT, unix.ELOOP}, 2, 0, &NonRegularError{}},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -89,7 +91,7 @@ func TestAppendFileOpenRetry(t *testing.T) {
 			opens, writes := 0, 0
 			open := func(name string, flags int, mode fs.FileMode) (*os.File, error) {
 				opens++
-				if opens > tt.opens || name != "journal" || flags&unix.O_CREAT == 0 || mode != 0o600 {
+				if opens > tt.opens || name != "journal" || flags != wantFlags || mode != 0o600 {
 					t.Fatalf("unexpected open %d: %q, flags=%#x, mode=%o", opens, name, flags, mode)
 				}
 				if opens <= len(tt.failures) {
@@ -101,10 +103,15 @@ func TestAppendFileOpenRetry(t *testing.T) {
 				writes++
 				return unix.Write(fd, data)
 			})
-			if opens != tt.opens || writes != tt.writes || !errors.Is(err, tt.wantErr) {
+			path := filepath.Join(dir, "journal")
+			matches := errors.Is(err, tt.wantErr)
+			if _, wantNonRegular := errors.AsType[*NonRegularError](tt.wantErr); wantNonRegular {
+				refusal, ok := errors.AsType[*NonRegularError](err)
+				matches = ok && refusal.Path == path
+			}
+			if opens != tt.opens || writes != tt.writes || !matches {
 				t.Fatalf("got (%d opens, %d writes, %v), want (%d, %d, %v)", opens, writes, err, tt.opens, tt.writes, tt.wantErr)
 			}
-			path := filepath.Join(dir, "journal")
 			if tt.wantErr == nil {
 				checkContents(t, path, newState)
 			} else if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {

@@ -74,8 +74,8 @@ func (d *directory) openAndAppend(name string, data []byte, mode fs.FileMode, op
 	const flags = unix.O_APPEND | unix.O_WRONLY | unix.O_CREAT | unix.O_NONBLOCK | unix.O_NOCTTY
 	f, err := open(name, flags, mode)
 	if errors.Is(err, unix.ENOENT) {
-		// A concurrent first append on macOS can report ENOENT despite O_CREAT.
-		// Retry once on the same directory; a removed directory stays missing.
+		// A hosted macOS run returned ENOENT from this O_CREAT open while two first
+		// appends raced. The cause is unknown; retry once on the same directory handle.
 		f, err = open(name, flags, mode)
 	}
 	if errors.Is(err, unix.ELOOP) || errors.Is(err, unix.EISDIR) || errors.Is(err, unix.ENXIO) {
