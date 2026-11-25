@@ -161,11 +161,15 @@ func TestFixtureDispatch(t *testing.T) {
 		path string
 		args []string
 	}{
-		"error: empty environment outside executable": {nil, outside, nil},
-		"error: no test selector":                     {env, self, nil},
-		"error: unrelated test":                       {nil, self, []string{"-test.run=^TestFakeClaudeProcess$", "--", "--gatewaytest-helper=claude"}},
-		"error: no child mode":                        {env, self, []string{helperTest, "--"}},
-		"error: unknown child mode":                   {env, self, []string{helperTest, "--", helperPrefix + "unknown"}},
+		"error: empty environment outside executable":     {nil, outside, nil},
+		"error: no test selector":                         {env, self, nil},
+		"error: unrelated test":                           {nil, self, []string{"-test.run=^TestFakeClaudeProcess$", "--", "--gatewaytest-helper=claude"}},
+		"error: malformed separator":                      {env, self, []string{"-test.run=^TestGatewayFixtureHelper$", "-", helperPrefix + "report-args9"}},
+		"error: wrong helper marker":                      {env, self, []string{"-test.run=^TestGatewayFixtureHelper$", "--", "report-args9"}},
+		"error: missing usage argument":                   {env, self, []string{"-test.run=^TestGatewayFixtureHelper$", "--", helperPrefix + "usage"}},
+		"error: too many usage arguments":                 {env, self, []string{"-test.run=^TestGatewayFixtureHelper$", "--", helperPrefix + "usage", "0", "extra"}},
+		"error: no child mode":                            {env, self, []string{helperTest, "--"}},
+		"error: custom helper cannot use legacy selector": {env, self, []string{helperTest, "--", helperPrefix + "report-args9"}},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -180,7 +184,7 @@ func TestFixtureDispatch(t *testing.T) {
 		})
 	}
 	if cmd, err := env.HelperCommand(t, "TestFakeClaudeProcess"); err == nil || cmd != nil {
-		t.Errorf("unregistered helper: cmd=%v err=%v", cmd, err)
+		t.Errorf("invalid helper name: cmd=%v err=%v", cmd, err)
 	}
 }
 
@@ -360,8 +364,31 @@ func TestEmptyFixtureRun(t *testing.T) {
 	}
 }
 
+const fixtureBuiltinOverride = "GATEWAYTEST_ATTEMPT_BUILTIN_OVERRIDE"
+
+type namedHelperReport struct {
+	Directory string
+	Args      []string
+}
+
 func TestGatewayFixtureHelper(t *testing.T) {
-	if endpoint := gatewaytest.DispatchHelper(t); endpoint != "" {
+	helpers := map[string]gatewaytest.HelperFunc{"report-args9": func(t testing.TB, args []string) {
+		dir, err := os.Getwd()
+		if err != nil {
+			t.Fatal(err)
+		}
+		report, err := json.Marshal(namedHelperReport{Directory: dir, Args: args})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stdout.Write(append(report, '\n')); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	if name := os.Getenv(fixtureBuiltinOverride); name != "" {
+		helpers[name] = func(t testing.TB, _ []string) { t.Fatal("replacement built-in helper was called") }
+	}
+	if endpoint := gatewaytest.DispatchHelper(t, helpers); endpoint != "" {
 		postFixtureUsage(t, endpoint)
 		return
 	}
@@ -377,6 +404,95 @@ func TestGatewayFixtureHelper(t *testing.T) {
 		if !os.SameFile(current, expected) {
 			t.Fatal("child did not enter the prepared working directory")
 		}
+	}
+}
+
+func TestNamedFixtureHelpers(t *testing.T) {
+	tests := map[string]struct {
+		helper, override, wantError string
+		args                        []string
+	}{
+		"success: registered helper": {
+			helper: "report-args9", args: []string{"one argument with spaces", "--", "-test.run=^Unrelated$", ""},
+		},
+		"error: unregistered helper fails in child": {
+			helper: "missing-helper", wantError: `unregistered gateway fixture helper "missing-helper"`,
+		},
+		"error: longest valid name reaches child": {
+			helper: strings.Repeat("a", 64), wantError: `unregistered gateway fixture helper "` + strings.Repeat("a", 64) + `"`,
+		},
+		"error: cannot replace fake Claude": {
+			helper: "claude", override: "claude", args: []string{"--version"}, wantError: `cannot override built-in gateway fixture helper "claude"`,
+		},
+		"error: cannot replace usage helper": {
+			helper: "usage", override: "usage", args: []string{"0"}, wantError: `cannot override built-in gateway fixture helper "usage"`,
+		},
+		"error: cannot register a legacy mode": {
+			helper: "claude", override: "empty", args: []string{"--version"}, wantError: `cannot override built-in gateway fixture helper "empty"`,
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			env := gatewaytest.NewEnv(t.TempDir(), nil, nil, nil)
+			if tt.override != "" {
+				env[fixtureBuiltinOverride] = tt.override
+			}
+			cmd, err := env.HelperCommand(t, tt.helper, tt.args...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			insideDirectory(t, env["HOME"], cmd.Dir)
+			want := namedHelperReport{Directory: cmd.Dir, Args: tt.args}
+			var output bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &output, &output
+			err = env.RunFixture(cmd)
+			if tt.wantError != "" {
+				if _, ok := errors.AsType[*exec.ExitError](err); !ok || !strings.Contains(output.String(), tt.wantError) || strings.Contains(output.String(), "replacement built-in helper was called") {
+					t.Fatalf("child error=%v; want %q in output:\n%s", err, tt.wantError, &output)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("RunFixture: %v\n%s", err, &output)
+			}
+			line, _, _ := strings.Cut(output.String(), "\n")
+			var got namedHelperReport
+			if err := json.Unmarshal([]byte(line), &got); err != nil {
+				t.Fatalf("decode child output %q: %v", line, err)
+			}
+			if diff := gocmp.Diff(want, got); diff != "" {
+				t.Errorf("helper output (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestInvalidFixtureHelperNames(t *testing.T) {
+	tests := map[string]struct{ helper string }{
+		"error: empty name":              {""},
+		"error: uppercase first letter":  {"TestFakeClaudeProcess"},
+		"error: numeric first letter":    {"9fixture"},
+		"error: embedded uppercase":      {"argS"},
+		"error: underscore":              {"one_two"},
+		"error: non-ASCII spelling":      {"fíxture"},
+		"error: name too long":           {strings.Repeat("a", 65)},
+		"error: legacy name is reserved": {"named-pins"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			env := gatewaytest.NewEnv(t.TempDir(), nil, nil, nil)
+			if cmd, err := env.HelperCommand(t, tt.helper); err == nil || cmd != nil {
+				t.Fatalf("HelperCommand: cmd=%v err=%v, want invalid name refusal", cmd, err)
+			}
+			cmd, err := env.HelperCommand(t, "report-args9")
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmd.Args[3] = helperPrefix + tt.helper
+			if err := env.RunFixture(cmd); !errors.Is(err, gatewaytest.ErrRealClaude) || cmd.Process != nil {
+				t.Fatalf("RunFixture: process=%v err=%v, want refusal before exec", cmd.Process, err)
+			}
+		})
 	}
 }
 

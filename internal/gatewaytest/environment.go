@@ -31,7 +31,6 @@ import (
 	"runtime"
 	"slices"
 	"strings"
-	"sync"
 
 	"github.com/zchee/claude-code-model-gateway/internal/config"
 	"github.com/zchee/claude-code-model-gateway/internal/paths"
@@ -210,18 +209,13 @@ func (env Environment) openSandboxDir(path string, allowRoot bool) (*os.Root, er
 
 const (
 	helperSelector       = "-test.run=^TestGatewayFixtureHelper$"
-	usageHelperDispatch  = "--gatewaytest-helper=usage"
+	helperDispatchPrefix = "--gatewaytest-helper="
+	claudeHelperName     = "claude"
+	usageHelperName      = "usage"
+	usageHelperDispatch  = helperDispatchPrefix + usageHelperName
 	legacyHelperSelector = "-test.run=^TestEmptyEnvironmentHelper$"
-	emptyLegacyDispatch  = "--gatewaytest-helper=empty"
+	emptyLegacyDispatch  = helperDispatchPrefix + "empty"
 )
-
-// A lease holds the collector open until an authorized child exits.
-type usageCollectorLease struct {
-	endpoint string
-	stopped  <-chan struct{}
-	mu       sync.RWMutex
-	revoked  bool
-}
 
 func validUsageEndpoint(endpoint string) bool {
 	if endpoint == "0" {
@@ -231,17 +225,41 @@ func validUsageEndpoint(endpoint string) bool {
 	return ok && port != 4318 // Do not let a fixture reach the default local collector.
 }
 
-func registeredDispatch(args []string) bool {
+func validHelperName(name string) bool {
+	if len(name) == 0 || len(name) > 64 || name[0] < 'a' || name[0] > 'z' {
+		return false
+	}
+	for i := 1; i < len(name); i++ {
+		c := name[i]
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func legacyHelperName(name string) bool {
+	switch name {
+	case "empty", "fixture", "alias", "pins", "named-alias", "named-pins":
+		return true
+	default:
+		return false
+	}
+}
+
+func validHelperDispatch(args []string) bool {
 	if len(args) < 3 || args[1] != "--" {
+		return false
+	}
+	name, ok := strings.CutPrefix(args[2], helperDispatchPrefix)
+	if !ok || !validHelperName(name) {
 		return false
 	}
 	switch args[0] {
 	case helperSelector:
-		return args[2] == "--gatewaytest-helper=claude" ||
-			(args[2] == usageHelperDispatch && len(args) == 4)
+		return !legacyHelperName(name) && (name != usageHelperName || len(args) == 4)
 	case legacyHelperSelector:
-		mode, ok := strings.CutPrefix(args[2], "--gatewaytest-helper=")
-		return ok && len(args) == 3 && slices.Contains([]string{"empty", "fixture", "alias", "pins", "named-alias", "named-pins"}, mode)
+		return len(args) == 3 && legacyHelperName(name)
 	default:
 		return false
 	}
@@ -251,7 +269,7 @@ func registeredDispatch(args []string) bool {
 // Usage reporting must be disabled; only the zero-entry legacy helper may omit the setting.
 func (env Environment) RunFixture(cmd *exec.Cmd) error { return env.runFixture(cmd, nil) }
 
-func (env Environment) runFixture(cmd *exec.Cmd, lease *usageCollectorLease) error {
+func (env Environment) runFixture(cmd *exec.Cmd, collector *usageCollectorState) error {
 	entries := make([]string, 0, len(env)) // A nil slice inherits the ambient environment.
 	for name, value := range env {
 		hasNUL := strings.IndexByte(value, 0) >= 0
@@ -278,7 +296,7 @@ func (env Environment) runFixture(cmd *exec.Cmd, lease *usageCollectorLease) err
 	var dispatch []string
 	if cmd.Path == self || (err == nil && os.SameFile(program, selfInfo)) {
 		dispatch = cmd.Args[1:]
-		if !registeredDispatch(dispatch) || (dispatch[0] == legacyHelperSelector && !filepath.IsAbs(cmd.Dir)) {
+		if !validHelperDispatch(dispatch) || (dispatch[0] == legacyHelperSelector && !filepath.IsAbs(cmd.Dir)) {
 			return ErrRealClaude
 		}
 	} else if !env.guarded() || !env.contains(cmd.Path) {
@@ -289,21 +307,13 @@ func (env Environment) runFixture(cmd *exec.Cmd, lease *usageCollectorLease) err
 	if len(dispatch) > 0 && dispatch[2] == usageHelperDispatch && endpoint != dispatch[3] {
 		return ErrUsageEndpoint
 	}
+	run := cmd.Run
 	legacyEmpty := len(env) == 0 && slices.Equal(dispatch, []string{legacyHelperSelector, "--", emptyLegacyDispatch})
 	if endpoint != "0" && !legacyEmpty {
-		if lease == nil || endpoint != lease.endpoint || !validUsageEndpoint(endpoint) {
+		if collector == nil || endpoint != collector.endpoint || !validUsageEndpoint(endpoint) {
 			return ErrUsageEndpoint
 		}
-		lease.mu.RLock()
-		defer lease.mu.RUnlock()
-		if lease.revoked {
-			return ErrUsageEndpoint
-		}
-		select {
-		case <-lease.stopped:
-			return ErrUsageEndpoint
-		default:
-		}
+		run = func() error { return collector.run(cmd) }
 	}
 
 	if len(dispatch) > 0 && dispatch[0] == helperSelector {
@@ -320,10 +330,10 @@ func (env Environment) runFixture(cmd *exec.Cmd, lease *usageCollectorLease) err
 		cmd.Dir = env.sandboxRoot()
 		cmd.ExtraFiles = append([]*os.File{dir}, cmd.ExtraFiles...)
 		cmd.Env = entries
-		return errors.Join(cmd.Run(), dir.Close(), root.Close())
+		return errors.Join(run(), dir.Close(), root.Close())
 	}
 	cmd.Env = entries
-	return cmd.Run()
+	return run()
 }
 
 func reservedPort(port int) bool { return port == 18764 || port == 18765 || port == 80 }

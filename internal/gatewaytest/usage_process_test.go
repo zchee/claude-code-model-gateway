@@ -17,14 +17,19 @@
 package gatewaytest_test
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"errors"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	gocmp "github.com/google/go-cmp/cmp"
 
@@ -83,6 +88,7 @@ func TestUsageFixtureProcess(t *testing.T) {
 			home := t.TempDir()
 			env := gatewaytest.NewEnv(home, nil, nil, nil)
 			collector := env.StartUsageCollector(t)
+			copied := *collector
 			parent := map[string]string{
 				fixtureUsageKey:                      collector.URL,
 				"OTEL_EXPORTER_OTLP_ENDPOINT":        collector.URL,
@@ -111,7 +117,7 @@ func TestUsageFixtureProcess(t *testing.T) {
 			cmd.Stdout, cmd.Stderr = &output, &output
 			var want []gatewaytest.UsageRequest
 			if tt.override || tt.isolated {
-				err = collector.RunFixture(env, cmd)
+				err = copied.RunFixture(env, cmd)
 				want = []gatewaytest.UsageRequest{{Method: "POST", RequestURI: "/v1/logs", ContentType: "application/json", Body: fixtureUsageBody}}
 			} else {
 				err = env.RunFixture(cmd)
@@ -121,6 +127,100 @@ func TestUsageFixtureProcess(t *testing.T) {
 			}
 			if diff := gocmp.Diff(want, collector.Requests()); diff != "" {
 				t.Errorf("collector requests (-want +got):\n%s", diff)
+			}
+			if diff := gocmp.Diff(want, copied.Requests()); diff != "" {
+				t.Errorf("copied collector requests (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestUsageCollectorChildLifetime(t *testing.T) {
+	tests := map[string]struct{ callerDeadline bool }{
+		"success: cleanup cancels a command without a context": {},
+		"success: caller deadline still cancels a command":     {callerDeadline: true},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			env := gatewaytest.NewEnv(home, nil, nil, nil)
+			bin := filepath.Join(home, "fixture-wait")
+			if err := os.WriteFile(bin, []byte("#!/bin/sh\nprintf 'ready\\n'\nexec /bin/sleep 30\n"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			var endpoint string
+			var cmd *exec.Cmd
+			var started time.Time
+			var runErr error
+			finished := make(chan struct{})
+			if !t.Run("launch child", func(t *testing.T) {
+				collector := env.StartUsageCollector(t)
+				endpoint = collector.URL
+				env[fixtureUsageKey] = endpoint
+				if tt.callerDeadline {
+					ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+					defer cancel()
+					cmd = exec.CommandContext(ctx, bin)
+				} else {
+					// No caller context: only the fixture can stop this command.
+					cmd = &exec.Cmd{Path: bin, Args: []string{bin}}
+				}
+				stdout, err := cmd.StdoutPipe()
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = stdout.Close() }()
+				ready := make(chan string, 1)
+				go func() {
+					line, _ := bufio.NewReader(stdout).ReadString('\n')
+					ready <- line
+				}()
+				started = time.Now()
+				go func() {
+					runErr = collector.RunFixture(env, cmd)
+					close(finished)
+				}()
+				select {
+				case line := <-ready:
+					if line != "ready\n" {
+						t.Fatalf("child ready line = %q", line)
+					}
+				case <-time.After(3 * time.Second):
+					t.Fatal("child did not start before cleanup")
+				}
+				if tt.callerDeadline {
+					select {
+					case <-finished:
+					case <-time.After(3 * time.Second):
+						t.Fatal("caller deadline did not stop the child before cleanup")
+					}
+				}
+			}) {
+				t.FailNow()
+			}
+			select {
+			case <-finished:
+				if _, ok := errors.AsType[*exec.ExitError](runErr); !ok || cmd.ProcessState == nil || cmd.ProcessState.Success() {
+					t.Fatalf("child not reaped with unsuccessful exit: state=%v err=%v", cmd.ProcessState, runErr)
+				}
+			case <-time.After(time.Until(started.Add(4 * time.Second))):
+				t.Fatal("child was not reaped within 4s")
+			}
+			if elapsed := time.Since(started); elapsed >= 4*time.Second {
+				t.Errorf("child exit and cleanup took %v; want under 4s", elapsed)
+			}
+			address, err := url.Parse(endpoint)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Rebind to prove cleanup released the socket without dialing a replacement listener.
+			var cfg net.ListenConfig
+			listener, err := env.Listen(t.Context(), "tcp4", address.Host, cfg.Listen)
+			if err != nil {
+				t.Fatalf("collector listener still occupied: %v", err)
+			}
+			if err := listener.Close(); err != nil {
+				t.Fatal(err)
 			}
 		})
 	}
@@ -140,13 +240,15 @@ func TestUsageCollectorAuthorization(t *testing.T) {
 		url, helperURL string
 		authorize      *gatewaytest.UsageCollector
 	}{
-		"error: arbitrary loopback URL":                 {url: "http://127.0.0.1:9000/v1/logs"},
-		"error: existing URL without collector":         {url: first.URL},
-		"error: constructed collector without lease":    {url: first.URL, authorize: &gatewaytest.UsageCollector{URL: first.URL}},
-		"error: changed collector path":                 {url: first.URL + "/other", authorize: first},
-		"error: previously cleaned up collector":        {url: stopped.URL, authorize: stopped},
-		"error: helper aimed at another live collector": {url: second.URL, helperURL: first.URL, authorize: second},
-		"error: helper strings alone are not authority": {url: first.URL, helperURL: first.URL},
+		"error: arbitrary loopback URL":                          {url: "http://127.0.0.1:9000/v1/logs"},
+		"error: existing URL without collector":                  {url: first.URL},
+		"error: constructed collector without lease":             {url: first.URL, authorize: &gatewaytest.UsageCollector{URL: first.URL}},
+		"error: changed collector path":                          {url: first.URL + "/other", authorize: first},
+		"error: changed collector query":                         {url: first.URL + "?fixture=other", authorize: first},
+		"error: different live collector for sandbox executable": {url: second.URL, authorize: first},
+		"error: previously cleaned up collector":                 {url: stopped.URL, authorize: stopped},
+		"error: helper aimed at another live collector":          {url: second.URL, helperURL: first.URL, authorize: second},
+		"error: helper strings alone are not authority":          {url: first.URL, helperURL: first.URL},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -285,7 +387,7 @@ func TestProbeUsagePolicyError(t *testing.T) {
 	}
 }
 
-func TestUsageOverrideRefusedBeforeLaunch(t *testing.T) {
+func TestUsageHelperRejectsInvalidEndpointSyntax(t *testing.T) {
 	tests := map[string]struct{ endpoint string }{
 		"error: empty would fall back":         {""},
 		"error: whitespace is not disabled":    {" 0 "},
@@ -293,6 +395,7 @@ func TestUsageOverrideRefusedBeforeLaunch(t *testing.T) {
 		"error: HTTPS":                         {"https://127.0.0.1:9999/v1/logs"},
 		"error: non-loopback IP":               {"http://192.0.2.1:9999/v1/logs"},
 		"error: hostname":                      {"http://localhost:9999/v1/logs"},
+		"error: encoded host":                  {"http://%31%32%37.0.0.1:9999/v1/logs"},
 		"error: credentials":                   {"http://user@127.0.0.1:9999/v1/logs"},
 		"error: zoned IP":                      {"http://[::1%25lo]:9999/v1/logs"},
 		"error: implicit port":                 {"http://127.0.0.1/v1/logs"},
@@ -307,17 +410,10 @@ func TestUsageOverrideRefusedBeforeLaunch(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			home := t.TempDir()
-			bin := filepath.Join(home, "fixture-launch-canary")
-			if err := os.WriteFile(bin, []byte(launchCanary), 0o700); err != nil {
-				t.Fatal(err)
+			env := gatewaytest.NewEnv(t.TempDir(), nil, nil, nil)
+			if cmd, err := env.HelperCommand(t, "usage", tt.endpoint); cmd != nil || !errors.Is(err, gatewaytest.ErrUsageEndpoint) {
+				t.Fatalf("HelperCommand: endpoint=%q cmd=%v err=%v; want ErrUsageEndpoint before launch", tt.endpoint, cmd, err)
 			}
-			env := gatewaytest.NewEnv(home, nil, map[string]string{fixtureUsageKey: tt.endpoint}, nil)
-			cmd := exec.CommandContext(t.Context(), bin)
-			if err := env.RunFixture(cmd); !errors.Is(err, gatewaytest.ErrUsageEndpoint) || cmd.Process != nil {
-				t.Fatalf("RunFixture: endpoint=%q process=%v err=%v; want ErrUsageEndpoint before launch", tt.endpoint, cmd.Process, err)
-			}
-			wantAbsent(t, filepath.Join(home, "launched"))
 		})
 	}
 }

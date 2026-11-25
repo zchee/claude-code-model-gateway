@@ -145,36 +145,10 @@ func (env Environment) StartCountingProxy(t testing.TB) *CountingProxy {
 	return p
 }
 
-// UsageRequest records the parts of a request observed by a fixture collector.
-type UsageRequest struct {
-	Method, RequestURI, ContentType, Body string
-}
-
-// UsageCollector records requests sent to its private loopback URL without forwarding them.
-type UsageCollector struct {
-	URL      string
-	lease    *usageCollectorLease
-	mu       sync.Mutex
-	requests []UsageRequest
-}
-
-// RunFixture authorizes a fixture to send usage to this collector while it is running.
-// The caller must set the collector URL in env and give cmd a bounded lifetime.
-func (c *UsageCollector) RunFixture(env Environment, cmd *exec.Cmd) error {
-	return env.runFixture(cmd, c.lease)
-}
-
-// Requests returns a snapshot of the requests recorded by the collector.
-func (c *UsageCollector) Requests() []UsageRequest {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return slices.Clone(c.requests)
-}
-
 // StartUsageCollector starts a recording HTTP collector and shuts it down at test cleanup.
 func (env Environment) StartUsageCollector(t testing.TB) *UsageCollector {
 	t.Helper()
-	collector := new(UsageCollector)
+	state := new(usageCollectorState)
 	base, stopped := env.serve(t, &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
 		if err != nil {
@@ -182,31 +156,40 @@ func (env Environment) StartUsageCollector(t testing.TB) *UsageCollector {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		collector.mu.Lock()
-		collector.requests = append(collector.requests, UsageRequest{r.Method, r.RequestURI, r.Header.Get("Content-Type"), string(body)})
-		collector.mu.Unlock()
+		state.mu.Lock()
+		state.requests = append(state.requests, UsageRequest{r.Method, r.RequestURI, r.Header.Get("Content-Type"), string(body)})
+		state.mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
 	})})
-	collector.URL = base + "/v1/logs"
-	lease := &usageCollectorLease{endpoint: collector.URL, stopped: stopped}
-	collector.lease = lease
-	// Cleanup runs before server shutdown and after any already authorized child exits.
+	state.endpoint, state.stopped = base+"/v1/logs", stopped
+	ctx, cancel := context.WithCancel(t.Context())
+	state.ctx = ctx
+	// Cleanup cancels children before waiting for them and before the server releases the port.
 	t.Cleanup(func() {
-		lease.mu.Lock()
-		lease.revoked = true
-		lease.mu.Unlock()
+		cancel()
+		state.mu.Lock()
+		idle := state.idle
+		state.mu.Unlock()
+		if idle == nil {
+			return
+		}
+		select {
+		case <-idle:
+		case <-time.After(fixtureTimeout):
+			t.Error("timed out waiting for usage fixture commands to finish after cancellation")
+		}
 	})
-	return collector
+	return &UsageCollector{URL: state.endpoint, state: state}
 }
 
-// HelperCommand prepares a registered helper in its own private sandbox directory.
-// The caller's test binary must define TestGatewayFixtureHelper(t *testing.T) calling
-// DispatchHelper(t). Use RunFixture on the sandbox environment to launch the helper.
+// HelperCommand prepares a subprocess helper in its own private sandbox directory.
+// A consuming package must declare exactly one TestGatewayFixtureHelper that calls DispatchHelper under the process build tag.
+// Custom names match [a-z][a-z0-9-]{0,63}. Use RunFixture on the sandbox environment to launch the helper.
 func (env Environment) HelperCommand(t testing.TB, helper string, args ...string) (*exec.Cmd, error) {
 	t.Helper()
-	dispatch := append([]string{helperSelector, "--", "--gatewaytest-helper=" + helper}, args...)
-	if !registeredDispatch(dispatch) {
-		return nil, errors.New("unregistered gateway fixture helper")
+	dispatch := append([]string{helperSelector, "--", helperDispatchPrefix + helper}, args...)
+	if !validHelperDispatch(dispatch) {
+		return nil, errors.New("invalid gateway fixture helper dispatch")
 	}
 	if dispatch[2] == usageHelperDispatch && !validUsageEndpoint(dispatch[3]) {
 		return nil, ErrUsageEndpoint
@@ -229,35 +212,57 @@ func (env Environment) HelperCommand(t testing.TB, helper string, args ...string
 			t.Error(err)
 		}
 	})
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), fixtureTimeout)
 	t.Cleanup(cancel)
 	cmd := exec.CommandContext(ctx, exe, dispatch...)
-	cmd.Dir, cmd.Env, cmd.WaitDelay = dir, []string{}, time.Second
+	cmd.Dir, cmd.Env, cmd.WaitDelay = dir, []string{}, fixtureWaitDelay
 	return cmd, nil
 }
 
+// HelperFunc runs a named subprocess helper with its arguments in the checked fixture directory.
+type HelperFunc func(t testing.TB, args []string)
+
 // DispatchHelper handles the reserved subprocess invocation, doing nothing during ordinary test runs.
-// It returns the approved endpoint argument for the usage helper; that helper checks its own environment.
-func DispatchHelper(t testing.TB) string {
+// A consuming package must declare exactly one TestGatewayFixtureHelper that calls DispatchHelper under the process build tag.
+// Pass nil for built-in helpers only; the usage helper returns its validated endpoint argument.
+func DispatchHelper(t testing.TB, helpers map[string]HelperFunc) string {
 	t.Helper()
-	if len(os.Args) >= 4 && os.Args[1] == helperSelector && registeredDispatch(os.Args[1:]) {
-		// The parent passes the checked working directory as the first ExtraFiles descriptor.
-		dir := os.NewFile(3, "fixture working directory")
-		if dir == nil {
-			t.Fatal("missing fixture working directory")
+	if len(os.Args) < 3 || os.Args[1] != helperSelector || os.Args[2] != "--" {
+		return ""
+	}
+	if !validHelperDispatch(os.Args[1:]) {
+		t.Fatal("invalid gateway fixture helper dispatch")
+	}
+	// The parent passes the checked working directory as the first ExtraFiles descriptor.
+	dir := os.NewFile(3, "fixture working directory")
+	if dir == nil {
+		t.Fatal("missing fixture working directory")
+	}
+	if err := errors.Join(dir.Chdir(), dir.Close()); err != nil {
+		t.Fatal(err)
+	}
+	for name := range helpers {
+		if name == claudeHelperName || name == usageHelperName || legacyHelperName(name) {
+			t.Fatalf("cannot override built-in gateway fixture helper %q", name)
 		}
-		if err := errors.Join(dir.Chdir(), dir.Close()); err != nil {
+	}
+	name, args := os.Args[3][len(helperDispatchPrefix):], os.Args[4:]
+	switch name {
+	case claudeHelperName:
+		if err := FakeClaude(args, os.Stdout); err != nil {
 			t.Fatal(err)
 		}
-		if os.Args[3] == usageHelperDispatch {
-			if !validUsageEndpoint(os.Args[4]) {
-				t.Fatal(ErrUsageEndpoint)
-			}
-			return os.Args[4]
+	case usageHelperName:
+		if !validUsageEndpoint(args[0]) {
+			t.Fatal(ErrUsageEndpoint)
 		}
-		if err := FakeClaude(os.Args[4:], os.Stdout); err != nil {
-			t.Fatal(err)
+		return args[0]
+	default:
+		helper := helpers[name]
+		if helper == nil {
+			t.Fatalf("unregistered gateway fixture helper %q", name)
 		}
+		helper(t, args)
 	}
 	return ""
 }
