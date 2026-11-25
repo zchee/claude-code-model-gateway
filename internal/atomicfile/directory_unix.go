@@ -165,20 +165,21 @@ func (d *directory) path(base string) string {
 const maxDestinationBase = 255 - len(".2147483647.0123456789ab.tmp")
 
 func validWriteBase(base string) bool {
-	return len(base) <= maxDestinationBase && validAppendBase(base)
+	return len(base) <= maxDestinationBase && validBase(base) && !stagingName(base)
 }
 
 func validAppendBase(base string) bool {
-	if !validBase(base) {
-		return false
-	}
+	return validBase(base) && !strings.ContainsRune(base, 0) && !stagingName(strings.ToLower(base))
+}
+
+func stagingName(base string) bool {
 	stem, ok := strings.CutSuffix(base, ".tmp")
 	if !ok {
-		return true
+		return false
 	}
 	stem, _, _ = strings.CutLast(stem, ".")
 	target, _, ok := strings.CutLast(stem, ".")
-	return !ok || target == "" || !generatedName(base, target)
+	return ok && target != "" && generatedName(base, target)
 }
 
 func splitDestination(path string) (string, string, error) {

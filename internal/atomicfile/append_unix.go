@@ -29,6 +29,8 @@ import (
 // AppendFile appends data to a regular file in one write without replacing it.
 // It creates a missing file with mode's permission bits subject to the creation
 // mask. It does not create parent directories or follow a final symlink.
+// It rejects ASCII case variants of reserved staging names as well as exact matches;
+// other filesystem aliases, including hard links, are not protected.
 // A write error reports the number of bytes appended; a partial record is not retried.
 func AppendFile(path string, data []byte, mode fs.FileMode) error {
 	if _, base := filepath.Split(path); !validAppendBase(base) {
@@ -53,7 +55,7 @@ func (d *Dir) AppendFile(name string, data []byte, mode fs.FileMode) error {
 	return d.root.appendFile(name, data, mode)
 }
 
-func (d *directory) appendFile(name string, data []byte, mode fs.FileMode) (err error) {
+func (d *directory) appendFile(name string, data []byte, mode fs.FileMode) error {
 	// Avoid opening a known device; the opened descriptor is authoritative if the entry changes.
 	st, err := d.lstatRetry(name)
 	if err == nil && st.Mode&unix.S_IFMT != unix.S_IFREG {
@@ -62,6 +64,10 @@ func (d *directory) appendFile(name string, data []byte, mode fs.FileMode) (err 
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
+	return d.openAndAppend(name, data, mode, unix.Write)
+}
+
+func (d *directory) openAndAppend(name string, data []byte, mode fs.FileMode, write func(int, []byte) (int, error)) (err error) {
 	f, err := d.OpenFile(name, unix.O_APPEND|unix.O_WRONLY|unix.O_CREAT|unix.O_NONBLOCK|unix.O_NOCTTY, mode)
 	if errors.Is(err, unix.ELOOP) || errors.Is(err, unix.EISDIR) || errors.Is(err, unix.ENXIO) {
 		return &NonRegularError{d.path(name)}
@@ -79,7 +85,7 @@ func (d *directory) appendFile(name string, data []byte, mode fs.FileMode) (err 
 	}
 	// os.File.Write may split a large buffer or continue after a short write.
 	for {
-		n, err := unix.Write(int(f.Fd()), data)
+		n, err := write(int(f.Fd()), data)
 		if n <= 0 && errors.Is(err, unix.EINTR) {
 			continue
 		}

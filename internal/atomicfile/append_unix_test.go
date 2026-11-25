@@ -29,22 +29,11 @@ import (
 	"time"
 
 	gocmp "github.com/google/go-cmp/cmp"
+	"golang.org/x/sys/unix"
 )
 
 func TestAppendFile(t *testing.T) {
-	dir := t.TempDir()
-	// No sibling is staged, so the destination may exceed the staging name limit.
-	path := filepath.Join(dir, strings.Repeat("x", 240))
-	control := filepath.Join(dir, "control")
-	if err := os.WriteFile(control, nil, 0o666); err != nil {
-		t.Fatal(err)
-	}
-	if err := AppendFile(path, []byte(oldState), 0o666); err != nil {
-		t.Fatal(err)
-	}
-	if diff := gocmp.Diff(exclusiveStat(t, control).Mode, exclusiveStat(t, path).Mode); diff != "" {
-		t.Fatalf("creation mode (-want +got):\n%s", diff)
-	}
+	path := stateFile(t)
 	f, err := os.Open(path)
 	if err != nil {
 		t.Fatal(err)
@@ -67,6 +56,61 @@ func TestAppendFile(t *testing.T) {
 	}
 	if diff := gocmp.Diff(oldState+newState, string(data)); diff != "" {
 		t.Fatalf("old descriptor (-want +got):\n%s", diff)
+	}
+}
+
+func TestAppendFileLongName(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, strings.Repeat("y", 240)), nil, 0o600); err != nil {
+		t.Fatalf("this test requires a filesystem supporting 240-byte basenames: %v", err)
+	}
+	path := filepath.Join(dir, strings.Repeat("x", 240))
+	if err := AppendFile(path, []byte(oldState), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	checkContents(t, path, oldState)
+}
+
+func TestAppendFileWriteCalls(t *testing.T) {
+	const record = "data"
+	tests := map[string]struct {
+		first, calls      int
+		firstErr, wantErr error
+		want              string
+	}{
+		"success: full write":                 {4, 1, nil, nil, record},
+		"error: short write":                  {2, 1, nil, io.ErrShortWrite, "da"},
+		"success: interrupted before writing": {-1, 2, unix.EINTR, nil, record},
+		"error: rejected before writing":      {-1, 1, unix.EFBIG, unix.EFBIG, ""},
+		"error: interrupted after writing":    {2, 1, unix.EINTR, unix.EINTR, "da"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			d := openTestDir(t, dir)
+			calls := 0
+			err := d.root.openAndAppend("journal", []byte(record), 0o600, func(fd int, data []byte) (int, error) {
+				calls++
+				if calls > tt.calls || string(data) != record {
+					t.Fatalf("unexpected write call %d: %q", calls, data)
+				}
+				if calls == 1 {
+					if tt.first < 0 {
+						return tt.first, tt.firstErr
+					}
+					n, err := unix.Write(fd, data[:tt.first])
+					return n, errors.Join(err, tt.firstErr)
+				}
+				return unix.Write(fd, data)
+			})
+			if calls != tt.calls || !errors.Is(err, tt.wantErr) {
+				t.Fatalf("got %d calls and %v, want %d and %v", calls, err, tt.calls, tt.wantErr)
+			}
+			if err != nil && !strings.Contains(err.Error(), fmt.Sprintf("%d of %d bytes", len(tt.want), len(record))) {
+				t.Fatalf("missing byte count: %v", err)
+			}
+			checkContents(t, filepath.Join(dir, "journal"), tt.want)
+		})
 	}
 }
 
@@ -151,11 +195,14 @@ func TestAppendFileNames(t *testing.T) {
 	dir := t.TempDir()
 	d := openTestDir(t, dir)
 	tests := map[string]struct{ path, name string }{
-		"error: empty":              {"", ""},
-		"error: trailing separator": {dir + "/file/", "file/"},
-		"error: dot":                {dir + "/missing/.", "."},
-		"error: dot-dot":            {dir + "/missing/..", ".."},
-		"error: reserved sibling":   {dir + "/missing/log.42.0123456789ab.tmp", "log.42.0123456789ab.tmp"},
+		"error: empty":                             {"", ""},
+		"error: trailing separator":                {dir + "/file/", "file/"},
+		"error: dot":                               {dir + "/missing/.", "."},
+		"error: dot-dot":                           {dir + "/missing/..", ".."},
+		"error: reserved sibling":                  {dir + "/missing/log.42.0123456789ab.tmp", "log.42.0123456789ab.tmp"},
+		"error: mixed-case nonce":                  {dir + "/missing/log.42.0123456789aB.tmp", "log.42.0123456789aB.tmp"},
+		"error: mixed-case extension":              {dir + "/missing/log.42.0123456789ab.TmP", "log.42.0123456789ab.TmP"},
+		"error: embedded NUL before parent lookup": {dir + "/missing/log\x00file", "log\x00file"},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
