@@ -130,10 +130,10 @@ func TestProbeFilters(t *testing.T) {
 		pin, picker map[string]string
 	}{
 		"success: case and precedence": {
-			env:     map[string]string{"anthropic_api_key": "test", "ANTHROPIC_DEFAULT_FABLE_MODEL": "old", "CLAUDECODE": "", "claudecode": "preserved", "UNRELATED": "x"},
-			gateway: map[string]string{"ANTHROPIC_DEFAULT_FABLE_MODEL": "new"},
+			env:     map[string]string{"ANTHROPIC_BASE_URL": "", "anthropic_base_url": "preserved by picker", "anthropic_api_key": "test", "ANTHROPIC_DEFAULT_FABLE_MODEL": "old", "CLAUDECODE": "", "claudecode": "preserved", "UNRELATED": "x"},
+			gateway: map[string]string{"ANTHROPIC_BASE_URL": "replacement", "ANTHROPIC_DEFAULT_FABLE_MODEL": "new"},
 			pin:     map[string]string{"CLAUDECODE": "", "claudecode": "preserved", "UNRELATED": "x"},
-			picker:  map[string]string{"anthropic_api_key": "test", "claudecode": "preserved", "UNRELATED": "x"},
+			picker:  map[string]string{"anthropic_base_url": "preserved by picker", "anthropic_api_key": "test", "claudecode": "preserved", "UNRELATED": "x"},
 		},
 	}
 	for label, tt := range tests {

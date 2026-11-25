@@ -47,15 +47,19 @@ type Key[T any] struct {
 
 // Get parses the variable from lookup without consulting the process environment.
 func (k Key[T]) Get(lookup LookupEnv) T {
-	var raw string
-	var set bool
+	value, _, _ := k.Read(lookup)
+	return value
+}
+
+// Read returns the parsed value, its raw spelling, and whether it was defined, from one lookup.
+func (k Key[T]) Read(lookup LookupEnv) (value T, raw string, set bool) {
 	if lookup != nil {
 		raw, set = lookup(k.variable.Name)
 	}
 	if !set {
 		raw = ""
 	}
-	return k.parse(raw, set)
+	return k.parse(raw, set), raw, set
 }
 
 func key[T any](name, fallback, meaning, rule, readers string, parse func(string, bool) T) Key[T] {
@@ -73,12 +77,14 @@ func candidate(name, fallback, meaning, rule, readers string) Key[string] {
 }
 
 func rawKey(name, meaning, rule, readers string) Key[*string] {
-	return key(name, "unset", meaning, rule, readers, func(s string, set bool) *string {
-		if set {
-			return &s
-		}
-		return nil
-	})
+	return key(name, "unset", meaning, rule, readers, presentString)
+}
+
+func presentString(s string, set bool) *string {
+	if set {
+		return &s
+	}
+	return nil
 }
 
 func trimmedKey(name, fallback, meaning, readers string) Key[string] {
@@ -224,8 +230,8 @@ func NoProxyForPinProbe(lookup LookupEnv) string {
 // PinProbeEnvironment returns a copy with inherited native authentication and model keys removed.
 func PinProbeEnvironment(env map[string]string) map[string]string {
 	excluded := [...]string{
-		anthropicAPIKey.variable.Name, anthropicAuth.variable.Name, AnthropicBaseURL.variable.Name,
-		anthropicFable.variable.Name, anthropicOpus.variable.Name, anthropicSonnet.variable.Name, claudeOAuth.variable.Name,
+		anthropicAPIKey.Name, anthropicAuth.Name, AnthropicBaseURL.variable.Name,
+		anthropicFable.Name, anthropicOpus.Name, anthropicSonnet.Name, claudeOAuth.Name,
 	}
 	out := maps.Clone(env)
 	maps.DeleteFunc(out, func(name, _ string) bool { return slices.Contains(excluded[:], strings.ToUpper(name)) })
@@ -234,7 +240,7 @@ func PinProbeEnvironment(env map[string]string) map[string]string {
 
 // NativePickerEnvironment returns the inherited environment minus session markers and gateway-owned keys.
 func NativePickerEnvironment(env, gatewayEnv map[string]string) map[string]string {
-	markers := [...]string{claudeCode.variable.Name, claudeEntrypoint.variable.Name, claudeSSEPort.variable.Name, claudeSessionID.variable.Name}
+	markers := [...]string{claudeCode.Name, claudeEntrypoint.Name, claudeSSEPort.Name, claudeSessionID.Name}
 	out := maps.Clone(env)
 	maps.DeleteFunc(out, func(name, _ string) bool {
 		_, owned := gatewayEnv[name]

@@ -17,6 +17,7 @@ package config
 import (
 	"math"
 	"os"
+	"strings"
 	"testing"
 
 	gocmp "github.com/google/go-cmp/cmp"
@@ -51,7 +52,10 @@ func checkKey[T any](key Key[T], valid, invalid string, want [4]T) envCheck {
 		}
 		for label, tt := range tests {
 			t.Run(label, func(t *testing.T) {
-				got := key.Get(lookup(name, tt.value, tt.set))
+				got, raw, set := key.Read(lookup(name, tt.value, tt.set))
+				if raw != tt.value || set != tt.set {
+					t.Errorf("lookup %s returned raw %q, defined %v; want %q, %v", name, raw, set, tt.value, tt.set)
+				}
 				if diff := gocmp.Diff(tt.want, got, cmpopts.EquateNaNs()); diff != "" {
 					t.Errorf("lookup %s = %q, present %v (-want +got):\n%s", name, tt.value, tt.set, diff)
 				}
@@ -89,16 +93,68 @@ func endpointCheck(key Key[Endpoint]) envCheck {
 	})
 }
 
+func filterCheck(name string, pin bool, picker string) envCheck {
+	return envCheck{name: name, check: func(t *testing.T) {
+		t.Helper()
+		tests := map[string]struct {
+			value string
+			set   bool
+		}{
+			"success: unset":             {set: false},
+			"success: empty":             {set: true},
+			"success: nonempty":          {value: "sample", set: true},
+			"success: unvalidated value": {value: " ", set: true},
+		}
+		for label, tt := range tests {
+			t.Run(label, func(t *testing.T) {
+				lower := strings.ToLower(name)
+				env := map[string]string{"UNRELATED": "keep"}
+				wantPin := map[string]string{"UNRELATED": "keep"}
+				wantPicker := map[string]string{"UNRELATED": "keep"}
+				wantUnowned := map[string]string{"UNRELATED": "keep"}
+				gateway := map[string]string{}
+				if picker == "owned" {
+					gateway[name] = "replacement"
+				}
+				if tt.set {
+					env[name], env[lower] = tt.value, tt.value
+					if !pin {
+						wantPin[name], wantPin[lower] = tt.value, tt.value
+					}
+					wantPicker[lower], wantUnowned[lower] = tt.value, tt.value
+					if picker == "" {
+						wantPicker[name] = tt.value
+					}
+					if picker != "marker" {
+						wantUnowned[name] = tt.value
+					}
+				}
+				if diff := gocmp.Diff(wantPin, PinProbeEnvironment(env)); diff != "" {
+					t.Errorf("pin probe environment (-want +got):\n%s", diff)
+				}
+				if diff := gocmp.Diff(wantPicker, NativePickerEnvironment(env, gateway)); diff != "" {
+					t.Errorf("picker probe environment (-want +got):\n%s", diff)
+				}
+				if diff := gocmp.Diff(wantUnowned, NativePickerEnvironment(env, nil)); diff != "" {
+					t.Errorf("picker probe with no owned keys (-want +got):\n%s", diff)
+				}
+			})
+		}
+	}}
+}
+
 func TestEveryVariable(t *testing.T) {
 	tests := map[string]struct{ checks []envCheck }{
 		"success: raw strings": {[]envCheck{
-			stringCheck(AppData, ""), stringCheck(ClaudeBin, "claude"), stringCheck(ClaudeConfig, ""),
+			stringCheck(AppData, ""), stringCheck(ClaudeConfig, ""),
+			checkKey(ClaudeBin, "/sandbox/fake-claude", "claude", [4]string{"claude", "claude", "/sandbox/fake-claude", "claude"}),
 			stringCheck(DispatchCachePath, ""), stringCheck(GrokEndpoint, "https://cli-chat-proxy.grok.com/v1/responses"),
 			stringCheck(GrokHome, ""), stringCheck(HostsFile, ""), stringCheck(NoProxy, ""), stringCheck(NoProxyLower, ""),
 			stringCheck(OpenCodeProxyKey, ""), stringCheck(OpenCodeKey, ""), stringCheck(PluginCache, ""),
 			stringCheck(PluginRoot, ""), stringCheck(ProxyConfig, ""), stringCheck(RegistryClaudeHome, ""),
 			stringCheck(RequestBodyDir, ""), stringCheck(RequestLogPath, ""), stringCheck(SocketPath, ""),
 			stringCheck(StateDirectory, ""), stringCheck(SystemRoot, `C:\Windows`),
+			stringCheck(Temp, ""), stringCheck(Tmp, ""), stringCheck(TmpDir, ""), stringCheck(WinDir, ""),
 			stringCheck(Upstream, "https://api.anthropic.com"), stringCheck(UserProfile, ""), stringCheck(WorkerPortValue, ""), stringCheck(XDGConfigHome, ""),
 			rawCheck(AnthropicBaseURL), rawCheck(Home), rawCheck(ProxyCompression), rawCheck(GatewayCompression), rawCheck(StartupGeneration),
 		}},
@@ -119,7 +175,7 @@ func TestEveryVariable(t *testing.T) {
 			checkKey(CompactMax, "2048", "Infinity", [4]float64{16777216, 16777216, 2048, 16777216}),
 			checkKey(CompactRetries, "0x4", "1.5", [4]float64{2, 0, 4, 2}),
 			checkKey(CompactDelay, ".5", "-1", [4]float64{250, 0, .5, 250}),
-			checkKey(CompactTrigger, "1e5", "1e5!", [4]float64{math.NaN(), 0, 100000, math.NaN()}),
+			checkKey(CompactTrigger, " 0x10000 ", "1e5!", [4]float64{math.NaN(), 0, 65536, math.NaN()}),
 			checkKey(DispatchMax, "50.0", "5.1", [4]float64{500, 500, 50, 500}),
 			checkKey(DispatchTTL, "1e5", "-1", [4]float64{14400000, 14400000, 100000, 14400000}),
 			checkKey(DrainTimeout, "-2", "bad", [4]float64{30000, 30000, -2, 30000}),
@@ -145,23 +201,23 @@ func TestEveryVariable(t *testing.T) {
 			}),
 		}},
 		"success: probe environment filters": {[]envCheck{
-			checkKey(anthropicAPIKey, "value", "any", [4]bool{false, true, true, true}),
-			checkKey(anthropicAuth, "value", "any", [4]bool{false, true, true, true}),
-			checkKey(anthropicFable, "value", "any", [4]bool{false, true, true, true}),
-			checkKey(anthropicOpus, "value", "any", [4]bool{false, true, true, true}),
-			checkKey(anthropicSonnet, "value", "any", [4]bool{false, true, true, true}),
-			checkKey(claudeOAuth, "value", "any", [4]bool{false, true, true, true}),
-			checkKey(claudeCode, "value", "any", [4]bool{false, true, true, true}),
-			checkKey(claudeEntrypoint, "value", "any", [4]bool{false, true, true, true}),
-			checkKey(claudeSSEPort, "value", "any", [4]bool{false, true, true, true}),
-			checkKey(claudeSessionID, "value", "any", [4]bool{false, true, true, true}),
-			checkKey(claudeDiscovery, "value", "any", [4]bool{false, true, true, true}),
-			checkKey(claudeNoFallback, "value", "any", [4]bool{false, true, true, true}),
-			checkKey(claudeMaxOutput, "value", "any", [4]bool{false, true, true, true}),
-			checkKey(enableToolSearch, "value", "any", [4]bool{false, true, true, true}),
-			checkKey(customModel, "value", "any", [4]bool{false, true, true, true}),
-			checkKey(customModelName, "value", "any", [4]bool{false, true, true, true}),
-			checkKey(customModelDesc, "value", "any", [4]bool{false, true, true, true}),
+			filterCheck("ANTHROPIC_API_KEY", true, ""),
+			filterCheck("ANTHROPIC_AUTH_TOKEN", true, ""),
+			filterCheck("ANTHROPIC_DEFAULT_FABLE_MODEL", true, "owned"),
+			filterCheck("ANTHROPIC_DEFAULT_OPUS_MODEL", true, "owned"),
+			filterCheck("ANTHROPIC_DEFAULT_SONNET_MODEL", true, "owned"),
+			filterCheck("CLAUDE_CODE_OAUTH_TOKEN", true, ""),
+			filterCheck("CLAUDECODE", false, "marker"),
+			filterCheck("CLAUDE_CODE_ENTRYPOINT", false, "marker"),
+			filterCheck("CLAUDE_CODE_SSE_PORT", false, "marker"),
+			filterCheck("CLAUDE_CODE_SESSION_ID", false, "marker"),
+			filterCheck("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", false, "owned"),
+			filterCheck("CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK", false, "owned"),
+			filterCheck("CLAUDE_CODE_MAX_OUTPUT_TOKENS", false, "owned"),
+			filterCheck("ENABLE_TOOL_SEARCH", false, "owned"),
+			filterCheck("ANTHROPIC_CUSTOM_MODEL_OPTION", false, "owned"),
+			filterCheck("ANTHROPIC_CUSTOM_MODEL_OPTION_NAME", false, "owned"),
+			filterCheck("ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION", false, "owned"),
 		}},
 	}
 	seen := make(map[string]bool)

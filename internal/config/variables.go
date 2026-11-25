@@ -31,14 +31,14 @@ var (
 		}
 		return nil
 	})
-	ClaudeBin      = stringKey("CODEX_GATEWAY_CLAUDE_BIN", "claude", "Claude CLI for probes; a .cmd or .bat uses the Windows shell.", "lib/runtime.js:549–550; lib/pins.js:212–214,251–262; lib/picker-guard.js:32–35,94")
+	ClaudeBin      = key("CODEX_GATEWAY_CLAUDE_BIN", "claude", "Claude CLI for probes; a .cmd or .bat uses the Windows shell.", `Use a nonempty command without trimming. The source's test-mode probe checks the raw value: any nonempty override is truthy, even "claude".`, "lib/runtime.js:549–550; lib/pins.js:212–214,251–262; lib/picker-guard.js:32–35,94", func(s string, _ bool) string { return cmp.Or(s, "claude") })
 	ClaudeConfig   = candidate("CLAUDE_CONFIG_DIR", "home/.claude (global config: home/.claude.json)", "Claude config, registry, discovery cache and transcripts.", "Use any nonempty string without trimming; only the registry search makes it absolute.", "lib/runtime.js:15,552,682–693; lib/previous-picker-rows.js:13–17; lib/usage-observability.js:134; lib/commands.js:320; hooks/registry-writer.js:43–51")
 	CompatPort     = portKey("CODEX_GATEWAY_COMPAT_PORT", "Remote-control compatibility listener port.", "lib/runtime.js:45", "80")
 	CompactGuard   = toggle("CODEX_GATEWAY_COMPACT_STREAM_GUARD", "Buffer Codex compaction streams for retry before committing the response.", "lib/request-worker.js:305", true)
 	CompactMax     = numberKey("CODEX_GATEWAY_COMPACT_STREAM_MAX_BYTES", "Maximum buffered compaction response bytes.", "accept a finite positive value.", "lib/request-worker.js:314–317", 16*1024*1024, finitePositive)
 	CompactRetries = numberKey("CODEX_GATEWAY_COMPACT_STREAM_RETRIES", "Number of retries for a failed compaction stream.", "accept a nonnegative integer.", "lib/request-worker.js:306–309", 2, integerNonnegative)
 	CompactDelay   = numberKey("CODEX_GATEWAY_COMPACT_STREAM_RETRY_DELAY_MS", "Delay between compaction stream retries in milliseconds.", "accept a finite nonnegative value.", "lib/request-worker.js:310–313", 250, finiteNonnegative)
-	CompactTrigger = key("CODEX_GATEWAY_COMPACT_TRIGGER", "no override", "Global synthetic compaction trigger candidate, unless compact-at is saved.", "Apply Number; only finite positive values become candidates. A saved-setting diagnostic distinguishes unset from empty.", "lib/runtime.js:320,339,358; lib/context-window.js:55–64", func(s string, set bool) float64 {
+	CompactTrigger = key("CODEX_GATEWAY_COMPACT_TRIGGER", "no override", "Global synthetic compaction trigger candidate, unless compact-at is saved.", "Apply Number; only finite positive values become candidates. A saved-setting diagnostic prints the raw spelling, including empty, and omits it only when unset.", "lib/runtime.js:320,339,358; lib/context-window.js:55–64", func(s string, set bool) float64 {
 		return envNumber(s, set)
 	})
 	CodexContextWindow = key("CODEX_GATEWAY_CONTEXT_WINDOW", "saved setting takes precedence; default 272000", "Legacy Codex context window cap.", `Accept the exact string "full", or apply Number and accept integers from 185000 to 1000000 inclusive.`, "lib/runtime.js:247,251–279,307–320", func(s string, set bool) ContextWindow {
@@ -59,7 +59,7 @@ var (
 	GoogleCloudProject = trimmedKey("GOOGLE_CLOUD_PROJECT", "vertex.project in proxy config", "Second Vertex project presence check.", "lib/commands.js:1674–1677")
 	GrokEndpoint       = stringKey("CODEX_GATEWAY_GROK_ENDPOINT", "https://cli-chat-proxy.grok.com/v1/responses", "Grok backend endpoint.", "lib/runtime.js:31; lib/commands.js:113; lib/grok-backend.js:8")
 	GrokHome           = candidate("CODEX_GATEWAY_GROK_HOME", "home/.grok", "Grok CLI state directory.", "Use any nonempty string without trimming.", "lib/grok-backend.js:18–20")
-	Home               = rawKey("HOME", "POSIX user home and the test-runner settings diagnostic.", "For paths, use any nonempty value; the diagnostic interpolates even an empty value.", "lib/runtime.js:15–16 (os.homedir); lib/settings-wiring.js:104")
+	Home               = key("HOME", "injected account home lookup if unset", "POSIX user home and the test-runner settings diagnostic.", "Use the value as provided when nonempty. Unlike Node, which keeps an explicitly empty HOME and derives relative paths, the Go port reports an error naming HOME and does not look up the account's home.", "lib/runtime.js:15–16 (os.homedir); lib/settings-wiring.js:104; Node v24.11.1 deps/uv/src/unix/core.c:1195–1209", presentString)
 	HostsFile          = candidate("CODEX_GATEWAY_HOSTS_FILE", "Windows: SystemRoot/System32/drivers/etc/hosts; otherwise /etc/hosts", "Remote-control compatibility hosts file.", "Use any nonempty string without trimming.", "lib/remote-control.js:10–15")
 	KeepPlanTools      = toggle("CODEX_GATEWAY_KEEP_PLAN_TOOLS", "Keep plan tools visible in adapted provider requests.", "lib/request-worker.js:2547", false)
 	ListDispatchModel  = toggle("CODEX_GATEWAY_LIST_DISPATCH_MODEL", "List the virtual auto dispatch model.", "lib/runtime.js:39; lib/commands.js:129", false)
@@ -96,14 +96,14 @@ var (
 	})
 	ProxyCompression   = rawKey("CCP_CODEX_REQUEST_COMPRESSION", "Proxy request compression override.", "Any defined string, even empty, wins over the gateway override.", "lib/process-supervision.js:1009–1013")
 	GatewayCompression = rawKey("CODEX_GATEWAY_REQUEST_COMPRESSION", "Legacy proxy request compression override.", "Pass the raw value, including empty, only if CCP_CODEX_REQUEST_COMPRESSION is unset.", "lib/process-supervision.js:1009–1013")
-	ProxyConfig        = stringKey("CCP_CONFIG_DIR", "", "Explicit proxy config directory; otherwise use the platform default.", "lib/proxy-config.js:12–16")
+	ProxyConfig        = candidate("CCP_CONFIG_DIR", `Windows: APPDATA/claude-code-proxy (or home/AppData/Roaming/claude-code-proxy); macOS: home/.config/claude-code-proxy; other platforms: XDG_CONFIG_HOME/claude-code-proxy (or home/.config/claude-code-proxy)`, "Explicit proxy config directory.", "Use any nonempty string without trimming; otherwise use the platform default.", "lib/proxy-config.js:12–16")
 	ProxyPort          = portKey("CODEX_GATEWAY_PROXY_PORT", "Underlying claude-code-proxy port.", "lib/runtime.js:26; lib/commands.js:90", "18765")
 	ProxyRecovery      = key("CODEX_GATEWAY_PROXY_RECOVERY_INTERVAL_MS", "5000", "Proxy recovery polling interval in milliseconds.", "Apply Number, fall back for zero or NaN, then clamp to at least 1000.", "lib/commands.js:2504", func(s string, set bool) float64 {
 		return max(1000, numericOr(envNumber(s, set), 5000))
 	})
 	PublicPort          = key("CODEX_GATEWAY_PORT", publicPortDefault, "Public shim port.", "Use the default if unset or empty, then apply Number without validating. Recovery compares the raw spelling with no numeric conversion.", "lib/runtime.js:24,46; lib/commands.js:88; lib/recovery-policy.js:29", func(s string, _ bool) float64 { return jsNumber(defaultPublicPort(s)) })
 	RegistryClaudeHome  = candidate("MODEL_GATEWAY_CLAUDE_HOME", "normal registry search", "Whole-config-directory override for the registry-writer launcher only.", "Use any nonempty string without trimming; skip both normal registry candidates.", "hooks/registry-writer.js:40–51")
-	RequestBodyDir      = candidate("MODEL_GATEWAY_REQUEST_BODY_DIR", "home/.claude/model-gateway/request-body", "Request-body high-water mark directory.", "Use any nonempty string without trimming.", "lib/usage-observability.js:23–24")
+	RequestBodyDir      = candidate("MODEL_GATEWAY_REQUEST_BODY_DIR", "Go: state/request-body; Node: home/.claude/model-gateway/request-body", "Request-body high-water mark directory.", "Use any nonempty string without trimming.", "lib/usage-observability.js:23–24")
 	RequestLog          = toggle("CODEX_GATEWAY_REQUEST_LOG", "Write request route logs.", "lib/runtime.js:35; lib/commands.js:126", true)
 	RequestLogPath      = candidate("CODEX_GATEWAY_REQUEST_LOG_PATH", "state/logs/request-routes.jsonl", "Request route log file.", "Use any nonempty string without trimming.", "lib/runtime.js:36; lib/commands.js:127")
 	Sentry              = toggle("CODEX_GATEWAY_SENTRY", "Enable the synthetic compaction sentry.", "lib/request-worker.js:255", true)
@@ -111,7 +111,11 @@ var (
 	SSEHeartbeatSeconds = numberKey("CODEX_GATEWAY_SSE_HEARTBEAT_S", "Stream heartbeat interval in seconds; zero disables heartbeats.", "accept a finite nonnegative value and convert seconds to milliseconds at the worker.", "lib/request-worker.js:268–271", 20, finiteNonnegative)
 	StartupGeneration   = rawKey("MODEL_GATEWAY_STARTUP_GENERATION", "Generation recorded in the supervisor failure diagnostic.", "Preserve an explicitly empty string; omit the field if unset.", "lib/commands.js:624")
 	StateDirectory      = candidate("MODEL_GATEWAY_STATE_DIR", "gateway home", "Go gateway state override; does not move the stable installation or Claude settings.", "Use any nonempty string without trimming.", "Go port only: internal/paths/paths.go")
-	SystemRoot          = stringKey("SystemRoot", `C:\Windows`, "Windows system directory parent for tar.exe and hosts.", "lib/commands.js:460; lib/remote-control.js:13")
+	SystemRoot          = key("SystemRoot", `C:\Windows for tar/hosts; windir fallback for temp`, "Windows system directory parent for tar.exe, hosts, and the default temporary directory.", `Use any nonempty value without trimming. The temporary directory uses the raw value or windir, then appends \temp.`, "lib/commands.js:460; lib/remote-control.js:13; Node v24.11.1 lib/os.js:180–194 (os.tmpdir)", func(s string, _ bool) string { return cmp.Or(s, `C:\Windows`) })
+	Temp                = tempPathKey("TEMP", `Windows: TMP, then SystemRoot or windir; POSIX: /tmp`, "First Windows temporary directory candidate; third on POSIX.")
+	Tmp                 = tempPathKey("TMP", `Windows: SystemRoot or windir; POSIX: TEMP, then /tmp`, "Second temporary directory candidate on each platform.")
+	TmpDir              = tempPathKey("TMPDIR", "TMP, then TEMP, then /tmp", "First POSIX temporary directory candidate; ignored on Windows.")
+	WinDir              = candidate("windir", `undefined\temp when neither Windows root value is defined`, "Fallback Windows system directory parent for the temporary directory.", `Used when TEMP, TMP and SystemRoot are empty or unset. Append \temp to the raw value, including empty.`, "lib/settings-wiring.js:103–104; lib/picker-guard.js:95; Node v24.11.1 lib/os.js:180–194")
 	Traceparent         = toggle("CLAUDE_CODE_PROPAGATE_TRACEPARENT", "Enable route tracing and traceparent propagation.", "lib/runtime.js:40; lib/commands.js:130", false)
 	Upstream            = stringKey("CODEX_GATEWAY_ANTHROPIC_UPSTREAM", "https://api.anthropic.com", "Upstream for Anthropic passthrough and catalog fetches.", "lib/runtime.js:34; lib/commands.js:122; lib/anthropic-catalog.js:61 (via runtime)")
 	UsageMaxResponse    = key("CODEX_GATEWAY_USAGE_MAX_RESPONSE_BYTES", "4194304", "Usage response side-buffer ceiling in bytes.", "Apply Number, fall back for zero or NaN, then clamp to at least 1024.", "lib/usage-observability.js:986–988", func(s string, set bool) float64 {
@@ -124,6 +128,10 @@ var (
 	WSRetryDelay    = numberKey("CODEX_GATEWAY_WS_UPGRADE_RETRY_DELAY_MS", "Milliseconds between WebSocket upgrade retries.", "accept a finite nonnegative value.", "lib/request-worker.js:284–287", 250, finiteNonnegative)
 	XDGConfigHome   = candidate("XDG_CONFIG_HOME", "home/.config", "Proxy config parent directory on non-Windows, non-macOS systems.", "Use any nonempty string without trimming and append claude-code-proxy; ignored on Windows and macOS.", "lib/proxy-config.js:12–16")
 )
+
+func tempPathKey(name, fallback, meaning string) Key[string] {
+	return candidate(name, fallback, meaning, "First nonempty candidate wins. Remove one trailing slash on POSIX unless the value is the root; on Windows remove one trailing backslash unless it is a root or follows a colon.", "lib/settings-wiring.js:103–104; lib/picker-guard.js:95; Node v24.11.1 lib/os.js:180–194 and src/node_credentials.cc:119–139")
+}
 
 const (
 	pinExclusion = "lib/pins.js:241–247"
@@ -151,12 +159,12 @@ var (
 	customModelDesc  = filteredKey("ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION", "Picker probe", pickerOwned+"; lib/pins.js:394–398,414–425", false)
 )
 
-func filteredKey(name, reader, sources string, caseInsensitive bool) Key[bool] {
+func filteredKey(name, reader, sources string, caseInsensitive bool) Variable {
 	rule := "Match the exact key regardless of its value, including empty."
 	if caseInsensitive {
 		rule = "Pin probe matches the key case-insensitively; picker probe, where applicable, matches it exactly. The value is never inspected."
 	}
-	return key(name, "unset", reader+" strips this inherited key.", rule, sources, func(_ string, set bool) bool { return set })
+	return Variable{Name: name, Default: "unset", Meaning: reader + " strips this inherited key.", Rule: rule, Readers: sources}
 }
 
 // Variables returns a copy of the environment catalog in name order.
@@ -167,8 +175,8 @@ func Variables() []Variable {
 }
 
 var variables = []Variable{
-	AnthropicBaseURL.variable, anthropicAPIKey.variable, anthropicAuth.variable, anthropicFable.variable,
-	anthropicOpus.variable, anthropicSonnet.variable, AppData.variable, ClaudeAutoCompactWindow.variable,
+	AnthropicBaseURL.variable, anthropicAPIKey, anthropicAuth, anthropicFable,
+	anthropicOpus, anthropicSonnet, AppData.variable, ClaudeAutoCompactWindow.variable,
 	ClaudeBin.variable, ClaudeConfig.variable, CompatPort.variable, CompactGuard.variable, CompactMax.variable,
 	CompactRetries.variable, CompactDelay.variable, CompactTrigger.variable, CodexContextWindow.variable,
 	DispatchCachePath.variable, DispatchMax.variable, DispatchTTL.variable, DrainTimeout.variable,
@@ -181,10 +189,11 @@ var variables = []Variable{
 	GatewayCompression.variable, ProxyConfig.variable, ProxyPort.variable, ProxyRecovery.variable, PublicPort.variable,
 	RegistryClaudeHome.variable, RequestBodyDir.variable, RequestLog.variable, RequestLogPath.variable, Sentry.variable,
 	SocketPath.variable, SSEHeartbeatSeconds.variable, StartupGeneration.variable, StateDirectory.variable, SystemRoot.variable,
+	Temp.variable, Tmp.variable, TmpDir.variable, WinDir.variable,
 	Traceparent.variable, Upstream.variable, UsageMaxResponse.variable, UserProfile.variable, VertexProject.variable,
 	WorkerPortValue.variable, WSRetries.variable, WSRetryDelay.variable, XDGConfigHome.variable,
-	claudeOAuth.variable, claudeCode.variable, claudeEntrypoint.variable, claudeSSEPort.variable, claudeSessionID.variable,
-	claudeDiscovery.variable, claudeNoFallback.variable, claudeMaxOutput.variable, enableToolSearch.variable,
-	customModel.variable, customModelName.variable, customModelDesc.variable,
+	claudeOAuth, claudeCode, claudeEntrypoint, claudeSSEPort, claudeSessionID,
+	claudeDiscovery, claudeNoFallback, claudeMaxOutput, enableToolSearch,
+	customModel, customModelName, customModelDesc,
 	TraceEndpoint.variable, OTelTracesEndpoint.variable, OTelEndpoint.variable, OTelLogsEndpoint.variable, UsageEndpoint.variable,
 }

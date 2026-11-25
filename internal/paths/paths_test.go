@@ -18,6 +18,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	gocmp "github.com/google/go-cmp/cmp"
@@ -34,8 +35,8 @@ func TestInjectedLookupsStayIndependent(t *testing.T) {
 	base := t.TempDir()
 	firstHome, secondHome := filepath.Join(base, "first"), filepath.Join(base, "second")
 	firstEnv := map[string]string{"MODEL_GATEWAY_STATE_DIR": "first-state"}
-	first := New(func(key string) (string, bool) { v, ok := firstEnv[key]; return v, ok }, func() (string, error) { return firstHome, nil })
-	second := New(nil, func() (string, error) { return secondHome, nil })
+	first := New(func(key string) (string, bool) { v, ok := firstEnv[key]; return v, ok }, func() (string, error) { return firstHome, nil }, nil)
+	second := New(nil, func() (string, error) { return secondHome, nil }, nil)
 	tests := map[string]struct {
 		resolver Resolver
 		state    string
@@ -90,18 +91,18 @@ func TestDirectories(t *testing.T) {
 			},
 		},
 		"success: Windows profile, AppData and SystemRoot": {
-			platform: "windows", env: map[string]string{"USERPROFILE": home, "HOME": "ignored", "APPDATA": "roaming", "XDG_CONFIG_HOME": "ignored", "SystemRoot": "win"},
+			platform: "windows", env: map[string]string{"USERPROFILE": `C:\users\sandbox`, "HOME": "ignored", "APPDATA": "D:", "XDG_CONFIG_HOME": "ignored", "SystemRoot": "E:"},
 			want: []string{
-				home, filepath.Join(home, ".claude"), gateway, gateway,
-				filepath.Join(home, ".claude", "settings.json"), filepath.Join(home, ".claude.json"), filepath.Join(home, ".claude", "projects"),
-				filepath.Join(home, ".claude", "cache", "gateway-models.json"), filepath.Join("roaming", "claude-code-proxy"), filepath.Join(home, ".grok"),
-				filepath.Join(gateway, "request-body"), filepath.Join(gateway, "logs", "request-routes.jsonl"), filepath.Join(gateway, "dispatch-routes.json"),
-				`\\.\pipe\model-gateway`, filepath.Join("win", "System32", "drivers", "etc", "hosts"),
+				`C:\users\sandbox`, `C:\users\sandbox\.claude`, `C:\users\sandbox\.claude\model-gateway`, `C:\users\sandbox\.claude\model-gateway`,
+				`C:\users\sandbox\.claude\settings.json`, `C:\users\sandbox\.claude.json`, `C:\users\sandbox\.claude\projects`,
+				`C:\users\sandbox\.claude\cache\gateway-models.json`, `D:\claude-code-proxy`, `C:\users\sandbox\.grok`,
+				`C:\users\sandbox\.claude\model-gateway\request-body`, `C:\users\sandbox\.claude\model-gateway\logs\request-routes.jsonl`, `C:\users\sandbox\.claude\model-gateway\dispatch-routes.json`,
+				`\\.\pipe\model-gateway`, `E:\System32\drivers\etc\hosts`,
 			},
 		},
 		"success: macOS ignores XDG; direct artifact overrides remain raw": {
 			platform: "darwin", fallback: home, env: map[string]string{
-				"HOME": "", "CLAUDE_CONFIG_DIR": "", "MODEL_GATEWAY_STATE_DIR": "", "XDG_CONFIG_HOME": "ignored",
+				"CLAUDE_CONFIG_DIR": "", "MODEL_GATEWAY_STATE_DIR": "", "XDG_CONFIG_HOME": "ignored",
 				"MODEL_GATEWAY_REQUEST_BODY_DIR": "body", "CODEX_GATEWAY_REQUEST_LOG_PATH": "log", "CODEX_GATEWAY_DISPATCH_CACHE_PATH": "dispatch", "CODEX_GATEWAY_SOCKET_PATH": "socket",
 			},
 			want: []string{
@@ -118,7 +119,7 @@ func TestDirectories(t *testing.T) {
 					t.Fatal("home lookup invoked despite an environment override")
 				}
 				return tt.fallback, nil
-			})
+			}, nil)
 			r.platform = tt.platform
 			read := []func() (string, error){
 				r.HomeDir, r.ClaudeConfigDir, r.GatewayHome, r.StateDir, r.UserSettingsPath,
@@ -168,7 +169,7 @@ func TestRegistries(t *testing.T) {
 	}
 	for label, tt := range tests {
 		t.Run(label, func(t *testing.T) {
-			r := New(func(key string) (string, bool) { value, ok := tt.env[key]; return value, ok }, func() (string, error) { return home, nil })
+			r := New(func(key string) (string, bool) { value, ok := tt.env[key]; return value, ok }, func() (string, error) { return home, nil }, nil)
 			registry, err := r.PluginRegistryPaths()
 			if err != nil {
 				t.Fatal(err)
@@ -200,12 +201,188 @@ func TestHomeLookupFailures(t *testing.T) {
 	}
 	for label, tt := range tests {
 		t.Run(label, func(t *testing.T) {
-			r := New(nil, tt.lookup)
+			r := New(nil, tt.lookup, nil)
 			for _, fn := range []func() (string, error){r.HomeDir, r.ClaudeConfigDir, r.GatewayHome, r.StateDir} {
 				got, err := fn()
 				if got != "" || err == nil || tt.want != nil && !errors.Is(err, tt.want) {
 					t.Errorf("got %q, %v: want empty path and error wrapping %v if set", got, err, tt.want)
 				}
+			}
+		})
+	}
+}
+
+func TestEmptyHOMEFailsWithoutAccountLookup(t *testing.T) {
+	base := t.TempDir()
+	tests := map[string]struct {
+		resolve func(Resolver) (string, error)
+	}{
+		"error: home":            {Resolver.HomeDir},
+		"error: Claude config":   {Resolver.ClaudeConfigDir},
+		"error: gateway home":    {Resolver.GatewayHome},
+		"error: state directory": {Resolver.StateDir},
+	}
+	for label, tt := range tests {
+		t.Run(label, func(t *testing.T) {
+			r := New(func(key string) (string, bool) { return "", key == "HOME" }, func() (string, error) {
+				t.Error("explicitly empty HOME reached the account home lookup")
+				return base, nil
+			}, nil)
+			r.platform = "linux"
+			got, err := tt.resolve(r)
+			if got != "" || err == nil || !strings.Contains(err.Error(), "HOME") {
+				t.Errorf("got %q, %v; want no path and an error naming HOME", got, err)
+			}
+		})
+	}
+}
+
+func TestRelativePathsUsePhysicalWorkingDirectory(t *testing.T) {
+	base := t.TempDir()
+	logical := filepath.Join(base, "logical")
+	target := filepath.Join(base, "physical", "work")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, logical); err != nil {
+		t.Fatal(err)
+	}
+	physical, err := filepath.EvalSymlinks(logical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Dir(physical)
+	if parent == filepath.Dir(logical) {
+		t.Fatal("fixture needs distinct logical and physical parents")
+	}
+	env := map[string]string{"CLAUDE_CONFIG_DIR": "../claude", "CLAUDE_CODE_PLUGIN_CACHE_DIR": "../cache", "CLAUDE_PLUGIN_ROOT": "../plugin"}
+	r := New(func(key string) (string, bool) { v, ok := env[key]; return v, ok }, nil, func() (string, error) { return physical, nil })
+	r.platform = "linux"
+	registries := []string{filepath.Join(parent, "cache", "installed_plugins.json"), filepath.Join(parent, "claude", "plugins", "installed_plugins.json")}
+	tests := map[string]struct {
+		read func() ([]string, error)
+		want []string
+	}{
+		"success: runtime registries":  {r.PluginRegistryPaths, registries},
+		"success: launcher registries": {r.LauncherRegistryPaths, registries},
+		"success: plugin root":         {func() ([]string, error) { root, err := r.PluginRoot("ignored"); return []string{root}, err }, []string{filepath.Join(parent, "plugin")}},
+	}
+	for label, tt := range tests {
+		t.Run(label, func(t *testing.T) {
+			got, err := tt.read()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if diff := gocmp.Diff(tt.want, got); diff != "" {
+				t.Errorf("resolved paths (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestWorkingDirectoryLookupFailures(t *testing.T) {
+	failure := errors.New("working directory unavailable")
+	tests := map[string]struct {
+		lookup func() (string, error)
+		want   string
+	}{
+		"error: missing lookup":         {want: "no lookup"},
+		"error: lookup failure":         {lookup: func() (string, error) { return "ignored", failure }, want: failure.Error()},
+		"error: relative lookup result": {lookup: func() (string, error) { return "relative", nil }, want: "not absolute"},
+	}
+	for label, tt := range tests {
+		t.Run(label, func(t *testing.T) {
+			r := New(nil, nil, tt.lookup)
+			r.platform = "linux"
+			got, err := r.PluginRoot("../plugin")
+			if got != "" || err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("got %q, %v; want no path and a %q error", got, err, tt.want)
+			}
+		})
+	}
+}
+
+func TestWindowsDriveJoins(t *testing.T) {
+	tests := map[string]struct {
+		env                map[string]string
+		home, proxy, hosts string
+	}{
+		"success: bare drives join as absolute": {
+			env:  map[string]string{"USERPROFILE": "C:", "APPDATA": "D:", "SystemRoot": "E:"},
+			home: `C:\.claude\model-gateway`, proxy: `D:\claude-code-proxy`, hosts: `E:\System32\drivers\etc\hosts`,
+		},
+		"success: bare profile drive with default roaming path": {
+			env:  map[string]string{"USERPROFILE": "C:"},
+			home: `C:\.claude\model-gateway`, proxy: `C:\AppData\Roaming\claude-code-proxy`, hosts: `C:\Windows\System32\drivers\etc\hosts`,
+		},
+		"success: Windows slash folding and UNC share": {
+			env:  map[string]string{"USERPROFILE": `\\server\share\sandbox`, "APPDATA": `D:/first/../roaming`, "SystemRoot": `E:/Windows/`},
+			home: `\\server\share\sandbox\.claude\model-gateway`, proxy: `D:\roaming\claude-code-proxy`, hosts: `E:\Windows\System32\drivers\etc\hosts`,
+		},
+	}
+	for label, tt := range tests {
+		t.Run(label, func(t *testing.T) {
+			r := New(func(key string) (string, bool) { value, ok := tt.env[key]; return value, ok }, nil, nil)
+			r.platform = "windows"
+			home, homeErr := r.GatewayHome()
+			proxy, proxyErr := r.ProxyConfigDir()
+			if homeErr != nil || proxyErr != nil {
+				t.Fatalf("gateway home or proxy config resolution: %v, %v", homeErr, proxyErr)
+			}
+			if diff := gocmp.Diff([]string{tt.home, tt.proxy, tt.hosts}, []string{home, proxy, r.HostsFile()}); diff != "" {
+				t.Errorf("resolved Windows paths (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestResolveWindowsFromInjectedDirectory(t *testing.T) {
+	tests := map[string]struct {
+		name string
+		want string
+	}{
+		"success: relative":                                              {`..\plugin`, `C:\physical\plugin`},
+		"success: rooted without a drive":                                {`\plugin`, `C:\plugin`},
+		"success: current drive relative":                                {`c:..\plugin`, `c:\physical\plugin`},
+		"success: alternate drive uses injected drive directory":         {`D:..\plugin`, `D:\saved\plugin`},
+		"success: alternate drive without saved directory uses its root": {`E:plugin`, `E:\plugin`},
+		"success: absolute UNC":                                          {`\\server\share\work\..\plugin`, `\\server\share\plugin`},
+	}
+	for label, tt := range tests {
+		t.Run(label, func(t *testing.T) {
+			r := New(func(key string) (string, bool) { return `D:\saved\work`, key == "=D:" }, nil, func() (string, error) { return `C:\physical\work`, nil })
+			r.platform = "windows"
+			if got, err := r.PluginRoot(tt.name); got != tt.want || err != nil {
+				t.Errorf("Windows path: got %q, %v; want %q", got, err, tt.want)
+			}
+		})
+	}
+}
+
+func TestTempDir(t *testing.T) {
+	tests := map[string]struct {
+		platform string
+		env      map[string]string
+		want     string
+	}{
+		"success: POSIX TMPDIR precedence and one trailing slash":            {"linux", map[string]string{"TMPDIR": "/chosen//", "TMP": "/ignored", "TEMP": "/ignored"}, "/chosen/"},
+		"success: POSIX empty TMPDIR falls through to TMP":                   {"linux", map[string]string{"TMPDIR": "", "TMP": "/second/", "TEMP": "/ignored"}, "/second"},
+		"success: POSIX TEMP fallback preserves root":                        {"linux", map[string]string{"TMP": "", "TEMP": "/"}, "/"},
+		"success: POSIX default":                                             {"linux", map[string]string{"TEMP": "", "SystemRoot": "ignored"}, "/tmp"},
+		"success: Windows TEMP beats TMP and TMPDIR":                         {"windows", map[string]string{"TEMP": `C:\chosen\\`, "TMP": `C:\ignored`, "TMPDIR": `C:\ignored`}, `C:\chosen\`},
+		"success: Windows TMP fallback preserves drive root":                 {"windows", map[string]string{"TEMP": "", "TMP": `D:\`}, `D:\`},
+		"success: Windows does not strip a forward slash":                    {"windows", map[string]string{"TEMP": "D:/work/"}, "D:/work/"},
+		"success: Windows SystemRoot fallback concatenates without cleaning": {"windows", map[string]string{"SystemRoot": `C:\Windows\`, "windir": `D:\ignored`}, `C:\Windows\\temp`},
+		"success: Windows windir fallback":                                   {"windows", map[string]string{"SystemRoot": "", "windir": `D:\Windows`}, `D:\Windows\temp`},
+		"success: Windows empty windir concatenation":                        {"windows", map[string]string{"windir": ""}, `\temp`},
+		"success: Windows undefined windir concatenation":                    {"windows", nil, `undefined\temp`},
+	}
+	for label, tt := range tests {
+		t.Run(label, func(t *testing.T) {
+			r := New(func(key string) (string, bool) { value, ok := tt.env[key]; return value, ok }, nil, nil)
+			r.platform = tt.platform
+			if got := r.TempDir(); got != tt.want {
+				t.Errorf("temp directory: got %q, want %q", got, tt.want)
 			}
 		})
 	}
@@ -223,7 +400,7 @@ func TestOverrideDoesNotRequireHome(t *testing.T) {
 	}
 	for label, tt := range tests {
 		t.Run(label, func(t *testing.T) {
-			r := New(func(key string) (string, bool) { value, ok := tt.env[key]; return value, ok }, nil)
+			r := New(func(key string) (string, bool) { value, ok := tt.env[key]; return value, ok }, nil, nil)
 			got, err := tt.read(r)
 			if got != tt.want || err != nil {
 				t.Errorf("got %q, %v, want %q, nil", got, err, tt.want)
