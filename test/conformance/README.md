@@ -32,8 +32,8 @@ The 57 test files have 693 text lines beginning with optional indentation and `t
 
 ## Assertions per case
 
-`assertion-pairs.tsv` is generated evidence: one row per pair of a case (`path`, `line`, `column`, `name`) and an assertion it can reach (`site_path`, `site_line`, `site_column`), with the call as written (`call`) and how the case reaches it (`via`: `direct`, `helper:`, `callback:`, `embedded:`). It covers all cases, is produced in a venue by `make assertion-sites` and `hack/assertion-extract`, and is never edited by hand. It records what a case may reach, not what ran.
+`assertion-pairs.tsv` is generated evidence: one row per pair of a case (`path`, `line`, `column`, `name`) and an assertion it can reach (`site_path`, `site_line`, `site_column`), with the callee or handed-off assertion function as written (`call`) and how the case reaches it (`via`: `direct`, `helper:`, `callback:`, `embedded:`). It covers all cases, is produced in a venue by `make assertion-sites` and `hack/assertion-extract`, and is never edited by hand. It records what a case may reach, not what ran.
 
-`assertion-overrides.tsv` holds reviewed corrections to that relation (the seven key columns, `action`, `reason`); the generator applies them. `assertion-unresolved.tsv` lists the calls the generator could not follow, each with a disposition and a reason; a call without a row, or a row for a call that no longer exists, fails the generation.
+`assertion-overrides.tsv` holds reviewed corrections to that relation (the seven key columns, `action`, `reason`); the generator applies them. `hack/assertions/call-dispositions.tsv` records a disposition and reason for calls the generator could not follow. Missing, unknown or stale dispositions prevent extraction.
 
 `assertion-sites.tsv` is the editable mapping: the pairs of due cases only, with `target` (the Go test that takes the assertion's place, or an approved `not-ported:` reason), `review` and `due` (a phase, never earlier than the case's phase). `hack/parity-check structure` requires its pairs to equal the generated pairs of due cases in both directions. See `hack/assertions/README.md` for the generator.

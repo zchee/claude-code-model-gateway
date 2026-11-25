@@ -1463,15 +1463,15 @@ test/gateway-process-isolation.test.js	1168	1	gateway fixture home teardown stop
 test/gateway-process-isolation.test.js	1182	1	isolated ensure preserves a foreign serve-shim process and cleans its own supervisor	test/gateway-process-isolation.test.js	1210	3	assert.equal	direct
 test/gateway-process-isolation.test.js	1182	1	isolated ensure preserves a foreign serve-shim process and cleans its own supervisor	test/gateway-process-isolation.test.js	1211	3	assert.equal	direct
 test/gateway-process-isolation.test.js	1182	1	isolated ensure preserves a foreign serve-shim process and cleans its own supervisor	test/gateway-process-isolation.test.js	1212	3	assert.equal	direct
-test/gateway-process-isolation.test.js	1304	1	stale-worker fixture cleanup fails closed for absent and reused birth identities	test/gateway-process-isolation.test.js	180	3	assert.deepEqual	helper:waitForProcessesToExit
+test/gateway-process-isolation.test.js	1304	1	stale-worker fixture cleanup fails closed for absent and reused birth identities	test/gateway-process-isolation.test.js	180	3	assert.deepEqual	callback:waitForProcessesToExit
 test/gateway-process-isolation.test.js	1304	1	stale-worker fixture cleanup fails closed for absent and reused birth identities	test/gateway-process-isolation.test.js	1264	3	assert.equal	helper:stopOwnedStaleFixture
 test/gateway-process-isolation.test.js	1304	1	stale-worker fixture cleanup fails closed for absent and reused birth identities	test/gateway-process-isolation.test.js	1311	3	assert.deepEqual	direct
-test/gateway-process-isolation.test.js	1314	1	stale-worker fixture cleanup requests one TERM only after exact identity verification	test/gateway-process-isolation.test.js	180	3	assert.deepEqual	helper:waitForProcessesToExit
+test/gateway-process-isolation.test.js	1314	1	stale-worker fixture cleanup requests one TERM only after exact identity verification	test/gateway-process-isolation.test.js	180	3	assert.deepEqual	callback:waitForProcessesToExit
 test/gateway-process-isolation.test.js	1314	1	stale-worker fixture cleanup requests one TERM only after exact identity verification	test/gateway-process-isolation.test.js	1264	3	assert.equal	helper:stopOwnedStaleFixture
 test/gateway-process-isolation.test.js	1314	1	stale-worker fixture cleanup requests one TERM only after exact identity verification	test/gateway-process-isolation.test.js	1321	3	assert.deepEqual	direct
 test/gateway-process-isolation.test.js	1314	1	stale-worker fixture cleanup requests one TERM only after exact identity verification	test/gateway-process-isolation.test.js	1322	9	assert.rejects	direct
 test/gateway-process-isolation.test.js	1314	1	stale-worker fixture cleanup requests one TERM only after exact identity verification	test/gateway-process-isolation.test.js	1323	86	assert.fail	callback:function
-test/gateway-process-isolation.test.js	1326	1	parallel healthy ensures reap a real owned stale-version orphan while the current worker and stream survive	test/gateway-process-isolation.test.js	180	3	assert.deepEqual	helper:waitForProcessesToExit
+test/gateway-process-isolation.test.js	1326	1	parallel healthy ensures reap a real owned stale-version orphan while the current worker and stream survive	test/gateway-process-isolation.test.js	180	3	assert.deepEqual	callback:waitForProcessesToExit
 test/gateway-process-isolation.test.js	1326	1	parallel healthy ensures reap a real owned stale-version orphan while the current worker and stream survive	test/gateway-process-isolation.test.js	1264	3	assert.equal	helper:stopOwnedStaleFixture
 test/gateway-process-isolation.test.js	1326	1	parallel healthy ensures reap a real owned stale-version orphan while the current worker and stream survive	test/gateway-process-isolation.test.js	1293	3	assert.equal	helper:startStaleWorkerFixture
 test/gateway-process-isolation.test.js	1326	1	parallel healthy ensures reap a real owned stale-version orphan while the current worker and stream survive	test/gateway-process-isolation.test.js	1299	5	assert.equal	helper:assertSuccessfulEnsures
@@ -3146,17 +3146,20 @@ test/readiness-gate.test.js	338	3	intentional stop launch handoff: setup spawn w
 test/readiness-gate.test.js	338	3	intentional stop launch handoff: setup spawn without a pid	test/readiness-gate.test.js	341	25	assert.match	direct
 test/readiness-gate.test.js	338	3	intentional stop launch handoff: setup spawn without a pid	test/readiness-gate.test.js	343	5	assert.equal	direct
 test/readiness-gate.test.js	338	3	intentional stop launch handoff: setup spawn without a pid	test/readiness-gate.test.js	344	5	assert.equal	direct
+test/readiness-gate.test.js	338	3	intentional stop launch handoff: start	test/readiness-gate.test.js	276	11	assert.equal	embedded:child-script
 test/readiness-gate.test.js	338	3	intentional stop launch handoff: start	test/readiness-gate.test.js	291	9	assert.equal	embedded:child-script
 test/readiness-gate.test.js	338	3	intentional stop launch handoff: start	test/readiness-gate.test.js	305	9	assert.equal	embedded:child-script
 test/readiness-gate.test.js	338	3	intentional stop launch handoff: start	test/readiness-gate.test.js	340	5	assert.equal	direct
 test/readiness-gate.test.js	338	3	intentional stop launch handoff: start	test/readiness-gate.test.js	343	5	assert.equal	direct
 test/readiness-gate.test.js	338	3	intentional stop launch handoff: start	test/readiness-gate.test.js	344	5	assert.equal	direct
 test/readiness-gate.test.js	338	3	intentional stop launch handoff: start	test/readiness-gate.test.js	345	28	assert.equal	direct
+test/readiness-gate.test.js	338	3	intentional stop launch handoff: start launch failure	test/readiness-gate.test.js	276	11	assert.equal	embedded:child-script
 test/readiness-gate.test.js	338	3	intentional stop launch handoff: start launch failure	test/readiness-gate.test.js	305	9	assert.equal	embedded:child-script
 test/readiness-gate.test.js	338	3	intentional stop launch handoff: start launch failure	test/readiness-gate.test.js	340	5	assert.equal	direct
 test/readiness-gate.test.js	338	3	intentional stop launch handoff: start launch failure	test/readiness-gate.test.js	341	25	assert.match	direct
 test/readiness-gate.test.js	338	3	intentional stop launch handoff: start launch failure	test/readiness-gate.test.js	343	5	assert.equal	direct
 test/readiness-gate.test.js	338	3	intentional stop launch handoff: start launch failure	test/readiness-gate.test.js	344	5	assert.equal	direct
+test/readiness-gate.test.js	338	3	intentional stop launch handoff: start spawn without a pid	test/readiness-gate.test.js	276	11	assert.equal	embedded:child-script
 test/readiness-gate.test.js	338	3	intentional stop launch handoff: start spawn without a pid	test/readiness-gate.test.js	305	9	assert.equal	embedded:child-script
 test/readiness-gate.test.js	338	3	intentional stop launch handoff: start spawn without a pid	test/readiness-gate.test.js	340	5	assert.equal	direct
 test/readiness-gate.test.js	338	3	intentional stop launch handoff: start spawn without a pid	test/readiness-gate.test.js	341	25	assert.match	direct
@@ -3660,6 +3663,7 @@ test/support.test.js	59	1	fixture process probe treats ESRCH as exited on every 
 test/support.test.js	59	1	fixture process probe treats ESRCH as exited on every platform	test/support.test.js	61	3	assert.equal	direct
 test/support.test.js	64	1	fixture process probe preserves unexpected errors as possibly running	test/support.test.js	66	3	assert.equal	direct
 test/support.test.js	69	1	fixture process probe ignores missing pids	test/support.test.js	70	3	assert.equal	direct
+test/support.test.js	69	1	fixture process probe ignores missing pids	test/support.test.js	70	47	assert.fail	callback:kill
 test/thread-negotiation.test.js	111	1	Codex continuation receives the client-compatible local refusal without forwarding	test/thread-negotiation.test.js	103	3	assert.equal	helper:assertThreadRefusal
 test/thread-negotiation.test.js	111	1	Codex continuation receives the client-compatible local refusal without forwarding	test/thread-negotiation.test.js	104	3	assert.equal	helper:assertThreadRefusal
 test/thread-negotiation.test.js	111	1	Codex continuation receives the client-compatible local refusal without forwarding	test/thread-negotiation.test.js	105	3	assert.equal	helper:assertThreadRefusal

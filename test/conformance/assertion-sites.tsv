@@ -2619,12 +2619,14 @@ test/readiness-gate.test.js	338	3	intentional stop launch handoff: setup spawn w
 test/readiness-gate.test.js	338	3	intentional stop launch handoff: setup spawn without a pid	test/readiness-gate.test.js	341	25			phase-4
 test/readiness-gate.test.js	338	3	intentional stop launch handoff: setup spawn without a pid	test/readiness-gate.test.js	343	5			phase-4
 test/readiness-gate.test.js	338	3	intentional stop launch handoff: setup spawn without a pid	test/readiness-gate.test.js	344	5			phase-4
+test/readiness-gate.test.js	338	3	intentional stop launch handoff: start	test/readiness-gate.test.js	276	11			phase-3
 test/readiness-gate.test.js	338	3	intentional stop launch handoff: start	test/readiness-gate.test.js	291	9			phase-3
 test/readiness-gate.test.js	338	3	intentional stop launch handoff: start	test/readiness-gate.test.js	305	9			phase-3
 test/readiness-gate.test.js	338	3	intentional stop launch handoff: start	test/readiness-gate.test.js	340	5			phase-3
 test/readiness-gate.test.js	338	3	intentional stop launch handoff: start	test/readiness-gate.test.js	343	5			phase-3
 test/readiness-gate.test.js	338	3	intentional stop launch handoff: start	test/readiness-gate.test.js	344	5			phase-3
 test/readiness-gate.test.js	338	3	intentional stop launch handoff: start	test/readiness-gate.test.js	345	28			phase-3
+test/readiness-gate.test.js	338	3	intentional stop launch handoff: start spawn without a pid	test/readiness-gate.test.js	276	11			phase-3
 test/readiness-gate.test.js	338	3	intentional stop launch handoff: start spawn without a pid	test/readiness-gate.test.js	305	9			phase-3
 test/readiness-gate.test.js	338	3	intentional stop launch handoff: start spawn without a pid	test/readiness-gate.test.js	340	5			phase-3
 test/readiness-gate.test.js	338	3	intentional stop launch handoff: start spawn without a pid	test/readiness-gate.test.js	341	25			phase-3
