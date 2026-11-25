@@ -1,0 +1,443 @@
+path	line	column	kind	via	case	argv
+test/anthropic-catalog.test.js	63	26	worker	startGateway	shim merges an authenticated upstream catalog first, preserves names, and caches without credentials	serve-worker
+test/anthropic-catalog.test.js	81	26	worker	startGateway	unreachable upstream keeps Codex rows and a stale cache still serves Anthropic rows	serve-worker
+test/anthropic-catalog.test.js	99	17	cli	spawnGatewayProcessSync	ensure advances cached catalog defaults, preserves overrides, and never adopts retired or older ids	[CLI, 'ensure', '--quiet']
+test/anthropic-catalog.test.js	105	16	cli	spawnGatewayProcessSync	ensure advances cached catalog defaults, preserves overrides, and never adopts retired or older ids	[CLI, 'pin']
+test/anthropic-catalog.test.js	108	22	cli	spawnGatewayProcessSync	ensure advances cached catalog defaults, preserves overrides, and never adopts retired or older ids	[CLI, 'ensure', '--quiet']
+test/anthropic-catalog.test.js	113	17	cli	spawnGatewayProcessSync	ensure advances cached catalog defaults, preserves overrides, and never adopts retired or older ids	[CLI, 'ensure', '--quiet']
+test/anthropic-catalog.test.js	128	28	worker	startGateway	apiKey credentials fetch every upstream catalog page	serve-worker
+test/anthropic-catalog.test.js	128	28	worker	startGateway	oauth credentials fetch every upstream catalog page	serve-worker
+test/anthropic-catalog.test.js	145	26	worker	startGateway	unauthenticated discovery never calls upstream and rejected credentials keep the gateway usable	serve-worker
+test/anthropic-catalog.test.js	176	9	worker	startGateway	OAuth picker discovery cache includes cached native models without live discovery	serve-worker
+test/anthropic-catalog.test.js	201	26	worker	startGateway	inference credentials populate the picker once without persisting secrets	serve-worker
+test/anthropic-catalog.test.js	236	26	worker	startGateway	inference catalog rejection retains old rows and reports the refresh reason	serve-worker
+test/anthropic-catalog.test.js	252	18	cli	spawnGatewayProcessSync	invalid persisted catalog pins cannot override shipped defaults	[CLI, 'pin']
+test/catalog-refresh.test.js	51	19	cli	spawnGatewayProcess	-	[CLI, 'catalog', ...commandArguments]
+test/catalog-refresh.test.js	81	24	cli	runCatalogCommand	an explicit refresh that observes new models writes them and exits 0	catalog ['--refresh', '--json']
+test/catalog-refresh.test.js	102	24	cli	runCatalogCommand	issue #227: an explicit refresh whose shim advertises no gateway ids fails instead of reprinting the stored catalog	catalog ['--refresh', '--json']
+test/catalog-refresh.test.js	117	24	cli	runCatalogCommand	issue #227: an explicit refresh whose model list errors fails with the shim status	catalog ['--refresh', '--json']
+test/catalog-refresh.test.js	136	24	cli	runCatalogCommand	issue #227: an explicit refresh against an unhealthy shim fails instead of exiting 0	catalog ['--refresh', '--json']
+test/catalog-refresh.test.js	151	24	cli	runCatalogCommand	issue #227: a shim that drops the /healthz connection is reported as not answering, with the error	catalog ['--refresh', '--json']
+test/catalog-refresh.test.js	163	24	cli	runCatalogCommand	a stale-triggered refresh stays advisory: it reports the reason but keeps exit 0	catalog ['--json']
+test/catalog-refresh.test.js	179	24	cli	runCatalogCommand	a fresh catalog read without --refresh touches nothing and says nothing	catalog ['--json']
+test/codex-upstream-cases.test.js	55	26	worker	startGateway	-	serve-worker
+test/codex-upstream-cases.test.js	145	26	worker	workerBehind	#190: a live 429 carries its Retry-After into readiness, lifts on time, and a later 2xx clears it early	serve-worker
+test/codex-upstream-cases.test.js	168	26	worker	workerBehind	#192: a Codex turn that completed with no output answers an empty end_turn, not a retryable 503	serve-worker
+test/codex-upstream-cases.test.js	192	26	worker	workerBehind	#192: a stream that finished its turn but lost message_stop is closed for the client; a cut-off turn is not	serve-worker
+test/codex-upstream-cases.test.js	208	33	worker	workerBehind	#238: /v1/models refreshes on a timer and a burst of 50 never triggers a refresh or waits on file writes	serve-worker
+test/codex-upstream-cases.test.js	252	26	worker	workerBehind	#238 #367: a 5 s proxy auth status stalls neither /healthz nor /v1/models, and concurrent probes share one check	serve-worker
+test/compact-stream.test.js	84	26	supervisor	startGateway	-	serve-shim
+test/compact-stream.test.js	272	26	supervisor	spawnShim	a lost terminal frame is only inferred complete for an end-of-generation stop reason	serve-shim
+test/compact-stream.test.js	313	26	supervisor	spawnShim	a stop reason the stream itself contradicts is re-inferred, not delivered	serve-shim
+test/compact-stream.test.js	333	26	supervisor	spawnShim	an error frame upstream never typed leaves a finished generation deliverable	serve-shim
+test/compact-stream.test.js	347	26	supervisor	spawnShim	a finished generation with no visible text is delivered, not re-inferred	serve-shim
+test/compact-stream.test.js	360	26	supervisor	spawnShim	the terminal frame synthesized for a lost one is byte-identical to a real one	serve-shim
+test/compact-stream.test.js	383	26	supervisor	spawnShim	a compaction stream that contradicts itself never clears attributed 429 evidence	serve-shim
+test/compact-stream.test.js	404	26	supervisor	spawnShim	a compaction stream that dies without a terminal event is retried and delivered complete	serve-shim
+test/compact-stream.test.js	426	26	supervisor	spawnShim	a compaction stream truncated with no error event at all is also retried	serve-shim
+test/compact-stream.test.js	448	26	supervisor	spawnShim	a terminal semantic failure preserves attributed auth until a completed inference clears it	serve-shim
+test/compact-stream.test.js	484	26	supervisor	spawnShim	a 200 JSON error does not clear attributed auth evidence	serve-shim
+test/compact-stream.test.js	498	26	supervisor	spawnShim	a healthy compaction stream is passed through untouched and never retried	serve-shim
+test/compact-stream.test.js	511	26	supervisor	spawnShim	exhausted compaction retries surface a truthful error instead of a fabricated terminal	serve-shim
+test/compact-stream.test.js	526	26	supervisor	spawnShim	exhausted compaction retries replay the real upstream error events verbatim	serve-shim
+test/compact-stream.test.js	544	26	supervisor	spawnShim	a request-shaped compaction failure is passed straight through without retrying	serve-shim
+test/compact-stream.test.js	572	26	supervisor	spawnShim	a non-compaction turn keeps streaming live and is never buffered or retried	serve-shim
+test/compact-stream.test.js	589	26	supervisor	spawnShim	the guard can be turned off entirely	serve-shim
+test/compact-stream.test.js	603	26	supervisor	spawnShim	healthz reports the compaction guard settings	serve-shim
+test/compact-stream.test.js	618	26	supervisor	spawnShim	an upstream error status on a compaction retry is reported in-band, not as a crash	serve-shim
+test/compact-stream.test.js	651	26	supervisor	spawnShim	a Claude-native compaction request is never buffered, retried, or rewritten	serve-shim
+test/compact-stream.test.js	694	26	supervisor	spawnShim	20 compaction requests whose first upstream attempt dies all come back complete	serve-shim
+test/compact-stream.test.js	738	26	supervisor	spawnShim	compaction route diagnostics classify safe terminal outcomes without response content	serve-shim
+test/compact-stream.test.js	793	26	supervisor	spawnShim	compaction diagnostics stay silent when telemetry is disabled	serve-shim
+test/context-sentry-lifecycle.test.js	61	25	supervisor	startGateway	-	serve-shim
+test/context-sentry-lifecycle.test.js	85	25	supervisor	lifecycleGateway	Codex sentry rearms after failed compaction and a completed ordinary turn, not incomplete or failed attempts	serve-shim
+test/context-sentry-lifecycle.test.js	100	25	supervisor	lifecycleGateway	Codex compaction bypasses an armed sentry, preserves hysteresis, and resets after lower usage	serve-shim
+test/context-sentry-lifecycle.test.js	117	25	supervisor	lifecycleGateway	Codex sentry keeps sessions, agents and models independent and rearms completed JSON responses	serve-shim
+test/context-sentry-lifecycle.test.js	133	25	supervisor	lifecycleGateway	Codex sentry waits for the ordinary stream to finish before rearming	serve-shim
+test/context-sentry-lifecycle.test.js	158	27	supervisor	lifecycleGateway	running compaction cannot rearm either backend before or after high-usage completion	serve-shim
+test/context-sentry-lifecycle.test.js	179	25	supervisor	lifecycleGateway	Grok sentry rearms only completed ordinary SSE and JSON responses and bypasses compaction	serve-shim
+test/context-sentry-lifecycle.test.js	200	25	supervisor	lifecycleGateway	high-usage Codex JSON compaction keeps the refusal latched and lower usage resets it	serve-shim
+test/context-sentry-lifecycle.test.js	217	27	supervisor	lifecycleGateway	incomplete Codex JSON keeps the refusal latched: max_tokens	serve-shim
+test/context-sentry-lifecycle.test.js	217	27	supervisor	lifecycleGateway	incomplete Codex JSON keeps the refusal latched: model_context_window_exceeded	serve-shim
+test/context-sentry-lifecycle.test.js	217	27	supervisor	lifecycleGateway	incomplete Codex JSON keeps the refusal latched: null	serve-shim
+test/context-sentry-lifecycle.test.js	217	27	supervisor	lifecycleGateway	incomplete Codex JSON keeps the refusal latched: pause_turn	serve-shim
+test/context-sentry-lifecycle.test.js	217	27	supervisor	lifecycleGateway	incomplete Codex JSON keeps the refusal latched: refusal	serve-shim
+test/context-sentry-lifecycle.test.js	217	27	supervisor	lifecycleGateway	incomplete Codex JSON keeps the refusal latched: undefined	serve-shim
+test/context-sentry-lifecycle.test.js	217	27	supervisor	lifecycleGateway	incomplete Codex JSON keeps the refusal latched: unknown	serve-shim
+test/context-sentry-lifecycle.test.js	236	27	supervisor	lifecycleGateway	completed ordinary Codex JSON rearms the refusal: end_turn	serve-shim
+test/context-sentry-lifecycle.test.js	236	27	supervisor	lifecycleGateway	completed ordinary Codex JSON rearms the refusal: stop_sequence	serve-shim
+test/context-sentry-lifecycle.test.js	236	27	supervisor	lifecycleGateway	completed ordinary Codex JSON rearms the refusal: tool_use	serve-shim
+test/context-window-setting.test.js	140	28	cli	spawnGatewayProcessSync	-	[CLI, ...args]
+test/context-window-setting.test.js	142	19	cli	run	context-window writes a Claude cap into project-wired settings and refuses without one	'context-window', '--claude', '500000'
+test/context-window-setting.test.js	147	16	cli	run	context-window writes a Claude cap into project-wired settings and refuses without one	'env', '--write-project'
+test/context-window-setting.test.js	149	17	cli	run	context-window writes a Claude cap into project-wired settings and refuses without one	'context-window', '--claude', '500000', '--codex', '300000'
+test/context-window-setting.test.js	156	17	cli	run	context-window writes a Claude cap into project-wired settings and refuses without one	'context-window'
+test/context-window-setting.test.js	161	33	cli	spawnGatewayProcessSync	-	[CLI, ...args]
+test/context-window-setting.test.js	163	16	cli	runLater	context-window writes a Claude cap into project-wired settings and refuses without one	'env', '--write-project'
+test/context-window-setting.test.js	166	21	cli	runLater	context-window writes a Claude cap into project-wired settings and refuses without one	'env', '--write-project'
+test/context-window-setting.test.js	171	17	cli	run	context-window writes a Claude cap into project-wired settings and refuses without one	'context-window', '--claude', 'full'
+test/context-window-setting.test.js	186	26	supervisor	startGateway	a saved Codex cap reaches the shim's advertised max_input_tokens without renaming picker ids	serve-shim
+test/context-window-setting.test.js	243	34	cli	spawnGatewayProcessSync	-	[CLI, ...arguments_]
+test/context-window-setting.test.js	245	17	cli	run	context-window preserves saved compact-at across cap updates and removal restores legacy policy	'context-window', '--codex-compact-at', '242000', '--grok-compact-at', '900000'
+test/context-window-setting.test.js	253	19	cli	run	context-window preserves saved compact-at across cap updates and removal restores legacy policy	'context-window', '--codex', '300000'
+test/context-window-setting.test.js	257	16	cli	run	context-window preserves saved compact-at across cap updates and removal restores legacy policy	'context-window', '--codex', '400000', '--grok-compact-at', '1.5'
+test/context-window-setting.test.js	258	16	cli	run	context-window preserves saved compact-at across cap updates and removal restores legacy policy	'context-window', '--claude-compact-at', '242000'
+test/context-window-setting.test.js	260	16	cli	run	context-window preserves saved compact-at across cap updates and removal restores legacy policy	'context-window', '--codex', '272000'
+test/context-window-setting.test.js	261	19	cli	run	context-window preserves saved compact-at across cap updates and removal restores legacy policy	'context-window', '--codex-compact-at', 'cap'
+test/context-window-setting.test.js	265	16	cli	run	context-window preserves saved compact-at across cap updates and removal restores legacy policy	'context-window', '--grok-compact-at', 'cap'
+test/context-window.test.js	123	26	supervisor	startGateway	-	serve-shim
+test/context-window.test.js	174	17	supervisor	spawnGatewayProcess	Codex discovery advertises client 1M aliases and forwards backend base ids	[CLI, 'serve-shim']
+test/context-window.test.js	466	17	worker	spawnGatewayProcess	Codex sentry logs a startup policy line for every advertised model row	node -e: request-worker.runWorker()
+test/context-window.test.js	526	17	supervisor	spawnGatewayProcess	CODEX_GATEWAY_CONTEXT_WINDOW overrides the advertised max_input_tokens	[CLI, 'serve-shim']
+test/context-window.test.js	552	26	supervisor	spawnShim	Codex fallback includes GPT-6 Astra when the proxy has no model route	serve-shim
+test/context-window.test.js	573	17	supervisor	spawnGatewayProcess	default request route logging records Fable metadata but never prompt data	[CLI, 'serve-shim']
+test/context-window.test.js	615	17	supervisor	spawnGatewayProcess	CODEX_GATEWAY_REQUEST_LOG=0 disables request route logging	[CLI, 'serve-shim']
+test/context-window.test.js	654	26	supervisor	spawnShim	Codex sentry sums all input usage fields from SSE message_delta frames	serve-shim
+test/context-window.test.js	674	26	supervisor	spawnShim	Codex sentry returns one client-distinguishable context-overflow 413	serve-shim
+test/context-window.test.js	701	26	supervisor	spawnShim	Grok sentry returns a client-distinguishable context-overflow 413	serve-shim
+test/context-window.test.js	735	26	supervisor	spawnShim	Codex sentry latch lets compaction through and rearms below its low watermark	serve-shim
+test/context-window.test.js	763	26	supervisor	spawnShim	CODEX_GATEWAY_SENTRY=0 disables usage gating and genuine-413 rewriting	serve-shim
+test/context-window.test.js	790	26	supervisor	spawnShim	Codex sentry never gates or rewrites Claude passthrough requests	serve-shim
+test/context-window.test.js	825	26	supervisor	spawnShim	genuine no-numbers 413 gets usage numbers appended	serve-shim
+test/context-window.test.js	867	26	supervisor	spawnShim	a genuine overflow lowers only the model that received it	serve-shim
+test/context-window.test.js	896	26	supervisor	spawnShim	rewrites Codex authentication failures for streaming and non-streaming requests	serve-shim
+test/context-window.test.js	936	26	supervisor	spawnShim	retries transient Codex WebSocket upgrade rejections before returning the response	serve-shim
+test/context-window.test.js	963	26	supervisor	spawnShim	exhausted Codex WebSocket upgrade retries become a transient gateway error	serve-shim
+test/context-window.test.js	994	17	supervisor	spawnGatewayProcess	an old-proxy context error is normalized to HTTP 413 request_too_large	[CLI, 'serve-shim']
+test/context-window.test.js	1036	17	supervisor	spawnGatewayProcess	an upstream 413 with parseable token counts keeps them and only appends diagnostics	[CLI, 'serve-shim']
+test/context-window.test.js	1110	17	supervisor	spawnGatewayProcess	Codex responses strip hallucinated plan-mode tools from JSON and SSE	[CLI, 'serve-shim']
+test/context-window.test.js	1157	3	cli	spawnGatewayProcessSync	SessionStart cleanup migrates an already-wired install	[CLI, 'ensure', '--quiet']
+test/context-window.test.js	1185	3	cli	spawnGatewayProcessSync	SessionStart cleanup leaves unrelated gateway caches alone	[CLI, 'ensure', '--quiet']
+test/context-window.test.js	1213	18	cli	spawnGatewayProcessSync	env wiring preserves Claude 1M aliases and removes the unsafe global threshold	[CLI, 'env', '--write-user']
+test/context-window.test.js	1236	19	cli	spawnGatewayProcessSync	env wiring preserves Claude 1M aliases and removes the unsafe global threshold	[CLI, 'env', '--write-user', '--remove']
+test/context-window.test.js	1354	18	cli	spawnGatewayProcessSync	a CLI alias that lags the shipped default loses to it, and pins and doctor name the lagging detection	[CLI, 'pin']
+test/context-window.test.js	1358	20	cli	spawnGatewayProcessSync	a CLI alias that lags the shipped default loses to it, and pins and doctor name the lagging detection	[CLI, 'doctor']
+test/context-window.test.js	1361	17	cli	spawnGatewayProcessSync	a CLI alias that lags the shipped default loses to it, and pins and doctor name the lagging detection	[CLI, 'pin', '--opus', 'claude-opus-4-8[1m]']
+test/context-window.test.js	1363	24	cli	spawnGatewayProcessSync	a CLI alias that lags the shipped default loses to it, and pins and doctor name the lagging detection	[CLI, 'pin']
+test/context-window.test.js	1587	17	cli	spawnGatewayProcessSync	Claude pin overrides persist outside the plugin and are applied by rewiring	[CLI, 'pin', '--opus', 'claude-opus-4-8[1m]']
+test/context-window.test.js	1593	19	cli	spawnGatewayProcessSync	Claude pin overrides persist outside the plugin and are applied by rewiring	[CLI, 'env', '--write-user']
+test/context-window.test.js	1598	18	cli	spawnGatewayProcessSync	Claude pin overrides persist outside the plugin and are applied by rewiring	[CLI, 'pin']
+test/context-window.test.js	1604	21	cli	spawnGatewayProcessSync	Claude pin overrides persist outside the plugin and are applied by rewiring	[CLI, 'pin', '--opus', 'default']
+test/context-window.test.js	1606	21	cli	spawnGatewayProcessSync	Claude pin overrides persist outside the plugin and are applied by rewiring	[CLI, 'env', '--write-user']
+test/context-window.test.js	1612	21	cli	spawnGatewayProcessSync	Claude pin overrides persist outside the plugin and are applied by rewiring	[CLI, 'pin', '--opus', 'bad;value']
+test/context-window.test.js	1626	19	cli	spawnGatewayProcessSync	rewiring without a Claude CLI wires the shipped pins and caches no detection	[CLI, 'env', '--write-user']
+test/context-window.test.js	1634	22	cli	spawnGatewayProcessSync	rewiring without a Claude CLI wires the shipped pins and caches no detection	[CLI, 'pin', '--opus', 'claude-opus-4-8[1m]']
+test/context-window.test.js	1636	21	cli	spawnGatewayProcessSync	rewiring without a Claude CLI wires the shipped pins and caches no detection	[CLI, 'env', '--write-user']
+test/context-window.test.js	1663	22	cli	spawnGatewayProcessSync	credential-free alias probes cache valid 1M defaults without replacing overrides	[CLI, 'pin', '--opus', 'claude-opus-4-8[1m]']
+test/context-window.test.js	1665	19	cli	spawnGatewayProcessSync	credential-free alias probes cache valid 1M defaults without replacing overrides	[CLI, 'env', '--write-user']
+test/context-window.test.js	1684	24	cli	spawnGatewayProcessSync	credential-free alias probes cache valid 1M defaults without replacing overrides	[CLI, 'env', '--write-user']
+test/context-window.test.js	1703	20	cli	spawnGatewayProcessSync	doctor describes project-local wiring as the default	[CLI, 'doctor']
+test/context-window.test.js	1731	19	cli	spawnGatewayProcessSync	doctor reports the 1M Codex resolver aliases and a lower explicit cap	[CLI, 'env', '--write-project']
+test/context-window.test.js	1742	21	cli	spawnGatewayProcessSync	doctor reports the 1M Codex resolver aliases and a lower explicit cap	[CLI, 'env', '--write-project']
+test/context-window.test.js	1750	20	cli	spawnGatewayProcessSync	doctor reports the 1M Codex resolver aliases and a lower explicit cap	[CLI, 'doctor']
+test/context-window.test.js	1781	20	cli	spawnGatewayProcessSync	doctor warns when the configured Codex window resolves to the unknown-model default	[CLI, 'doctor']
+test/context-window.test.js	1849	19	cli	spawnGatewayProcessSync	env with no scope flag explains project wiring and writes nothing	[CLI, 'env']
+test/context-window.test.js	1861	21	cli	spawnGatewayProcessSync	env with no scope flag explains project wiring and writes nothing	[CLI, 'env', '--mode', 'global']
+test/context-window.test.js	1905	17	supervisor	spawnGatewayProcess	claude-* passthrough is byte-identical and never subjected to Codex window/error rewriting	[CLI, 'serve-shim']
+test/context-window.test.js	1953	17	supervisor	spawnGatewayProcess	count_tokens for a Codex model still routes to the proxy	[CLI, 'serve-shim']
+test/context-window.test.js	1987	17	supervisor	spawnGatewayProcess	Codex SSE sends heartbeat comments while upstream is silent	[CLI, 'serve-shim']
+test/discovery-cache.test.js	57	19	cli	spawnGatewayProcess	-	[CLI, command, ...argumentsAfterCommand]
+test/discovery-cache.test.js	204	22	supervisor	startGateway	refreshModels writes the configured gateway discovery cache	serve-shim
+test/discovery-cache.test.js	248	9	supervisor	startGateway	a shim that starts before its proxy serves the fallback catalog without persisting it	serve-shim
+test/discovery-cache.test.js	254	24	cli	runGatewayCommand	a shim that starts before its proxy serves the fallback catalog without persisting it	'status'
+test/discovery-cache.test.js	256	25	cli	runGatewayCommand	a shim that starts before its proxy serves the fallback catalog without persisting it	'catalog'
+test/discovery-cache.test.js	301	31	cli	runGatewayCommand	ensure writes the discovery cache with missing ChatGPT auth without refusing the router	'ensure'
+test/discovery-cache.test.js	314	24	cli	runGatewayCommand	ensure writes the discovery cache with missing ChatGPT auth without refusing the router	'ensure'
+test/discovery-cache.test.js	326	29	cli	runGatewayCommand	ensure writes the discovery cache with missing ChatGPT auth without refusing the router	'ensure' ['--quiet']
+test/discovery-cache.test.js	336	25	cli	runGatewayCommand	ensure writes the discovery cache with missing ChatGPT auth without refusing the router	'stop'
+test/discovery-cache.test.js	366	30	cli	runGatewayCommand	healthy quiet ensure emits only the discovery-cache context without a readiness nudge	'ensure'
+test/discovery-cache.test.js	371	29	cli	runGatewayCommand	healthy quiet ensure emits only the discovery-cache context without a readiness nudge	'ensure' ['--quiet']
+test/dispatch-model.test.js	92	17	supervisor	spawnGatewayProcess	dispatch model stays routable when omitted from the default model listing	[CLI, 'serve-shim']
+test/dispatch-model.test.js	169	17	supervisor	spawnGatewayProcess	dispatch usage records a marker ticket only for its originating agent	[CLI, 'serve-shim']
+test/dispatch-model.test.js	229	17	supervisor	spawnGatewayProcess	dispatch model is listed with the explicit rollback flag and stays routable	[CLI, 'serve-shim']
+test/dispatch-model.test.js	258	17	supervisor	spawnGatewayProcess	dispatch model rejects missing and malformed route markers	[CLI, 'serve-shim']
+test/dispatch-model.test.js	399	17	supervisor	spawnGatewayProcess	dispatch route ignores markers echoed through tool_result blocks end-to-end	[CLI, 'serve-shim']
+test/dispatch-model.test.js	618	19	cli	spawnGatewayProcess	SQ-2208: catalog --refresh --json keeps stdout parseable while it logs a preserved subset	[CLI, 'catalog', '--refresh', '--json']
+test/dispatch-model.test.js	655	20	cli	spawnGatewayProcessSync	doctor prints the catalog writer version	[CLI, 'doctor']
+test/dispatch-model.test.js	723	17	supervisor	spawnGatewayProcess	the shim keeps Claude ids on the Anthropic path and claims both id forms for Codex	[CLI, 'serve-shim']
+test/gateway-drain.test.js	299	43	worker	startGateway	draining shim finishes an in-flight request before it exits	serve-worker
+test/gateway-drain.test.js	346	55	supervisor	startGateway	supervisor keeps its listener available while a hard-killed worker restarts	serve-shim
+test/gateway-drain.test.js	403	39	supervisor	startGateway	supervisor records an orderly signal before it exits	serve-shim
+test/gateway-drain.test.js	436	36	supervisor	startGateway	supervisor drains a planned worker restart without refusing connections	serve-shim
+test/gateway-drain.test.js	467	36	supervisor	startGateway	restart rejects an older installed worker script without restarting	serve-shim
+test/gateway-drain.test.js	516	36	supervisor	startGateway	supervisor refuses the client retry only when a worker took the body	serve-shim
+test/gateway-drain.test.js	548	36	supervisor	startGateway	restart adopts a newer installed worker script	serve-shim
+test/gateway-drain.test.js	568	36	supervisor	startGateway	restart refuses to switch a development checkout to a different installation	serve-shim
+test/gateway-drain.test.js	585	36	supervisor	startGateway	supervisor rejects unauthenticated and browser-origin controls and foreign worker paths	serve-shim
+test/gateway-drain.test.js	615	26	supervisor	startGateway	authenticated drain relays through a random-port supervisor without leaking its token upstream	serve-shim
+test/gateway-drain.test.js	630	36	supervisor	startGateway	a second supervisor exits when the singleton listener is already owned	serve-shim
+test/gateway-drain.test.js	633	19	supervisor	spawnGatewayProcess	a second supervisor exits when the singleton listener is already owned	[CLI, 'serve-shim']
+test/gateway-drain.test.js	746	19	cli	spawnGatewayProcess	doctor reports a serving version mismatch and the ensure remedy	[CLI, 'doctor']
+test/gateway-drain.test.js	795	19	cli	spawnGatewayProcess	doctor describes an observed lifecycle exit	[CLI, 'doctor']
+test/gateway-process-isolation.test.js	207	19	cli	spawn	-	[cliPath, command, ...commandArguments]
+test/gateway-process-isolation.test.js	625	25	supervisor	startGateway	gateway fixture processes isolate outer body, socket, and Codex state	serve-shim
+test/gateway-process-isolation.test.js	640	33	supervisor	startGateway	gateway fixture processes isolate outer body, socket, and Codex state	serve-shim
+test/gateway-process-isolation.test.js	656	18	cli	spawnGatewayProcessSync	sync gateway fixture cleanup removes helper-owned homes and preserves supplied homes	[CLI, 'env']
+test/gateway-process-isolation.test.js	662	26	cli	spawnGatewayProcessSync	sync gateway fixture cleanup removes helper-owned homes and preserves supplied homes	[CLI, 'env']
+test/gateway-process-isolation.test.js	862	27	worker	startGateway	direct worker fixture drains to exit zero and a real close event	serve-worker
+test/gateway-process-isolation.test.js	932	22	worker	startGateway	-	fixture CLI: serve-worker
+test/gateway-process-isolation.test.js	949	42	helper	fakeDirectWorker	direct worker drain records bounded malformed failure even after a later real close	fixture script posing as serve-worker (keep on Node)
+test/gateway-process-isolation.test.js	949	42	helper	fakeDirectWorker	direct worker drain records bounded malformed-token failure even after a later real close	fixture script posing as serve-worker (keep on Node)
+test/gateway-process-isolation.test.js	949	42	helper	fakeDirectWorker	direct worker drain records bounded missing-token failure even after a later real close	fixture script posing as serve-worker (keep on Node)
+test/gateway-process-isolation.test.js	949	42	helper	fakeDirectWorker	direct worker drain records bounded not-draining failure even after a later real close	fixture script posing as serve-worker (keep on Node)
+test/gateway-process-isolation.test.js	949	42	helper	fakeDirectWorker	direct worker drain records bounded null-response failure even after a later real close	fixture script posing as serve-worker (keep on Node)
+test/gateway-process-isolation.test.js	949	42	helper	fakeDirectWorker	direct worker drain records bounded oversize failure even after a later real close	fixture script posing as serve-worker (keep on Node)
+test/gateway-process-isolation.test.js	949	42	helper	fakeDirectWorker	direct worker drain records bounded oversize-token failure even after a later real close	fixture script posing as serve-worker (keep on Node)
+test/gateway-process-isolation.test.js	949	42	helper	fakeDirectWorker	direct worker drain records bounded redirect failure even after a later real close	fixture script posing as serve-worker (keep on Node)
+test/gateway-process-isolation.test.js	949	42	helper	fakeDirectWorker	direct worker drain records bounded stall failure even after a later real close	fixture script posing as serve-worker (keep on Node)
+test/gateway-process-isolation.test.js	949	42	helper	fakeDirectWorker	direct worker drain records bounded wrong-token failure even after a later real close	fixture script posing as serve-worker (keep on Node)
+test/gateway-process-isolation.test.js	968	40	helper	fakeDirectWorker	direct worker drain uses only its registered loopback endpoint and settled local control	fixture script posing as serve-worker (keep on Node)
+test/gateway-process-isolation.test.js	982	27	helper	fakeDirectWorker	direct worker natural close with a reset does not manufacture a control failure	fixture script posing as serve-worker (keep on Node)
+test/gateway-process-isolation.test.js	991	27	helper	fakeDirectWorker	direct worker drain clamps its subdeadline to the remaining shutdown budget	fixture script posing as serve-worker (keep on Node)
+test/gateway-process-isolation.test.js	1003	33	helper	fakeDirectWorker	direct worker drain revalidates its registered root before reading control credentials	fixture script posing as serve-worker (keep on Node)
+test/gateway-process-isolation.test.js	1013	33	helper	fakeDirectWorker	direct worker refused control never counts as observed close	fixture script posing as serve-worker (keep on Node)
+test/gateway-process-isolation.test.js	1177	26	supervisor	startGateway	gateway fixture home teardown stops a supervisor even after later commands reused its home	serve-shim
+test/gateway-process-isolation.test.js	1178	18	cli	spawnGatewayProcess	gateway fixture home teardown stops a supervisor even after later commands reused its home	[CLI, 'status']
+test/gateway-process-isolation.test.js	1191	19	helper	spawn	isolated ensure preserves a foreign serve-shim process and cleans its own supervisor	foreign fixture CLI: serve-shim (not the gateway)
+test/gateway-process-isolation.test.js	1199	18	cli	spawnGatewayProcessSync	isolated ensure preserves a foreign serve-shim process and cleans its own supervisor	[CLI, 'ensure', '--quiet']
+test/gateway-process-isolation.test.js	1278	22	worker	spawn	-	copied gateway CLI serve-worker
+test/gateway-process-isolation.test.js	1278	22	worker	spawn	parallel healthy ensures reap a real owned stale-version orphan while the current worker and stream survive	copied gateway CLI serve-worker
+test/gateway-process-isolation.test.js	1346	17	helper	startStaleWorkerFixture	parallel healthy ensures reap a real owned stale-version orphan while the current worker and stream survive	worker-birth.cjs birth (it spawns a real copied worker CLI)
+test/gateway-process-isolation.test.js	1349	28	supervisor	startGateway	parallel healthy ensures reap a real owned stale-version orphan while the current worker and stream survive	serve-shim
+test/gateway-process-isolation.test.js	1363	71	cli	runGatewayCli	parallel healthy ensures reap a real owned stale-version orphan while the current worker and stream survive	newerCli 'ensure' ['--quiet']
+test/gateway-process-isolation.test.js	1368	36	cli	runGatewayCli	parallel healthy ensures reap a real owned stale-version orphan while the current worker and stream survive	newerCli 'ensure' ['--quiet']
+test/gateway-process-isolation.test.js	1406	21	supervisor	spawn	sibling ensure retires dead records without deleting replacement worker and proxy records	[olderCli, 'serve-shim']
+test/gateway-process-isolation.test.js	1414	11	cli	runGatewayCli	sibling ensure retires dead records without deleting replacement worker and proxy records	newerCli 'stop'
+test/gateway-process-isolation.test.js	1433	14	cli	spawn	sibling ensure retires dead records without deleting replacement worker and proxy records	[newerCli, 'ensure', '--quiet']
+test/gateway-process-isolation.test.js	1456	24	cli	runGatewayCli	sibling ensure retires dead records without deleting replacement worker and proxy records	newerCli 'doctor'
+test/gateway-process-isolation.test.js	1478	25	cli	runGatewayCli	sibling ensure retires dead records without deleting replacement worker and proxy records	newerCli 'stop'
+test/gateway-process-isolation.test.js	1531	16	supervisor	spawnGatewayProcess	-	optional delayed-start preload; CLI serve-shim
+test/gateway-process-isolation.test.js	1555	9	cli	versionChangeRestartScenario	version-change restart leaves the replacement proxy under its live supervisor	[cliPath, command, ...commandArguments]
+test/gateway-process-isolation.test.js	1555	9	supervisor	versionChangeRestartScenario	version-change restart leaves the replacement proxy under its live supervisor	CLI serve-shim
+test/gateway-process-isolation.test.js	1559	9	cli	versionChangeRestartScenario	version-change restart preserves its assertions after delayed initial proxy readiness	[cliPath, command, ...commandArguments]
+test/gateway-process-isolation.test.js	1559	9	supervisor	versionChangeRestartScenario	version-change restart preserves its assertions after delayed initial proxy readiness	CLI serve-shim with delayed proxy preload
+test/gateway-process-isolation.test.js	1585	19	helper	spawn	foreign configured-port supervisor is preserved and reported	foreign fixture CLI: serve-shim (not the gateway)
+test/gateway-process-isolation.test.js	1602	19	cli	spawnGatewayProcessSync	foreign configured-port supervisor is preserved and reported	[CLI, 'ensure', '--quiet']
+test/gateway-process-isolation.test.js	1603	19	cli	spawnGatewayProcessSync	foreign configured-port supervisor is preserved and reported	[CLI, 'stop']
+test/gateway-process-isolation.test.js	1604	21	cli	spawnGatewayProcessSync	foreign configured-port supervisor is preserved and reported	[CLI, 'doctor']
+test/gateway-process-isolation.test.js	1627	19	helper	spawn	cache-junction gateway process is preserved as a foreign port owner	foreign fixture CLI: serve-shim (not the gateway)
+test/gateway-process-isolation.test.js	1640	25	cli	runGatewayCli	cache-junction gateway process is preserved as a foreign port owner	newerCli 'stop'
+test/gateway-process-isolation.test.js	1664	22	supervisor	spawnGatewayProcess	proxy recovery preserves a foreign configured-port proxy owner	[CLI, 'serve-shim']
+test/gateway-process-isolation.test.js	1769	19	cli	spawnGatewayProcessSync	ensure and stop discard a stale guardian PID without killing its reused process	[CLI, 'ensure', '--quiet']
+test/gateway-process-isolation.test.js	1778	19	cli	spawnGatewayProcessSync	ensure and stop discard a stale guardian PID without killing its reused process	[CLI, 'stop']
+test/gateway-process-isolation.test.js	1911	22	helper	spawn	supervisor shutdown reaps a timed probe child before fixture cleanup	node -e: fixture supervisor running proxy recovery
+test/gateway-readiness.test.js	248	36	supervisor	startGateway	shim health retains an OpenAI rejection until a successful proxied request	serve-shim
+test/gateway-telemetry.test.js	54	26	supervisor	startGateway	-	serve-shim
+test/gateway-telemetry.test.js	127	26	supervisor	spawnShim	emits a linked metadata-only route span and strips trace and auth before Codex	serve-shim
+test/gateway-telemetry.test.js	215	26	supervisor	spawnShim	records failed Codex spans as canonical route observations	serve-shim
+test/gateway-telemetry.test.js	256	26	supervisor	spawnShim	normalizes legacy context failures before final Codex readiness classification	serve-shim
+test/gateway-telemetry.test.js	310	26	supervisor	spawnShim	uses one failed semantic span and one successful retry span	serve-shim
+test/gateway-telemetry.test.js	347	26	supervisor	spawnShim	reports dispatch and cached-route truth while invalid trace context stays unlinked	serve-shim
+test/gateway-telemetry.test.js	397	26	supervisor	spawnShim	telemetry transport failure cannot change the routed response	serve-shim
+test/gateway-telemetry.test.js	426	26	supervisor	spawnShim	Anthropic passthrough consumes trace context but keeps its required credential	serve-shim
+test/gateway-usage.test.js	119	17	supervisor	spawnGatewayProcess	-	[CLI, 'serve-shim']
+test/gateway-usage.test.js	235	26	supervisor	spawnShim	isolated JSON proxy emits resolved, exact, counts-only gateway usage	[CLI, 'serve-shim']
+test/gateway-usage.test.js	303	26	supervisor	spawnShim	isolated SSE usage merges final counts and a slow collector cannot delay inference	[CLI, 'serve-shim']
+test/gateway-usage.test.js	355	26	supervisor	spawnShim	isolated multi-block Codex SSE emits one usage record per request	[CLI, 'serve-shim']
+test/gateway-usage.test.js	393	26	supervisor	spawnShim	isolated throttled proxy emits header-only limit evidence	[CLI, 'serve-shim']
+test/gateway-usage.test.js	443	26	supervisor	spawnShim	isolated Anthropic SSE emits usage for the requested model	[CLI, 'serve-shim']
+test/grok-backend.test.js	350	17	worker	spawnGatewayProcess	the shim lists and routes Grok 1M picker aliases	[cli, 'serve-worker']
+test/hook-ensure-delegation.test.js	49	10	hook	spawnGatewayProcessSync	-	[hook, ...args]
+test/hook-ensure-delegation.test.js	70	19	hook	runHook	a checkout loaded from a directory marketplace runs the registered install instead of itself	hooks/ensure.js ['ensure', '--quiet']
+test/hook-ensure-delegation.test.js	94	19	hook	runHook	delegation does not depend on the generated stable launcher existing yet	hooks/ensure.js ['ensure', '--quiet']
+test/hook-ensure-delegation.test.js	116	19	hook	runHook	the config-dir registry is used when no plugin cache dir is configured	hooks/ensure.js ['ensure', '--quiet']
+test/hook-ensure-delegation.test.js	143	19	hook	runHook	the newest recorded install wins across a migrated host's two registries	hooks/ensure.js ['ensure', '--quiet']
+test/hook-ensure-delegation.test.js	169	19	hook	runHook	a recorded install whose CLI is gone does not hide one that is still on disk	hooks/ensure.js ['ensure', '--quiet']
+test/hook-ensure-delegation.test.js	189	19	hook	runHook	a checkout the registry does not list runs its own CLI	hooks/ensure.js ['ensure']
+test/hook-ensure-delegation.test.js	206	19	hook	runHook	a missing registry file leaves the loaded copy running itself	hooks/ensure.js ['ensure', '--quiet']
+test/hook-ensure-delegation.test.js	229	17	hook	runHook	no CLI anywhere names the registries it searched, and keeps the hook contract on exit codes	hooks/ensure.js ['ensure', '--quiet']
+test/hook-ensure-delegation.test.js	230	16	hook	runHook	no CLI anywhere names the registries it searched, and keeps the hook contract on exit codes	hooks/ensure.js ['ensure']
+test/hook-ensure-delegation.test.js	253	19	hook	runHook	the exit status of the delegated CLI is the hook's exit status	hooks/ensure.js ['ensure']
+test/keep-alive-listener-leak.test.js	39	33	worker	startGateway	sequential keep-alive requests leave the shared socket listener count flat	serve-worker
+test/lmstudio.test.js	195	26	supervisor	startGateway	-	serve-shim
+test/lmstudio.test.js	425	32	supervisor	spawnShim	the shim advertises each LM Studio model at the window it is loaded with	serve-shim
+test/lmstudio.test.js	444	26	supervisor	spawnShim	the shim sends the LM Studio token to its server and to nothing else	serve-shim
+test/lmstudio.test.js	463	26	supervisor	spawnShim	LM Studio usage is counted once: the cached part is not added to an input that already holds it	serve-shim
+test/lmstudio.test.js	483	26	supervisor	spawnShim	LM Studio usage past the trigger still arms the sentry	serve-shim
+test/lmstudio.test.js	500	26	supervisor	spawnShim	LM Studio usage in a non-streaming answer is corrected the same way	serve-shim
+test/lmstudio.test.js	512	26	supervisor	spawnShim	usage that cannot be an inclusive count is left as it came	serve-shim
+test/lmstudio.test.js	523	26	supervisor	spawnShim	a prompt LM Studio refuses without streaming becomes a 413 with its own token counts	serve-shim
+test/lmstudio.test.js	554	30	supervisor	spawnShim	a prompt LM Studio refuses inside a 200 stream becomes a real 413 > success: the engine text is not JSON, so the wording gives the counts	serve-shim
+test/lmstudio.test.js	554	30	supervisor	spawnShim	a prompt LM Studio refuses inside a 200 stream becomes a real 413 > success: the error event arrives at once	serve-shim
+test/lmstudio.test.js	554	30	supervisor	spawnShim	a prompt LM Studio refuses inside a 200 stream becomes a real 413 > success: the error event arrives in two writes, after a comment frame	serve-shim
+test/lmstudio.test.js	591	30	supervisor	spawnShim	an LM Studio stream that is not an overflow reaches the client as a 200 stream > error: a stream that ends before one frame is complete	serve-shim
+test/lmstudio.test.js	591	30	supervisor	spawnShim	an LM Studio stream that is not an overflow reaches the client as a 200 stream > error: an empty stream	serve-shim
+test/lmstudio.test.js	591	30	supervisor	spawnShim	an LM Studio stream that is not an overflow reaches the client as a 200 stream > error: another error event stays an in-band error	serve-shim
+test/lmstudio.test.js	591	30	supervisor	spawnShim	an LM Studio stream that is not an overflow reaches the client as a 200 stream > success: an ordinary answer arrives whole	serve-shim
+test/lmstudio.test.js	591	30	supervisor	spawnShim	an LM Studio stream that is not an overflow reaches the client as a 200 stream > success: an ordinary answer split inside its first frame	serve-shim
+test/lmstudio.test.js	614	26	supervisor	spawnShim	a first event that stalls past the wait gets the stream heartbeat back, and still arrives whole	serve-shim
+test/lmstudio.test.js	644	26	supervisor	spawnShim	an overflow that arrives after the wait stays an in-band error on a 200 stream	serve-shim
+test/lmstudio.test.js	658	26	supervisor	spawnShim	other providers' streams are not held for a first event	serve-shim
+test/lmstudio.test.js	676	26	supervisor	spawnShim	an LM Studio overflow with its exact limit never lowers the trigger below the window	serve-shim
+test/lmstudio.test.js	692	26	supervisor	spawnShim	a model reloaded with another context moves its row and its sentry trigger at the next refresh	serve-shim
+test/lmstudio.test.js	744	26	supervisor	spawnShim	a model key that ends like a Codex service tier keeps its own sentry state	serve-shim
+test/local-llama.test.js	120	26	supervisor	startGateway	-	serve-shim
+test/local-llama.test.js	279	29	supervisor	spawnShim	the shim advertises the local row at the window its llama-server reports > success: a 262144 context gets the [1m] alias	serve-shim
+test/local-llama.test.js	279	29	supervisor	spawnShim	the shim advertises the local row at the window its llama-server reports > success: a 40960 context	serve-shim
+test/local-llama.test.js	279	29	supervisor	spawnShim	the shim advertises the local row at the window its llama-server reports > success: router mode stays an unmeasured row	serve-shim
+test/local-llama.test.js	290	26	supervisor	spawnShim	a llama-server stream that reports input only in message_start still arms the sentry	serve-shim
+test/local-llama.test.js	309	31	supervisor	spawnShim	a local row below the sentry floor forwards every turn	serve-shim
+test/local-llama.test.js	325	26	supervisor	spawnShim	llama-server context overflow becomes a 413 with its own token counts	serve-shim
+test/local-llama.test.js	348	26	supervisor	spawnShim	a llama-server overflow with its exact limit never lowers the trigger below the window	serve-shim
+test/local-llama.test.js	364	26	supervisor	spawnShim	a llama-server restarted with another context moves the sentry trigger at the next refresh	serve-shim
+test/proxy-providers.test.js	120	26	supervisor	startGateway	-	serve-shim
+test/proxy-providers.test.js	141	26	supervisor	spawnShim	the shim advertises every proxy provider row and none of its Claude aliases	serve-shim
+test/proxy-providers.test.js	261	26	supervisor	spawnShim	non-Codex rows reach the proxy under their backend id with credentials and plan tools removed	serve-shim
+test/proxy-providers.test.js	304	26	supervisor	spawnShim	Claude ids and ids the proxy never listed still go to Anthropic	serve-shim
+test/proxy-providers.test.js	325	32	supervisor	spawnShim	a non-Codex rejection passes through without touching Codex readiness state	serve-shim
+test/proxy-providers.test.js	342	26	supervisor	spawnShim	a non-Codex context overflow is normalized so Claude Code compacts	serve-shim
+test/proxy-providers.test.js	585	26	supervisor	startGateway	a shim that starts before the proxy lists the proxy models without waiting for a request	serve-shim
+test/proxy-providers.test.js	613	30	supervisor	spawnShim	Grok 4.7 Fast rows reach the proxy and compact 40000 below their 500000 window > backend id	serve-shim
+test/proxy-providers.test.js	613	30	supervisor	spawnShim	Grok 4.7 Fast rows reach the proxy and compact 40000 below their 500000 window > local alias	serve-shim
+test/proxy-providers.test.js	639	26	supervisor	spawnShim	Muse rows reach the proxy and compact 40000 below their 1007997 window	serve-shim
+test/proxy-providers.test.js	671	30	supervisor	spawnShim	Vertex AI rows reach the proxy and compact 40000 below their documented window > Claude on Vertex, a window equal to the client window	serve-shim
+test/proxy-providers.test.js	671	30	supervisor	spawnShim	Vertex AI rows reach the proxy and compact 40000 below their documented window > Gemini, a window above the [1m] client window	serve-shim
+test/proxy-providers.test.js	671	30	supervisor	spawnShim	Vertex AI rows reach the proxy and compact 40000 below their documented window > Gemma, a window far below the [1m] client window	serve-shim
+test/proxy-providers.test.js	697	26	supervisor	spawnShim	a Vertex AI row with no policy row has no sentry and forwards every turn	serve-shim
+test/proxy-upgrade.test.js	144	18	shim	spawnGatewayProcessSync	stable command launcher follows registry changes and forwards command exits	[updateLauncher]
+test/proxy-upgrade.test.js	152	17	shim	spawnGatewayProcessSync	stable command launcher follows registry changes and forwards command exits	[launcher, 'status', '--json']
+test/proxy-upgrade.test.js	163	22	shim	spawnGatewayProcessSync	stable command launcher follows registry changes and forwards command exits	[launcher, 'doctor']
+test/proxy-upgrade.test.js	172	19	shim	spawnGatewayProcessSync	stable command launcher follows registry changes and forwards command exits	[launcher, 'status']
+test/proxy-upgrade.test.js	196	15	shim	spawnGatewayProcessSync	GH-380: stable command launcher finds a model-gateway installed from another marketplace	[launcher, 'doctor']
+test/proxy-upgrade.test.js	257	19	shim	spawnGatewayProcessSync	stable command launcher reads the registry in CLAUDE_CODE_PLUGIN_CACHE_DIR	[launcher, 'doctor']
+test/rc-compat-mode.test.js	46	19	cli	spawn	-	[CLI, ...argumentsList]
+test/rc-compat-mode.test.js	99	17	supervisor	spawnGatewayProcess	-	[CLI, 'serve-shim']
+test/rc-compat-mode.test.js	580	16	supervisor	spawnShim	remote-control CLI adopts an unmarked mapping from its serving supervisor	[CLI, 'serve-shim']
+test/rc-compat-mode.test.js	596	25	cli	runGatewayCommand	remote-control CLI adopts an unmarked mapping from its serving supervisor	CLI ['remote-control', 'enable', '--confirm']
+test/rc-compat-mode.test.js	838	3	supervisor	spawnShim	serve-shim binds a second RC-compatibility listener only when the hosts entry is present	[CLI, 'serve-shim']
+test/rc-compat-mode.test.js	866	3	supervisor	spawnShim	serve-shim stays default-only when no hosts entry is present	[CLI, 'serve-shim']
+test/rc-compat-mode.test.js	883	3	supervisor	spawnShim	serve-shim exposes bounded RC control only through the main loopback listener	[CLI, 'serve-shim']
+test/rc-compat-mode.test.js	939	3	supervisor	spawnShim	serve-shim accepts requests through ANTHROPIC_UNIX_SOCKET	[CLI, 'serve-shim']
+test/rc-compat-mode.test.js	966	3	supervisor	spawnShim	serve-shim forwards an unexpected bodyless request without crashing on raw.length	[CLI, 'serve-shim']
+test/rc-compat-mode.test.js	996	3	supervisor	spawnShim	serve-shim safely retains default mode when the compatibility port is unavailable	[CLI, 'serve-shim']
+test/readiness-fast-path.test.js	49	17	shim	spawn	-	[fixture.launcher, 'readiness-gate']
+test/readiness-fast-path.test.js	66	26	shim	invoke	healthy installed gate skips commands.js for both hook payloads without Codex auth	[fixture.launcher, 'readiness-gate']
+test/readiness-fast-path.test.js	84	26	shim	invoke	installed gate falls through to recovery: different supervisor	[fixture.launcher, 'readiness-gate']
+test/readiness-fast-path.test.js	84	26	shim	invoke	installed gate falls through to recovery: missing proxy recovery	[fixture.launcher, 'readiness-gate']
+test/readiness-fast-path.test.js	84	26	shim	invoke	installed gate falls through to recovery: newer preserves quiet reload notice	[fixture.launcher, 'readiness-gate']
+test/readiness-fast-path.test.js	84	26	shim	invoke	installed gate falls through to recovery: outdated	[fixture.launcher, 'readiness-gate']
+test/readiness-fast-path.test.js	84	26	shim	invoke	installed gate falls through to recovery: unhealthy	[fixture.launcher, 'readiness-gate']
+test/readiness-fast-path.test.js	94	25	shim	invoke	intentional stop and foreign PID record fall through even with healthy HTTP	[fixture.launcher, 'readiness-gate']
+test/readiness-fast-path.test.js	99	25	shim	invoke	intentional stop and foreign PID record fall through even with healthy HTTP	[fixture.launcher, 'readiness-gate']
+test/readiness-gate.test.js	26	10	shim	spawnSync	-	[fixture.launcher, 'readiness-gate']
+test/readiness-gate.test.js	60	20	shim	spawnSync	the stable gate survives stdin the host cut short	[fixture.launcher, 'readiness-gate']
+test/readiness-gate.test.js	76	18	shim	invokeGate	a failed wiring repair never holds up a project that does not route through the gateway	[fixture.launcher, 'readiness-gate']
+test/readiness-gate.test.js	90	20	shim	invokeGate	installed stable gate accepts startup and resume stdin without enabled plugins and bypasses a non-gateway endpoint	[fixture.launcher, 'readiness-gate']
+test/readiness-gate.test.js	99	18	shim	invokeGate	stable gate keeps its inherited cwd when the session cwd was deleted	[fixture.launcher, 'readiness-gate']
+test/readiness-gate.test.js	107	18	shim	invokeGate	wired gate reports gateway readiness, not a chdir crash, when the session cwd was deleted	[fixture.launcher, 'readiness-gate']
+test/readiness-gate.test.js	115	18	shim	invokeGate	installed prompt gate blocks missing setup with local recovery guidance	[fixture.launcher, 'readiness-gate']
+test/readiness-gate.test.js	124	18	shim	invokeGate	stable wired gate fails with exit 2 when the installed plugin disappears	[fixture.launcher, 'readiness-gate']
+test/readiness-gate.test.js	132	18	shim	invokeGate	stable non-gateway gate succeeds without an installed CLI or spawn	[fixture.launcher, 'readiness-gate']
+test/readiness-gate.test.js	140	18	shim	invokeGate	absent plugin entry still attempts wired recovery	[fixture.launcher, 'readiness-gate']
+test/readiness-gate.test.js	149	18	shim	invokeGate	explicit effective plugin false skips recovery before CLI resolution or spawn	[fixture.launcher, 'readiness-gate']
+test/readiness-gate.test.js	162	20	shim	invokeGate	stable gate follows upgrade and downgrade registry entries after old caches disappear	[fixture.launcher, 'readiness-gate']
+test/readiness-gate.test.js	177	17	shim	invokeGate	installed gate waits for delayed recovery and kills its CLI at the finite deadline	[fixture.launcher, 'readiness-gate']
+test/readiness-gate.test.js	183	19	shim	invokeGate	installed gate waits for delayed recovery and kills its CLI at the finite deadline	[fixture.launcher, 'readiness-gate']
+test/readiness-gate.test.js	234	18	helper	spawnSync	maintenance setup preserves persistent stop through a bounded acquisition failure	node -e: injected commands.setup() with argv setup --preserve-wiring; keep fixture on Node
+test/readiness-gate.test.js	321	20	helper	spawnSync	-	node -e: injected start/setup command selected by fixture scenario; keep on Node
+test/readiness-gate.test.js	339	33	helper	launchHandoffFixture	intentional stop launch handoff: cleanup-failure	node -e: injected start/setup command selected by fixture scenario; keep on Node
+test/readiness-gate.test.js	339	33	helper	launchHandoffFixture	intentional stop launch handoff: foreign-owner	node -e: injected start/setup command selected by fixture scenario; keep on Node
+test/readiness-gate.test.js	339	33	helper	launchHandoffFixture	intentional stop launch handoff: maintenance	node -e: injected start/setup command selected by fixture scenario; keep on Node
+test/readiness-gate.test.js	339	33	helper	launchHandoffFixture	intentional stop launch handoff: setup	node -e: injected start/setup command selected by fixture scenario; keep on Node
+test/readiness-gate.test.js	339	33	helper	launchHandoffFixture	intentional stop launch handoff: setup launch failure	node -e: injected start/setup command selected by fixture scenario; keep on Node
+test/readiness-gate.test.js	339	33	helper	launchHandoffFixture	intentional stop launch handoff: setup spawn without a pid	node -e: injected start/setup command selected by fixture scenario; keep on Node
+test/readiness-gate.test.js	339	33	helper	launchHandoffFixture	intentional stop launch handoff: start	node -e: injected start/setup command selected by fixture scenario; keep on Node
+test/readiness-gate.test.js	339	33	helper	launchHandoffFixture	intentional stop launch handoff: start launch failure	node -e: injected start/setup command selected by fixture scenario; keep on Node
+test/readiness-gate.test.js	339	33	helper	launchHandoffFixture	intentional stop launch handoff: start spawn without a pid	node -e: injected start/setup command selected by fixture scenario; keep on Node
+test/recovery-lifecycle.test.js	22	19	shim	spawnGatewayProcess	-	[launcher, command, ...commandArguments]
+test/recovery-lifecycle.test.js	101	25	shim	invoke	installed prompt gate leaves a foreign listener untouched and reports local recovery	stable launcher 'readiness-gate'
+test/recovery-lifecycle.test.js	144	5	shim	invoke	installed gates recover stale boot state once, preserve streaming, recover death and honor persistent stop	stable launcher 'readiness-gate'
+test/recovery-lifecycle.test.js	145	5	shim	invoke	installed gates recover stale boot state once, preserve streaming, recover death and honor persistent stop	stable launcher 'readiness-gate'
+test/recovery-lifecycle.test.js	151	25	shim	invoke	installed gates recover stale boot state once, preserve streaming, recover death and honor persistent stop	stable launcher 'readiness-gate'
+test/recovery-lifecycle.test.js	157	27	shim	invoke	installed gates recover stale boot state once, preserve streaming, recover death and honor persistent stop	stable launcher 'readiness-gate'
+test/recovery-lifecycle.test.js	163	29	shim	invoke	installed gates recover stale boot state once, preserve streaming, recover death and honor persistent stop	stable launcher 'readiness-gate'
+test/recovery-lifecycle.test.js	169	33	shim	invoke	installed gates recover stale boot state once, preserve streaming, recover death and honor persistent stop	stable launcher 'readiness-gate'
+test/recovery-lifecycle.test.js	174	29	shim	invoke	installed gates recover stale boot state once, preserve streaming, recover death and honor persistent stop	stable launcher 'readiness-gate'
+test/recovery-lifecycle.test.js	178	25	shim	invoke	installed gates recover stale boot state once, preserve streaming, recover death and honor persistent stop	stable launcher 'stop'
+test/recovery-lifecycle.test.js	180	25	shim	invoke	installed gates recover stale boot state once, preserve streaming, recover death and honor persistent stop	stable launcher 'readiness-gate'
+test/recovery-lifecycle.test.js	185	29	shim	invoke	installed gates recover stale boot state once, preserve streaming, recover death and honor persistent stop	stable launcher 'setup' ['--preserve-wiring']
+test/recovery-lifecycle.test.js	189	25	shim	invoke	installed gates recover stale boot state once, preserve streaming, recover death and honor persistent stop	stable launcher 'setup'
+test/recovery-lifecycle.test.js	194	30	shim	invoke	installed gates recover stale boot state once, preserve streaming, recover death and honor persistent stop	stable launcher 'setup'
+test/registry.test.js	54	18	hook	spawnGatewayProcessSync	does not fail SessionStart when registry state cannot be initialized	[path.join(root, 'hooks', 'registry-writer.js')]
+test/relay-stream-abort.test.js	71	28	supervisor	startGateway	serve-shim: a streaming upstream that dies mid-answer terminates the client response	serve-shim
+test/relay-stream-abort.test.js	71	28	worker	startGateway	serve-worker: a streaming upstream that dies mid-answer terminates the client response	serve-worker
+test/relay-stream-abort.test.js	105	28	supervisor	startGateway	serve-shim: a passthrough Anthropic SSE upstream that closes mid-chunk terminates the client response	serve-shim
+test/relay-stream-abort.test.js	105	28	worker	startGateway	serve-worker: a passthrough Anthropic SSE upstream that closes mid-chunk terminates the client response	serve-worker
+test/relay-stream-abort.test.js	157	28	supervisor	startGateway	serve-shim: a Grok SSE upstream that closes mid-chunk terminates the client response	serve-shim
+test/relay-stream-abort.test.js	157	28	worker	startGateway	serve-worker: a Grok SSE upstream that closes mid-chunk terminates the client response	serve-worker
+test/request-worker.test.js	67	26	supervisor	startGateway	-	serve-shim
+test/request-worker.test.js	100	33	supervisor	overflowGateway	a first request over the window says there is nothing to compact and records why	serve-shim
+test/request-worker.test.js	124	33	supervisor	overflowGateway	a first request without upstream counts keeps the placeholder but reports its tokens as UNVERIFIED	serve-shim
+test/request-worker.test.js	138	33	supervisor	overflowGateway	a continuation refused by the sentry says compact and retry with the measured previous turn	serve-shim
+test/request-worker.test.js	159	33	supervisor	overflowGateway	a compaction request over the window says compacting again cannot shrink it	serve-shim
+test/request-worker.test.js	181	26	supervisor	overflowGateway	one agent crossing the sentry never refuses another agent in the same session	serve-shim
+test/request-worker.test.js	192	33	supervisor	overflowGateway	a legacy proxy context error carries the same diagnostics with the sentry off	serve-shim
+test/session-route-cache.test.js	135	17	supervisor	spawnGatewayProcess	dispatch model reuses a session route after compaction and logs cache hits	[CLI, 'serve-shim']
+test/session-route-cache.test.js	235	15	supervisor	spawnGatewayProcess	dispatch route survives a shim restart before a compacted continuation	[CLI, 'serve-shim']
+test/session-route-cache.test.js	248	11	supervisor	spawnGatewayProcess	dispatch route survives a shim restart before a compacted continuation	[CLI, 'serve-shim']
+test/session-route-cache.test.js	299	17	supervisor	spawnGatewayProcess	native Agent route survives repeated tools and the compaction identity transition	[CLI, 'serve-shim']
+test/session-route-cache.test.js	424	17	supervisor	spawnGatewayProcess	route log identifies parent-only Agent dispatch cache misses	[CLI, 'serve-shim']
+test/session-route-cache.test.js	505	17	supervisor	spawnGatewayProcess	markerless child agents inherit only their trusted parent route	[CLI, 'serve-shim']
+test/shim-upload-abort.test.js	192	35	supervisor	startGateway	aborting /internal/rc-compatibility during upload leaves the supervisor and sibling SSE alive	serve-shim
+test/shim-upload-abort.test.js	192	35	supervisor	startGateway	aborting /v1/messages during upload leaves the supervisor and sibling SSE alive	serve-shim
+test/start-gateway-timeout.test.js	234	11	helper	startGateway	startGateway reports the startup phase that timed out	fixture CLI: test-shim
+test/start-gateway-timeout.test.js	242	11	helper	startGateway	startGateway reports the startup phase that timed out	fixture CLI: test-shim
+test/supervisor-security.test.js	34	26	supervisor	startGateway	supervisor refuses browser Origin headers before relaying inference	serve-shim
+test/supervisor-security.test.js	42	26	supervisor	startGateway	supervisor refuses foreign and missing Host headers before relaying inference	serve-shim
+test/supervisor-security.test.js	50	26	supervisor	startGateway	supervisor relays Origin-less requests with either local Host	serve-shim
+test/supervisor-security.test.js	106	26	supervisor	startGateway	supervisor returns HTTP 413 for an oversized streaming upload	serve-shim
+test/support.js	772	17	helper	spawnGatewayProcess	-	command and args supplied by caller
+test/support.js	783	12	helper	spawnGatewayProcessSync	-	command and args supplied by caller
+test/support.js	792	19	helper	startGateway	-	node [cliPath, command]
+test/thread-negotiation.test.js	80	36	supervisor	startGateway	-	serve-shim
+test/thread-negotiation.test.js	112	25	supervisor	startGatewayFixture	Codex continuation receives the client-compatible local refusal without forwarding	serve-shim
+test/thread-negotiation.test.js	130	27	supervisor	startGatewayFixture	Codex refuses malformed thread array without forwarding	serve-shim
+test/thread-negotiation.test.js	130	27	supervisor	startGatewayFixture	Codex refuses malformed thread empty object without forwarding	serve-shim
+test/thread-negotiation.test.js	130	27	supervisor	startGatewayFixture	Codex refuses malformed thread null without forwarding	serve-shim
+test/thread-negotiation.test.js	130	27	supervisor	startGatewayFixture	Codex refuses malformed thread string without forwarding	serve-shim
+test/thread-negotiation.test.js	130	27	supervisor	startGatewayFixture	Codex refuses malformed thread unknown type without forwarding	serve-shim
+test/thread-negotiation.test.js	139	25	supervisor	startGatewayFixture	Codex forwards a self-contained thread creation with its complete history	serve-shim
+test/thread-negotiation.test.js	152	25	supervisor	startGatewayFixture	Codex forwards requests without a thread unchanged apart from model routing	serve-shim
+test/thread-negotiation.test.js	164	25	supervisor	startGatewayFixture	Anthropic passthrough retains continuation bytes unchanged	serve-shim
+test/thread-negotiation.test.js	178	25	supervisor	startGatewayFixture	count_tokens carries thread payloads through the Codex path	serve-shim
+test/thread-negotiation.test.js	190	25	supervisor	startGatewayFixture	Grok continuation refuses before authentication or forwarding	serve-shim
+test/tool-search.test.js	110	17	supervisor	spawnGatewayProcess	Codex tool search resolves references while Anthropic passthrough stays byte-identical	[CLI, 'serve-shim']
+test/tool-search.test.js	248	17	supervisor	spawnGatewayProcess	-	[CLI, 'serve-shim']
+test/tool-search.test.js	272	41	supervisor	startCodexFixture	proxy routes turn tool_addition blocks into tools entries and drop the blocks	[CLI, 'serve-shim']
+test/wiring-mode.test.js	27	18	cli	spawnGatewayProcessSync	-	[CLI, ...args]
+test/wiring-mode.test.js	99	16	cli	run	env --write-project wires the current project-local settings	['env', '--write-project']
+test/wiring-mode.test.js	117	16	cli	run	env --write-project normalizes a legacy gateway model cache through the canonical window policy	['env', '--write-project']
+test/wiring-mode.test.js	128	16	cli	run	env --write-user keeps a deliberate shared fallback available	['env', '--write-user']
+test/wiring-mode.test.js	137	20	cli	run	retired wiring-mode flags fail loudly	retired
+test/wiring-mode.test.js	148	16	cli	run	writing project wiring retires a stale local wiring-mode config	['env', '--write-project']
+test/wiring-mode.test.js	159	16	cli	run	project wiring registry records writes and prunes missing or unowned settings	['env', '--write-user']
+test/wiring-mode.test.js	160	16	cli	run	project wiring registry records writes and prunes missing or unowned settings	['env', '--write-user']
+test/wiring-mode.test.js	165	16	cli	run	project wiring registry records writes and prunes missing or unowned settings	['env', '--write-user']
+test/wiring-mode.test.js	187	18	cli	run	pin updates registered projects, skips user pins, and prunes missing entries	['pin', '--opus', 'claude-opus-5-5[1m]']
+test/wiring-mode.test.js	232	18	cli	run	pin refresh updates registered un-overridden pins	['env', '--write-project']
+test/wiring-mode.test.js	253	18	cli	run	a pin refresh rewrites registered projects still holding retired shipped defaults	['env', '--write-project']
+test/wiring-mode.test.js	273	18	cli	run	SQ-3205: a CLI alias detected older than the shipped default never pulls projects back to it	['env', '--write-project']
+test/wiring-mode.test.js	282	16	cli	run	SQ-3205: a CLI alias detected older than the shipped default never pulls projects back to it	['pin']
+test/wiring-mode.test.js	292	16	cli	run	project wiring registry deduplicates an existing project alias	['env', '--write-user']
+test/wiring-mode.test.js	293	16	cli	run	project wiring registry deduplicates an existing project alias	['env', '--write-user']
+test/wiring-mode.test.js	303	18	cli	run	user wiring reports conflicting current project wiring without changing it	['env', '--write-user']
+test/wiring-mode.test.js	319	18	cli	run	user-fallback reconciliation removes only plugin-owned project env entries	['env', '--write-user', '--reconcile']
+test/wiring-mode.test.js	333	18	cli	run	user-fallback reconciliation leaves agreeing project wiring alone	['env', '--write-user', '--reconcile']
+test/wiring-mode.test.js	344	18	cli	run	doctor fails when wiring is not configured	['doctor']
+test/wiring-mode.test.js	356	18	cli	run	doctor skips a project env block without ANTHROPIC_BASE_URL	['doctor']
+test/wiring-mode.test.js	373	16	cli	run	user fallback preserves existing user env values	['env', '--write-user']
+test/wiring-mode.test.js	775	18	cli	spawnGatewayProcessSync	-	[CLI, 'ensure', '--quiet']
+test/wiring-mode.test.js	861	16	cli	runHook	SessionStart leaves a recorded project's unwired committed settings byte-identical	[CLI, 'ensure', '--quiet']
+test/wiring-mode.test.js	880	16	cli	runHook	SessionStart migrates a gateway-owned committed settings file	[CLI, 'ensure', '--quiet']
+test/wiring-mode.test.js	896	16	cli	runHook	migration preserves user settings that resolve to the legacy file	[CLI, 'ensure', '--quiet']
+test/wiring-mode.test.js	955	16	cli	runHook	SQ-1901: the SessionStart hook shows the user an actionable state instead of only the model	[CLI, 'ensure', '--quiet']
+test/wiring-mode.test.js	969	16	cli	runHook	SQ-1901: a refusal state reaches the user through the hook and still fails a direct ensure	[CLI, 'ensure', '--quiet']
+test/wiring-mode.test.js	975	18	cli	run	SQ-1901: a refusal state reaches the user through the hook and still fails a direct ensure	['ensure']
+test/wiring-mode.test.js	984	29	cli	runHook	SQ-1901: only states someone must act on become the user line	[CLI, 'ensure', '--quiet']
+test/wiring-mode.test.js	1024	22	cli	run	ensure repairs orphan aliases before the missing-binary early return and doctor only reports	['doctor']
+test/wiring-mode.test.js	1028	20	cli	run	ensure repairs orphan aliases before the missing-binary early return and doctor only reports	['ensure', '--quiet']
+test/wiring-mode.test.js	1042	22	cli	run	ensure registers a wired project missing from the registry and doctor only reports the gap	['doctor']
+test/wiring-mode.test.js	1046	3	cli	run	ensure registers a wired project missing from the registry and doctor only reports the gap	['ensure', '--quiet']
+test/wiring-mode.test.js	1060	18	cli	run	env removal clears every owned env key and names preserved user pins	['env', '--remove']
+test/wiring-mode.test.js	1073	18	cli	run	reconciliation preserves and names non-owned alias pins	['env', '--write-user', '--reconcile']
+test/wiring-mode.test.js	1088	18	shim	spawnGatewayProcessSync	installed unwired readiness gate cleans owned leftovers without starting recovery	[launcher, 'readiness-gate']
