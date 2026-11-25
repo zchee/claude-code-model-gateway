@@ -45,12 +45,15 @@ var (
 	ErrOutsideSandbox = errors.New("refusing to touch settings outside the sandbox")
 	// ErrInvalidEnvironment identifies a child environment entry os/exec cannot represent exactly.
 	ErrInvalidEnvironment = errors.New("invalid fixture environment entry")
+	// ErrUsageEndpoint identifies a usage override that is neither disabled nor a safe loopback HTTP endpoint.
+	ErrUsageEndpoint = errors.New("fixture usage requires 0 or an HTTP loopback IP with an explicit non-reserved port")
 )
 
 // Environment is the environment of a gateway process, not its parent's live environment.
 type Environment map[string]string
 
 // NewEnv builds an isolated environment in the caller's temporary home. Overrides cannot move the sandbox root.
+// Usage reporting is off unless an override directs it to a test-owned collector.
 func NewEnv(home string, parent, overrides, isolatedOverrides map[string]string) Environment {
 	socket := filepath.Join(home, "gateway.sock")
 	if runtime.GOOS == "windows" {
@@ -83,10 +86,13 @@ func NewEnv(home string, parent, overrides, isolatedOverrides map[string]string)
 		"CODEX_GATEWAY_DISPATCH_CACHE_PATH": filepath.Join(home, "dispatch-routes.json"),
 		"CODEX_GATEWAY_REQUEST_LOG_PATH":    filepath.Join(home, "request-routes.jsonl"),
 		"CODEX_GATEWAY_TELEMETRY_ENDPOINT":  "http://127.0.0.1:9",
+		usageEndpointKey:                    "0",
 	}
 	isolated := func(key string) bool {
 		_, forced := env[key]
-		return forced || strings.HasPrefix(key, "CODEX_GATEWAY_") || strings.HasPrefix(key, "MODEL_GATEWAY_") || key == "ANTHROPIC_BASE_URL" || key == "ANTHROPIC_UNIX_SOCKET" || key == "CLAUDE_CODE_PLUGIN_CACHE_DIR"
+		return forced || strings.HasPrefix(key, "CODEX_GATEWAY_") || strings.HasPrefix(key, "MODEL_GATEWAY_") ||
+			strings.HasPrefix(strings.ToUpper(key), "OTEL_EXPORTER_OTLP") ||
+			key == "ANTHROPIC_BASE_URL" || key == "ANTHROPIC_UNIX_SOCKET" || key == "CLAUDE_CODE_PLUGIN_CACHE_DIR"
 	}
 	for key, value := range parent {
 		if !isolated(key) {
@@ -104,7 +110,10 @@ func NewEnv(home string, parent, overrides, isolatedOverrides map[string]string)
 	return env
 }
 
-const sandboxKey = "MODEL_GATEWAY_TEST_SANDBOX"
+const (
+	sandboxKey       = "MODEL_GATEWAY_TEST_SANDBOX"
+	usageEndpointKey = "CODEX_GATEWAY_USAGE_ENDPOINT"
+)
 
 func (env Environment) lookup(key string) (string, bool) {
 	value, ok := env[key]
@@ -194,7 +203,18 @@ func (env Environment) openSandboxDir(path string, allowRoot bool) (*os.Root, er
 	return child, nil
 }
 
-const helperSelector = "-test.run=^TestGatewayFixtureHelper$"
+const (
+	helperSelector      = "-test.run=^TestGatewayFixtureHelper$"
+	usageHelperDispatch = "--gatewaytest-helper=usage"
+)
+
+func validUsageEndpoint(endpoint string) bool {
+	if endpoint == "0" {
+		return true
+	}
+	port, ok := loopbackHTTPPort(endpoint)
+	return ok && port != 4318 // Do not let a fixture reach the default local collector.
+}
 
 func registeredDispatch(args []string) bool {
 	if len(args) < 3 || args[1] != "--" {
@@ -202,7 +222,8 @@ func registeredDispatch(args []string) bool {
 	}
 	switch args[0] {
 	case helperSelector:
-		return args[2] == "--gatewaytest-helper=claude"
+		return args[2] == "--gatewaytest-helper=claude" ||
+			(args[2] == usageHelperDispatch && len(args) == 4 && validUsageEndpoint(args[3]))
 	case "-test.run=^TestEmptyEnvironmentHelper$":
 		mode, ok := strings.CutPrefix(args[2], "--gatewaytest-helper=")
 		return ok && len(args) == 3 && slices.Contains([]string{"empty", "fixture", "alias", "pins", "named-alias", "named-pins"}, mode)
@@ -212,8 +233,11 @@ func registeredDispatch(args []string) bool {
 }
 
 // RunFixture runs a sandbox executable or a registered helper dispatch with exactly env.
-// Only the legacy isolation check may run without a sandbox.
+// Only the legacy isolation check may run without a sandbox. Invalid usage overrides are refused before launch.
 func (env Environment) RunFixture(cmd *exec.Cmd) error {
+	if endpoint, set := env[usageEndpointKey]; set && !validUsageEndpoint(endpoint) {
+		return ErrUsageEndpoint
+	}
 	entries := make([]string, 0, len(env)) // A nil slice inherits the ambient environment.
 	for name, value := range env {
 		if name == "" || strings.ContainsAny(name, "=\x00") || strings.IndexByte(value, 0) >= 0 {

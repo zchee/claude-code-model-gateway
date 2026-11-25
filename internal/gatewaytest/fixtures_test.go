@@ -361,7 +361,10 @@ func TestEmptyFixtureRun(t *testing.T) {
 }
 
 func TestGatewayFixtureHelper(t *testing.T) {
-	gatewaytest.DispatchHelper(t)
+	if endpoint := gatewaytest.DispatchHelper(t); endpoint != "" {
+		postFixtureUsage(t, endpoint)
+		return
+	}
 	if want, ok := os.LookupEnv("GATEWAYTEST_EXPECTED_CWD"); ok {
 		current, err := os.Stat(".")
 		if err != nil {

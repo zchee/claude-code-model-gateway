@@ -34,24 +34,31 @@ import (
 // ErrProbeEndpoint identifies a fixture endpoint that is not a safe loopback HTTP address.
 var ErrProbeEndpoint = errors.New("fixture probe requires an HTTP loopback IP with an explicit non-reserved port")
 
+func loopbackHTTPPort(endpoint string) (uint16, bool) {
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Scheme != "http" || u.User != nil {
+		return 0, false
+	}
+	addr, err := netip.ParseAddrPort(u.Host)
+	if err != nil || addr.Addr().Zone() != "" || !addr.Addr().Unmap().IsLoopback() || addr.Port() == 0 || reservedPort(int(addr.Port())) {
+		return 0, false
+	}
+	return addr.Port(), true
+}
+
 // ProbeAlias reads the init event from an explicitly named sandbox fixture. A refused,
 // missing, timed-out or unsuccessful fixture produces no model. It never falls back to PATH.
 // Only the initial HTTP authority is checked. Built-in responses neither redirect nor forward;
 // the venue, not this check, must contain network activity by a misbehaving fixture.
 func (env Environment) ProbeAlias(ctx context.Context, alias, endpoint string) (*string, error) {
-	u, err := url.Parse(endpoint)
-	if err != nil || u.Scheme != "http" || u.User != nil {
-		return nil, ErrProbeEndpoint
-	}
-	addr, err := netip.ParseAddrPort(u.Host)
-	if err != nil || addr.Addr().Zone() != "" || !addr.Addr().Unmap().IsLoopback() || addr.Port() == 0 || reservedPort(int(addr.Port())) {
+	if _, ok := loopbackHTTPPort(endpoint); !ok {
 		return nil, ErrProbeEndpoint
 	}
 	if !env.guarded() {
 		return nil, nil
 	}
 	var output initLines
-	err = env.StartClaude(ctx, func(ctx context.Context, path string) error {
+	err := env.StartClaude(ctx, func(ctx context.Context, path string) error {
 		ctx, cancel := context.WithTimeout(ctx, time.Duration(config.PinProbeTimeout.Get(env.lookup))*time.Millisecond)
 		defer cancel()
 		child := Environment(config.PinProbeEnvironment(env))

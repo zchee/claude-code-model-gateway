@@ -139,6 +139,44 @@ func (env Environment) StartCountingProxy(t testing.TB) *CountingProxy {
 	return p
 }
 
+// UsageRequest records the parts of a request observed by a fixture collector.
+type UsageRequest struct {
+	Method, RequestURI, ContentType, Body string
+}
+
+// UsageCollector records requests sent to its private loopback URL without forwarding them.
+type UsageCollector struct {
+	URL      string
+	mu       sync.Mutex
+	requests []UsageRequest
+}
+
+// Requests returns a snapshot of the requests recorded by the collector.
+func (c *UsageCollector) Requests() []UsageRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.requests)
+}
+
+// StartUsageCollector starts a recording HTTP collector and shuts it down at test cleanup.
+func (env Environment) StartUsageCollector(t testing.TB) *UsageCollector {
+	t.Helper()
+	collector := new(UsageCollector)
+	collector.URL = env.StartUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+		if err != nil {
+			t.Errorf("read usage request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		collector.mu.Lock()
+		collector.requests = append(collector.requests, UsageRequest{r.Method, r.RequestURI, r.Header.Get("Content-Type"), string(body)})
+		collector.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	})) + "/v1/logs"
+	return collector
+}
+
 // HelperCommand prepares a registered helper in its own private sandbox directory.
 // The caller's test binary must define TestGatewayFixtureHelper(t *testing.T) calling
 // DispatchHelper(t). Use RunFixture on the sandbox environment to launch the helper.
@@ -174,7 +212,8 @@ func (env Environment) HelperCommand(t testing.TB, helper string, args ...string
 }
 
 // DispatchHelper handles the reserved subprocess invocation, doing nothing during ordinary test runs.
-func DispatchHelper(t testing.TB) {
+// It returns the approved endpoint argument for the usage helper; that helper checks its own environment.
+func DispatchHelper(t testing.TB) string {
 	t.Helper()
 	if len(os.Args) >= 4 && os.Args[1] == helperSelector && registeredDispatch(os.Args[1:]) {
 		// The parent passes the checked working directory as the first ExtraFiles descriptor.
@@ -185,10 +224,14 @@ func DispatchHelper(t testing.TB) {
 		if err := errors.Join(dir.Chdir(), dir.Close()); err != nil {
 			t.Fatal(err)
 		}
+		if os.Args[3] == usageHelperDispatch {
+			return os.Args[4]
+		}
 		if err := FakeClaude(os.Args[4:], os.Stdout); err != nil {
 			t.Fatal(err)
 		}
 	}
+	return ""
 }
 
 // FakeClaude answers the version and stream-json requests used by a fixture Claude executable.
