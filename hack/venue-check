@@ -67,12 +67,23 @@ darwin_busy_port() {
     LC_ALL=C perl - "$@" 2>/dev/null <<'PERL'
 use strict;
 use warnings;
-use IO::Socket::INET;
+use Errno qw(EADDRINUSE);
 use IPC::Open3;
-use Socket qw(AF_INET AF_INET6 inet_pton);
+use Socket qw(AF_INET AF_INET6 SOCK_STREAM inet_pton sockaddr_in);
 use Symbol qw(gensym);
-my $canary = IO::Socket::INET->new(LocalAddr=>'127.0.0.1', LocalPort=>0, Listen=>1) or die;
-my $port = $canary->sockport;
+# The kernel's ephemeral range is configurable and may include a gateway port.
+socket(my $canary, AF_INET, SOCK_STREAM, 0) or die;
+my ($port, %tried);
+for (1..16) {
+    my $candidate = 20000 + int rand 40001;
+    next if $tried{$candidate}++;
+    if (bind($canary, sockaddr_in($candidate, inet_pton(AF_INET,'127.0.0.1')))) {
+        $port=$candidate; last;
+    }
+    die unless $! == EADDRINUSE;
+}
+die unless defined $port;
+listen($canary,1) or die;
 my $errors = gensym;
 my $child = open3(undef, my $out, $errors, '/usr/sbin/lsof', '-nP',
     '-iTCP:'.join(',', $port, @ARGV), '-sTCP:LISTEN', '-Fpfn');
