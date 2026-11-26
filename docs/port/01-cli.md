@@ -32,6 +32,8 @@ UNREAD (other lanes): `createProxyRecovery` internals (`lib/process-supervision.
 
 ## 1. Command table
 
+For `remote-control` only: Not ported: user decision of 2026-11-26; see the plan's differences table.
+
 `commands` map: `commands.js:2935-3041`; `ensure` is rewrapped by `automaticLifecycle` at `commands.js:3043-3044`.
 **There is no `restart` command.** "Restart" exists only as the supervisor's `POST /restart` endpoint (`commands.js:2831-2857`) and the client helper `restartWorkerWithDrain` (`lib/process-supervision.js:945-961`).
 
@@ -338,6 +340,9 @@ Env block (`lib/pins.js:428-430,472-474`, `lib/runtime.js:522-532`): `ANTHROPIC_
 
 ### 3.8 `serve-shim` (`commands.js:2456-2905`)
 
+For the compatibility listener and its control endpoint only: Not ported: user decision of 2026-11-26;
+see the plan's differences table.
+
 | Aspect | Behavior | Citation |
 |---|---|---|
 | Startup | `mkdirs`; `ensureControlToken()` (64 hex + `\n`, 0600, `wx`); lifecycle `supervisor-started`; `exit` hook records `supervisor-exit` with `exitCode`; `uncaughtExceptionMonitor` records `supervisor-uncaught-failure` and writes failure file | `:2457-2486`, `lib/control-auth.js:23-33` |
@@ -369,6 +374,8 @@ Supervisor launch (`lib/process-supervision.js:962-991` **[other lane]**): POSIX
 Catalog JSON (`commands.js:1900-1908`, schema 4, file written atomically with 2-space JSON + `\n`): `{schemaVersion:4, source:'model-gateway', updatedAt, writtenBy:<plugin version>, providers:{<p>:{ready,state,message}}, codexReadiness:<providers.codex|null>, models:[{slug,id,label,provider,contextWindow?,contextWindowNote?}]}`. Slug rule `^[a-z0-9][a-z0-9-]{1,31}$`, sha1-6 suffix on overflow, `-N` on collision (`:1583-1608`).
 
 ### 3.10 Remote Control compatibility (`remote-control`, `lib/remote-control.js:137-269` **[other lane]**)
+
+Not ported: user decision of 2026-11-26; see the plan's differences table.
 
 | Action | Behavior |
 |---|---|

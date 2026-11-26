@@ -399,6 +399,8 @@ reliability 0.6 (ownership/PID-command fixtures, #8–#9, are the uncertain part
 
 ### 4.10 RC compatibility
 
+Not ported: user decision of 2026-11-26; see the plan's differences table.
+
 | Invariant | Pinned by |
 |---|---|
 | Managed hosts block parse/add/remove preserves other content; partial blocks refused | `rc-compat-mode:159-225` |
@@ -444,6 +446,9 @@ reliability 0.6 (ownership/PID-command fixtures, #8–#9, are the uncertain part
 ---
 
 ## 5. Skills contract
+
+The `remote-control-compatibility` skill is not shipped with the Go port.
+Not ported: user decision of 2026-11-26; see the plan's differences table.
 
 ### 5.1 Invocation form
 

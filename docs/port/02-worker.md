@@ -35,6 +35,9 @@ tool-result tracker); `lmstudio.js`/`local-llama.js` refresh functions; `setting
 
 ## 1. HTTP surface
 
+For the RC listener and its `compat` diagnostics only: Not ported: user decision of 2026-11-26;
+see the plan's differences table.
+
 The worker is one `http.createServer(handleRequest)` handler shared by up to three listeners (section 10). `handleRequest` is
 `lib/request-worker.js:2361-2678`. Dispatch is strictly in this order; the first match wins.
 
@@ -150,7 +153,7 @@ if raw && path startsWith "/v1/messages":
 | `gpt-5.6-sol` (no `claude-` prefix) | Anthropic passthrough | unchanged | pins.js:25 |
 | missing / non-string `model`, non-JSON body, non-`/v1/messages` path | Anthropic passthrough | unchanged | request-worker.js:2594, 2646 |
 
-Unknown ids are never refused by the gateway; they go to `api.anthropic.com`, which answers for itself.
+Ids not claimed by the preceding rules go to `api.anthropic.com`, which answers for itself.
 
 `[1m]` alias handling: stripped by `proxyRouteFromId` (pins.js:19) and by the Grok branch (`replace(/\[1m\]$/, '')`, request-worker.js:2601).
 The upstream sees the bare backend id; the client's original string (with `claude-` and `[1m]`) is kept as `advertisedModel` and written
@@ -822,6 +825,8 @@ section 4.4: `codex-upstream-blocked.json` `{state:"upstream-blocked", observedA
 
 ### 10.1 Listeners (request-worker.js:2680-2726)
 
+For the RC compatibility listener only: Not ported: user decision of 2026-11-26; see the plan's differences table.
+
 | listener | address | notes | cite |
 |---|---|---|---|
 | main | `127.0.0.1:SHIM_PORT`; `SHIM_PORT = CODEX_GATEWAY_WORKER_PORT || CODEX_GATEWAY_PORT || 18764` | the supervisor forks the worker with `CODEX_GATEWAY_WORKER_PORT=<configured or "0">`, so a supervised worker listens on an ephemeral port and reports it over IPC `{type:"listening", port}`; the supervisor waits 5 s for it | request-worker.js:2688-2694; runtime.js:24-25; commands.js:2487-2488, 2612-2638 |
@@ -832,6 +837,8 @@ All three use the same handler and timeouts (`requestTimeout 0`, `headersTimeout
 wildcard listener; no TLS listener.
 
 ### 10.2 Hosts-bypass resolver (`createHostsBypassResolver`, request-worker.js:881-931)
+
+Not ported: user decision of 2026-11-26; see the plan's differences table.
 
 - `resolve(hostname)`: one cache slot (not keyed by hostname), TTL 5 min. `dns.promises.resolve4` first (first address, family 4), then
   `resolve6`; success refreshes the slot; both failing returns the stale slot if any, else `null`.

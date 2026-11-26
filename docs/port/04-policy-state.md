@@ -16,6 +16,9 @@ Notation: `STATE` = `$HOME/.claude/model-gateway` (see section 2). "load" = read
 
 ## 1. Environment variables
 
+For the variables that configure the RC runtime only: Not ported: user decision of 2026-11-26;
+see the plan's differences table.
+
 ### 1.1 Read in this slice
 
 | Name | Default | Type / parse | Meaning | When | Citation |
@@ -135,6 +138,8 @@ transcripts and `.claude.json` use `CLAUDE_CONFIG_DIR`. `MODEL_GATEWAY_CLAUDE_HO
 `mkdirs()` creates `STATE`, `LOGS`, `BIN_DIR` recursively (`lib/runtime.js:775-777`).
 
 ### 2.3 Network constants
+
+For the RC compatibility constants only: Not ported: user decision of 2026-11-26; see the plan's differences table.
 
 | Constant | Value | Citation |
 |---|---|---|

@@ -29,6 +29,9 @@ Everything else in lib/ (request routing, catalog, settings-wiring, readiness-ho
 
 ## 1. Process topology
 
+For the RC compatibility listener and its probe only: Not ported: user decision of 2026-11-26; see the plan's
+differences table.
+
 ### 1.1 Process table
 
 | Process | Spawned by | Command line | Env additions | Listens on | Cite |
@@ -164,6 +167,8 @@ The supervisor has no `/drain` handler: it authenticates the request and relays 
 `canReplaceInstalledCliPath(current, candidate)` (runtime.js:648-671): both strings, both absolute; both `realpath` resolvable; if equal lexically → realpaths must be equal; else all four paths (lexical and real) end `bin/model-gateway.js`; same cache root (`dirname³`) lexically **and** after realpath; both parent dirs parse as `X.Y.Z`; candidate's lexical and real version-dir basenames equal; candidate version ≥ current.
 
 ### 3.4 `/internal/rc-compatibility` (commands.js:2715-2799, 852-886)
+
+Not ported: user decision of 2026-11-26; see the plan's differences table.
 
 | Item | Value |
 |---|---|
@@ -461,7 +466,7 @@ Intentional-stop marker functions live in the same module (96-108, see §2).
 |---|---|---|
 | Path | `~/.claude/model-gateway/logs/lifecycle.jsonl` (no env override) | runtime.js:37 |
 | Write | `mkdir -p`; trim; `appendFileSync(JSON + '\n')`; every error swallowed | 36-43 |
-| Bound | before each append: if the file has ≥ 200 non-empty lines, rewrite it with the last 199 (non-atomic `writeFileSync`); so the file holds at most 200 records | 7, 29-34 |
+| Bound | before each append: if the file has ≥ 200 non-empty lines, rewrite it with the last 199 (non-atomic `writeFileSync`). The trim and append are not locked, so the nominal bound is 200 records, not a concurrency guarantee | 7, 29-34 |
 | Concurrency | no lock; supervisor and CLIs append concurrently; a concurrent trim can drop records (inference) | — |
 | Read | `readLifecycleRecords` skips unparsable lines; doctor shows the last `supervisor-exit`/`worker-exit`/`proxy-exit` and last `ensure-hook-wait-cut-short` | 45-59; commands.js:1430, 1438 |
 
@@ -544,6 +549,8 @@ Other Windows branches in the slice:
 
 ## 9. Remote Control compatibility (lib/remote-control.js, full)
 
+Not ported: user decision of 2026-11-26; see the plan's differences table.
+
 Constants (runtime.js:44-53): `COMPAT_HOST='api.anthropic.com'`, `COMPAT_PORT=80` (`CODEX_GATEWAY_COMPAT_PORT`), `COMPAT_BASE_URL='http://api.anthropic.com'`, block start `# >>> model-gateway RC compatibility >>>`, end `# <<< model-gateway RC compatibility <<<`, line `127.0.0.1 api.anthropic.com`.
 
 | Item | Rule | Cite |
@@ -568,7 +575,7 @@ Constants (runtime.js:44-53): `COMPAT_HOST='api.anthropic.com'`, `COMPAT_PORT=80
 | Race guard | re-read file; bytes differ from the first read → die, untouched | same |
 | Write | backup `<hosts>.model-gateway-<ISO with :/. → ->.bak` via `copyFileSync`; `writeFileSync(hosts)` (not atomic); failure → die naming backup | same |
 | Activate | `reconcile` with expected supervisor pid → must be `bound`; `remoteControlVerify(requireCompatibility:true)`; `syncCompatMode({requiredMode:'compat'})` must return mode `compat` | `startAll()` ok; `reconcile` must be `bound`; verify with `requireCompatibility:false`; `syncCompatMode()` |
-| Rollback (enable only) | if the file still equals what this command wrote → restore original bytes; else keep and point to backup; then `reconcile` again and report; finally die "hosts file changed, but gateway reconciliation failed" | disable: no rollback, die with backup name |
+| Rollback (enable only) | if the decoded text still equals what this command wrote → write back the original decoded UTF-8 text; else keep and point to backup; then `reconcile` again and report; finally die "hosts file changed, but gateway reconciliation failed" | disable: no rollback, die with backup name |
 
 `remoteControlVerify` (271-292): ready iff `health.ok`, supervisor pid matches (when expected), and (compat) hosts entry present ∧ `compat.hostsDetected` ∧ `compat.port80Bound`, or (default) all three false. Prints DNS lookup of the host, entry, port state, health, model count; for compat it also states Remote Control end-to-end is not verified (session creation uses HTTPS while the transport is HTTP).
 
