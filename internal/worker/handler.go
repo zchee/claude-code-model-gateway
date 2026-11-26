@@ -314,7 +314,8 @@ func (h *handler) models(w http.ResponseWriter, r *http.Request, snap route.Snap
 		body, err := h.options.Models(r.Context(), r.Header.Clone())
 		switch {
 		case r.Context().Err() != nil:
-			// The client left; nothing is written for it.
+			// The client left; nothing is written for it, and net/http must not answer in the handler's place.
+			panic(http.ErrAbortHandler)
 		case err != nil:
 			writeJSON(w, http.StatusBadGateway, []byte(modelsFailureBody))
 			h.diagnose("model-gateway: the model listing failed; answered %d\n", http.StatusBadGateway)
@@ -324,7 +325,7 @@ func (h *handler) models(w http.ResponseWriter, r *http.Request, snap route.Snap
 		return
 	}
 	if r.Context().Err() != nil {
-		return
+		panic(http.ErrAbortHandler)
 	}
 	_, rows := snap.Catalog()
 	if len(rows) == 0 {
@@ -425,7 +426,8 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request, snap route.Snaps
 	}()
 
 	// gone accounts a client that has left: the departure callback has delivered the cancelled result, or, when it
-	// could still be stopped, the same result is delivered here. Nothing is written for that client.
+	// could still be stopped, the same result is delivered here. Nothing is written for that client, and the caller
+	// aborts the connection so that net/http does not answer a handler that returned without a status.
 	gone := func() bool {
 		if r.Context().Err() == nil {
 			return false
@@ -457,13 +459,13 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request, snap route.Snaps
 		return
 	}
 	if gone() {
-		return
+		panic(http.ErrAbortHandler)
 	}
 
 	d := snap.Classify(r.Method, target, body)
 	if d.Branch == "refused" {
 		if gone() {
-			return
+			panic(http.ErrAbortHandler)
 		}
 		h.refuse(w, d.Reason)
 		if !settle() {
@@ -474,7 +476,7 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request, snap route.Snaps
 	forward := h.branch(d.Branch)
 	if forward == nil {
 		if gone() {
-			return
+			panic(http.ErrAbortHandler)
 		}
 		writeJSON(w, http.StatusBadGateway, []byte(noBranchBody))
 		if !settle() {
@@ -483,7 +485,7 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request, snap route.Snaps
 		return
 	}
 	if gone() {
-		return
+		panic(http.ErrAbortHandler)
 	}
 	result, err := forward(w, r, snap, d, body, func(selected outcome.Route, audit *outcome.Audit) {
 		h.admit(r, d, t, selected, audit)

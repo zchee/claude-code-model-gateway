@@ -154,7 +154,7 @@ func Run(ctx context.Context, opts Options) error {
 			}
 		case err := <-served:
 			served <- err
-			stopErr, waiting = errors.Join(errors.New("model-gateway: the public listener stopped"), err), false
+			stopErr, waiting = fmt.Errorf("model-gateway: the public listener stopped: %w", err), false
 		case err := <-s.fatal:
 			stopErr, waiting = err, false
 		}

@@ -43,6 +43,11 @@ const (
 	relayWait     = 50 * time.Millisecond
 	// shutdownGrace bounds how long a cancelled Serve waits for in-flight requests before closing their connections.
 	shutdownGrace = 5 * time.Second
+	// maxInterim is the number of interim responses tolerated before the worker's final answer; the next one ends the
+	// exchange, as in net/http's client.
+	maxInterim = 5
+	// maxHealthBody bounds the worker's health document the supervisor reads to add its own identity.
+	maxHealthBody = 1 << 20
 )
 
 type handler struct {
@@ -242,6 +247,10 @@ var relayExcluded = []string{"Host", "Content-Length", "Transfer-Encoding", "Tra
 // roundTrip sends one request on a connection of its own (lib/commands.js:2467-2472) and reads the response head.
 // connected reports whether the worker accepted the connection, after which it may have taken the body. The request
 // line carries target byte for byte. The returned body closes the connection.
+//
+// The Connection: close on this leg concerns the worker connection only. http.ReadResponse removes a Connection: close
+// field from the worker's answer, so the relayed response does not carry it and the client's connection stays open
+// unless the client or the public listener ends it.
 func roundTrip(ctx context.Context, r *http.Request, target string, body []byte, port int) (*http.Response, bool, error) {
 	authority := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 	var dialer net.Dialer
@@ -274,7 +283,7 @@ func roundTrip(ctx context.Context, r *http.Request, target string, body []byte,
 		return nil, true, err
 	}
 	br := bufio.NewReader(conn)
-	for {
+	for interim := 0; ; interim++ {
 		resp, err := http.ReadResponse(br, &http.Request{Method: r.Method})
 		if err != nil {
 			release()
@@ -285,9 +294,17 @@ func roundTrip(ctx context.Context, r *http.Request, target string, body []byte,
 			return resp, true, nil
 		}
 		_ = resp.Body.Close()
-		if resp.StatusCode == http.StatusSwitchingProtocols {
+		// The worker took the connection, so each of these is answered as a worker that never answered.
+		switch {
+		case resp.StatusCode < http.StatusContinue:
+			release()
+			return nil, true, fmt.Errorf("model-gateway: the worker answered with status %d", resp.StatusCode)
+		case resp.StatusCode == http.StatusSwitchingProtocols:
 			release()
 			return nil, true, errors.New("model-gateway: the worker switched protocols on a relayed request")
+		case interim+1 > maxInterim:
+			release()
+			return nil, true, errors.New("model-gateway: the worker sent too many interim responses")
 		}
 	}
 }
@@ -334,9 +351,14 @@ func streamBody(w http.ResponseWriter, body io.Reader) error {
 
 // relayHealth adds the supervisor's identity to the worker's health document (lib/commands.js:2408-2419).
 func (h *handler) relayHealth(w http.ResponseWriter, resp *http.Response) {
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxHealthBody+1))
 	if err != nil {
 		panic(http.ErrAbortHandler)
+	}
+	if len(data) > maxHealthBody {
+		// Too large to be the worker's health document.
+		w.WriteHeader(http.StatusBadGateway)
+		return
 	}
 	health, err := jsonx.DecodeWire(data)
 	if err != nil || health.Kind != '{' {

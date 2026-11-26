@@ -39,8 +39,11 @@ import (
 // lib/control-auth.js:41-43). Each request head is parsed exactly once, by net/textproto (the parser net/http uses for
 // the same purpose), and Request.Host is the Host field of that parse. A connection serves its requests strictly one
 // after another: the next head is read only after the previous response is complete and the previous body has been read
-// to its framed end, trailers included; otherwise the connection is closed. Nothing is answered without the handler
-// except a refusal of a request that cannot be parsed or framed.
+// to its framed end, trailers included; otherwise the connection is closed. A response whose head is sent before the
+// request body was read to its end says Connection: close. Nothing is answered without the handler except a refusal of
+// a complete request head that cannot be parsed or framed. A head cut off by the end of the stream gets no refusal, and
+// a request whose client departed, or whose body ended early or failed, gets no answer the handler did not write: in
+// both cases the connection is closed without response bytes.
 
 const (
 	// headTimeout and idleTimeout are the source's server settings; a request has no overall time limit
@@ -50,14 +53,23 @@ const (
 	// maxHeadBytes bounds the bytes read from the connection while one request head or trailer section is parsed,
 	// as net/http bounds them by its default header limit plus its read slack.
 	maxHeadBytes = http.DefaultMaxHeaderBytes + 4096
-	// maxDiscard bounds the unread request body read away so that the connection can serve its next request.
+	// maxHeaderFields bounds the field lines of one request head or trailer section. Node's server keeps at most
+	// 2000 header fields; a head with more is refused here rather than cut short.
+	maxHeaderFields = 2000
+	// maxDiscard bounds the request bytes read away while a closing connection lingers.
 	maxDiscard = 256 << 10
 	// lingerTimeout bounds the wait for the client to close its end of a connection that is being closed, so that
 	// unread request bytes do not turn the close into a reset that destroys the response.
 	lingerTimeout = 500 * time.Millisecond
+	// closingWriteTimeout bounds a refusal and the final flush before a linger, so that a client that never reads
+	// cannot hold the connection open.
+	closingWriteTimeout = 5 * time.Second
 )
 
-var errHeadTooLarge = errors.New("model-gateway: request head too large")
+var (
+	errHeadTooLarge     = errors.New("model-gateway: request head too large")
+	errMalformedTrailer = errors.New("model-gateway: malformed request trailer")
+)
 
 type server struct {
 	handler http.Handler
@@ -75,7 +87,7 @@ type server struct {
 func Serve(ctx context.Context, listener net.Listener, handler http.Handler) error {
 	s := &server{handler: handler, base: context.WithoutCancel(ctx), conns: make(map[*conn]struct{})}
 	accepted := make(chan error, 1)
-	go func() { accepted <- s.accept(listener) }()
+	go func() { accepted <- s.accept(ctx, listener) }()
 	var err error
 	select {
 	case err = <-accepted:
@@ -92,7 +104,7 @@ func Serve(ctx context.Context, listener net.Listener, handler http.Handler) err
 	return nil
 }
 
-func (s *server) accept(listener net.Listener) error {
+func (s *server) accept(ctx context.Context, listener net.Listener) error {
 	var delay time.Duration
 	for {
 		rwc, err := listener.Accept()
@@ -101,7 +113,13 @@ func (s *server) accept(listener net.Listener) error {
 				return err
 			}
 			delay = min(max(2*delay, 5*time.Millisecond), time.Second)
-			time.Sleep(delay)
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return err
+			case <-timer.C:
+			}
 			continue
 		}
 		delay = 0
@@ -167,10 +185,12 @@ func (s *server) isStopping() bool {
 }
 
 // budgetReader limits the bytes read from the connection while a head or trailer section is parsed. The budget counts
-// the bytes actually read, so a head is judged the same however the network splits it.
+// the bytes actually read, so a head is judged the same however the network splits it. It also records whether the
+// stream ended during the parse, because bufio returns a cut-off last line without the end-of-stream error.
 type budgetReader struct {
 	r      io.Reader
 	remain int64 // Negative when no parse is in progress.
+	ended  bool  // The stream ended while a section was parsed.
 }
 
 func (b *budgetReader) Read(p []byte) (int, error) {
@@ -185,6 +205,9 @@ func (b *budgetReader) Read(p []byte) (int, error) {
 	}
 	n, err := b.r.Read(p)
 	b.remain -= int64(n)
+	if errors.Is(err, io.EOF) {
+		b.ended = true
+	}
 	return n, err
 }
 
@@ -226,10 +249,14 @@ func (c *conn) serve() {
 		if !c.awaitHead(first) {
 			return
 		}
-		if !c.serveOne() {
-			c.linger()
-			return
+		keep, linger := c.serveOne()
+		if keep {
+			continue
 		}
+		if linger {
+			c.linger()
+		}
+		return
 	}
 }
 
@@ -259,17 +286,18 @@ func (c *conn) awaitHead(first bool) bool {
 	return true
 }
 
-// serveOne reads, dispatches and completes one request. It reports whether the connection can carry another one.
-func (c *conn) serveOne() bool {
+// serveOne reads, dispatches and completes one request. It reports whether the connection can carry another one and,
+// when it cannot, whether a complete closing response head was written, after which the connection lingers.
+func (c *conn) serveOne() (keep, linger bool) {
 	_ = c.rwc.SetReadDeadline(time.Now().Add(headTimeout))
-	c.budget.remain = maxHeadBytes
+	c.budget.remain, c.budget.ended = maxHeadBytes, false
 	parsed, status := c.readRequest()
+	ended := c.budget.ended
 	c.budget.remain = -1
 	if parsed == nil {
-		if status != 0 {
-			c.writeRefusal(status)
-		}
-		return false
+		// A head the stream cut off is not refused, whatever its partial last line looks like: the client never
+		// finished it, so the connection closes without response bytes.
+		return false, status != 0 && !ended && c.writeRefusal(status)
 	}
 	_ = c.rwc.SetReadDeadline(time.Time{})
 
@@ -286,24 +314,34 @@ func (c *conn) serveOne() bool {
 
 	body := parsed.body
 	req := parsed.req.WithContext(ctx)
-	body.done = parsed.req.ContentLength == 0
+	body.done.Store(parsed.req.ContentLength == 0)
 	body.atEnd = func() { c.watchDeparture(cancel) }
-	if body.done {
+	if body.done.Load() {
 		c.watchDeparture(cancel)
 	}
 	c.answered = false
-	w := &response{c: c, req: req, header: make(http.Header), length: -1}
+	w := &response{c: c, req: req, body: body, header: make(http.Header), length: -1}
 	aborted := c.dispatch(w, req)
+	// A handler that set no status for a client that departed, or for a body that ended early or failed, wrote
+	// nothing for it; a success is never made up in its place. The context is read before it is cancelled below.
+	abandoned := w.status == 0 && (ctx.Err() != nil || c.departed.Load() || body.failed())
 	c.stopWatch()
 	cancel()
-	if aborted {
-		return false
+	// Nothing reads the body after this, so the connection's reader is free for the next head.
+	_ = body.Close()
+	if aborted || abandoned {
+		return false, false
 	}
 	w.finish()
-	if w.close || w.failed != nil || c.departed.Load() || c.srv.isStopping() {
-		return false
+	switch {
+	case w.failed != nil:
+		return false, false
+	case w.close || c.departed.Load() || c.srv.isStopping():
+		return false, w.closing
 	}
-	return body.discard()
+	// A head sent before the body ended says Connection: close, so a response that kept the connection followed a
+	// body read to its end.
+	return body.done.Load(), false
 }
 
 func (c *conn) dispatch(w *response, req *http.Request) (aborted bool) {
@@ -355,6 +393,7 @@ func (c *conn) stopWatch() {
 // client receives the response before the connection ends.
 func (c *conn) linger() {
 	c.wmu.Lock()
+	_ = c.rwc.SetWriteDeadline(time.Now().Add(closingWriteTimeout))
 	_ = c.bw.Flush()
 	c.wmu.Unlock()
 	if cw, ok := c.rwc.(interface{ CloseWrite() error }); ok {
@@ -364,11 +403,15 @@ func (c *conn) linger() {
 	_, _ = io.Copy(io.Discard, io.LimitReader(c.rwc, maxDiscard))
 }
 
-func (c *conn) writeRefusal(status int) {
+// writeRefusal answers a request that cannot be parsed or framed and reports whether the answer was sent.
+func (c *conn) writeRefusal(status int) bool {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
-	_, _ = fmt.Fprintf(c.bw, "HTTP/1.1 %d %s\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", status, http.StatusText(status))
-	_ = c.bw.Flush()
+	_ = c.rwc.SetWriteDeadline(time.Now().Add(closingWriteTimeout))
+	if _, err := fmt.Fprintf(c.bw, "HTTP/1.1 %d %s\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", status, http.StatusText(status)); err != nil {
+		return false
+	}
+	return c.bw.Flush() == nil
 }
 
 func (c *conn) writeContinue() error {
@@ -425,12 +468,8 @@ func (c *conn) readRequest() (*parsedRequest, int) {
 		return nil, readFailure(err)
 	}
 	header := http.Header(mime)
-	for _, values := range header {
-		for _, v := range values {
-			if !validFieldValue(v) {
-				return nil, http.StatusBadRequest
-			}
-		}
+	if status := fieldsStatus(header); status != 0 {
+		return nil, status
 	}
 	hosts := header["Host"]
 	if len(hosts) > 1 || len(hosts) == 0 && minor == 1 {
@@ -484,24 +523,15 @@ func framing(header http.Header, minor int) (int64, int) {
 	if len(lengths) == 0 {
 		return 0, 0
 	}
-	first := strings.TrimSpace(lengths[0])
-	for _, v := range lengths[1:] {
-		if strings.TrimSpace(v) != first {
-			return 0, http.StatusBadRequest
-		}
-	}
-	if first == "" || strings.Trim(first, "0123456789") != "" {
-		return 0, http.StatusBadRequest
-	}
-	n, err := strconv.ParseInt(first, 10, 64)
-	if err != nil {
+	n, ok := singleLength(lengths)
+	if !ok {
 		return 0, http.StatusBadRequest
 	}
 	return n, 0
 }
 
-// readFailure maps a head read error: an oversized head is refused, a malformed one gets 400, and a connection that
-// failed or closed is closed without an answer.
+// readFailure maps a head read error: an oversized head is refused, a malformed one gets 400 unless the stream ended
+// inside it (serveOne drops that refusal), and a connection that failed or closed is closed without an answer.
 func readFailure(err error) int {
 	var protocol textproto.ProtocolError
 	switch {
@@ -512,6 +542,31 @@ func readFailure(err error) int {
 	default:
 		return 0
 	}
+}
+
+// fieldsStatus refuses a header or trailer section with too many field lines (431), or else one with a field name that
+// is not a token or a field value with a control character (400). The count is checked first, over the whole section,
+// so the answer does not depend on map order. net/textproto accepts a name with a space before the colon and keeps it
+// as sent, so without the name check such a field would pass every comparison by its real name.
+func fieldsStatus(header http.Header) int {
+	lines := 0
+	for _, values := range header {
+		lines += len(values)
+	}
+	if lines > maxHeaderFields {
+		return http.StatusRequestHeaderFieldsTooLarge
+	}
+	for name, values := range header {
+		if !isToken(name) {
+			return http.StatusBadRequest
+		}
+		for _, v := range values {
+			if !validFieldValue(v) {
+				return http.StatusBadRequest
+			}
+		}
+	}
+	return 0
 }
 
 func isToken(s string) bool {
@@ -558,8 +613,10 @@ type requestBody struct {
 	expect  bool // The client waits for 100 Continue before sending the body.
 	atEnd   func()
 
+	// done is set once the body was read to its framed end. It is read without mu while the response head is sent.
+	done atomic.Bool
+
 	mu     sync.Mutex
-	done   bool
 	err    error
 	closed bool
 }
@@ -575,7 +632,7 @@ func (b *requestBody) Read(p []byte) (int, error) {
 
 func (b *requestBody) read(p []byte) (int, error) {
 	switch {
-	case b.done:
+	case b.done.Load():
 		return 0, io.EOF
 	case b.err != nil:
 		return 0, b.err
@@ -608,7 +665,7 @@ func (b *requestBody) read(p []byte) (int, error) {
 		}
 	}
 	if errors.Is(err, io.EOF) {
-		b.done = true
+		b.done.Store(true)
 		if b.atEnd != nil {
 			b.atEnd()
 		}
@@ -620,16 +677,32 @@ func (b *requestBody) read(p []byte) (int, error) {
 	return n, err
 }
 
+// readTrailer reads the trailer section under the same byte budget and time limit as a request head.
 func (b *requestBody) readTrailer() error {
 	b.c.budget.remain = maxHeadBytes
-	defer func() { b.c.budget.remain = -1 }()
-	if _, err := textproto.NewReader(b.c.br).ReadMIMEHeader(); err != nil {
+	_ = b.c.rwc.SetReadDeadline(time.Now().Add(headTimeout))
+	defer func() {
+		b.c.budget.remain = -1
+		_ = b.c.rwc.SetReadDeadline(time.Time{})
+	}()
+	trailer, err := textproto.NewReader(b.c.br).ReadMIMEHeader()
+	if err != nil {
 		if errors.Is(err, io.EOF) {
 			return io.ErrUnexpectedEOF
 		}
 		return err
 	}
+	if fieldsStatus(http.Header(trailer)) != 0 {
+		return errMalformedTrailer
+	}
 	return io.EOF
+}
+
+// failed reports whether a body read ended in an error, including an early end.
+func (b *requestBody) failed() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.err != nil
 }
 
 func (b *requestBody) Close() error {
@@ -639,40 +712,13 @@ func (b *requestBody) Close() error {
 	return nil
 }
 
-// discard reads the unread rest of the body so that the connection can serve another request. It reports false when
-// the rest is too large, the client still waits for 100 Continue, or the read fails.
-func (b *requestBody) discard() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.done {
-		return true
-	}
-	if b.expect || b.err != nil {
-		return false
-	}
-	b.atEnd = nil
-	_ = b.c.rwc.SetReadDeadline(time.Now().Add(headTimeout))
-	defer func() { _ = b.c.rwc.SetReadDeadline(time.Time{}) }()
-	buf := make([]byte, 32<<10)
-	for total := 0; total <= maxDiscard; {
-		n, err := b.read(buf)
-		total += n
-		if errors.Is(err, io.EOF) {
-			return true
-		}
-		if err != nil {
-			return false
-		}
-	}
-	return false
-}
-
 // response writes one HTTP/1.1 response. The head is sent with the first body bytes, a flush or the handler's return,
 // so a response without a body carries Content-Length: 0. A body of unknown length is chunked for an HTTP/1.1 client
 // and delimited by the connection's end otherwise.
 type response struct {
 	c      *conn
 	req    *http.Request
+	body   *requestBody
 	header http.Header
 
 	status   int
@@ -683,6 +729,7 @@ type response struct {
 	length   int64 // -1 when unknown.
 	written  int64
 	close    bool
+	closing  bool // The head carried Connection: close.
 	failed   error
 	finished bool
 }
@@ -712,12 +759,14 @@ func (w *response) sendHead() {
 	}
 	h := w.head
 	w.noBody = w.req.Method == http.MethodHead || w.status == http.StatusNoContent || w.status == http.StatusNotModified
-	if v := h.Get("Content-Length"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
-			w.length = n
-		} else {
-			h.Del("Content-Length")
-		}
+	if w.status == http.StatusNoContent {
+		// A 204 response carries no Content-Length (RFC 9110, section 8.6).
+		h.Del("Content-Length")
+	} else if n, ok := singleLength(h["Content-Length"]); ok {
+		w.length = n
+		h["Content-Length"] = []string{strconv.FormatInt(n, 10)}
+	} else {
+		h.Del("Content-Length")
 	}
 	h.Del("Transfer-Encoding")
 	switch {
@@ -731,8 +780,9 @@ func (w *response) sendHead() {
 	default:
 		w.close = true
 	}
-	if w.close || w.req.Close || headerHasToken(h["Connection"], "close") || w.c.srv.isStopping() {
-		w.close = true
+	if w.close || w.req.Close || !w.body.done.Load() || headerHasToken(h["Connection"], "close") || w.c.srv.isStopping() {
+		// The rest of an unread body is not read away: the connection ends after this response.
+		w.close, w.closing = true, true
 		h.Set("Connection", "close")
 	}
 	if _, ok := h["Date"]; !ok {
@@ -754,6 +804,24 @@ func (w *response) sendHead() {
 	if _, err := w.c.bw.WriteString("\r\n"); err != nil {
 		w.fail(err)
 	}
+}
+
+// singleLength returns the one Content-Length the values agree on, or false when there is none or they disagree.
+func singleLength(values []string) (int64, bool) {
+	if len(values) == 0 {
+		return 0, false
+	}
+	first := strings.TrimSpace(values[0])
+	for _, v := range values[1:] {
+		if strings.TrimSpace(v) != first {
+			return 0, false
+		}
+	}
+	if first == "" || strings.Trim(first, "0123456789") != "" {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(first, 10, 64)
+	return n, err == nil
 }
 
 func (w *response) fail(err error) {

@@ -18,28 +18,66 @@
 package cli
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/spf13/cobra"
 
 	"github.com/zchee/claude-code-model-gateway/internal/cli/argscan"
 	"github.com/zchee/claude-code-model-gateway/internal/cli/completions"
+	"github.com/zchee/claude-code-model-gateway/internal/cli/serveshim"
+	"github.com/zchee/claude-code-model-gateway/internal/cli/serveworker"
 	"github.com/zchee/claude-code-model-gateway/internal/cli/version"
+	"github.com/zchee/claude-code-model-gateway/internal/config"
 )
 
+// Process holds the facts about the running process that the commands may need. A nil function stands for a fact
+// the caller cannot supply: the environment list is then empty, and a command that needs a missing working directory
+// or executable fails with an ordinary error.
+type Process struct {
+	Lookup     func(string) (string, bool)
+	Environ    func() []string
+	Home, Cwd  func() (string, error)
+	Executable func() (string, error)
+}
+
 // Run dispatches argv, including the executable name, and returns an exit status.
-// It uses lookup and home to resolve paths without reading the process environment.
+// It uses lookup and home to resolve paths without reading the process environment. The environment list it gives
+// the commands holds the gateway's registered variables that lookup reports, as NAME=value in the order of the
+// environment catalog; it supplies no working directory or executable.
 func Run(argv []string, stdin io.Reader, stdout, stderr io.Writer, lookup func(string) (string, bool), home func() (string, error)) int {
 	return run(argv, stdin, stdout, stderr, lookup, home, sourceCommands())
 }
 
+// RunProcess dispatches argv like Run, taking every fact about the running process from p.
+func RunProcess(argv []string, stdin io.Reader, stdout, stderr io.Writer, p Process) int {
+	return runProcess(argv, stdin, stdout, stderr, p, sourceCommands())
+}
+
 func run(argv []string, stdin io.Reader, stdout, stderr io.Writer, lookup func(string) (string, bool), home func() (string, error), commands []sourceCommand) int {
+	environ := func() []string {
+		var entries []string
+		for _, variable := range config.Variables() {
+			if value, ok := lookup(variable.Name); ok {
+				entries = append(entries, variable.Name+"="+value)
+			}
+		}
+		return entries
+	}
+	return runProcess(argv, stdin, stdout, stderr, Process{Lookup: lookup, Environ: environ, Home: home}, commands)
+}
+
+func runProcess(argv []string, stdin io.Reader, stdout, stderr io.Writer, p Process, commands []sourceCommand) int {
+	lookup, home := p.Lookup, p.Home
 	name := commandName(argv)
-	root := newRoot(name, commands, lookup, home)
+	root := newRoot(name, commands, p)
 	var args []string
 	var command string
 	if len(argv) > 1 {
@@ -113,12 +151,14 @@ type sourceCommand struct {
 }
 
 type invocation struct {
-	name    string
-	scan    *commandScan // Nil for the early stdin-only dispatch.
-	streams argscan.Streams
-	stdin   io.Reader
-	lookup  func(string) (string, bool)
-	home    func() (string, error)
+	name       string
+	scan       *commandScan // Nil for the early stdin-only dispatch.
+	streams    argscan.Streams
+	stdin      io.Reader
+	lookup     func(string) (string, bool)
+	environ    func() []string
+	home, cwd  func() (string, error)
+	executable func() (string, error)
 }
 
 type commandScan struct {
@@ -164,13 +204,13 @@ func sourceCommands() []sourceCommand {
 		// bin/model-gateway.js:7 and lib/commands.js:1397,3037.
 		{name: "doctor", short: "Run a full gateway health check", mode: scanNone, handle: stubRun},
 		// lib/commands.js:2456-2905,3039.
-		{name: "serve-shim", short: "Run the router in the foreground (internal)", mode: scanNone, handle: stubRun},
+		{name: "serve-shim", short: "Run the router in the foreground (internal)", mode: scanNone, handle: serveShim},
 		// lib/commands.js:3040 and lib/request-worker.js:1208 onward.
-		{name: "serve-worker", short: "Run the worker in the foreground", hidden: true, mode: scanNone, handle: stubRun},
+		{name: "serve-worker", short: "Run the worker in the foreground", hidden: true, mode: scanNone, handle: serveWorker},
 	}
 }
 
-func newRoot(name string, commands []sourceCommand, lookup func(string) (string, bool), home func() (string, error)) *cobra.Command {
+func newRoot(name string, commands []sourceCommand, p Process) *cobra.Command {
 	root := &cobra.Command{
 		Use:               name,
 		Short:             "Manage the Claude Code model gateway",
@@ -186,10 +226,13 @@ func newRoot(name string, commands []sourceCommand, lookup func(string) (string,
 			SilenceUsage:       true,
 			RunE: func(cmd *cobra.Command, args []string) error {
 				stdout, stderr := cmd.OutOrStdout(), cmd.ErrOrStderr()
-				call := invocation{name: spec.name, stdin: cmd.InOrStdin(), lookup: lookup, home: home}
+				call := invocation{
+					name: spec.name, stdin: cmd.InOrStdin(),
+					lookup: p.Lookup, environ: p.Environ, home: p.Home, cwd: p.Cwd, executable: p.Executable,
+				}
 				if spec.mode == scanStdin {
 					call.streams = argscan.Streams{Log: stdout, Output: stdout, Error: stderr}
-					return spec.handle(call)
+					return handled(cmd, spec.handle(call))
 				}
 				scan := argscan.Scan(args)
 				call.streams = scan.Streams(stdout, stderr)
@@ -205,7 +248,7 @@ func newRoot(name string, commands []sourceCommand, lookup func(string) (string,
 					call.scan.pairOptions = spec.flags
 					call.scan.pairs = slices.Collect(scan.Pairs())
 				}
-				return spec.handle(call)
+				return handled(cmd, spec.handle(call))
 			},
 		}
 		root.AddCommand(cmd)
@@ -216,4 +259,87 @@ func newRoot(name string, commands []sourceCommand, lookup func(string) (string,
 
 func stubRun(call invocation) error {
 	return fmt.Errorf("%s: not implemented", call.name)
+}
+
+// errReported is returned by a command that already wrote its failure to stderr; it only sets the exit status.
+var errReported = errors.New("model-gateway: failure already reported")
+
+// handled passes a command's result to cobra, which prints every error except errReported.
+func handled(cmd *cobra.Command, err error) error {
+	if errors.Is(err, errReported) {
+		cmd.SilenceErrors = true
+	}
+	return err
+}
+
+// serveShim runs the supervisor in the foreground (lib/commands.js:3039). Its worker is this executable. Without an
+// executable lookup the supervisor gets an empty path, which it refuses only after resolving its state directory.
+func serveShim(call invocation) error {
+	stderr := &stderrTail{w: call.streams.Error}
+	var executable string
+	if call.executable != nil {
+		path, err := call.executable()
+		if err != nil {
+			return stderr.report(fmt.Errorf("could not locate the worker executable: %w", err))
+		}
+		executable = path
+	}
+	var environ []string
+	if call.environ != nil {
+		environ = call.environ()
+	}
+	return stderr.report(serveshim.Run(context.Background(), serveshim.Options{
+		Environment: environ, Home: call.home, Executable: executable,
+		Version: version.String(), Stdout: call.streams.Output, Stderr: stderr,
+	}))
+}
+
+// serveWorker runs the request worker in the foreground (lib/commands.js:3040).
+func serveWorker(call invocation) error {
+	stderr := &stderrTail{w: call.streams.Error}
+	return stderr.report(serveworker.Run(context.Background(), serveworker.Options{
+		Lookup: call.lookup, Home: call.home, Cwd: call.cwd,
+		Version: version.String(), Stdout: call.streams.Output, Stderr: stderr,
+	}))
+}
+
+// maxStderrTail bounds the end of a serve command's stderr kept to recognize an error the command printed itself.
+const maxStderrTail = 64 << 10
+
+// stderrTail passes a serve command's diagnostics through and keeps their end. The commands print some failures
+// themselves before returning them, so a returned error whose text is already there is not printed again.
+type stderrTail struct {
+	w    io.Writer
+	mu   sync.Mutex
+	tail []byte
+}
+
+func (s *stderrTail) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	s.tail = append(s.tail, p...)
+	if over := len(s.tail) - maxStderrTail; over > 0 {
+		s.tail = s.tail[over:]
+	}
+	s.mu.Unlock()
+	return s.w.Write(p)
+}
+
+// report writes err as one line with one "model-gateway: " prefix unless the command already printed it, and returns
+// errReported so that the exit status is set without a second copy. A nil err stays nil.
+func (s *stderrTail) report(err error) error {
+	if err == nil {
+		return nil
+	}
+	message := err.Error()
+	s.mu.Lock()
+	printed := bytes.Contains(s.tail, []byte(message))
+	s.mu.Unlock()
+	if !printed {
+		line := strings.ReplaceAll(strings.TrimRight(message, "\n"), "\n", "; ")
+		if !strings.HasPrefix(line, installedName+": ") {
+			line = installedName + ": " + line
+		}
+		_, _ = fmt.Fprintln(s.w, line)
+	}
+	return errReported
 }

@@ -35,7 +35,9 @@ import (
 )
 
 const (
-	// reportTimeout is how long a worker without a configured port has to report its listener (lib/commands.js:2488).
+	// reportTimeout is how long a worker has to report its listener (lib/commands.js:2488). The source applies it only
+	// without a configured port; here it applies to a configured port too, which a worker must also report before it
+	// receives a request.
 	reportTimeout = 5 * time.Second
 	// maxReport is the longest accepted report line, newline included.
 	maxReport = 256
@@ -162,7 +164,7 @@ func (s *shim) startWorker() {
 		return
 	}
 	s.endpoint.Store(0)
-	if s.configuredPort == 0 && s.reportTimer == nil {
+	if s.reportTimer == nil {
 		// An installed timer is kept across failed launches, so the deadline counts from the first of them.
 		s.reportEpoch++
 		epoch := s.reportEpoch
@@ -212,10 +214,11 @@ func (s *shim) spawn() (*workerProc, error) {
 }
 
 // readReport accepts one listening report from the worker's own generation, publishes the worker's pid record, and
-// only then makes the worker's port eligible for relay. A configured port must be the port the worker reports.
+// only then makes the worker's port eligible for relay. Until then the record carries port 0. A configured port must
+// be the port the worker reports; a current worker that reports another one stops the supervisor at once.
 func (s *shim) readReport(w *workerProc) {
 	defer func() { _ = w.report.Close() }()
-	if err := s.publish(w, s.configuredPort, false); err != nil {
+	if err := s.publish(w, 0, false); err != nil {
 		s.logf("model-gateway: could not publish the worker pid record: %v\n", err)
 	}
 	_ = w.report.SetReadDeadline(time.Now().Add(reportTimeout))
@@ -224,7 +227,13 @@ func (s *shim) readReport(w *workerProc) {
 		return
 	}
 	port, ok := parseReport(data, w.generation)
-	if !ok || (s.configuredPort != 0 && port != s.configuredPort) {
+	if !ok {
+		return
+	}
+	if s.configuredPort != 0 && port != s.configuredPort {
+		if s.isCurrent(w) {
+			s.fail(fmt.Errorf("model-gateway: the shim worker reported port %d instead of CODEX_GATEWAY_WORKER_PORT %d", port, s.configuredPort))
+		}
 		return
 	}
 	if err := s.publish(w, port, true); err != nil {

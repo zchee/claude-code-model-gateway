@@ -38,11 +38,16 @@ func NewCommand() *cobra.Command {
 		Args:         cobra.NoArgs,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			info, _ := debug.ReadBuildInfo()
-			_, err := fmt.Fprintln(cmd.OutOrStdout(), resolve(releaseVersion, info))
+			_, err := fmt.Fprintln(cmd.OutOrStdout(), String())
 			return err
 		},
 	}
+}
+
+// String returns the build version that the version command prints, without a line end.
+func String() string {
+	info, _ := debug.ReadBuildInfo()
+	return resolve(releaseVersion, info)
 }
 
 // resolve returns a non-empty linker version verbatim. Otherwise it returns

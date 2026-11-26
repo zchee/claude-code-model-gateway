@@ -16,10 +16,22 @@ package main
 
 import (
 	"os"
+	"path/filepath"
 
 	"github.com/zchee/claude-code-model-gateway/internal/cli"
 )
 
 func main() {
-	os.Exit(cli.Run(os.Args, os.Stdin, os.Stdout, os.Stderr, os.LookupEnv, os.UserHomeDir))
+	os.Exit(cli.RunProcess(os.Args, os.Stdin, os.Stdout, os.Stderr, cli.Process{
+		Lookup: os.LookupEnv, Environ: os.Environ, Home: os.UserHomeDir, Cwd: physicalWorkingDir, Executable: os.Executable,
+	}))
+}
+
+// physicalWorkingDir returns the working directory with symbolic links resolved, as path resolution requires.
+func physicalWorkingDir() (string, error) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(dir)
 }
