@@ -15,8 +15,9 @@
 package toolschema
 
 import (
-	"cmp"
+	"encoding/json/jsontext"
 	json "encoding/json/v2"
+	"math"
 	"strings"
 	"testing"
 	"unicode/utf16"
@@ -45,10 +46,10 @@ type supplementCase struct {
 func readSupplement(t *testing.T) map[string]supplementCase {
 	t.Helper()
 	var inputs []struct {
-		Name    string `json:"name"`
-		Pattern string `json:"pattern"`
-		Repeat  int    `json:"repeat"`
-		Adapter bool   `json:"adapter"`
+		Name    string         `json:"name"`
+		Pattern string         `json:"pattern"`
+		Repeat  jsontext.Value `json:"repeat"`
+		Adapter bool           `json:"adapter"`
 	}
 	var golden struct {
 		Direct map[string]string       `json:"direct"`
@@ -78,7 +79,21 @@ func readSupplement(t *testing.T) map[string]supplementCase {
 			t.Fatalf("missing, repeated or invalid constructor verdict for %q: %q", in.Name, want)
 		}
 		delete(golden.Direct, in.Name)
-		pattern := strings.Repeat(in.Pattern, cmp.Or(in.Repeat, 1))
+		pattern := in.Pattern
+		if in.Repeat != nil {
+			const maxSafeInteger = 1<<53 - 1 // Number.isSafeInteger in the generator.
+			var repeat float64
+			if err := json.Unmarshal(in.Repeat, &repeat); err != nil || repeat < 1 || repeat > maxSafeInteger || repeat != math.Trunc(repeat) {
+				t.Fatalf("%s: repeat must be an integer from 1 through %d, got %s", in.Name, int64(maxSafeInteger), in.Repeat)
+			}
+			if pattern != "" {
+				const maxStringUnits = 1<<29 - 24 // v8::String::kMaxLength on the 64-bit oracle venue.
+				if repeat > float64(maxStringUnits/len(utf16.Encode([]rune(pattern)))) {
+					t.Fatalf("%s: repeat %s exceeds the engine's expanded string limit (%d UTF-16 code units)", in.Name, in.Repeat, maxStringUnits)
+				}
+				pattern = strings.Repeat(pattern, int(repeat))
+			}
+		}
 		cases["constructor/"+in.Name] = supplementCase{pattern, supplementVerdict{Valid: want == "valid"}}
 		if in.Adapter {
 			result, ok := golden.Cases[in.Name]
@@ -170,6 +185,9 @@ func TestEngineQuirkRefusals(t *testing.T) {
 				t.Fatalf("missing engine observation for %s", name)
 			}
 			t.Logf("%s If the port and engine now agree, remove %s from the engine quirk table.", q.reason, name)
+			if gocmp.Equal(q.node, q.port) {
+				t.Fatalf("redundant exception: remove %s from the engine quirk table", name)
+			}
 			if diff := gocmp.Diff(q.node, c.engine); diff != "" {
 				t.Errorf("engine observation changed (-recorded +oracle):\n%s", diff)
 			}
