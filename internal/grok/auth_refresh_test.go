@@ -1473,15 +1473,13 @@ func (b *breakingBody) Close() error { return nil }
 
 // TestRefreshBodyBound verifies that discovery and exchange response bodies are read through a
 // 1 MiB bound. A complete body of exactly 1 MiB is used; one byte more fails the refresh, as does a
-// body past the bound whose last read also reported an error, and no reader consumes much more than
-// the bound of a larger body. A discovery body past the bound fails the refresh without any
-// exchange: neither the endpoint it names nor the conventional fallback is contacted.
+// body past the bound whose last read also reported an error. A body within the bound is read whole
+// and a larger body exactly to one byte past the bound, never further. A discovery body past the
+// bound fails the refresh without any exchange: neither the endpoint it names nor the conventional
+// fallback is contacted, and no exchange body is read.
 func TestRefreshBodyBound(t *testing.T) {
-	const (
-		mib = 1 << 20
-		// readSlack allows a bounded reader to look one buffer past the bound to detect a larger body.
-		readSlack = 64 << 10
-	)
+	// mib restates the production bound maxAuthBody (1 MiB).
+	const mib = 1 << 20
 	discoveryObject := `{"token_endpoint":"` + refreshFixtureIssuer + `/discovered/token"}`
 	exchangeObject := `{"access_token":"fixture-bounded-key","expires_in":3600}`
 
@@ -1568,11 +1566,23 @@ func TestRefreshBodyBound(t *testing.T) {
 
 			token, err := store.Refresh(t.Context())
 
-			if got := discoveryRead.Load(); got > mib+readSlack {
-				t.Errorf("discovery body bytes read = %d, want at most %d (1 MiB bound plus one read buffer)", got, mib+readSlack)
+			// bodyLen is the length of the reply a case sends; a reader stops one byte past the bound.
+			bodyLen := func(obj string, size int) int64 {
+				if size > 0 {
+					return int64(size)
+				}
+				return int64(len(obj))
 			}
-			if got := exchangeRead.Load(); got > mib+readSlack {
-				t.Errorf("exchange body bytes read = %d, want at most %d (1 MiB bound plus one read buffer)", got, mib+readSlack)
+			wantDiscoveryRead := min(bodyLen(discoveryObject, tt.discoverySize), mib+1)
+			wantExchangeRead := min(bodyLen(exchangeObject, tt.exchangeSize), mib+1)
+			if tt.discoverySize > mib {
+				wantExchangeRead = 0
+			}
+			if got := discoveryRead.Load(); got != wantDiscoveryRead {
+				t.Errorf("discovery body bytes read = %d, want %d (the whole body within the 1 MiB bound, else the bound plus one byte)", got, wantDiscoveryRead)
+			}
+			if got := exchangeRead.Load(); got != wantExchangeRead {
+				t.Errorf("exchange body bytes read = %d, want %d (the whole body within the 1 MiB bound, else the bound plus one byte; none without an exchange)", got, wantExchangeRead)
 			}
 			if got := otherHits.Load(); got != 0 {
 				t.Errorf("requests to anything but discovery and the discovered token endpoint = %d, want 0 (no fallback exchange)", got)

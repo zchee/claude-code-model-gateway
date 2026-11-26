@@ -27,6 +27,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,8 +48,9 @@ import (
 // The tests in this file pin the answers where the port deliberately differs from the source:
 // requests the source cannot translate, the text of a failed send, upstream error messages whose
 // conversion would throw, stored expiries outside the explicit date grammar or whose numeric
-// conversion would throw, an issuer lifetime whose conversion would throw, and a refreshed
-// credential that cannot be stored.
+// conversion would throw, an issuer lifetime whose conversion would throw, a refreshed
+// credential that cannot be stored, the body of an outdated-version reply, which is drained rather
+// than kept, and an explicit refresh skew of zero or below, which is replaced by the default.
 
 const (
 	// pipeEndpoint is the upstream URL whose connections handleOverPipe answers in memory.
@@ -862,6 +864,172 @@ func TestRefreshStoreReplacementFailure(t *testing.T) {
 				t.Errorf("the holding directory has %d entries, want only auth.json (no staged replacement)", len(entries))
 			}
 			check(t)
+		})
+	}
+}
+
+// TestBranchOutdatedVersionDrainsBody verifies that the body of an upstream 426 is read to its end
+// and discarded rather than kept: the source collects every chunk of that body and never uses
+// them, while the port's memory stays bounded whatever its size. The fixture upstream sends a
+// 32 MiB body from one small reused buffer, so the bytes allocated during the call that exceed a
+// quarter of the body can only come from a reader that keeps it. The client still gets the fixed
+// outdated-version answer once the whole body was received.
+func TestBranchOutdatedVersionDrainsBody(t *testing.T) {
+	const (
+		bodySize  = 32 << 20
+		chunkSize = 64 << 10
+		// allocLimit is a quarter of the body: far above what draining the body allocates, far
+		// below what keeping it would.
+		allocLimit = bodySize / 4
+		// outdatedMessage restates the production text outdatedVersionMessage.
+		outdatedMessage = "model-gateway: Grok CLI version header is outdated. Update the grok CLI, then retry."
+	)
+	head := fmt.Sprintf("HTTP/1.1 426 Upgrade Required\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", bodySize)
+	chunk := []byte(strings.Repeat("x", chunkSize))
+
+	tests := map[string]struct {
+		wantResult outcome.Result
+	}{
+		"success: a 32 MiB outdated-version body is drained and the fixed 426 answered": {
+			wantResult: outcome.Result{Route: pipeRoute, Status: http.StatusUpgradeRequired, Contacted: true},
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Cleanup(func() { goleak.VerifyNone(t) })
+			synctest.Test(t, func(t *testing.T) {
+				now := time.UnixMilli(1_700_000_000_000)
+				store := mustNewAuthStore(t, grok.AuthOptions{File: validAuthFixture(t, now), Transport: denyNetworkTransport(t), Now: func() time.Time { return now }})
+				body := `{"model":"claude-grok-4.7[1m]","max_tokens":10,"messages":[{"role":"user","content":"hello"}]}`
+
+				var written atomic.Int64
+				serve := func(conn net.Conn) {
+					if !readPipedRequest(conn) {
+						return
+					}
+					if _, err := io.WriteString(conn, head); err != nil {
+						return
+					}
+					for written.Load() < bodySize {
+						n, err := conn.Write(chunk)
+						written.Add(int64(n))
+						if err != nil {
+							return
+						}
+					}
+				}
+
+				var before, after runtime.MemStats
+				runtime.ReadMemStats(&before)
+				got := handleOverPipe(t, store, body, serve)
+				runtime.ReadMemStats(&after)
+
+				if got.dials != 1 {
+					t.Errorf("upstream dials = %d, want 1", got.dials)
+				}
+				if n := written.Load(); n != bodySize {
+					t.Errorf("the client read %d bytes of the %d byte outdated-version body, want all of it", n, bodySize)
+				}
+				if allocated := after.TotalAlloc - before.TotalAlloc; allocated >= allocLimit {
+					t.Errorf("answering a %d byte outdated-version body allocated %d bytes, want less than %d (the body is kept, not drained)", bodySize, allocated, allocLimit)
+				}
+				if got.elapsed >= time.Hour {
+					t.Errorf("the drain took %v of virtual time, want less than the inactivity timeout", got.elapsed)
+				}
+				checkPipedAnswer(t, got, http.StatusUpgradeRequired, errorEnvelope("api_error", outdatedMessage), tt.wantResult)
+			})
+		})
+	}
+}
+
+// TestAccessTokenNonPositiveSkew verifies that an explicit refresh skew of zero or below is
+// replaced by the default lead time of five minutes, where the source honours it: with either, a
+// key expiring exactly five minutes ahead is refreshed and one expiring a millisecond later is used
+// as stored, and an hour of negative skew does not make a key that expired half an hour ago usable.
+// A positive skew is used as given.
+func TestAccessTokenNonPositiveSkew(t *testing.T) {
+	// defaultSkewMillis restates the production default DefaultRefreshSkew (five minutes).
+	const defaultSkewMillis = 5 * 60 * 1000
+
+	tests := map[string]struct {
+		skew time.Duration
+		// expiresIn is the stored expiry in milliseconds after the fixture clock.
+		expiresIn   int64
+		wantRefresh bool
+	}{
+		"success: zero skew refreshes a key expiring exactly five minutes ahead": {
+			expiresIn:   defaultSkewMillis,
+			wantRefresh: true,
+		},
+		"success: zero skew uses a key expiring a millisecond past five minutes as stored": {
+			expiresIn: defaultSkewMillis + 1,
+		},
+		"success: negative skew refreshes a key expiring exactly five minutes ahead": {
+			skew:        -time.Minute,
+			expiresIn:   defaultSkewMillis,
+			wantRefresh: true,
+		},
+		"success: negative skew uses a key expiring a millisecond past five minutes as stored": {
+			skew:      -time.Minute,
+			expiresIn: defaultSkewMillis + 1,
+		},
+		"success: an hour of negative skew refreshes a key that expired half an hour ago": {
+			skew:        -time.Hour,
+			expiresIn:   -30 * 60 * 1000,
+			wantRefresh: true,
+		},
+		"success: a positive one-minute skew uses a key expiring in four minutes as stored": {
+			skew:      time.Minute,
+			expiresIn: 4 * 60 * 1000,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Cleanup(func() { goleak.VerifyNone(t) })
+
+			dir := t.TempDir()
+			file := filepath.Join(dir, "auth.json")
+			expiresAt := strconv.FormatInt(refreshFixtureNow.UnixMilli()+tt.expiresIn, 10)
+			content := `{"https://auth.x.ai::fixture-client":{"key":"fixture-expired-token","refresh_token":"fixture-refresh-token","expires_at":` + expiresAt + `,"oidc_client_id":"fixture-client","oidc_issuer":"` + refreshFixtureIssuer + `"}}`
+			writeFixtureFile(t, file, content)
+
+			var tr http.RoundTripper
+			var exchanges atomic.Int32
+			var before os.FileInfo
+			if tt.wantRefresh {
+				tr = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					if req.URL.Path == "/.well-known/openid-configuration" {
+						return jsonHTTPResponse(req, http.StatusOK, `{"token_endpoint":"`+refreshFixtureIssuer+`/discovered/token"}`), nil
+					}
+					exchanges.Add(1)
+					return jsonHTTPResponse(req, http.StatusOK, `{"access_token":"fixture-fresh-token","expires_in":3600}`), nil
+				})
+			} else {
+				tr = denyNetworkTransport(t)
+				before = freezeAuthFixture(t, dir, file)
+			}
+			store := mustNewAuthStore(t, grok.AuthOptions{File: file, Transport: tr, Now: func() time.Time { return refreshFixtureNow }, Skew: tt.skew})
+
+			token, err := store.AccessToken(t.Context())
+			if err != nil {
+				assertNoSecrets(t, "AccessToken error", err.Error(), refreshSecrets...)
+				t.Fatalf("AccessToken() error = %v", err)
+			}
+			if !tt.wantRefresh {
+				if token != "fixture-expired-token" {
+					t.Errorf("AccessToken() did not return the stored key of an expiry outside the skew (len=%d)", len(token))
+				}
+				assertAuthFixtureUntouched(t, dir, file, before, content)
+				return
+			}
+			if token != "fixture-fresh-token" {
+				t.Errorf("AccessToken() returned the stored key with skew %v instead of refreshing inside the five-minute default (len=%d)", tt.skew, len(token))
+			}
+			if got := exchanges.Load(); got != 1 {
+				t.Errorf("exchanges = %d, want 1", got)
+			}
 		})
 	}
 }

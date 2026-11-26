@@ -117,20 +117,34 @@ func serveUpstreamHead(conn net.Conn, head string, stall bool, done chan<- struc
 // TestBranchUpstreamBodyBreakBeforeHeaders verifies the answer to an upstream body that ends
 // before any client header was written. When the body stalls until the upstream connection's
 // one-hour inactivity timeout, the client gets the fixed 502 the source sends for an upstream
-// timeout; any other break keeps the aborted response. The upstream is an in-memory connection
-// and the hour passes in virtual time.
+// timeout; any other break keeps the aborted response, with the upstream status in the outcome:
+// a body cut short of its length is upstream_aborted, and a body whose framing cannot be read is
+// upstream_error. The upstream is an in-memory connection and the hour passes in virtual time.
 func TestBranchUpstreamBodyBreakBeforeHeaders(t *testing.T) {
 	const (
 		partialJSON   = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n{\"id\":\"resp_partial\""
 		partialError  = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n{\"error\":{\"message\""
 		partialUpdate = "HTTP/1.1 426 Upgrade Required\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n{\"error\""
+		// The malformed heads announce a chunked body and send a complete chunk-size line that is
+		// not hexadecimal: the body read fails at once with an error that is neither the end of
+		// the connection nor the inactivity timeout.
+		malformedJSON   = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n"
+		malformedError  = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n"
+		malformedUpdate = "HTTP/1.1 426 Upgrade Required\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n"
 	)
 	route := outcome.Route{SelectedModel: "claude-grok-4.7[1m]", EffectiveModel: "grok-4.7", Backend: "grok", Via: "direct"}
+
+	// aborted is the exact outcome of an aborted answer to an upstream reply with status.
+	aborted := func(status int, override string) outcome.Result {
+		return outcome.Result{Route: route, Status: status, StatusOverride: override, Contacted: true}
+	}
 
 	tests := map[string]struct {
 		head        string
 		stall       bool
 		wantTimeout bool
+		// wantAbort is the exact outcome of a case that aborts the client response.
+		wantAbort outcome.Result
 	}{
 		"error: buffered JSON body stalled until the inactivity timeout answers the fixed 502": {
 			head:        partialJSON,
@@ -148,13 +162,28 @@ func TestBranchUpstreamBodyBreakBeforeHeaders(t *testing.T) {
 			wantTimeout: true,
 		},
 		"error: buffered JSON body cut short keeps the aborted response": {
-			head: partialJSON,
+			head:      partialJSON,
+			wantAbort: aborted(http.StatusOK, "upstream_aborted"),
 		},
 		"error: upstream error body cut short keeps the aborted response": {
-			head: partialError,
+			head:      partialError,
+			wantAbort: aborted(http.StatusInternalServerError, "upstream_aborted"),
 		},
 		"error: outdated version body cut short keeps the aborted response": {
-			head: partialUpdate,
+			head:      partialUpdate,
+			wantAbort: aborted(http.StatusUpgradeRequired, "upstream_aborted"),
+		},
+		"error: buffered JSON body with malformed chunk framing keeps the aborted response": {
+			head:      malformedJSON,
+			wantAbort: aborted(http.StatusOK, "upstream_error"),
+		},
+		"error: upstream error body with malformed chunk framing keeps the aborted response": {
+			head:      malformedError,
+			wantAbort: aborted(http.StatusInternalServerError, "upstream_error"),
+		},
+		"error: outdated version body with malformed chunk framing keeps the aborted response": {
+			head:      malformedUpdate,
+			wantAbort: aborted(http.StatusUpgradeRequired, "upstream_error"),
 		},
 	}
 
@@ -219,8 +248,11 @@ func TestBranchUpstreamBodyBreakBeforeHeaders(t *testing.T) {
 					if !res.Contacted {
 						t.Error("outcome.Result.Contacted = false, want true")
 					}
+					if diff := gocmp.Diff(tt.wantAbort, res); diff != "" {
+						t.Errorf("outcome.Result of the abort (-want +got):\n%s", diff)
+					}
 					if elapsed >= time.Hour {
-						t.Errorf("a cut-short body took %v of virtual time, want less than the inactivity timeout", elapsed)
+						t.Errorf("a broken body took %v of virtual time, want less than the inactivity timeout", elapsed)
 					}
 					return
 				}
@@ -435,6 +467,7 @@ func TestBranchStreamTimeoutBeforeHeaders(t *testing.T) {
 		"error: event stream cut short for a departed client keeps the abort and writes nothing": {
 			head:       streamCut,
 			clientGone: true,
+			abortFacts: &outcome.Result{Route: route, Status: http.StatusOK, StatusOverride: "upstream_aborted", Contacted: true},
 		},
 		"error: event stream stalled for a present client commits its 200 at once and aborts at the timeout": {
 			head:       streamHead,
