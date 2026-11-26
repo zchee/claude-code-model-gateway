@@ -127,121 +127,166 @@ type overflowCall struct {
 	Counts sentry.Counts
 }
 
+// overflowWrite records the byte count and error of one Write call inside the overflow responder.
+type overflowWrite struct {
+	N   int
+	Err error
+}
+
 // TestGuardDepartedClientPeekOverflow checks that an engine overflow reported by the
 // first-event peek after the client has gone still reaches the overflow responder, so the
-// sentry learns the counts, while nothing reaches the departed client.
+// sentry learns the counts, while nothing reaches the departed client and the responder's
+// error is suppressed; for a live client, the responder's response and error are returned.
 func TestGuardDepartedClientPeekOverflow(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		service, stop := context.WithCancel(t.Context())
-		defer stop()
-		client, disconnect := context.WithCancel(t.Context())
-		defer disconnect()
-		rd, wr := io.Pipe()
-		defer func() { _ = wr.Close() }()
-		body := &peekReadBody{PipeReader: rd, started: make(chan struct{})}
-		req := guardRequest()
-		req.ProxyProvider = "lmstudio"
-		req.Stream.Provider = "lmstudio"
-		req.Stream.FirstEventWait = time.Hour
-		var heads []bool
-		req.Next = func(_ context.Context, head bool) (*upstream.Response, outcome.Result, error) {
-			heads = append(heads, head)
-			return sseResponse(body), outcome.Result{Contacted: true}, nil
-		}
-		var calls []overflowCall
-		var writeErrs []error
-		req.Stream.OnOverflow = func(rw http.ResponseWriter, status int, counts sentry.Counts) (outcome.Result, error) {
-			calls = append(calls, overflowCall{Status: status, Counts: counts})
-			rw.Header().Set("Content-Type", "application/json")
-			rw.WriteHeader(http.StatusRequestEntityTooLarge)
-			_, err := io.WriteString(rw, `{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long"}}`)
-			writeErrs = append(writeErrs, err)
-			return outcome.Result{Status: http.StatusRequestEntityTooLarge, Contacted: true, Route: outcome.Route{Overflow: &outcome.Overflow{Phase: "upstream"}}}, nil
-		}
-		w := &headRecorder{rec: httptest.NewRecorder()}
-		type serveResult struct {
-			res outcome.Result
-			err error
-		}
-		done := make(chan serveResult, 1)
-		joined := false
-		go func() {
-			res, err := guardRunner(service, 1).Serve(client, w, req)
-			done <- serveResult{res: res, err: err}
-		}()
-		defer func() {
-			if !joined {
-				disconnect()
-				stop()
-				_ = wr.Close()
+	const overflowBody = `{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long"}}`
+	errOverflow := errors.New("overflow responder failed")
+	overflowResult := outcome.Result{
+		Status:    http.StatusRequestEntityTooLarge,
+		Contacted: true,
+		Route:     outcome.Route{Overflow: &outcome.Overflow{Phase: "upstream"}},
+	}
+	tests := map[string]struct {
+		disconnect bool
+		wantRes    outcome.Result
+		wantErr    error
+		wantHeads  []int
+		wantType   string
+		wantBody   string
+	}{
+		"success: departed client runs responder but suppresses body and error": {
+			disconnect: true,
+			wantRes:    outcome.Result{Contacted: true},
+			wantErr:    nil,
+		},
+		"error: live client delivers responder output and returns sentinel error": {
+			disconnect: false,
+			wantRes:    overflowResult,
+			wantErr:    errOverflow,
+			wantHeads:  []int{http.StatusRequestEntityTooLarge},
+			wantType:   "application/json",
+			wantBody:   overflowBody,
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				service, stop := context.WithCancel(t.Context())
+				defer stop()
+				client, disconnect := context.WithCancel(t.Context())
+				defer disconnect()
+				rd, wr := io.Pipe()
+				defer func() { _ = wr.Close() }()
+				body := &peekReadBody{PipeReader: rd, started: make(chan struct{})}
+				req := guardRequest()
+				req.ProxyProvider = "lmstudio"
+				req.Stream.Provider = "lmstudio"
+				req.Stream.FirstEventWait = time.Hour
+				var heads []bool
+				req.Next = func(_ context.Context, head bool) (*upstream.Response, outcome.Result, error) {
+					heads = append(heads, head)
+					return sseResponse(body), outcome.Result{Contacted: true}, nil
+				}
+				var calls []overflowCall
+				var writes []overflowWrite
+				req.Stream.OnOverflow = func(rw http.ResponseWriter, status int, counts sentry.Counts) (outcome.Result, error) {
+					calls = append(calls, overflowCall{Status: status, Counts: counts})
+					rw.Header().Set("Content-Type", "application/json")
+					rw.WriteHeader(http.StatusRequestEntityTooLarge)
+					n, err := rw.Write([]byte(overflowBody))
+					writes = append(writes, overflowWrite{N: n, Err: err})
+					return overflowResult, errOverflow
+				}
+				w := &headRecorder{rec: httptest.NewRecorder()}
+				type serveResult struct {
+					res outcome.Result
+					err error
+				}
+				done := make(chan serveResult, 1)
+				joined := false
+				go func() {
+					res, err := guardRunner(service, 1).Serve(client, w, req)
+					done <- serveResult{res: res, err: err}
+				}()
+				defer func() {
+					if !joined {
+						disconnect()
+						stop()
+						_ = wr.Close()
+						synctest.Wait()
+						select {
+						case <-done:
+						default:
+							t.Error("Serve did not exit during cleanup")
+						}
+					}
+				}()
 				synctest.Wait()
 				select {
-				case <-done:
+				case <-body.started:
+				case got := <-done:
+					joined = true
+					t.Fatalf("Serve ended before the peek started: %v", got.err)
 				default:
-					t.Error("Serve did not exit during cleanup")
+					t.Fatal("peek did not start")
 				}
-			}
-		}()
-		synctest.Wait()
-		select {
-		case <-body.started:
-		case got := <-done:
-			joined = true
-			t.Fatalf("Serve ended before the peek started: %v", got.err)
-		default:
-			t.Fatal("peek did not start")
-		}
-		disconnect()
-		synctest.Wait()
-		select {
-		case got := <-done:
-			joined = true
-			t.Fatalf("client departure ended the peek in flight: %v", got.err)
-		default:
-		}
-		go func() {
-			_, _ = io.WriteString(wr, overflowFirstEvent)
-			_ = wr.Close()
-		}()
-		synctest.Wait()
-		var got serveResult
-		select {
-		case got = <-done:
-			joined = true
-		default:
-			t.Fatal("Serve did not return after the peek reported an overflow")
-		}
-		if got.err != nil {
-			t.Errorf("Serve error = %v, want nil", got.err)
-		}
-		if diff := gocmp.Diff(outcome.Result{Contacted: true}, got.res); diff != "" {
-			t.Errorf("Serve result for a departed client (-want +got):\n%s", diff)
-		}
-		wantCalls := []overflowCall{{Status: http.StatusOK, Counts: sentry.Counts{Tokens: new(6017.0), Limit: new(4096.0)}}}
-		if diff := gocmp.Diff(wantCalls, calls); diff != "" {
-			t.Errorf("overflow responder calls (-want +got):\n%s", diff)
-		}
-		for i, err := range writeErrs {
-			if err != nil {
-				t.Errorf("overflow responder write %d failed: %v", i, err)
-			}
-		}
-		if diff := gocmp.Diff([]bool{false}, heads); diff != "" {
-			t.Errorf("Next head arguments (-want +got):\n%s", diff)
-		}
-		if n := body.closes.Load(); n != 1 {
-			t.Errorf("upstream body closed %d times, want 1", n)
-		}
-		if len(w.heads) != 0 {
-			t.Errorf("departed client received status %v", w.heads)
-		}
-		if h := w.Header(); len(h) != 0 {
-			t.Errorf("departed client received headers %v", h)
-		}
-		if b := w.bodyString(); b != "" {
-			t.Errorf("departed client received body %q", b)
-		}
-	})
+				if tt.disconnect {
+					disconnect()
+					synctest.Wait()
+					select {
+					case got := <-done:
+						joined = true
+						t.Fatalf("client departure ended the peek in flight: %v", got.err)
+					default:
+					}
+				}
+				go func() {
+					_, _ = io.WriteString(wr, overflowFirstEvent)
+					_ = wr.Close()
+				}()
+				synctest.Wait()
+				var got serveResult
+				select {
+				case got = <-done:
+					joined = true
+				default:
+					t.Fatal("Serve did not return after the peek reported an overflow")
+				}
+				if !errors.Is(got.err, tt.wantErr) || (tt.wantErr == nil && got.err != nil) {
+					t.Errorf("Serve error = %v, want %v", got.err, tt.wantErr)
+				}
+				if diff := gocmp.Diff(tt.wantRes, got.res); diff != "" {
+					t.Errorf("Serve result (-want +got):\n%s", diff)
+				}
+				wantCalls := []overflowCall{{Status: http.StatusOK, Counts: sentry.Counts{Tokens: new(6017.0), Limit: new(4096.0)}}}
+				if diff := gocmp.Diff(wantCalls, calls); diff != "" {
+					t.Errorf("overflow responder calls (-want +got):\n%s", diff)
+				}
+				wantWrites := []overflowWrite{{N: len(overflowBody), Err: nil}}
+				if diff := gocmp.Diff(wantWrites, writes); diff != "" {
+					t.Errorf("overflow responder writes (-want +got):\n%s", diff)
+				}
+				if diff := gocmp.Diff([]bool{false}, heads); diff != "" {
+					t.Errorf("Next head arguments (-want +got):\n%s", diff)
+				}
+				if n := body.closes.Load(); n != 1 {
+					t.Errorf("upstream body closed %d times, want 1", n)
+				}
+				if diff := gocmp.Diff(tt.wantHeads, w.heads); diff != "" {
+					t.Errorf("client heads (-want +got):\n%s", diff)
+				}
+				if tt.disconnect {
+					if h := w.Header(); len(h) != 0 {
+						t.Errorf("departed client received headers %v", h)
+					}
+				} else if gotType := w.Header().Get("Content-Type"); gotType != tt.wantType {
+					t.Errorf("client Content-Type = %q, want %q", gotType, tt.wantType)
+				}
+				if diff := gocmp.Diff(tt.wantBody, w.bodyString()); diff != "" {
+					t.Errorf("client body (-want +got):\n%s", diff)
+				}
+			})
+		})
+	}
 }
 
 // injectedPanic is the value a test hook panics with.
@@ -292,32 +337,34 @@ func TestGuardClosesBodyOnPanic(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			req := guardRequest()
-			req.ProxyProvider = tt.provider
-			req.Stream.Provider = tt.provider
-			tt.bind(&req)
-			body := &countedBody{ReadCloser: io.NopCloser(strings.NewReader(tt.stream))}
-			calls := 0
-			req.Next = func(context.Context, bool) (*upstream.Response, outcome.Result, error) {
-				calls++
-				return sseResponse(body), outcome.Result{Contacted: true}, nil
-			}
-			w := &headRecorder{rec: httptest.NewRecorder()}
-			recovered := func() (v any) {
-				defer func() { v = recover() }()
-				_, err := guardRunner(t.Context(), 1).Serve(t.Context(), w, req)
-				t.Errorf("Serve returned (error %v) instead of propagating the hook's panic", err)
-				return nil
-			}()
-			if recovered != tt.want {
-				t.Errorf("recovered %#v, want %#v", recovered, tt.want)
-			}
-			if calls != 1 {
-				t.Errorf("Next called %d times, want 1", calls)
-			}
-			if n := body.closes.Load(); n != 1 {
-				t.Errorf("upstream body closed %d times after the panic, want 1", n)
-			}
+			synctest.Test(t, func(t *testing.T) {
+				req := guardRequest()
+				req.ProxyProvider = tt.provider
+				req.Stream.Provider = tt.provider
+				tt.bind(&req)
+				body := &countedBody{ReadCloser: io.NopCloser(strings.NewReader(tt.stream))}
+				calls := 0
+				req.Next = func(context.Context, bool) (*upstream.Response, outcome.Result, error) {
+					calls++
+					return sseResponse(body), outcome.Result{Contacted: true}, nil
+				}
+				w := &headRecorder{rec: httptest.NewRecorder()}
+				recovered := func() (v any) {
+					defer func() { v = recover() }()
+					_, err := guardRunner(t.Context(), 1).Serve(t.Context(), w, req)
+					t.Errorf("Serve returned (error %v) instead of propagating the hook's panic", err)
+					return nil
+				}()
+				if recovered != tt.want {
+					t.Errorf("recovered %#v, want %#v", recovered, tt.want)
+				}
+				if calls != 1 {
+					t.Errorf("Next called %d times, want 1", calls)
+				}
+				if n := body.closes.Load(); n != 1 {
+					t.Errorf("upstream body closed %d times after the panic, want 1", n)
+				}
+			})
 		})
 	}
 }
@@ -408,7 +455,13 @@ func TestGuardSilentAfterFailedClientWrite(t *testing.T) {
 				req.Stream.HeartbeatInterval = time.Second
 				rd, wr := io.Pipe()
 				body := &countedBody{ReadCloser: rd}
-				var wg sync.WaitGroup
+				tail := frameBlockStart + frameTextDelta("after the failure") + frameBlockStop + frameMessageDelta + frameMessageStop
+				var (
+					wg       sync.WaitGroup
+					tailN    int
+					tailErr  error
+					tailSent bool
+				)
 				calls := 0
 				req.Next = func(context.Context, bool) (*upstream.Response, outcome.Result, error) {
 					calls++
@@ -419,20 +472,25 @@ func TestGuardSilentAfterFailedClientWrite(t *testing.T) {
 						}
 						// Silence across many heartbeat intervals, then more data.
 						time.Sleep(10 * time.Second)
-						_, _ = io.WriteString(wr, frameBlockStart+frameTextDelta("after the failure")+frameBlockStop+frameMessageDelta+frameMessageStop)
+						tailN, tailErr = io.WriteString(wr, tail)
+						tailSent = true
 					})
 					return sseResponse(body), outcome.Result{Contacted: true}, nil
 				}
 				w := &failingWriter{header: http.Header{}, failWrite: tt.failWrite, failFlush: tt.failFlush}
 				start := time.Now()
 				got, err := r.Serve(t.Context(), w, req)
+				elapsed := time.Since(start)
 				_ = rd.Close()
 				wg.Wait()
 				if err != nil {
 					t.Fatalf("Serve error = %v, want nil", err)
 				}
-				if elapsed := time.Since(start); elapsed != 10*time.Second {
+				if elapsed != 10*time.Second {
 					t.Errorf("Serve returned after %s, want it to read the upstream to its end at 10s", elapsed)
+				}
+				if !tailSent || tailErr != nil || tailN != len(tail) {
+					t.Errorf("producer tail write sent=%v n=%d/%d err=%v, want full write with nil error", tailSent, tailN, len(tail), tailErr)
 				}
 				if diff := gocmp.Diff(outcome.Result{Contacted: true}, got); diff != "" {
 					t.Errorf("Serve result (-want +got):\n%s", diff)
