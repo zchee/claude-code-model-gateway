@@ -95,27 +95,24 @@ func validToken(token string) bool {
 //
 // A worker that died without closing leaves its socket file behind, and binding over it fails with EADDRINUSE although
 // nothing answers there. Only a refused connection to an actual socket proves that no process owns the path
-// (lib/request-worker.js:1180-1206). Starters that reclaim the same path take an advisory lock on the sibling file
-// path+".lock" for the probe, the unlink and the rebind, so one of them cannot unlink the socket another has just bound.
-// A path that changed identity between the checks, or a lock that cannot be taken, is not reclaimed. Any other bind
+// (lib/request-worker.js:1180-1206). A bind creates the socket file before listen makes it accept connections, and a
+// connection in between is refused exactly as by a stale socket. Every starter therefore holds an advisory lock on the
+// sibling file path+".lock" from its first bind until it listens, and probes, unlinks and rebinds only while holding
+// it, so no starter can take another's half-bound socket for a stale one. A path that changed identity between the
+// checks is not reclaimed. When the lock cannot be taken the path is bound once and never reclaimed. Any other bind
 // failure is returned unchanged.
 func ListenUnix(path string) (net.Listener, error) {
 	addr := &net.UnixAddr{Name: path, Net: "unix"}
+	unlock, lockErr := lockReclaim(path)
+	if lockErr == nil {
+		defer unlock()
+	}
 	ln, err := net.ListenUnix("unix", addr)
 	if err == nil {
 		return ln, nil
 	}
-	if !errors.Is(err, syscall.EADDRINUSE) {
-		return nil, err
-	}
-	unlock, lockErr := lockReclaim(path)
 	if lockErr != nil {
 		return nil, err
-	}
-	defer unlock()
-	// Another starter may have reclaimed the path while this one waited for the lock.
-	if ln, err = net.ListenUnix("unix", addr); err == nil {
-		return ln, nil
 	}
 	if !errors.Is(err, syscall.EADDRINUSE) || !removeStaleSocket(path) {
 		return nil, err
