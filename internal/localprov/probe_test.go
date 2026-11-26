@@ -44,8 +44,17 @@ import (
 
 const (
 	studioTestSecret     = "lmstudio-test-token-never-printed"
+	studioRejectedSecret = "lmstudio-rejected-marker-73c1"
 	studioRedirectSecret = "lmstudio-redirect-marker-49a7"
 )
+
+func redactStudioMarkers(s string) string {
+	return strings.NewReplacer(
+		studioTestSecret, "<studio-test-secret>",
+		studioRejectedSecret, "<studio-rejected-secret>",
+		studioRedirectSecret, "<studio-redirect-secret>",
+	).Replace(s)
+}
 
 func mapLookup(values map[string]string) config.LookupEnv {
 	return func(key string) (string, bool) {
@@ -247,7 +256,7 @@ func TestProbeStudio(t *testing.T) {
 			want: localprov.StudioState{Enabled: true, BaseURL: locked.baseURL, Reachable: true, AuthRequired: true},
 		},
 		"error: a server that refuses the token it is given": {
-			env:  map[string]string{"CCP_LMSTUDIO_BASE_URL": locked.baseURL, "LM_API_TOKEN": "wrong-token"},
+			env:  map[string]string{"CCP_LMSTUDIO_BASE_URL": locked.baseURL, "LM_API_TOKEN": studioRejectedSecret},
 			want: localprov.StudioState{Enabled: true, BaseURL: locked.baseURL, HasAPIKey: true, Reachable: true, AuthRequired: true},
 		},
 		"error: a server without the listing, as before LM Studio 0.4.1": {
@@ -300,13 +309,13 @@ func TestProbeStudio(t *testing.T) {
 		for _, name := range order {
 			got := results[name]
 			if diff := gocmp.Diff(tests[name].want, got, cmpopts.EquateEmpty()); diff != "" {
-				t.Errorf("%s: StudioState mismatch (-want +got):\n%s", name, diff)
+				t.Errorf("%s: StudioState mismatch (-want +got):\n%s", name, redactStudioMarkers(diff))
 			}
 		}
 	})
 
 	t.Run("no_token_in_state", func(t *testing.T) {
-		tokenPattern := regexp.MustCompile(regexp.QuoteMeta(studioTestSecret) + `|wrong-token`)
+		tokenPattern := regexp.MustCompile(regexp.QuoteMeta(studioTestSecret) + `|` + regexp.QuoteMeta(studioRejectedSecret))
 		for _, name := range order {
 			raw, err := json.Marshal(results[name])
 			if err != nil {
@@ -321,7 +330,7 @@ func TestProbeStudio(t *testing.T) {
 	t.Run("open_requests", func(t *testing.T) {
 		want := []seenRequest{{URL: "/api/v1/models", HasAuthHeader: false, AuthValues: nil}}
 		if diff := gocmp.Diff(want, open.requests()); diff != "" {
-			t.Errorf("open server requests mismatch (-want +got):\n%s", diff)
+			t.Errorf("open server requests mismatch (-want +got):\n%s", redactStudioMarkers(diff))
 		}
 	})
 
@@ -329,10 +338,10 @@ func TestProbeStudio(t *testing.T) {
 		want := []seenRequest{
 			{URL: "/api/v1/models", HasAuthHeader: true, AuthValues: []string{"Bearer " + studioTestSecret}},
 			{URL: "/api/v1/models", HasAuthHeader: false, AuthValues: nil},
-			{URL: "/api/v1/models", HasAuthHeader: true, AuthValues: []string{"Bearer wrong-token"}},
+			{URL: "/api/v1/models", HasAuthHeader: true, AuthValues: []string{"Bearer " + studioRejectedSecret}},
 		}
 		if diff := gocmp.Diff(want, locked.requests()); diff != "" {
-			t.Errorf("locked server requests mismatch (-want +got):\n%s", diff)
+			t.Errorf("locked server requests mismatch (-want +got):\n%s", redactStudioMarkers(diff))
 		}
 	})
 }
@@ -472,6 +481,39 @@ func TestRefreshStudioState(t *testing.T) {
 	if got := tracker.State(); got != nil {
 		t.Errorf("tracker.State() after unlisted provider = %+v, want nil", got)
 	}
+
+	// Mutating Invalid on copies returned by Refresh or State must not alter tracked state.
+	var invalidTracker localprov.StudioTracker
+	wantInvalid := &proxyconfig.InvalidSetting{
+		Setting: "CCP_LMSTUDIO_BASE_URL",
+		Reason:  "must be a scheme, a host and a port only, without a path such as /v1",
+	}
+	invalidEnv := mapLookup(map[string]string{"CCP_LMSTUDIO_BASE_URL": "http://127.0.0.1:1234/v1"})
+	invalidRefreshed := invalidTracker.Refresh(t.Context(), studioRoutes, invalidEnv, emptyDir, localprov.ProbeOptions{})
+	if invalidRefreshed == nil || invalidRefreshed.Invalid == nil {
+		t.Fatalf("invalid-setting Refresh = %+v, want non-nil Invalid", invalidRefreshed)
+	}
+	if diff := gocmp.Diff(wantInvalid, invalidRefreshed.Invalid); diff != "" {
+		t.Errorf("invalid-setting Refresh Invalid mismatch (-want +got):\n%s", diff)
+	}
+	invalidRefreshed.Invalid.Setting = "MUTATED_FROM_REFRESH"
+	invalidRefreshed.Invalid.Reason = "mutated from refresh"
+	invalidSnap := invalidTracker.State()
+	if invalidSnap == nil || invalidSnap.Invalid == nil {
+		t.Fatalf("invalid-setting State() = %+v, want non-nil Invalid", invalidSnap)
+	}
+	if diff := gocmp.Diff(wantInvalid, invalidSnap.Invalid); diff != "" {
+		t.Errorf("invalid-setting State() mutated through Refresh copy (-want +got):\n%s", diff)
+	}
+	invalidSnap.Invalid.Setting = "MUTATED_FROM_STATE"
+	invalidSnap.Invalid.Reason = "mutated from state"
+	invalidAfter := invalidTracker.State()
+	if invalidAfter == nil || invalidAfter.Invalid == nil {
+		t.Fatalf("invalid-setting State() after copy mutation = %+v, want non-nil Invalid", invalidAfter)
+	}
+	if diff := gocmp.Diff(wantInvalid, invalidAfter.Invalid); diff != "" {
+		t.Errorf("invalid-setting State() mutated through State copy (-want +got):\n%s", diff)
+	}
 }
 
 func TestRefreshStudioUnlistedNoContact(t *testing.T) {
@@ -590,7 +632,7 @@ func TestStudioReadiness(t *testing.T) {
 			described: regexp.MustCompile(`^MISSING \(LM Studio at http://127\.0\.0\.1:1234 requires an API token: set CCP_LMSTUDIO_API_KEY \(or LM_API_TOKEN\) where the gateway starts .*, or lmstudio\.apiKey in .*config\.json; the token comes from LM Studio's server settings\. Then ` + regexp.QuoteMeta(restartSuffix) + `\)$`),
 		},
 		"error: server refuses the token that is set": {
-			env:       map[string]string{"CCP_LMSTUDIO_API_KEY": studioTestSecret},
+			env:       map[string]string{"CCP_LMSTUDIO_API_KEY": studioRejectedSecret},
 			state:     probed(nil, func(s *localprov.StudioState) { s.AuthRequired = true; s.HasAPIKey = true }),
 			wantState: "auth-missing",
 			described: regexp.MustCompile(`^MISSING \(LM Studio at http://127\.0\.0\.1:1234 refused the API token it was sent: check CCP_LMSTUDIO_API_KEY.*\. Then ` + regexp.QuoteMeta(restartSuffix) + `\)$`),
@@ -631,14 +673,14 @@ func TestStudioReadiness(t *testing.T) {
 			StudioState: c.state,
 		}
 		line := readiness.DescribeProviderAuth("lmstudio", authState, msgOpts)
-		if !c.described.MatchString(line) {
-			t.Errorf("%s: DescribeProviderAuth = %q, does not match %s", name, line, c.described)
-		}
-		if strings.Contains(line, studioTestSecret) {
+		if strings.Contains(line, studioTestSecret) || strings.Contains(line, studioRejectedSecret) {
 			t.Errorf("%s: DescribeProviderAuth leaked studio token marker", name)
 		}
+		if !c.described.MatchString(line) {
+			t.Errorf("%s: DescribeProviderAuth = %q, does not match %s", name, redactStudioMarkers(line), c.described)
+		}
 		got := readiness.ProxyProviderReadiness("lmstudio", healthy, func(string) string { return authState }, msgOpts)
-		if strings.Contains(got.Message, studioTestSecret) {
+		if strings.Contains(got.Message, studioTestSecret) || strings.Contains(got.Message, studioRejectedSecret) {
 			t.Errorf("%s: ProxyProviderReadiness.Message leaked studio token marker", name)
 		}
 		if got.Ready != expectReady {
@@ -646,14 +688,14 @@ func TestStudioReadiness(t *testing.T) {
 		}
 		if expectReady {
 			if !readyMsgPattern.MatchString(got.Message) {
-				t.Errorf("%s: ready Message = %q, does not match %s", name, got.Message, readyMsgPattern)
+				t.Errorf("%s: ready Message = %q, does not match %s", name, redactStudioMarkers(got.Message), readyMsgPattern)
 			}
 		} else {
 			if got.Message == "" {
 				t.Errorf("%s: non-ready Message is empty", name)
 			}
 			if forbiddenPattern.MatchString(got.Message) {
-				t.Errorf("%s: non-ready Message mentions proxy login: %q", name, got.Message)
+				t.Errorf("%s: non-ready Message mentions proxy login: %q", name, redactStudioMarkers(got.Message))
 			}
 		}
 	}
@@ -946,7 +988,7 @@ func TestProbeRedirects(t *testing.T) {
 			Models:    []localprov.Model{{Key: "qwen3-coder-30b", Loaded: true, ContextWindow: 65536}},
 		}
 		if diff := gocmp.Diff(want, got); diff != "" {
-			t.Errorf("same-origin redirect StudioState mismatch (-want +got):\n%s", diff)
+			t.Errorf("same-origin redirect StudioState mismatch (-want +got):\n%s", redactStudioMarkers(diff))
 		}
 		mu.Lock()
 		gotSeen := slices.Clone(seen)
@@ -956,7 +998,7 @@ func TestProbeRedirects(t *testing.T) {
 			{URL: "/redirected/models", HasAuthHeader: true, AuthValues: []string{"Bearer " + studioRedirectSecret}},
 		}
 		if diff := gocmp.Diff(wantSeen, gotSeen); diff != "" {
-			t.Errorf("same-origin redirect requests mismatch (-want +got):\n%s", diff)
+			t.Errorf("same-origin redirect requests mismatch (-want +got):\n%s", redactStudioMarkers(diff))
 		}
 	})
 
@@ -1021,7 +1063,7 @@ func TestProbeRedirects(t *testing.T) {
 			Models:    []localprov.Model{{Key: "qwen3-coder-30b", Loaded: true, ContextWindow: 40960}},
 		}
 		if diff := gocmp.Diff(want, got); diff != "" {
-			t.Errorf("cross-origin redirect StudioState mismatch (-want +got):\n%s", diff)
+			t.Errorf("cross-origin redirect StudioState mismatch (-want +got):\n%s", redactStudioMarkers(diff))
 		}
 		if targetSawSecret.Load() {
 			t.Error("cross-origin redirect leaked studio token marker to different-origin target")
@@ -1037,7 +1079,7 @@ func TestProbeRedirects(t *testing.T) {
 		targetMu.Unlock()
 		wantTarget := []seenRequest{{URL: "/cross/models", HasAuthHeader: false, AuthValues: nil}}
 		if diff := gocmp.Diff(wantTarget, gotTarget); diff != "" {
-			t.Errorf("cross-origin target requests mismatch (-want +got):\n%s", diff)
+			t.Errorf("cross-origin target requests mismatch (-want +got):\n%s", redactStudioMarkers(diff))
 		}
 	})
 

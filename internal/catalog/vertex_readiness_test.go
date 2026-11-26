@@ -161,11 +161,16 @@ func TestLiveReadinessSourceSnapshotAndReadGrok(t *testing.T) {
 		StudioState: studio,
 	})
 
-	// Mutate caller-owned local states after construction; per-build snapshots must remain immutable.
+	// Mutate caller-owned local states after construction; Probe observes the copied readiness fields
+	// (Reachable, Port, BaseURL, AuthRequired, Error), while nested Models/Invalid deep-copy isolation is
+	// verified where those fields are directly exposed by StudioTracker and Cache.
 	llama.Reachable = false
-	llama.ContextWindow = 0
+	llama.Port = 9999
+	llama.Error = "mutated"
 	studio.Reachable = false
-	studio.Models[0].ContextWindow = 0
+	studio.AuthRequired = true
+	studio.BaseURL = "http://127.0.0.1:9999"
+	studio.Error = "mutated"
 
 	t.Run("success: local and lmstudio use immutable construction snapshot", func(t *testing.T) {
 		localGot := source.Probe(t.Context(), "local")
