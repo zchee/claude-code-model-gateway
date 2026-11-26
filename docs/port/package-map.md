@@ -57,7 +57,7 @@ What happens to one inference request, in the order it happens.
 | `worker/sentry` | Tracks context usage per session and refuses a request that cannot fit | `lib/request-worker.js` | 1 | ✅ |
 | `worker/proxyreq` | Builds the request for a proxy model and answers local refusals | `lib/request-worker.js` | 2 | 🔶 reviewed; follow-up tests pending |
 | `grok` | Translates between Anthropic messages and Grok's wire format, and keeps the Grok credential fresh | `lib/grok-backend.js` | 1, 2 | 🔶 translation ✅; request branch in review |
-| `toolschema` | Adapts tool schemas to what each upstream accepts | `lib/tool-schema-compat.js` | 1 | ✅ |
+| `toolschema` | Adapts tool input schemas for Codex | `lib/tool-schema-compat.js` | 1 | ✅ |
 | `worker/upstream` | Filters headers and sends the request to Anthropic, the proxy or Grok | `lib/request-worker.js` | 2 | 🔶 reviewed; TLS error text in review |
 | `worker/reply` | Handles a buffered answer: errors, retries, overflow, rejections | `lib/request-worker.js` | 2 | 🔶 in review |
 | `worker/sse`, `sse` | Relays a streamed answer to the client; `sse` splits the event stream | `lib/request-worker.js` | 1, 2 | 🔶 splitter ✅; relays in review |
@@ -76,7 +76,7 @@ Who listens, who starts and stops whom, and how the gateway knows a process is i
 | `cli/serveshim`, `cli/serveworker` | The two long-running commands: supervisor and worker | `lib/commands.js` | 2 | 🔶 in review |
 | `procinfo` | Reads process and listener facts from the operating system | `lib/process-supervision.js` | 0 | ✅ |
 | `ownership`, `supervisor/proxyrecovery`, `launch` | Decide which processes belong to the gateway, recover the proxy, start detached processes | `lib/process-supervision.js`, `lib/windows-detached.js` | 3 | 🔜 |
-| `shimstate` | Records the supervisor's own state on disk | `lib/shim-state.js` | 3 | 🔜 |
+| `shimstate` | Works out whether a gateway already answers on the port and whether it is this install's | `lib/shim-state.js` | 3 | 🔜 |
 | `lifecycle` | Serializes start, stop and repair, and records what happened | `lib/lifecycle-lock.js`, `lib/lifecycle-diagnostics.js` | 1 | ✅ |
 | `controlauth` | Authorizes local start and stop requests | `lib/control-auth.js` | 1 | ✅ |
 
@@ -92,7 +92,7 @@ Which models exist, which one a picker alias means, and what limits apply.
 | `proxymodels` | Reads the model listing the proxy serves | `lib/proxy-models.js` | 1 | ✅ |
 | `localprov`, `proxyconfig` | Read local providers (LM Studio, llama.cpp) and the proxy's configuration | `lib/lmstudio.js`, `lib/local-llama.js`, `lib/proxy-config.js` | 1, 2 | 🔶 parsers ✅; live probes in review |
 | `catalog` | Builds the catalog document other tools consume | `lib/commands.js` | 1 | ✅ |
-| `pickerguard` | Guards the model picker against stale rows | `lib/picker-guard.js` | 4 | 🔜 |
+| `pickerguard` | The model-picker guard that `ensure` runs; it keeps its own state file | `lib/picker-guard.js` | 4 | 🔜 |
 
 ## 4. Settings, installation and files
 
@@ -116,6 +116,7 @@ How the gateway writes itself into Claude Code's settings and keeps its own file
 | `usage` | Builds and emits counts-only usage records | `lib/usage-observability.js` | 1, 2 | 🔶 records ✅; capture and emitter in review |
 | `telemetry` | Records route decisions as spans and a local log, without message content | `lib/request-worker.js` | 2 | 🔶 in review |
 | `upstreamstate` | Remembers that Codex refused dispatch, with evidence and expiry | `lib/codex-upstream-state.js` | 1 | ✅ |
+| `jsdate` | Parses dates the way the Node code's `Date.parse` did, independent of the time zone; used by the two packages above | new | 1 | ✅ |
 
 ## 6. Command line
 
@@ -142,7 +143,6 @@ block the Node version manages, in `doctor` and in the migration check.
 |---|---|---|---|
 | `venue` | Refuses to run a test binary on a machine that runs a real gateway | 0 | ✅ |
 | `gatewaytest` | Gives tests an isolated home, environment and child processes | 0 | ✅ |
-| `jsdate` | Parses the dates the Node code parsed with `Date.parse`, independent of the time zone | 1 | ✅ |
 | `test/conformance/` | Runs the same cases against the Node gateway and the Go binary (not a Go package) | 2 | 🔶 cases and hosted evidence export exist; the binary proof is the phase 2 gate |
 
 ## Index: from a Node file to its Go packages
