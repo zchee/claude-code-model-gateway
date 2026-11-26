@@ -93,6 +93,40 @@ func wireNumber(v jsonx.WireValue) (float64, bool) {
 	return 0, false
 }
 
+var toStringName = utf16.Encode([]rune("toString"))
+
+// numericConversionFails reports whether the source's numeric conversion throws while merging
+// usage, which drops the whole JSON observation there. The source converts every member value
+// of usage and of its nested objects down to the merge's depth limit, including a "__proto__"
+// member that the merge then skips; usage itself is not converted.
+func numericConversionFails(usage jsonx.WireValue) bool { return treeConversionFails(usage, 0) }
+
+func treeConversionFails(v jsonx.WireValue, depth int) bool {
+	if depth > 6 || v.Kind != '{' {
+		return false
+	}
+	for _, m := range v.Members {
+		if conversionFails(m.Value) || m.Value.Kind == '{' && treeConversionFails(m.Value, depth+1) {
+			return true
+		}
+	}
+	return false
+}
+
+// conversionFails reports whether converting v to a number throws in the source. An object with
+// an own member named "toString" has no callable conversion method, because its inherited
+// valueOf returns the object itself; an array converts each element to a string first, at any
+// depth, and an object element converts the same way.
+func conversionFails(v jsonx.WireValue) bool {
+	switch v.Kind {
+	case '{':
+		return slices.ContainsFunc(v.Members, func(m jsonx.Member) bool { return slices.Equal(m.Name, toStringName) })
+	case '[':
+		return slices.ContainsFunc(v.Elements, conversionFails)
+	}
+	return false
+}
+
 // MergeWireUsage combines numeric observations without discarding the source's
 // object-property order. The inputs are not modified.
 func MergeWireUsage(current, next jsonx.WireValue) jsonx.WireValue {

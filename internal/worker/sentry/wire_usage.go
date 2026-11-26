@@ -14,7 +14,11 @@
 
 package sentry
 
-import "github.com/zchee/claude-code-model-gateway/internal/jsonx"
+import (
+	"slices"
+
+	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
+)
 
 // ObserveWire records a decoded message_delta's usage for the session and target.
 // An ordinary completed turn may rearm a fired refusal; an absent event has no effect.
@@ -28,8 +32,10 @@ func (s *State) ObserveWire(session string, target Target, event jsonx.WireValue
 // Without a usable usage member it returns the previous value unchanged.
 // A merged result has its own top-level member slice; nested values are shared with the inputs.
 func MergeWireUsage(previous, event jsonx.WireValue) jsonx.WireValue {
-	if merged, ok := mergeUsage(previous, event); ok {
-		return merged
+	usage, ok := eventUsage(event)
+	if !ok {
+		return previous
 	}
-	return previous
+	// A new slice: normalizing in place must not write into the caller's members.
+	return jsonx.WireValue{Kind: '{', Members: jsonx.NormalizeMembers(slices.Concat(spread(previous), spread(usage)))}
 }

@@ -116,7 +116,7 @@ func readWire(d *jsontext.Decoder) (WireValue, error) {
 			}
 			v.Members = append(v.Members, Member{name, item})
 		}
-		v.Members = orderedMembers(v.Members)
+		v.Members = NormalizeMembers(v.Members)
 		_, err := d.ReadToken()
 		return v, err
 	default:
@@ -234,9 +234,13 @@ func appendNumber(dst []byte, n float64) []byte {
 	}
 }
 
-// orderedMembers normalizes a private slice in place: the first occurrence fixes
-// a property's position and the last occurrence supplies its value.
-func orderedMembers(members []Member) []Member {
+// NormalizeMembers applies JSON.parse's object normalization to an owned slice in
+// place and returns it: the first occurrence of a name fixes its position, the last
+// occurrence supplies its value, and array-index names sort before all other names
+// in numeric order. Names compare by exact UTF-16 code units. The result shares the
+// input's backing array and the elements past its length are cleared, so the caller
+// must own the slice and use only the result afterwards.
+func NormalizeMembers(members []Member) []Member {
 	if len(members) < 2 {
 		return members
 	}
@@ -291,7 +295,7 @@ func appendWire(dst []byte, v WireValue, depth int) ([]byte, error) {
 		}
 		return append(dst, ']'), nil
 	case '{':
-		members := orderedMembers(slices.Clone(v.Members))
+		members := NormalizeMembers(slices.Clone(v.Members))
 		dst = append(dst, '{')
 		for i, m := range members {
 			if i != 0 {

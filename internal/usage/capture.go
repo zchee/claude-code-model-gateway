@@ -62,7 +62,7 @@ type Capture struct {
 	builder       *Builder
 	req           Request
 	maxBytes      int
-	started       time.Time
+	evidence      requestEvidence
 	emit          func(Record)
 	usage         jsonx.WireValue
 	id            string
@@ -80,16 +80,28 @@ type Capture struct {
 
 // NewCapture observes a standalone request and emits its primary record to emit, if non-nil.
 // A zero maxResponseBytes selects the default bound; any bound below 1024 bytes is raised to 1024.
-// The response fields of req are replaced by the observations.
+// The response fields of req are replaced by the observations. The request evidence is fixed here:
+// changing the body, the headers or the sequence of req afterwards does not change the record.
+// A standalone capture reports no sequence unless req supplies one, and it derives no records and
+// changes neither the builder's numbering nor its tool-result baseline.
 func NewCapture(builder *Builder, req Request, maxResponseBytes int, emit func(Record)) *Capture {
 	if maxResponseBytes == 0 {
 		maxResponseBytes = defaultMaxResponseBytes
 	}
-	return &Capture{builder: builder, req: req, maxBytes: max(1024, maxResponseBytes), started: time.Now(), emit: emit, usage: jsonx.WireValue{Kind: '{'}}
+	c := &Capture{builder: builder, maxBytes: max(1024, maxResponseBytes), emit: emit, usage: jsonx.WireValue{Kind: '{'}}
+	if builder != nil {
+		c.evidence = builder.start(req, time.Now())
+	}
+	// The evidence holds what the record needs from the body and the sequence.
+	req.Body, req.Sequence, req.Headers = jsonx.WireValue{}, nil, req.Headers.Clone()
+	c.req = req
+	return c
 }
 
-// SetResponse saves the response status and headers for the final observation.
+// SetResponse saves the response status and a copy of the headers for the final observation.
+// The status is a valid HTTP status, 100 to 599, or zero when none was supplied.
 func (c *Capture) SetResponse(status int, headers http.Header) {
+	headers = headers.Clone()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.status, c.headers = status, headers
@@ -99,7 +111,7 @@ func (c *Capture) SetResponse(status int, headers http.Header) {
 func (c *Capture) ObserveJSON(body []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.bytes += int64(len(body))
+	c.bytes = addBytes(c.bytes, int64(len(body)))
 	if len(body) > c.maxBytes {
 		c.overflowed = true
 		return
@@ -108,14 +120,19 @@ func (c *Capture) ObserveJSON(body []byte) {
 }
 
 // observeDocument merges a parsed response document's identity and usage. A body that is not
-// JSON, or is JSON null, is ignored and leaves the response mode unset.
+// JSON, or is JSON null, is ignored and leaves the response mode unset. So is the usage of a
+// document whose numeric conversion fails in the source, after its identity has been kept.
 func (c *Capture) observeDocument(body []byte) {
 	v, err := jsonx.DecodeWire(body)
 	if err != nil || v.Kind == 'n' {
 		return
 	}
 	c.observeIdentity(v)
-	c.usage = MergeWireUsage(c.usage, field(v, "usage"))
+	usage := field(v, "usage")
+	if numericConversionFails(usage) {
+		return
+	}
+	c.usage = MergeWireUsage(c.usage, usage)
 	c.mode = cmp.Or(c.mode, "json")
 }
 
@@ -129,11 +146,14 @@ func (c *Capture) observeIdentity(message jsonx.WireValue) {
 	}
 }
 
-// ObserveChunk observes and counts a piece of a buffered JSON response.
+// ObserveChunk observes and counts a piece of a buffered JSON response. An empty chunk is ignored.
 func (c *Capture) ObserveChunk(chunk []byte) {
+	if len(chunk) == 0 {
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.bytes += int64(len(chunk))
+	c.bytes = addBytes(c.bytes, int64(len(chunk)))
 	if c.overflowed {
 		return
 	}
@@ -175,7 +195,16 @@ var (
 func (c *Capture) NoteResponseBytes(n int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.bytes += max(0, n)
+	c.bytes = addBytes(c.bytes, max(0, n))
+}
+
+// addBytes adds a non-negative count to a non-negative byte total, saturating at the largest
+// int64 instead of wrapping to a negative total.
+func addBytes(total, n int64) int64 {
+	if n > math.MaxInt64-total {
+		return math.MaxInt64
+	}
+	return total + n
 }
 
 // MarkOverflow discards buffered content and suppresses successful usage export.
@@ -213,8 +242,8 @@ func (c *Capture) SetResponseComplete(complete bool) {
 	c.incomplete = !complete
 }
 
-// Finish emits at most once and returns the primary record, or nil if none was emitted.
-// Derived records built for the request are not emitted.
+// Finish emits at most once and returns the primary record, or nil if none was built or Finish
+// was called before. A panic in the emit callback is recovered: the record is still returned.
 func (c *Capture) Finish() *Record {
 	c.mu.Lock()
 	if c.finished || c.builder == nil {
@@ -231,22 +260,22 @@ func (c *Capture) Finish() *Record {
 	req.StatusCode, req.ResponseHeaders = c.status, c.headers
 	req.Usage, req.WireUsage = nil, c.usage
 	req.MessageID, req.ResponseModel, req.ResponseMode = c.id, c.model, c.mode
-	req.ResponseBytes, req.Elapsed = c.bytes, time.Since(c.started)
+	req.ResponseBytes = c.bytes
 	req.Incomplete, req.Overflowed = c.incomplete, c.overflowed
-	if req.Sequence == nil {
-		// A capture started outside an emitter has no arrival sequence and reports none.
-		// Build reports no sequence above the exact-integer range instead of numbering it itself.
-		unsequenced := uint64(math.MaxUint64)
-		req.Sequence = &unsequenced
-	}
 	c.mu.Unlock()
-	records := c.builder.Build(req)
-	if len(records) == 0 {
+	evidence := c.evidence
+	c.builder.mu.Lock()
+	record, _, _, ok := c.builder.primary(req, &evidence)
+	c.builder.mu.Unlock()
+	if !ok {
 		return nil
 	}
-	record := records[0]
 	if c.emit != nil {
-		c.emit(record)
+		func() {
+			// The source ignores a failing callback; the caller still receives the record.
+			defer func() { _ = recover() }()
+			c.emit(record)
+		}()
 	}
 	return &record
 }

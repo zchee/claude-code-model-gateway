@@ -23,6 +23,7 @@ import (
 	"maps"
 	"net/http"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -174,11 +175,85 @@ func statusClass(code int) string {
 	}
 }
 
+// requestEvidence holds the request facts a capture fixes when it starts, as the source does: the input
+// composition, the incoming trace with a new span ID, the generated fallback request ID, the arrival sequence
+// and the start time. A direct Build leaves fixed unset and sets only sequence; the request is then measured
+// while the record is built and random identifiers are drawn only when the record uses them.
+type requestEvidence struct {
+	fixed      bool
+	counts     map[string]int64
+	servers    []serverMeasure
+	traceID    string
+	spanID     string
+	fallbackID string
+	// sequence is the arrival order, or nil when the request has none.
+	sequence *uint64
+	started  time.Time
+}
+
+// start fixes the evidence of a request whose capture began at started. The body is measured without
+// the builder lock; the trace span and then the fallback request ID are drawn, in the source's order.
+func (b *Builder) start(req Request, started time.Time) requestEvidence {
+	ev := requestEvidence{fixed: true, started: started}
+	if req.Sequence != nil {
+		ev.sequence = new(*req.Sequence)
+	}
+	ev.counts, ev.servers = measureInput(req.Body, req.BodyBytes)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	ev.traceID, ev.spanID = b.trace(req.Headers)
+	ev.fallbackID = b.id("gateway-request-")
+	return ev
+}
+
+// trace returns the trace ID of a valid incoming traceparent header with a new span ID, or two empty
+// strings when the header is absent or invalid or no span ID can be drawn. The caller holds b.mu.
+func (b *Builder) trace(h http.Header) (traceID, spanID string) {
+	tp, _ := header(h, "traceparent")
+	m := tracePattern.FindStringSubmatch(config.JSTrim(tp))
+	if m == nil || m[1] == "ff" || strings.Trim(m[2], "0") == "" || strings.Trim(m[3], "0") == "" {
+		return "", ""
+	}
+	var span [8]byte
+	reader := b.options.Random
+	if reader == nil {
+		reader = rand.Reader
+	}
+	if _, e := io.ReadFull(reader, span[:]); e != nil {
+		return "", ""
+	}
+	return m[2], hex.EncodeToString(span[:])
+}
+
 // Build returns the primary record and any derived records for a completed request.
+// Every call advances the builder's own request numbering, which a request without a Sequence reports.
 func (b *Builder) Build(req Request) []Record {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.sequence++
+	seq := b.sequence
+	if req.Sequence != nil {
+		seq = *req.Sequence
+	}
+	r, key, servers, ok := b.primary(req, &requestEvidence{sequence: &seq})
+	if !ok {
+		return nil
+	}
+	records := []Record{r}
+	if r.EventName != tokenUsageEvent {
+		return records
+	}
+	records = append(records, b.footprints(r, servers)...)
+	return append(records, b.toolRecords(r, key, req.Body)...)
+}
+
+const tokenUsageEvent = "gateway.token.usage"
+
+// primary builds the primary record of a completed request. It does not number the request, derive
+// records or update the tool-result baseline. It reports false when a successful response lacks complete
+// usage or a failed one carries no limit evidence. The identity and the MCP servers it returns are what the
+// derived records need; servers is empty unless the record reports token usage. The caller holds b.mu.
+func (b *Builder) primary(req Request, ev *requestEvidence) (Record, identity, []serverMeasure, bool) {
 	now := b.options.Now()
 	limits := limitEvidence(req.ResponseHeaders, now)
 	a := make(map[string]any)
@@ -192,17 +267,20 @@ func (b *Builder) Build(req Request) []Record {
 		}
 		exact := exactWireUsage(raw)
 		if req.Incomplete || req.Overflowed || exact["input_tokens"] == nil && exact["output_tokens"] == nil && exact["cache_read_tokens"] == nil && exact["cache_creation_tokens"] == nil {
-			return nil
+			return Record{}, identity{}, nil, false
 		}
 		maps.Copy(a, exact)
-		counts, measures := measureInput(req.Body, req.BodyBytes)
+		counts, measures := ev.counts, slices.Clone(ev.servers) // attribute fills and reorders the servers in place.
+		if !ev.fixed {
+			counts, measures = measureInput(req.Body, req.BodyBytes)
+		}
 		for k, v := range counts {
 			a[k] = v
 		}
 		servers = attribute(a, counts, measures)
-		event = "gateway.token.usage"
+		event = tokenUsageEvent
 	} else if len(limits) == 0 {
-		return nil
+		return Record{}, identity{}, nil, false
 	}
 	key := identity{identifierHeader(req.Headers, "x-claude-code-session-id"), identifierHeader(req.Headers, "x-claude-code-agent-id"), identifierHeader(req.Headers, "x-claude-code-parent-agent-id")}
 	r := b.record(event, "gateway-usage-", now)
@@ -213,7 +291,10 @@ func (b *Builder) Build(req Request) []Record {
 		src = "message_id"
 	}
 	if rid == "" {
-		rid = b.id("gateway-request-")
+		if !ev.fixed {
+			ev.fallbackID = b.id("gateway-request-")
+		}
+		rid = ev.fallbackID
 		src = "generated"
 	}
 	r.add("request_id", nullable(rid))
@@ -221,6 +302,11 @@ func (b *Builder) Build(req Request) []Record {
 	r.add("client_request_id", nullable(cmp.Or(identifierHeader(req.Headers, "x-claude-code-request-id"), identifierHeader(req.Headers, "x-request-id"))))
 	r.add("session_id", nullable(key.session))
 	r.add("project_name", nullable(b.projectName(key.session)))
+	elapsed := req.Elapsed
+	if ev.fixed {
+		// The source measures the duration after the project lookup.
+		elapsed = time.Since(ev.started)
+	}
 	r.add("agent_id", nullable(key.agent))
 	r.add("parent_agent_id", nullable(key.parent))
 	role := "orchestrator"
@@ -259,15 +345,11 @@ func (b *Builder) Build(req Request) []Record {
 	}
 	r.add("token_estimator", estimator)
 	r.add("cache_attribution", cache)
-	seq := b.sequence
-	if req.Sequence != nil {
-		seq = *req.Sequence
-	}
-	if seq <= maxSafeInteger {
-		sequence = seq
+	if ev.sequence != nil && *ev.sequence <= maxSafeInteger {
+		sequence = *ev.sequence
 	}
 	r.add("request_sequence", sequence)
-	r.add("duration_ms", float64(req.Elapsed)/float64(time.Millisecond))
+	r.add("duration_ms", float64(elapsed)/float64(time.Millisecond))
 	r.add("response_body_bytes", req.ResponseBytes)
 	for _, limit := range limits {
 		r.add(limit.key, limit.value)
@@ -281,32 +363,26 @@ func (b *Builder) Build(req Request) []Record {
 		}
 		r.take(a, "input_system_tokens", "input_first_message_tokens", "input_history_tokens", "input_tool_results_tokens", "cache_read_tools_tokens", "cache_read_system_tokens", "cache_read_first_message_tokens", "cache_read_history_tokens", "fresh_tools_tokens", "fresh_system_tokens", "fresh_first_message_tokens", "fresh_history_tokens")
 	}
-	tp, _ := header(req.Headers, "traceparent")
-	if m := tracePattern.FindStringSubmatch(config.JSTrim(tp)); m != nil && m[1] != "ff" && strings.Trim(m[2], "0") != "" && strings.Trim(m[3], "0") != "" {
-		var span [8]byte
-		reader := b.options.Random
-		if reader == nil {
-			reader = rand.Reader
-		}
-		if _, e := io.ReadFull(reader, span[:]); e == nil {
-			r.TraceID = m[2]
-			r.SpanID = hex.EncodeToString(span[:])
-		}
+	if !ev.fixed {
+		ev.traceID, ev.spanID = b.trace(req.Headers)
 	}
-	records := []Record{r}
-	if !success {
-		return records
-	}
+	r.TraceID, r.SpanID = ev.traceID, ev.spanID
+	return r, key, servers, true
+}
+
+// footprints derives one record for each measured MCP server of a token usage record.
+func (b *Builder) footprints(primary Record, servers []serverMeasure) []Record {
+	var records []Record
 	for _, s := range servers {
 		if len(s.name) > 64 {
 			continue
 		}
-		foot := b.derived(r, "gateway.mcp.footprint", "gateway-mcp-footprint-")
+		foot := b.derived(primary, "gateway.mcp.footprint", "gateway-mcp-footprint-")
 		foot.add("mcp_server", s.name)
 		foot.add("input_mcp_tools_tokens", s.tokens)
 		records = append(records, foot)
 	}
-	return append(records, b.toolRecords(r, key, req.Body)...)
+	return records
 }
 
 func (b *Builder) record(event, prefix string, now time.Time) Record {
