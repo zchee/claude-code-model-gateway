@@ -15,6 +15,7 @@
 package jsonx
 
 import (
+	"errors"
 	"fmt"
 	"unicode/utf16"
 	"unicode/utf8"
@@ -24,7 +25,9 @@ import (
 // JavaScript string such as a decoded wire string value. An unpaired surrogate inside a string
 // literal stays the same code unit in the result. One outside a string literal, or directly after
 // the backslash that opens an escape, is a syntax error, as it is in JavaScript. Tokenizing,
-// duplicate names and the nesting limit are those of DecodeWire.
+// duplicate names and the nesting limit are those of DecodeWire. A document deeper than that limit
+// returns *WireDepthError; any other failure is a syntax error that, unlike the tokenizer's, names
+// no part of the input, because the text may be prompt or tool content.
 func DecodeWireUnits(text []uint16) (WireValue, error) {
 	const hex = "0123456789abcdef"
 	b := make([]byte, 0, len(text))
@@ -58,5 +61,12 @@ func DecodeWireUnits(text []uint16) (WireValue, error) {
 		}
 		b = utf8.AppendRune(b, u)
 	}
-	return DecodeWire(b)
+	v, err := DecodeWire(b)
+	if depth := (*WireDepthError)(nil); errors.As(err, &depth) {
+		return WireValue{}, depth
+	}
+	if err != nil {
+		return WireValue{}, errors.New("invalid JSON text")
+	}
+	return v, nil
 }

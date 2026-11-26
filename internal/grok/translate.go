@@ -357,18 +357,29 @@ func stopReason(toolUse bool) string {
 	return "end_turn"
 }
 
-// TranslateResponse builds a message for the advertised model, using now, which must not be nil,
-// for missing IDs. A response that could not be parsed is passed as JSON null and translates as
-// the source translates null.
-//
-// The call fails where the source's translateResponse throws, which is when Number() of a usage
-// field would throw (see CoercionError). It then returns the zero WireValue, whose Kind is 0 and
-// which EncodeWire refuses, so a caller cannot send it by mistake. The result may share subtrees
-// with response; treat both as read-only.
+// TranslateResponse is TranslateResponseChecked without the error: on failure it returns the zero
+// WireValue, whose Kind is 0 and which EncodeWire refuses, so a caller cannot send it by mistake.
 func TranslateResponse(response jsonx.WireValue, model string, now func() time.Time) jsonx.WireValue {
-	u, err := usage(get(response, "usage"))
+	v, err := TranslateResponseChecked(response, model, now)
 	if err != nil {
 		return jsonx.WireValue{}
+	}
+	return v
+}
+
+// TranslateResponseChecked builds a message for the advertised model, using now, which must not
+// be nil, for missing IDs. A response that could not be parsed is passed as JSON null and
+// translates as the source translates null.
+//
+// The call fails where the source's translateResponse throws, which is when Number() of a usage
+// field would throw; the error is then a *CoercionError, and the WireValue is zero. A caller
+// translates and encodes the body before it commits the HTTP status and headers, so a failure can
+// still become an error response. The result may share subtrees with response; treat both as
+// read-only.
+func TranslateResponseChecked(response jsonx.WireValue, model string, now func() time.Time) (jsonx.WireValue, error) {
+	u, err := usage(get(response, "usage"))
+	if err != nil {
+		return jsonx.WireValue{}, err
 	}
 	content, toolUse := responseContent(response, now)
 	id := get(response, "id")
@@ -384,5 +395,5 @@ func TranslateResponse(response jsonx.WireValue, model string, now func() time.T
 		member("stop_reason", str(stopReason(toolUse))),
 		member("stop_sequence", null()),
 		member("usage", u),
-	)
+	), nil
 }

@@ -168,7 +168,12 @@ func toCount(v jsonx.WireValue) (float64, error) {
 
 // jsString is String(v) for a value on which it does not throw (see toString); an object reads
 // as "[object Object]".
-func jsString(v jsonx.WireValue) []uint16 { return appendString(nil, v) }
+func jsString(v jsonx.WireValue) []uint16 {
+	if v.Kind == '"' {
+		return v.Text // Shared, not copied; callers treat it as read-only.
+	}
+	return appendString(nil, v)
+}
 
 // appendString appends String(v) to dst. Nested arrays write into the one buffer, so the cost is
 // linear in the size of v.

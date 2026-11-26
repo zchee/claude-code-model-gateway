@@ -248,3 +248,23 @@ func TestStreamLifetime(t *testing.T) {
 		})
 	}
 }
+
+// TestStreamFailedArgumentDeltaSuppressesDone checks the one state the port sets before a frame in
+// source order: an argument delta too deep to encode writes nothing, yet marks its tool as having
+// seen a delta, so the later arguments.done emits nothing either.
+func TestStreamFailedArgumentDeltaSuppressesDone(t *testing.T) {
+	deep := strings.Repeat("[", 9999) + strings.Repeat("]", 9999)
+	tests := map[string]struct{ steps []exchange }{
+		"error: unencodable delta then done": {[]exchange{
+			event(created, messageStart("resp_fixture", zeroUsage)),
+			event(`{"type":"response.output_item.added","output_index":1,"item":`+toolItem+`}`, blockStart("0", toolBlock)),
+			event(`{"type":"response.function_call_arguments.delta","item_id":"fc_resp_0","delta":`+deep+`}`, ""),
+			event(`{"type":"response.function_call_arguments.done","item_id":"fc_resp_0","arguments":"{}"}`, ""),
+			event(`{"type":"response.output_item.done","output_index":1,"item":`+toolItem+`}`, blockStop("0")),
+			event(toolComplete, terminal("tool_use", zeroUsage)),
+		}},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) { checkStream(t, tt.steps, "") })
+	}
+}

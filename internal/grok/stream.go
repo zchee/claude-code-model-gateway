@@ -39,12 +39,23 @@ type tool struct {
 // and it must not be copied. Late events after response.completed are still translated until End,
 // as in the source.
 //
-// An event is handled whole or not at all where the source's String() or Number() would throw: the
-// worker catches that exception per event (lib/request-worker.js:363-377), and the translator finds
-// it before the event changes anything, so the event yields no frame and no state change. When a
-// frame cannot be encoded (an upstream value deeper than the wire policy's nesting limit), handling
-// of that event stops at that frame: frames already produced for the event are kept, and the
-// message start or content block the frame would have announced is not registered.
+// Two failure rules differ deliberately from the source, which writes and mutates up to the point
+// where it throws and leaves those effects in place (the worker catches the exception per event,
+// lib/request-worker.js:363-377):
+//
+//   - Where the source's String() or Number() would throw, the port handles the event not at all:
+//     every such conversion is computed before the event's first frame or state change, so the
+//     event yields no frame and no state change. In the source, a text delta whose item_id throws
+//     has already written message_start and marked the message started, and a completion whose
+//     usage throws has already closed every open block (and set its stopped flag) before the
+//     throw; the port writes none of that.
+//   - When a frame cannot be encoded (an upstream value deeper than the wire policy's nesting
+//     limit), handling stops at that frame and frames already produced for the event are kept.
+//     The message start or content block the frame would announce is registered only after the
+//     frame is written, whereas the source registers a block before writing its start; so no
+//     later event closes a block the client never saw. Other state keeps the source's order: an
+//     argument delta marks its tool as having seen a delta before the frame is written, so a delta
+//     that fails to encode still suppresses the later arguments.done.
 //
 // An `event: error` frame relays the upstream error message to the client, as the source does;
 // that is response content passed through, not a Go error or a log line.

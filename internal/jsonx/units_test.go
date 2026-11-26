@@ -19,6 +19,7 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf16"
+	"unicode/utf8"
 
 	gocmp "github.com/google/go-cmp/cmp"
 
@@ -36,8 +37,8 @@ func unitsOf(s string) []uint16 {
 		case strings.HasPrefix(s, "<lo>"):
 			out, s = append(out, 0xdc00), s[len("<lo>"):]
 		default:
-			r := []rune(s)[0]
-			out, s = utf16.AppendRune(out, r), s[len(string(r)):]
+			r, width := utf8.DecodeRuneInString(s)
+			out, s = utf16.AppendRune(out, r), s[width:]
 		}
 	}
 	return out
@@ -50,24 +51,28 @@ func TestDecodeWireUnits(t *testing.T) {
 		members int
 		wantErr bool
 	}{
-		"success: lone high surrogate in a string stays a unit":    {input: `{"k":"<hi>"}`, want: `{"k":"\ud800"}`, members: 1},
-		"success: lone low surrogate between characters":           {input: `["a<lo>b"]`, want: `["a\udc00b"]`},
-		"success: reversed pair stays two units":                   {input: `["<lo><hi>"]`, want: `["\udc00\ud800"]`},
-		"success: escaped lone surrogate stays a unit":             {input: `{"k":"\ud800"}`, want: `{"k":"\ud800"}`, members: 1},
-		"success: pair is one character":                           {input: "[\"\U0001F600\"]", want: "[\"\U0001F600\"]"},
-		"success: lone key differs from the replacement character": {input: "{\"<hi>\":1,\"\ufffd\":2}", want: "{\"\\ud800\":1,\"\ufffd\":2}", members: 2},
-		"success: escaped backslash before a lone unit":            {input: `["\\<hi>"]`, want: `["\\\ud800"]`},
-		"success: duplicate names collapse as in DecodeWire":       {input: `{"<hi>":1,"\ud800":2}`, want: `{"\ud800":2}`, members: 1},
-		"success: whitespace and numbers as in DecodeWire":         {input: " \t[1e400, -0, 0.1]\r\n", want: `[null,0,0.1]`},
-		"error: lone unit outside a string":                        {input: `[1]<hi>`, wantErr: true},
-		"error: lone unit before a document":                       {input: `<lo>[1]`, wantErr: true},
-		"error: lone unit right after the escape backslash":        {input: `["\<hi>"]`, wantErr: true},
-		"error: pair right after the escape backslash":             {input: "[\"\\\U0001F600\"]", wantErr: true},
-		"error: lone unit among unicode escape digits":             {input: `["\u12<hi>"]`, wantErr: true},
-		"error: lone unit as an object name outside quotes":        {input: `{<hi>:1}`, wantErr: true},
-		"error: trailing value":                                    {input: `[1] [2]`, wantErr: true},
-		"error: empty input":                                       {input: ``, wantErr: true},
-		"error: byte order mark is not JSON white space":           {input: "\ufeff[1]", wantErr: true},
+		"success: lone high surrogate in a string stays a unit":      {input: `{"k":"<hi>"}`, want: `{"k":"\ud800"}`, members: 1},
+		"success: lone low surrogate between characters":             {input: `["a<lo>b"]`, want: `["a\udc00b"]`},
+		"success: reversed pair stays two units":                     {input: `["<lo><hi>"]`, want: `["\udc00\ud800"]`},
+		"success: escaped lone surrogate stays a unit":               {input: `{"k":"\ud800"}`, want: `{"k":"\ud800"}`, members: 1},
+		"success: pair is one character":                             {input: "[\"\U0001F600\"]", want: "[\"\U0001F600\"]"},
+		"success: lone key differs from the replacement character":   {input: "{\"<hi>\":1,\"\ufffd\":2}", want: "{\"\\ud800\":1,\"\ufffd\":2}", members: 2},
+		"success: escaped backslash before a lone unit":              {input: `["\\<hi>"]`, want: `["\\\ud800"]`},
+		"success: duplicate names collapse as in DecodeWire":         {input: `{"<hi>":1,"\ud800":2}`, want: `{"\ud800":2}`, members: 1},
+		"success: whitespace and numbers as in DecodeWire":           {input: " \t[1e400, -0, 0.1]\r\n", want: `[null,0,0.1]`},
+		"error: lone unit outside a string":                          {input: `[1]<hi>`, wantErr: true},
+		"error: lone unit before a document":                         {input: `<lo>[1]`, wantErr: true},
+		"error: lone unit right after the escape backslash":          {input: `["\<hi>"]`, wantErr: true},
+		"error: pair right after the escape backslash":               {input: "[\"\\\U0001F600\"]", wantErr: true},
+		"error: lone unit among unicode escape digits":               {input: `["\u12<hi>"]`, wantErr: true},
+		"error: lone unit as an object name outside quotes":          {input: `{<hi>:1}`, wantErr: true},
+		"success: raw high half then escaped low half form one pair": {input: `["<hi>\udc00"]`, want: "[\"\U00010000\"]"},
+		"success: escaped high half then raw low half form one pair": {input: `["\ud800<lo>"]`, want: "[\"\U00010000\"]"},
+		"success: line and paragraph separators inside literals":     {input: "{\"\u2028\":\"a\u2029b\"}", want: "{\"\u2028\":\"a\u2029b\"}", members: 1},
+		"error: line separator outside a literal":                    {input: "[1,\u20282]", wantErr: true},
+		"error: trailing value":                                      {input: `[1] [2]`, wantErr: true},
+		"error: empty input":                                         {input: ``, wantErr: true},
+		"error: byte order mark is not JSON white space":             {input: "\ufeff[1]", wantErr: true},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -143,6 +148,28 @@ func TestDecodeWireUnitsDepth(t *testing.T) {
 			}
 			if _, ok := errors.AsType[*jsonx.WireDepthError](err); !ok {
 				t.Fatalf("depth %d: error %v, want *jsonx.WireDepthError", tt.depth, err)
+			}
+		})
+	}
+}
+
+// TestDecodeWireUnitsErrorNamesNoContent checks that a syntax error repeats no part of the input:
+// the tokenizer's own error quotes member names through its JSON pointer.
+func TestDecodeWireUnitsErrorNamesNoContent(t *testing.T) {
+	tests := map[string]struct{ input string }{
+		"error: malformed array under a member":   {`{"private-label":[?]}`},
+		"error: missing value after a member":     {`{"private-label":}`},
+		"error: lone unit inside a nested member": {`{"private-label":{"x":1}<hi>}`},
+		"error: bad escape in a member value":     {`{"private-label":"\q"}`},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, err := jsonx.DecodeWireUnits(unitsOf(tt.input))
+			if err == nil {
+				t.Fatalf("DecodeWireUnits(%q) accepted the input", tt.input)
+			}
+			if strings.Contains(err.Error(), "private-label") {
+				t.Errorf("error %q names input content", err)
 			}
 		})
 	}
