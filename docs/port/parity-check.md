@@ -68,43 +68,192 @@ all plan replacements.
 
 ### Collect hosted Go evidence
 
-From the clean checkout of the gated commit, list its completed push runs.
-Select a successful run named `Build, lint, and test` whose two hosted jobs
-both ran in the same attempt. If rerunning, use **Re-run all jobs**, not a
-single-job rerun. Keep the separate Linux development-venue logs required by
-the verification plan; use the hosted artifacts as the Go JSON inputs below.
+Run either collection procedure from the main checkout of a standard clone; both
+refuse linked worktrees, separate Git directories, and bare repositories.
+At the gated commit, list
+completed runs of `.github/workflows/test.yaml` (`Build, lint, and test`)
+filtered by `--workflow test.yaml` — `--event push` (which also produces the
+hosted conformance export when `.github/conformance-phase` names `$phase`) or
+`--event workflow_dispatch` (triggered with `-f conformance_phase=$phase` on
+the pushed branch). Never accept `pull_request` runs as gate evidence. Select a
+successful run whose hosted jobs all ran in the same attempt. If rerunning, use
+**Re-run all jobs**, not a single-job rerun. Keep the separate Linux
+development-venue logs required by the verification plan; use the hosted
+artifacts as the Go JSON (and, for phases with due conformance cases, the
+conformance export) inputs below. No `retention-days` is set in
+`.github/workflows/test.yaml`, so the repository's artifact retention policy
+applies uniformly to all uploaded artifacts.
+
+In both procedures below,
+downloads are guarded in the same command by resolving
+`.github/workflows/test.yaml` to its workflow ID with `gh api` and checking
+`gh run view --attempt --json` so the command fails unless the selected run
+attempt is `completed` with conclusion `success` and matches that
+`workflowDatabaseId`, event (`push` or `workflow_dispatch`), commit, run ID, and
+attempt. Downloads are staged in a directory resolved physically outside the
+checkouts and checked by directory identity (`test -ef`) across every ancestor
+(refusing if `TMPDIR` resolves to or inside a checkout, and exporting `TMPDIR`
+as the physical staging root before any helper runs), verification runs from a
+separate clean detached worktree of the gated commit created outside the
+repository for that purpose, and verified files are copied into the main
+checkout's `.omc/artifacts/verify/` only afterwards. A trap removes the
+temporary worktree and staging directory on exit so repeating the procedure for
+a later attempt or gate works without manual cleanup
+(`hack/conformance-export verify` disables user-global ignore files and rejects
+a checkout with untracked files, including `.omc/`).
+
+#### Go-only phases (`phase-0`, `phase-1`)
 
 ```sh
 phase=phase-0
+event=push # or workflow_dispatch
 commit=$(git rev-parse HEAD)
-gh run list --event push --commit "$commit" --status completed \
-  --json name,databaseId,attempt,headSha,conclusion,url
+gh run list --workflow test.yaml --event "$event" --commit "$commit" --status completed \
+  --json workflowName,name,databaseId,attempt,headSha,conclusion,url
 ```
 
 Enter that run's `databaseId` and `attempt`, separated by a space, at `read`.
-Check that both `checks` jobs are present and passed before downloading. Use
-a fresh download directory so an old file cannot fill in for a missing suite.
+Inspect the run summary to confirm both `checks` legs are present and passed.
 
 ```sh
 read -r run attempt
 gh run view "$run" --attempt "$attempt" --exit-status
 ```
 
-```sh
-dir="$PWD/.omc/artifacts/verify/$phase"
-mkdir -p "$dir" && out=$(mktemp -d "$dir/gha-$run-$attempt.XXXXXXXX") &&
-  gh run download "$run" --name "go-test-ubuntu-26.04-$attempt" --dir "$out/ubuntu-26.04" &&
-  gh run download "$run" --name "go-test-xcode-27-$attempt" --dir "$out/xcode-27"
-```
-
-Check all four headers against the selected run and commit before running the
-results check. The checker only compares run identifiers across its inputs.
+Guard the selected run attempt, download into a physical staging directory
+outside the repository, verify all four Go headers and the results gate from a
+separate clean worktree of `$commit`, and archive into the main checkout's
+`.omc/artifacts/verify/` only if every check passes:
 
 ```sh
 (
+  set -eu
+  within_any_checkout() {
+    dir=$1
+    shift
+    while :; do
+      for checkout in "$@"; do
+        if [ -n "$checkout" ] && test "$dir" -ef "$checkout"; then
+          return 0
+        fi
+      done
+      case "$dir" in
+        /|//|'') break ;;
+      esac
+      parent=${dir%/*}
+      [ -n "$parent" ] || parent=/
+      [ "$parent" != "$dir" ] || break
+      dir=$parent
+    done
+    return 1
+  }
+
+  refuse_layout() {
+    printf 'standard git layout required: run from the main checkout\n' >&2
+    exit 1
+  }
+  [ -z "${GIT_DIR+x}${GIT_WORK_TREE+x}${GIT_COMMON_DIR+x}" ] || refuse_layout
+  core_wt_rc=0
+  git config --get-all core.worktree >/dev/null 2>&1 || core_wt_rc=$?
+  [ "$core_wt_rc" -eq 1 ] || refuse_layout
+
+  # Keep any trailing newline in the checkout name when capturing Git's path.
+  top=$(git rev-parse --path-format=absolute --show-toplevel 2>/dev/null && printf .) || refuse_layout
+  main_real=${top%??}
+  [ -d "$main_real/.git" ] && [ ! -L "$main_real/.git" ] || refuse_layout
+  git_dir=$(git rev-parse --path-format=absolute --git-dir 2>/dev/null) || refuse_layout
+  common_dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || refuse_layout
+  test "$git_dir" -ef "$common_dir" && test "$main_real/.git" -ef "$common_dir" || refuse_layout
+
+  if [ ! -d "${TMPDIR:-/tmp}" ]; then
+    printf 'TMPDIR must name an existing directory: %s\n' "${TMPDIR:-/tmp}" >&2
+    exit 1
+  fi
+  tmp_base=$(CDPATH='' cd -P -- "${TMPDIR:-/tmp}" && pwd -P)
+  if within_any_checkout "$tmp_base" "$main_real"; then
+    printf 'TMPDIR must resolve outside the repository: %s\n' "$tmp_base" >&2
+    exit 1
+  fi
+
+  workflow_meta=$(gh api 'repos/{owner}/{repo}/actions/workflows/test.yaml')
+  if ! workflow_id=$(printf '%s\n' "$workflow_meta" | jq -esr \
+    'if length == 1
+        and (.[0] | type == "object")
+        and (.[0].id | type == "number")
+        and ((.[0].id | tostring) | test("^[1-9][0-9]*$"))
+        and .[0].path == ".github/workflows/test.yaml"
+     then .[0].id | tostring
+     else empty
+     end') || [ -z "$workflow_id" ]; then
+    printf 'failed to resolve workflow id for .github/workflows/test.yaml\n' >&2
+    exit 1
+  fi
+
+  run_meta=$(gh run view "$run" --attempt "$attempt" \
+    --json databaseId,attempt,status,conclusion,event,headSha,workflowDatabaseId)
+  if ! printf '%s\n' "$run_meta" | jq -es \
+    --arg run "$run" \
+    --arg attempt "$attempt" \
+    --arg workflow_id "$workflow_id" \
+    --arg event "$event" \
+    --arg commit "$commit" \
+    'length == 1
+     and ($run | test("^[1-9][0-9]*$"))
+     and ($attempt | test("^[1-9][0-9]*$"))
+     and ($workflow_id | test("^[1-9][0-9]*$"))
+     and ($event == "push" or $event == "workflow_dispatch")
+     and (.[0].databaseId | type == "number")
+     and ((.[0].databaseId | tostring) == $run)
+     and (.[0].attempt | type == "number")
+     and ((.[0].attempt | tostring) == $attempt)
+     and (.[0].workflowDatabaseId | type == "number")
+     and ((.[0].workflowDatabaseId | tostring) == $workflow_id)
+     and .[0].status == "completed"
+     and .[0].conclusion == "success"
+     and .[0].event == $event
+     and .[0].headSha == $commit' >/dev/null; then
+    printf 'selected run attempt failed guard: run=%s attempt=%s workflow_id=%s event=%s commit=%s\n' \
+      "$run" "$attempt" "$workflow_id" "$event" "$commit" >&2
+    exit 1
+  fi
+
+  work_root=$(mktemp -d "${tmp_base%/}/parity-check-$phase-gha-$run-$attempt.XXXXXXXX")
+  work_root=$(CDPATH='' cd -P -- "$work_root" && pwd -P)
+  verify_wt=''
+  trap '
+    if [ -n "$verify_wt" ] && [ -e "$verify_wt" ]; then
+      git -C "$main_real" worktree remove --force "$verify_wt" >/dev/null 2>&1 || true
+    fi
+    if [ -n "$work_root" ] && [ -d "$work_root" ]; then
+      rm -rf -- "$work_root"
+    fi
+  ' EXIT
+
+  if within_any_checkout "$work_root" "$main_real"; then
+    printf 'staging root must resolve outside the repository: %s\n' "$work_root" >&2
+    exit 1
+  fi
+  TMPDIR=$work_root
+  export TMPDIR
+
+  stage="$work_root/stage"
+  mkdir -p -- "$stage"
+  stage_real=$(CDPATH='' cd -P -- "$stage" && pwd -P)
+
+  gh run download "$run" --name "go-test-ubuntu-26.04-$attempt" --dir "$stage_real/ubuntu-26.04"
+  gh run download "$run" --name "go-test-xcode-27-$attempt" --dir "$stage_real/xcode-27"
+
+  verify_wt="$work_root/verify-wt"
+  git -C "$main_real" worktree add --detach "$verify_wt" "$commit"
+  verify_wt_real=$(CDPATH='' cd -P -- "$verify_wt" && pwd -P)
+  if within_any_checkout "$stage_real" "$verify_wt_real" "$main_real"; then
+    printf 'staging directory must resolve outside the verifying checkout: %s\n' "$stage_real" >&2
+    exit 1
+  fi
+
   for runner in ubuntu-26.04 xcode-27; do
     for suite in plain process; do
-      file="$out/$runner/go-test-$suite.jsonl"
+      file="$stage_real/$runner/go-test-$suite.jsonl"
       if ! head -n 1 "$file" | jq -es --arg commit "$commit" --arg run_id "gha-$run-$attempt" \
         'length == 1 and .[0].commit == $commit and .[0].run_id == $run_id' >/dev/null; then
         printf 'wrong or missing evidence metadata: %s\n' "$file" >&2
@@ -113,21 +262,231 @@ results check. The checker only compares run identifiers across its inputs.
     done
   done
 
-  ./hack/parity-check results "$phase" --commit "$commit" \
-    --go-json "$out/ubuntu-26.04/go-test-plain.jsonl" \
-    --go-json "$out/ubuntu-26.04/go-test-process.jsonl" \
-    --go-json "$out/xcode-27/go-test-plain.jsonl" \
-    --go-json "$out/xcode-27/go-test-process.jsonl"
+  "$verify_wt_real/hack/parity-check" results "$phase" --commit "$commit" \
+    --go-json "$stage_real/ubuntu-26.04/go-test-plain.jsonl" \
+    --go-json "$stage_real/ubuntu-26.04/go-test-process.jsonl" \
+    --go-json "$stage_real/xcode-27/go-test-plain.jsonl" \
+    --go-json "$stage_real/xcode-27/go-test-process.jsonl"
+
+  archive="$main_real/.omc/artifacts/verify/$phase"
+  mkdir -p -- "$archive"
+  out=$(mktemp -d "$archive/gha-$run-$attempt.XXXXXXXX")
+  cp -R "$stage_real/." "$out/"
+  printf 'archived: %s\n' "$out"
 )
 ```
 
-For phases with due conformance cases, take `--census` and `--launches` together from the verified phase export,
-not from individual diagnostics. The export contract in [the work plan, §6](model-gateway-go-port.md#6-verification-steps)
+#### Gate phases with conformance (`phase-2` through `phase-5`)
+
+Only the final `conformance-export-$phase-$attempt` artifact published by the
+downstream `publish-conformance-export` job (after both matrix legs succeed in
+the same attempt and both attempt-qualified Go artifacts exist) is gate
+evidence. Never use `conformance-export-candidate-$phase-$attempt` as gate
+evidence.
+
+```sh
+phase=phase-2
+event=push # or workflow_dispatch
+commit=$(git rev-parse HEAD)
+gh run list --workflow test.yaml --event "$event" --commit "$commit" --status completed \
+  --json workflowName,name,databaseId,attempt,headSha,conclusion,url
+```
+
+Enter that run's `databaseId` and `attempt`, separated by a space, at `read`,
+and inspect the run summary to confirm both `checks` legs and
+`publish-conformance-export` passed in that attempt.
+
+```sh
+read -r run attempt
+gh run view "$run" --attempt "$attempt" --exit-status
+```
+
+Guard the selected run attempt, download the two Go artifacts and the final
+conformance export into a physical staging directory outside the repository,
+verify the export, manifest, all four Go headers, and the results gate from a
+separate clean worktree of `$commit`, and archive into the main checkout's
+`.omc/artifacts/verify/` only if every check passes:
+
+```sh
+(
+  set -eu
+  within_any_checkout() {
+    dir=$1
+    shift
+    while :; do
+      for checkout in "$@"; do
+        if [ -n "$checkout" ] && test "$dir" -ef "$checkout"; then
+          return 0
+        fi
+      done
+      case "$dir" in
+        /|//|'') break ;;
+      esac
+      parent=${dir%/*}
+      [ -n "$parent" ] || parent=/
+      [ "$parent" != "$dir" ] || break
+      dir=$parent
+    done
+    return 1
+  }
+
+  refuse_layout() {
+    printf 'standard git layout required: run from the main checkout\n' >&2
+    exit 1
+  }
+  [ -z "${GIT_DIR+x}${GIT_WORK_TREE+x}${GIT_COMMON_DIR+x}" ] || refuse_layout
+  core_wt_rc=0
+  git config --get-all core.worktree >/dev/null 2>&1 || core_wt_rc=$?
+  [ "$core_wt_rc" -eq 1 ] || refuse_layout
+
+  # Keep any trailing newline in the checkout name when capturing Git's path.
+  top=$(git rev-parse --path-format=absolute --show-toplevel 2>/dev/null && printf .) || refuse_layout
+  main_real=${top%??}
+  [ -d "$main_real/.git" ] && [ ! -L "$main_real/.git" ] || refuse_layout
+  git_dir=$(git rev-parse --path-format=absolute --git-dir 2>/dev/null) || refuse_layout
+  common_dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || refuse_layout
+  test "$git_dir" -ef "$common_dir" && test "$main_real/.git" -ef "$common_dir" || refuse_layout
+
+  if [ ! -d "${TMPDIR:-/tmp}" ]; then
+    printf 'TMPDIR must name an existing directory: %s\n' "${TMPDIR:-/tmp}" >&2
+    exit 1
+  fi
+  tmp_base=$(CDPATH='' cd -P -- "${TMPDIR:-/tmp}" && pwd -P)
+  if within_any_checkout "$tmp_base" "$main_real"; then
+    printf 'TMPDIR must resolve outside the repository: %s\n' "$tmp_base" >&2
+    exit 1
+  fi
+
+  workflow_meta=$(gh api 'repos/{owner}/{repo}/actions/workflows/test.yaml')
+  if ! workflow_id=$(printf '%s\n' "$workflow_meta" | jq -esr \
+    'if length == 1
+        and (.[0] | type == "object")
+        and (.[0].id | type == "number")
+        and ((.[0].id | tostring) | test("^[1-9][0-9]*$"))
+        and .[0].path == ".github/workflows/test.yaml"
+     then .[0].id | tostring
+     else empty
+     end') || [ -z "$workflow_id" ]; then
+    printf 'failed to resolve workflow id for .github/workflows/test.yaml\n' >&2
+    exit 1
+  fi
+
+  run_meta=$(gh run view "$run" --attempt "$attempt" \
+    --json databaseId,attempt,status,conclusion,event,headSha,workflowDatabaseId)
+  if ! printf '%s\n' "$run_meta" | jq -es \
+    --arg run "$run" \
+    --arg attempt "$attempt" \
+    --arg workflow_id "$workflow_id" \
+    --arg event "$event" \
+    --arg commit "$commit" \
+    'length == 1
+     and ($run | test("^[1-9][0-9]*$"))
+     and ($attempt | test("^[1-9][0-9]*$"))
+     and ($workflow_id | test("^[1-9][0-9]*$"))
+     and ($event == "push" or $event == "workflow_dispatch")
+     and (.[0].databaseId | type == "number")
+     and ((.[0].databaseId | tostring) == $run)
+     and (.[0].attempt | type == "number")
+     and ((.[0].attempt | tostring) == $attempt)
+     and (.[0].workflowDatabaseId | type == "number")
+     and ((.[0].workflowDatabaseId | tostring) == $workflow_id)
+     and .[0].status == "completed"
+     and .[0].conclusion == "success"
+     and .[0].event == $event
+     and .[0].headSha == $commit' >/dev/null; then
+    printf 'selected run attempt failed guard: run=%s attempt=%s workflow_id=%s event=%s commit=%s\n' \
+      "$run" "$attempt" "$workflow_id" "$event" "$commit" >&2
+    exit 1
+  fi
+
+  work_root=$(mktemp -d "${tmp_base%/}/parity-check-$phase-gha-$run-$attempt.XXXXXXXX")
+  work_root=$(CDPATH='' cd -P -- "$work_root" && pwd -P)
+  verify_wt=''
+  trap '
+    if [ -n "$verify_wt" ] && [ -e "$verify_wt" ]; then
+      git -C "$main_real" worktree remove --force "$verify_wt" >/dev/null 2>&1 || true
+    fi
+    if [ -n "$work_root" ] && [ -d "$work_root" ]; then
+      rm -rf -- "$work_root"
+    fi
+  ' EXIT
+
+  if within_any_checkout "$work_root" "$main_real"; then
+    printf 'staging root must resolve outside the repository: %s\n' "$work_root" >&2
+    exit 1
+  fi
+  TMPDIR=$work_root
+  export TMPDIR
+
+  stage="$work_root/stage"
+  mkdir -p -- "$stage"
+  stage_real=$(CDPATH='' cd -P -- "$stage" && pwd -P)
+
+  gh run download "$run" --name "go-test-ubuntu-26.04-$attempt" --dir "$stage_real/ubuntu-26.04"
+  gh run download "$run" --name "go-test-xcode-27-$attempt" --dir "$stage_real/xcode-27"
+  gh run download "$run" --name "conformance-export-$phase-$attempt" --dir "$stage_real/conformance-export"
+
+  verify_wt="$work_root/verify-wt"
+  git -C "$main_real" worktree add --detach "$verify_wt" "$commit"
+  verify_wt_real=$(CDPATH='' cd -P -- "$verify_wt" && pwd -P)
+  if within_any_checkout "$stage_real" "$verify_wt_real" "$main_real"; then
+    printf 'staging directory must resolve outside the verifying checkout: %s\n' "$stage_real" >&2
+    exit 1
+  fi
+
+  "$verify_wt_real/hack/conformance-export" verify "$stage_real/conformance-export"
+
+  if ! jq -es --arg commit "$commit" --arg run_id "gha-$run-$attempt" --arg phase "$phase" \
+    'length == 1
+     and .[0].producer == "hosted"
+     and .[0].commit == $commit
+     and .[0].run_id == $run_id
+     and .[0].phase == $phase
+     and .[0].clean_tree == true
+     and .[0].verdict == "pass"
+     and .[0].status == 0
+     and .[0].selection == ("conformance<=" + $phase)' \
+    "$stage_real/conformance-export/manifest.json" >/dev/null; then
+    printf 'wrong or missing conformance manifest metadata: %s\n' "$stage_real/conformance-export/manifest.json" >&2
+    exit 1
+  fi
+
+  for runner in ubuntu-26.04 xcode-27; do
+    for suite in plain process; do
+      file="$stage_real/$runner/go-test-$suite.jsonl"
+      if ! head -n 1 "$file" | jq -es --arg commit "$commit" --arg run_id "gha-$run-$attempt" \
+        'length == 1 and .[0].commit == $commit and .[0].run_id == $run_id' >/dev/null; then
+        printf 'wrong or missing evidence metadata: %s\n' "$file" >&2
+        exit 1
+      fi
+    done
+  done
+
+  "$verify_wt_real/hack/parity-check" results "$phase" --commit "$commit" \
+    --go-json "$stage_real/ubuntu-26.04/go-test-plain.jsonl" \
+    --go-json "$stage_real/ubuntu-26.04/go-test-process.jsonl" \
+    --go-json "$stage_real/xcode-27/go-test-plain.jsonl" \
+    --go-json "$stage_real/xcode-27/go-test-process.jsonl" \
+    --census "$stage_real/conformance-export/census.tsv" \
+    --launches "$stage_real/conformance-export/launches.tsv"
+
+  archive="$main_real/.omc/artifacts/verify/$phase"
+  mkdir -p -- "$archive"
+  out=$(mktemp -d "$archive/gha-$run-$attempt.XXXXXXXX")
+  cp -R "$stage_real/." "$out/"
+  printf 'archived: %s\n' "$out"
+)
+```
+
+For phases with due conformance cases, take `--census` and `--launches` together from the verified final export (`conformance-export-<phase>-<attempt>`),
+not from individual diagnostics or a candidate artifact. The export contract in [the work plan, §6](model-gateway-go-port.md#6-verification-steps)
 requires a producer manifest and a full passing binary run through that phase; matching metadata lines alone do not
 establish either. For the hosted run above, reject
 files for a different commit or a different run ID (`gha-<run>-<attempt>`),
-a single-job rerun, and concatenated or edited files. Suite failures may still
-produce artifacts; they do not count as passing evidence.
+a single-job rerun, a `pull_request` run, and concatenated or edited files. Suite failures may still
+produce Go test artifacts (and a Linux-only pass while macOS fails may produce a
+candidate artifact); they never produce the final `conformance-export-<phase>-<attempt>`
+artifact and do not count as passing evidence.
 
 Producers must collect unfiltered Go events without caching and record the
 executable path and measured digest from the actual Go launch for conformance.

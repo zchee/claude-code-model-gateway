@@ -6,9 +6,15 @@ on:
       - main
       - 'port/**'
   pull_request:
+  workflow_dispatch:
+    inputs:
+      conformance_phase:
+        description: Gate phase for hosted binary conformance export (auto reads .github/conformance-phase)
+        required: false
+        default: auto
+        type: string
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -16,6 +22,8 @@ concurrency:
 
 jobs:
   checks:
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -23,6 +31,8 @@ jobs:
           - ubuntu-26.04
           - xcode-27
     runs-on: ${{ matrix.runner }}
+    outputs:
+      conformance_phase: ${{ steps.conformance_phase.outputs.phase }}
     env:
       TEST_EVIDENCE_RUN_ID: gha-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
@@ -72,6 +82,7 @@ jobs:
           fi
           exit "${rc:-0}"
       - name: Run process tests
+        id: process_tests
         # A failure in the plain suite must not hide the process suite's result.
         # Both run only on an attested runner.
         if: ${{ !cancelled() && steps.attest.outcome == 'success' && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure') }}
@@ -84,6 +95,7 @@ jobs:
           fi
           exit "${rc:-0}"
       - name: Upload test evidence
+        id: test_evidence
         if: ${{ !cancelled() && steps.attest.outcome == 'success' && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure') }}
         uses: actions/upload-artifact@v7
         with:
@@ -91,4 +103,240 @@ jobs:
           path: |
             ${{ runner.temp }}/go-test-plain.jsonl
             ${{ runner.temp }}/go-test-process.jsonl
+          if-no-files-found: error
+      - name: Resolve conformance phase
+        id: conformance_phase
+        # Runs after Go evidence upload on both matrix legs so the job output
+        # stays consistent regardless of which leg finishes last, and a bad
+        # phase file cannot block attestation, Go tests, or Go evidence upload.
+        # When .github/conformance-phase is present, validate it first as raw
+        # bytes identically on both runners using the same phase validator as
+        # the dispatch input; only after it passes may an explicit dispatch
+        # input override the phase it names.
+        if: ${{ !cancelled() && steps.attest.outcome == 'success' && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure') && (steps.test_evidence.outcome == 'success' || steps.test_evidence.outcome == 'failure') }}
+        env:
+          INPUT_PHASE: ${{ inputs.conformance_phase }}
+        run: |
+          phase=$(python3 -I - <<'PY'
+          import os
+          import stat
+          import sys
+
+          SUPPORTED = frozenset({"phase-2", "phase-3", "phase-4", "phase-5"})
+          PATH = ".github/conformance-phase"
+
+
+          def validate_phase(value: str, source: str) -> str:
+              if value not in SUPPORTED:
+                  print(
+                      f"unsupported conformance phase from {source}: {value!r}",
+                      file=sys.stderr,
+                  )
+                  sys.exit(2)
+              return value
+
+
+          file_phase = ""
+          if os.path.lexists(PATH):
+              try:
+                  st = os.lstat(PATH)
+              except OSError as exc:
+                  print(f"{PATH} must be a regular file: {exc}", file=sys.stderr)
+                  sys.exit(2)
+              if not stat.S_ISREG(st.st_mode):
+                  print(f"{PATH} must be a regular file", file=sys.stderr)
+                  sys.exit(2)
+              try:
+                  fd = os.open(PATH, os.O_RDONLY | os.O_NOFOLLOW)
+              except OSError as exc:
+                  print(f"{PATH} must be a regular file: {exc}", file=sys.stderr)
+                  sys.exit(2)
+              with os.fdopen(fd, "rb") as fh:
+                  if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                      print(f"{PATH} must be a regular file", file=sys.stderr)
+                      sys.exit(2)
+                  raw = fh.read()
+              # Reject NUL and any other ASCII control byte (C0 except LF, and DEL).
+              if any(b != 0x0A and (b < 0x20 or b == 0x7F) for b in raw):
+                  print(f"{PATH} must not contain NUL or control bytes", file=sys.stderr)
+                  sys.exit(2)
+              try:
+                  text = raw.decode("utf-8")
+              except UnicodeDecodeError:
+                  print(f"{PATH} must be valid UTF-8", file=sys.stderr)
+                  sys.exit(2)
+              if any(0x80 <= ord(ch) <= 0x9F for ch in text):
+                  print(f"{PATH} must not contain control characters", file=sys.stderr)
+                  sys.exit(2)
+              for line in text.split("\n"):
+                  if line == "" or line.startswith("#"):
+                      continue
+                  if file_phase:
+                      print(
+                          f"{PATH} must contain exactly one phase line",
+                          file=sys.stderr,
+                      )
+                      sys.exit(2)
+                  file_phase = line
+              if not file_phase:
+                  print(
+                      f"{PATH} must contain exactly one supported phase",
+                      file=sys.stderr,
+                  )
+                  sys.exit(2)
+              file_phase = validate_phase(file_phase, PATH)
+
+          dispatch_phase = os.environ.get("INPUT_PHASE", "")
+          if dispatch_phase and dispatch_phase != "auto":
+              phase = validate_phase(dispatch_phase, "workflow_dispatch input")
+          else:
+              phase = file_phase
+
+          sys.stdout.write(phase)
+          PY
+          ) || exit $?
+          printf 'phase=%s\n' "$phase" >> "$GITHUB_OUTPUT"
+      - name: Set up pinned Node for conformance
+        id: setup_node
+        if: ${{ !cancelled() && matrix.runner == 'ubuntu-26.04' && steps.attest.outcome == 'success' && steps.conformance_phase.outcome == 'success' && steps.conformance_phase.outputs.phase != '' }}
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24.11.1'
+      - name: Install lsof for conformance
+        id: install_lsof
+        # Disposable-runner exception: installing via apt-get writes to system
+        # paths, which is acceptable because GitHub-hosted runners are discarded
+        # after the job. The pinned suite's own process supervisor calls lsof on
+        # Linux to identify port owners, and two conformance cases due at a
+        # later gate fail without it (test/conformance/baseline/README.md lines
+        # 35 and 39).
+        if: ${{ !cancelled() && matrix.runner == 'ubuntu-26.04' && steps.attest.outcome == 'success' && steps.conformance_phase.outcome == 'success' && steps.conformance_phase.outputs.phase != '' && steps.setup_node.outcome == 'success' }}
+        run: |
+          if ! command -v lsof >/dev/null; then
+            sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends lsof
+          fi
+      - name: Run binary conformance export
+        id: conformance
+        # Run on the attested hosted Linux runner whenever a conformance phase is
+        # selected, even if a Go suite failed, so diagnostics are visible; upload
+        # requires all suites on this runner to pass, and final publication runs
+        # only after both matrix legs succeed in the same attempt.
+        if: ${{ !cancelled() && matrix.runner == 'ubuntu-26.04' && steps.attest.outcome == 'success' && steps.conformance_phase.outcome == 'success' && steps.conformance_phase.outputs.phase != '' && steps.setup_node.outcome == 'success' && steps.install_lsof.outcome == 'success' }}
+        env:
+          PHASE: ${{ steps.conformance_phase.outputs.phase }}
+          MAX_TIMEOUT_SECONDS: '600'
+          TIMEOUT_SECONDS: '600'
+          # Keep temporary fixture Unix socket paths within Linux's 108-byte AF_UNIX limit.
+          TMPDIR: /tmp
+        run: |
+          node_ver=$(node --version)
+          if [[ $node_ver != v24.11.1 ]]; then
+            printf 'unexpected Node version: %s (expected v24.11.1)\n' "$node_ver" >&2
+            exit 70
+          fi
+          real_temp=$(realpath "$RUNNER_TEMP")
+          npm_cache="$real_temp/npm-cache"
+          mkdir -p "$npm_cache"
+          bin="$real_temp/conformance-model-gateway"
+          export_dir="$real_temp/conformance-export"
+          go build -o "$bin" .
+          npm_config_cache="$npm_cache" TARGET="binary:$bin" EXPORT_DIR="$export_dir" ./hack/conformance-export run
+          ./hack/conformance-export verify "$export_dir"
+          printf 'export_dir=%s\n' "$export_dir" >> "$GITHUB_OUTPUT"
+      - name: Upload conformance export candidate
+        if: ${{ !cancelled() && matrix.runner == 'ubuntu-26.04' && steps.attest.outcome == 'success' && steps.tests.outcome == 'success' && steps.process_tests.outcome == 'success' && steps.test_evidence.outcome == 'success' && steps.conformance_phase.outcome == 'success' && steps.conformance_phase.outputs.phase != '' && steps.conformance.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: conformance-export-candidate-${{ steps.conformance_phase.outputs.phase }}-${{ github.run_attempt }}
+          path: ${{ steps.conformance.outputs.export_dir }}
+          if-no-files-found: error
+
+  publish-conformance-export:
+    permissions: {}
+    needs:
+      - checks
+    if: ${{ !cancelled() && needs.checks.result == 'success' && needs.checks.outputs.conformance_phase != '' }}
+    runs-on: ubuntu-26.04
+    env:
+      TEST_EVIDENCE_RUN_ID: gha-${{ github.run_id }}-${{ github.run_attempt }}
+      CONFORMANCE_PHASE: ${{ needs.checks.outputs.conformance_phase }}
+    steps:
+      - name: Download Linux test evidence
+        uses: actions/download-artifact@v8
+        with:
+          name: go-test-ubuntu-26.04-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/publish-check/ubuntu-26.04
+      - name: Download macOS test evidence
+        uses: actions/download-artifact@v8
+        with:
+          name: go-test-xcode-27-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/publish-check/xcode-27
+      - name: Download conformance export candidate
+        uses: actions/download-artifact@v8
+        with:
+          name: conformance-export-candidate-${{ needs.checks.outputs.conformance_phase }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/publish-check/candidate
+      - name: Verify attempt evidence and candidate
+        run: |
+          base="$RUNNER_TEMP/publish-check"
+          for runner in ubuntu-26.04 xcode-27; do
+            for suite in plain process; do
+              file="$base/$runner/go-test-$suite.jsonl"
+              if [[ -L $file || ! -f $file ]]; then
+                printf 'missing Go test evidence: %s\n' "$file" >&2
+                exit 1
+              fi
+              if ! head -n 1 "$file" | jq -es --arg commit "$GITHUB_SHA" --arg run_id "$TEST_EVIDENCE_RUN_ID" \
+                'length == 1 and .[0].commit == $commit and .[0].run_id == $run_id' >/dev/null; then
+                printf 'wrong Go test evidence metadata: %s\n' "$file" >&2
+                exit 1
+              fi
+            done
+          done
+
+          cand="$base/candidate"
+          shopt -s dotglob nullglob
+          entries=("$cand"/*)
+          shopt -u dotglob nullglob
+          if [[ ${#entries[@]} -ne 3 ]]; then
+            printf 'expected 3 candidate files, found %d\n' "${#entries[@]}" >&2
+            exit 1
+          fi
+          for name in census.tsv launches.tsv manifest.json; do
+            if [[ -L "$cand/$name" || ! -f "$cand/$name" ]]; then
+              printf 'missing or non-regular candidate file: %s\n' "$name" >&2
+              exit 1
+            fi
+          done
+
+          if ! jq -es \
+            --arg commit "$GITHUB_SHA" \
+            --arg run_id "$TEST_EVIDENCE_RUN_ID" \
+            --arg phase "$CONFORMANCE_PHASE" \
+            'length == 1
+             and .[0].producer == "hosted"
+             and .[0].commit == $commit
+             and .[0].run_id == $run_id
+             and .[0].phase == $phase
+             and .[0].clean_tree == true
+             and .[0].verdict == "pass"
+             and .[0].status == 0
+             and .[0].selection == ("conformance<=" + $phase)' \
+            "$cand/manifest.json" >/dev/null; then
+            printf 'candidate manifest failed verification\n' >&2
+            exit 1
+          fi
+
+          for tsv in census.tsv launches.tsv; do
+            if ! head -n 1 "$cand/$tsv" | jq -es --arg commit "$GITHUB_SHA" --arg run_id "$TEST_EVIDENCE_RUN_ID" \
+              'length == 1 and .[0].commit == $commit and .[0].run_id == $run_id' >/dev/null; then
+              printf 'wrong metadata header in %s\n' "$tsv" >&2
+              exit 1
+            fi
+          done
+      - name: Upload conformance export
+        uses: actions/upload-artifact@v7
+        with:
+          name: conformance-export-${{ needs.checks.outputs.conformance_phase }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/publish-check/candidate
           if-no-files-found: error
