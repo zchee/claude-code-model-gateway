@@ -16,16 +16,14 @@
 package sse
 
 import (
-	"context"
-	"errors"
 	"io"
 	"net/http"
 	"time"
 
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
+	sseframe "github.com/zchee/claude-code-model-gateway/internal/sse"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/outcome"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/sentry"
-	"github.com/zchee/claude-code-model-gateway/internal/worker/upstream"
 )
 
 const (
@@ -52,8 +50,6 @@ const (
 	// cleanly without sending a message_stop frame.
 	SynthesizedMessageStop = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 )
-
-var errNotImplemented = errors.New("not implemented")
 
 // UsageCapture records response-side usage observations for one request.
 // Implementations must be safe for concurrent calls from the relay and its side-branch observer.
@@ -83,25 +79,6 @@ type Attempt struct {
 	MergedUsage         jsonx.WireValue
 }
 
-// NoteEvent updates attempt structure, error state, and merged usage from one decoded SSE event.
-// Non-object or absent events have no effect.
-func (a *Attempt) NoteEvent(event jsonx.WireValue) {
-	_ = a
-	_ = event
-}
-
-// Finished reports whether the stream reached message_stop or a clean end-of-generation stop with no open blocks.
-func (a *Attempt) Finished() bool {
-	_ = a
-	return false
-}
-
-// Deliverable reports whether the attempt finished cleanly without seeing an upstream error event.
-func (a *Attempt) Deliverable() bool {
-	_ = a
-	return false
-}
-
 // TransformerConfig configures per-frame proxy SSE rewriting and observation.
 // Observe may be nil when no per-event observation is needed.
 type TransformerConfig struct {
@@ -119,26 +96,16 @@ type TransformerConfig struct {
 // wire value, rewrite model IDs, filter plan tools, and re-encode with the wire JSON policy.
 type Transformer struct {
 	cfg TransformerConfig
-}
 
-// NewTransformer creates a proxy SSE frame transformer.
-func NewTransformer(cfg TransformerConfig) *Transformer {
-	return &Transformer{cfg: cfg}
-}
+	// advertised and backend hold the model IDs as the UTF-16 units decoded strings compare against.
+	advertised, backend []uint16
 
-// Feed processes one upstream chunk and passes each emitted wire frame to emit.
-func (t *Transformer) Feed(chunk []byte, emit func([]byte) error) error {
-	_ = t
-	_ = chunk
-	_ = emit
-	return errNotImplemented
-}
+	scanner sseframe.Scanner
 
-// End flushes any remaining unterminated frame and passes it to emit.
-func (t *Transformer) End(emit func([]byte) error) error {
-	_ = t
-	_ = emit
-	return errNotImplemented
+	// dropped holds the original indexes of filtered plan-tool blocks; droppedCount shifts later indexes.
+	dropped      map[float64]struct{}
+	droppedCount int
+	keptToolUse  bool
 }
 
 // EventObserver parses SSE frames on a side branch without altering relayed bytes.
@@ -148,23 +115,14 @@ type EventObserver struct {
 	maxPendingBytes int
 	observe         func(jsonx.WireValue)
 	onOverflow      func()
-}
 
-// NewEventObserver creates a side-branch SSE observer with the given pending byte limit.
-// A non-positive maxPendingBytes defaults to DefaultMaxObserveBytes.
-func NewEventObserver(maxPendingBytes int, observe func(jsonx.WireValue), onOverflow func()) *EventObserver {
-	return &EventObserver{maxPendingBytes: maxPendingBytes, observe: observe, onOverflow: onOverflow}
-}
-
-// Write feeds raw or decompressed stream bytes into the observer.
-func (o *EventObserver) Write(chunk []byte) {
-	_ = o
-	_ = chunk
-}
-
-// End flushes any remaining unterminated frame if the observer has not overflowed.
-func (o *EventObserver) End() {
-	_ = o
+	// carry holds a trailing UTF-8 sequence still waiting for its continuation bytes.
+	carry []byte
+	// pending holds decoded text that has not yet reached a blank-line separator.
+	pending []byte
+	// scanFrom is where the next separator search may start: earlier offsets cannot begin one.
+	scanFrom   int
+	overflowed bool
 }
 
 // PeekResult describes the outcome of inspecting the first data event of an eligible LM Studio SSE body.
@@ -180,25 +138,6 @@ type PeekResult struct {
 	Body             io.ReadCloser
 	Overflow         *sentry.Counts
 	EarlyEndOverride string
-}
-
-// PeekFirstEvent inspects body up to its first complete SSE data event or wait deadline.
-// The ctx parameter is the service-owned lifetime context, not the client request context.
-// PeekFirstEvent takes ownership of body on entry. The body passed in must allow Close
-// concurrently with Read, and Close must unblock a Read in flight. A zero wait uses
-// DefaultFirstEventWait; a negative wait times out immediately.
-//
-// A clean EOF before a first data event is not an error and returns a non-nil replay Body.
-// An abnormal upstream read error returns a nil Body, a non-empty EarlyEndOverride, and a nil error.
-// On wait expiration, PeekFirstEvent does not close the usable stream and does not leave a goroutine
-// racing a second reader; the single reader transfers to the returned Body whose Close unblocks and
-// joins it. On ctx cancellation, PeekFirstEvent closes body, joins its reader goroutine, and returns
-// ctx.Err().
-func PeekFirstEvent(ctx context.Context, body io.ReadCloser, wait time.Duration) (PeekResult, error) {
-	_ = ctx
-	_ = body
-	_ = wait
-	return PeekResult{}, errNotImplemented
 }
 
 // ProxyOptions configures streaming relay of a 2xx proxy text/event-stream response.
@@ -220,26 +159,6 @@ type ProxyOptions struct {
 	OnPeek            func() // Optional hook invoked when LM Studio first-event peeking starts.
 }
 
-// RelayProxy relays a 2xx proxy SSE response to w with model rewriting, plan-tool filtering,
-// heartbeats, sentry observation, and (for eligible LM Studio streams) first-event overflow peeking.
-// The ctx parameter is the service-owned lifetime context, not the client request context.
-// When opts.ClientDone closes or a write to w fails, RelayProxy stops heartbeats and writes nothing
-// more to w, then drains the finite upstream tail (observing usage and sentry) until EOF or ctx
-// cancellation. When ctx ends after the client is gone, RelayProxy closes resp.Body and returns a
-// nil error (neither ctx.Err() nor http.ErrAbortHandler). It never sets outcome.Result.Cancelled.
-// It copies relay headers from resp.RelayHeader (or resp.Header if RelayHeader is nil) minus
-// hop-by-hop and Content-Length headers without mutating resp.Header or resp.RelayHeader.
-// It takes ownership of resp.Body and closes it before returning.
-// If the upstream breaks after response headers are committed, RelayProxy returns the terminal
-// outcome facts alongside http.ErrAbortHandler rather than panicking.
-func RelayProxy(ctx context.Context, w http.ResponseWriter, resp *upstream.Response, opts ProxyOptions) (outcome.Result, error) {
-	_ = ctx
-	_ = w
-	_ = resp
-	_ = opts
-	return outcome.Result{}, errNotImplemented
-}
-
 // PassthroughOptions configures untouched streaming relay for Anthropic responses
 // and non-2xx or non-rewritten responses.
 type PassthroughOptions struct {
@@ -251,26 +170,4 @@ type PassthroughOptions struct {
 	Sentry            *sentry.State   // Used only when ProxyProvider is nonempty; Anthropic passthrough never touches Sentry.
 	SentryTarget      sentry.Target   // Used only when ProxyProvider is nonempty; Anthropic passthrough never touches Sentry.
 	Usage             UsageCapture
-}
-
-// RelayPassthrough forwards upstream status, relay headers minus hop-by-hop headers, and raw body bytes
-// unchanged, flushing each chunk. The ctx parameter is the service-owned lifetime context, not the
-// client request context. It copies headers from resp.RelayHeader (or resp.Header if RelayHeader is nil)
-// without mutating resp.Header or resp.RelayHeader, takes ownership of resp.Body, and closes it before
-// returning. For 2xx SSE responses with Usage or eligible proxy Sentry set, it decodes gzip, deflate,
-// or br on a side branch subject to MaxObserveBytes without altering delivered bytes. When
-// opts.ClientDone closes or a write to w fails, RelayPassthrough stops heartbeats (if enabled) and
-// writes nothing more to w; Anthropic passthrough (ProxyProvider == "") never sends heartbeats, never
-// updates sentry state, and pauses reading resp.Body for back-pressure without eagerly closing the
-// provider until ctx is canceled. When ctx ends after the client is gone, RelayPassthrough closes
-// resp.Body and returns a nil error (neither ctx.Err() nor http.ErrAbortHandler). RelayPassthrough
-// never sets outcome.Result.Cancelled. If the upstream breaks after response headers are committed,
-// RelayPassthrough returns the terminal outcome facts alongside http.ErrAbortHandler rather than
-// panicking.
-func RelayPassthrough(ctx context.Context, w http.ResponseWriter, resp *upstream.Response, opts PassthroughOptions) (outcome.Result, error) {
-	_ = ctx
-	_ = w
-	_ = resp
-	_ = opts
-	return outcome.Result{}, errNotImplemented
 }
