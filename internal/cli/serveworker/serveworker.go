@@ -70,7 +70,8 @@ func Run(ctx context.Context, options Options) error {
 	if lookup == nil {
 		lookup = func(string) (string, bool) { return "", false }
 	}
-	stdout, stderr := writerOr(options.Stdout), writerOr(options.Stderr)
+	// Request handlers and background catalog work write to the same streams as Run itself.
+	stdout, stderr := &syncWriter{w: writerOr(options.Stdout)}, &syncWriter{w: writerOr(options.Stderr)}
 
 	control, err := supervisedDescriptors(lookup)
 	if err != nil {
@@ -104,6 +105,25 @@ func Run(ctx context.Context, options Options) error {
 		return fmt.Errorf("model-gateway: could not load the local control token: %w", err)
 	}
 
+	stop := newStopper()
+	workerOptions, life, err := buildWorker(workerSetup{
+		ctx:        ctx,
+		lookup:     lookup,
+		resolver:   resolver,
+		state:      state,
+		cwd:        options.Cwd,
+		version:    options.Version,
+		token:      token,
+		stdout:     stdout,
+		stderr:     stderr,
+		beginDrain: func() { stop.signal(stopDrain) },
+	})
+	if err != nil {
+		return err
+	}
+	// Runs after the servers have stopped: the worker context ends and its background work is joined.
+	defer life.stop()
+
 	port, err := workerPort(lookup)
 	if err != nil {
 		return err
@@ -127,17 +147,11 @@ func Run(ctx context.Context, options Options) error {
 		_, _ = fmt.Fprintf(stdout, "model-gateway shim listening on ANTHROPIC_UNIX_SOCKET %s\n", socket)
 	}
 
-	stop := newStopper()
-	handler, err := worker.NewHandler(worker.Options{
-		Version:      options.Version,
-		ControlToken: token,
-		Lookup:       lookup,
-		BeginDrain:   func() { stop.signal(stopDrain) },
-		Diagnostics:  stderr,
-	})
+	handler, err := worker.NewHandler(workerOptions)
 	if err != nil {
 		return err
 	}
+	life.start()
 	servers := make([]*http.Server, len(listeners))
 	served := make(chan error, len(listeners))
 	for i, ln := range listeners {
