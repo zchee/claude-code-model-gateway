@@ -57,8 +57,6 @@ func TestRunStubs(t *testing.T) {
 		"error: context-window": {command: "context-window"},
 		"error: env":            {command: "env"},
 		"error: doctor":         {command: "doctor"},
-		"error: serve-shim":     {command: "serve-shim"},
-		"error: serve-worker":   {command: "serve-worker"},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {

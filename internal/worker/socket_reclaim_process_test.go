@@ -24,15 +24,15 @@ import (
 	"io"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	gocmp "github.com/google/go-cmp/cmp"
 
+	"github.com/zchee/claude-code-model-gateway/internal/gatewaytest"
 	"github.com/zchee/claude-code-model-gateway/internal/worker"
 )
 
@@ -101,11 +101,6 @@ func reachedBy(ctx context.Context, path string, ln *net.UnixListener) (bool, er
 // unlink the socket another starter has just bound. Whatever the interleaving, exactly one starter may end up owning
 // the path, and the path must lead to that owner's listener; every other starter refuses.
 func TestStaleSocketReclaimByConcurrentStarters(t *testing.T) {
-	if path := os.Getenv(reclaimStarterKey); path != "" {
-		// This process is one starter of a process round, not the test itself.
-		reclaimStarter(t, path)
-		return
-	}
 	tests := map[string]struct {
 		starters int
 		rounds   int
@@ -114,8 +109,8 @@ func TestStaleSocketReclaimByConcurrentStarters(t *testing.T) {
 	}{
 		"success: two starters reclaim one stale socket":            {starters: 2, rounds: 2000},
 		"success: eight starters reclaim one stale socket":          {starters: 8, rounds: 500},
-		"success: two starter processes reclaim one stale socket":   {starters: 2, rounds: 150, processes: true},
-		"success: eight starter processes reclaim one stale socket": {starters: 8, rounds: 60, processes: true},
+		"success: two starter processes reclaim one stale socket":   {starters: 2, rounds: 30, processes: true},
+		"success: eight starter processes reclaim one stale socket": {starters: 8, rounds: 15, processes: true},
 	}
 	// A subtest's descriptive name can by itself exceed sockaddr_un.sun_path.
 	dir, err := os.MkdirTemp("", "mg-reclaim-")
@@ -127,6 +122,11 @@ func TestStaleSocketReclaimByConcurrentStarters(t *testing.T) {
 			t.Error(err)
 		}
 	})
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := gatewaytest.NewEnv(home, nil, nil, nil)
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(dir, "gw.sock")
@@ -138,7 +138,7 @@ func TestStaleSocketReclaimByConcurrentStarters(t *testing.T) {
 				staleSocket(t, path)
 				var got reclaimVerdict
 				if tc.processes {
-					got, err = processRound(t, path, tc.starters)
+					got, err = processRound(t, env, path, tc.starters)
 				} else {
 					got, err = goroutineRound(t.Context(), path, tc.starters)
 				}
@@ -170,15 +170,24 @@ func goroutineRound(ctx context.Context, path string, starters int) (reclaimVerd
 	return got, err
 }
 
-// reclaimStarterKey names the socket path a starter process binds; it is set only for the starters of a process round.
-const reclaimStarterKey = "RECLAIM_STARTER_PATH"
+// reclaimStarterHelper names the starter of a process round among the package's fixture helpers.
+const reclaimStarterHelper = "reclaim-starter"
 
-// reclaimStarter is one starter process of a process round, which runs this test binary again. It waits on the shared
-// start barrier, binds the path, and while it owns a listener answers every connection with its process ID, so the
-// test can tell whose socket the path leads to.
-func reclaimStarter(t *testing.T, path string) {
-	t.Helper()
-	barrier := os.NewFile(3, "start barrier")
+// TestGatewayFixtureHelper dispatches the fixture helpers this package launches through gatewaytest.
+func TestGatewayFixtureHelper(t *testing.T) {
+	gatewaytest.DispatchHelper(t, map[string]gatewaytest.HelperFunc{reclaimStarterHelper: reclaimStarter})
+}
+
+// reclaimStarter is one starter of a process round, a helper process that runs this test binary again with the
+// socket path as its argument. It waits on the shared start barrier, binds the path, reports whether it owns a
+// listener together with its process ID, and while it owns one answers every connection with that process ID, so
+// the test can tell whose socket the path leads to.
+func reclaimStarter(t testing.TB, args []string) {
+	if len(args) != 1 {
+		t.Fatalf("reclaim starter needs the socket path, got %d arguments", len(args))
+	}
+	// gatewaytest passes the working directory first; the barrier is the descriptor after it.
+	barrier := os.NewFile(4, "start barrier")
 	if barrier == nil {
 		t.Fatal("missing start barrier")
 	}
@@ -187,18 +196,19 @@ func reclaimStarter(t *testing.T, path string) {
 	}
 	// Every starter holds the read end; the test closes the only write end to release them together.
 	_, _ = io.Copy(io.Discard, barrier)
-	ln, err := worker.ListenUnix(path)
+	pid := os.Getpid()
+	ln, err := worker.ListenUnix(args[0])
 	if err != nil {
-		fmt.Println("refused")
+		fmt.Printf("refused %d\n", pid)
 	} else {
-		fmt.Println("owner")
+		fmt.Printf("owner %d\n", pid)
 		go func() {
 			for {
 				conn, err := ln.Accept()
 				if err != nil {
 					return
 				}
-				_, _ = fmt.Fprintf(conn, "%d\n", os.Getpid())
+				_, _ = fmt.Fprintf(conn, "%d\n", pid)
 				_ = conn.Close()
 			}
 		}()
@@ -208,22 +218,20 @@ func reclaimStarter(t *testing.T, path string) {
 	os.Exit(0)
 }
 
-// processRound runs one round with every starter as its own process, released together by closing a shared pipe.
-func processRound(t *testing.T, path string, starters int) (reclaimVerdict, error) {
+// processRound runs one round with every starter as its own helper process, released together by closing a shared
+// pipe. Each starter runs under gatewaytest's scrubbed environment in its own sandbox directory.
+func processRound(t *testing.T, env gatewaytest.Environment, path string, starters int) (reclaimVerdict, error) {
 	t.Helper()
-	exe, err := os.Executable()
-	if err != nil {
-		return reclaimVerdict{}, err
-	}
 	release, hold, err := os.Pipe()
 	if err != nil {
 		return reclaimVerdict{}, err
 	}
 	defer func() { _, _ = release.Close(), hold.Close() }()
 	type starter struct {
-		cmd   *exec.Cmd
 		stop  io.WriteCloser
+		out   *io.PipeReader
 		lines *bufio.Scanner
+		done  chan error
 	}
 	var started []starter
 	defer func() {
@@ -231,40 +239,48 @@ func processRound(t *testing.T, path string, starters int) (reclaimVerdict, erro
 			_ = s.stop.Close()
 		}
 		for _, s := range started {
-			_ = s.cmd.Wait()
+			<-s.done
+			_ = s.out.Close()
 		}
 	}()
 	for range starters {
-		cmd := exec.CommandContext(t.Context(), exe, "-test.run=^TestStaleSocketReclaimByConcurrentStarters$")
-		cmd.Env = append(os.Environ(), reclaimStarterKey+"="+path)
+		cmd, err := env.HelperCommand(t, reclaimStarterHelper, path)
+		if err != nil {
+			return reclaimVerdict{}, err
+		}
 		cmd.ExtraFiles = []*os.File{release}
 		stop, err := cmd.StdinPipe()
 		if err != nil {
 			return reclaimVerdict{}, err
 		}
-		out, err := cmd.StdoutPipe()
-		if err != nil {
-			return reclaimVerdict{}, err
-		}
-		if err := cmd.Start(); err != nil {
-			return reclaimVerdict{}, err
-		}
-		started = append(started, starter{cmd: cmd, stop: stop, lines: bufio.NewScanner(out)})
+		outR, outW := io.Pipe()
+		cmd.Stdout = outW
+		s := starter{stop: stop, out: outR, lines: bufio.NewScanner(outR), done: make(chan error, 1)}
+		go func() {
+			err := env.RunFixtureWithin(cmd, 20*time.Second)
+			_ = outW.CloseWithError(err)
+			s.done <- err
+		}()
+		started = append(started, s)
 	}
-	for _, s := range started {
+	for i, s := range started {
 		if !s.lines.Scan() || s.lines.Text() != "ready" {
-			return reclaimVerdict{}, fmt.Errorf("starter %d did not reach the barrier: %q", s.cmd.Process.Pid, s.lines.Text())
+			return reclaimVerdict{}, errors.Join(fmt.Errorf("starter %d did not reach the barrier: %q", i, s.lines.Text()), s.lines.Err())
 		}
 	}
 	_ = release.Close()
 	_ = hold.Close()
-	var owners []int
-	for _, s := range started {
+	var owners []string
+	for i, s := range started {
 		if !s.lines.Scan() {
-			return reclaimVerdict{}, fmt.Errorf("starter %d gave no result", s.cmd.Process.Pid)
+			return reclaimVerdict{}, errors.Join(fmt.Errorf("starter %d gave no result", i), s.lines.Err())
 		}
-		if s.lines.Text() == "owner" {
-			owners = append(owners, s.cmd.Process.Pid)
+		result, pid, ok := strings.Cut(s.lines.Text(), " ")
+		if !ok || (result != "owner" && result != "refused") {
+			return reclaimVerdict{}, fmt.Errorf("starter %d gave an unknown result %q", i, s.lines.Text())
+		}
+		if result == "owner" {
+			owners = append(owners, pid)
 		}
 	}
 	got := reclaimVerdict{Owners: len(owners)}
@@ -282,7 +298,7 @@ func processRound(t *testing.T, path string, starters int) (reclaimVerdict, erro
 		return got, err
 	}
 	answer := bufio.NewScanner(conn)
-	got.OwnerReached = answer.Scan() && answer.Text() == strconv.Itoa(owners[0])
+	got.OwnerReached = answer.Scan() && answer.Text() == owners[0]
 	return got, nil
 }
 

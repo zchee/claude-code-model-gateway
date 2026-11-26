@@ -29,11 +29,13 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -41,15 +43,20 @@ import (
 
 	"github.com/zchee/claude-code-model-gateway/internal/cli/serveshim"
 	"github.com/zchee/claude-code-model-gateway/internal/gatewaytest"
+	"github.com/zchee/claude-code-model-gateway/internal/supervisor"
 )
 
 // eligibilityControlKey names the Unix socket over which a test drives the worker child it is waiting for. It is set
 // only in the environment of a worker the supervisor under test starts.
 const eligibilityControlKey = "ELIGIBILITY_FIXTURE_CONTROL"
 
+// reportDeadline is how long the supervisor waits for its worker's listening report before it stops.
+const reportDeadline = 5 * time.Second
+
 // eligibilityChild is the worker the supervisor under test starts through the launcher script, which runs this test
 // binary again. It binds, reports and exits only when the test tells it to, so the test decides when an endpoint
-// becomes eligible.
+// becomes eligible. It counts the requests it receives before and after its report, and tells the test those counts
+// when its supervisor goes away.
 func eligibilityChild(ctx context.Context, control string) error {
 	generation := os.Getenv("MODEL_GATEWAY_WORKER_GENERATION")
 	if generation == "" || os.Getenv("MODEL_GATEWAY_CONTROL_FDS") != "3,4" {
@@ -75,16 +82,20 @@ func eligibilityChild(ctx context.Context, control string) error {
 		_, _ = fmt.Fprintf(conn, format+"\n", args...)
 	}
 	send("hello %d", os.Getpid())
+	var reported atomic.Bool
+	var before, after atomic.Int32
 	// A worker stops when its supervisor goes away.
 	go func() {
 		_, _ = io.Copy(io.Discard, live)
+		send("parent gone %d %d", before.Load(), after.Load())
 		os.Exit(0)
 	}()
 	var ln net.Listener
 	port := 0
 	commands := bufio.NewScanner(conn)
 	for commands.Scan() {
-		switch commands.Text() {
+		command, arg, _ := strings.Cut(commands.Text(), " ")
+		switch command {
 		case "listen":
 			var cfg net.ListenConfig
 			if ln, err = cfg.Listen(ctx, "tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(configured))); err != nil {
@@ -93,6 +104,11 @@ func eligibilityChild(ctx context.Context, control string) error {
 			}
 			port = ln.Addr().(*net.TCPAddr).Port
 			srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if reported.Load() {
+					after.Add(1)
+				} else {
+					before.Add(1)
+				}
 				_, _ = io.Copy(io.Discard, r.Body)
 				w.Header().Set("X-Child-Pid", strconv.Itoa(os.Getpid()))
 				w.WriteHeader(http.StatusOK)
@@ -100,7 +116,16 @@ func eligibilityChild(ctx context.Context, control string) error {
 			go func() { _ = srv.Serve(ln) }()
 			send("listening %d", port)
 		case "report":
-			line, err := json.Marshal(map[string]any{"type": "listening", "port": port, "generation": generation})
+			// "report N" reports port N instead of the bound one.
+			reportPort := port
+			if arg != "" {
+				if reportPort, err = strconv.Atoi(arg); err != nil {
+					send("error %v", err)
+					continue
+				}
+			}
+			reported.Store(true)
+			line, err := json.Marshal(map[string]any{"type": "listening", "port": reportPort, "generation": generation})
 			if err == nil {
 				_, err = report.Write(append(line, '\n'))
 			}
@@ -109,6 +134,8 @@ func eligibilityChild(ctx context.Context, control string) error {
 				continue
 			}
 			send("reported")
+		case "requests":
+			send("requests %d %d", before.Load(), after.Load())
 		case "exit":
 			if ln != nil {
 				_ = ln.Close()
@@ -116,6 +143,9 @@ func eligibilityChild(ctx context.Context, control string) error {
 			send("closed")
 			os.Exit(0)
 		}
+	}
+	if err := commands.Err(); err != nil {
+		return fmt.Errorf("read control commands: %w", err)
 	}
 	// The test closed its control socket.
 	os.Exit(0)
@@ -153,6 +183,15 @@ func (c *fixtureChild) exited(t *testing.T) {
 	}
 }
 
+// farewell returns the request counts the child sent when its supervisor went away.
+func (c *fixtureChild) farewell(t *testing.T) string {
+	t.Helper()
+	if !c.lines.Scan() {
+		t.Fatalf("child closed its control connection without its request counts: %v", c.lines.Err())
+	}
+	return c.lines.Text()
+}
+
 type lockedBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
@@ -175,14 +214,17 @@ type shimUnderTest struct {
 	public   string
 	token    string
 	ready    chan int
+	readyAt  time.Time
 	done     chan struct{}
 	result   error
+	doneAt   time.Time
 	stderr   *lockedBuffer
 	children chan *fixtureChild
 }
 
 // startShim runs serveshim.Run with the given port settings. The control token is a fixture written by the test.
-func startShim(t *testing.T, env map[string]string) *shimUnderTest {
+// Each prepare function runs on the state directory before the supervisor starts.
+func startShim(t *testing.T, env map[string]string, prepare ...func(state string)) *shimUnderTest {
 	t.Helper()
 	home, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -199,6 +241,9 @@ func startShim(t *testing.T, env map[string]string) *shimUnderTest {
 	token := hex.EncodeToString(raw[:])
 	if err := os.WriteFile(filepath.Join(state, "control-token"), []byte(token+"\n"), 0o600); err != nil {
 		t.Fatal(err)
+	}
+	for _, p := range prepare {
+		p(state)
 	}
 
 	// sun_path is short; the test's temporary directory can exceed it.
@@ -267,6 +312,7 @@ func startShim(t *testing.T, env map[string]string) *shimUnderTest {
 	pr, pw := io.Pipe()
 	ctx, cancel := context.WithCancel(t.Context())
 	var watched sync.WaitGroup
+	var watchErr error
 	watched.Go(func() {
 		lines := bufio.NewScanner(pr)
 		for lines.Scan() {
@@ -279,6 +325,7 @@ func startShim(t *testing.T, env map[string]string) *shimUnderTest {
 				}
 			}
 		}
+		watchErr = lines.Err()
 		_ = pr.Close()
 	})
 	go func() {
@@ -287,12 +334,16 @@ func startShim(t *testing.T, env map[string]string) *shimUnderTest {
 			Environment: entries, Home: func() (string, error) { return home, nil }, Executable: launcher,
 			Version: fixtureVersion, Stdout: pw, Stderr: s.stderr,
 		})
+		s.doneAt = time.Now()
 		_ = pw.Close()
 	}()
 	t.Cleanup(func() {
 		cancel()
 		<-s.done
 		watched.Wait()
+		if watchErr != nil {
+			t.Errorf("read the supervisor's stdout: %v", watchErr)
+		}
 		_ = control.Close()
 		accepted.Wait()
 		connsMu.Lock()
@@ -309,9 +360,22 @@ func (s *shimUnderTest) awaitReady(t *testing.T) {
 	t.Helper()
 	select {
 	case port := <-s.ready:
+		s.readyAt = time.Now()
 		s.public = net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 	case <-s.done:
 		t.Fatalf("supervisor stopped before it was ready: %v; stderr: %s", s.result, s.stderr)
+	}
+}
+
+// awaitStop waits until the supervisor stops or the deadline passes, and reports whether it stopped.
+func (s *shimUnderTest) awaitStop(deadline time.Time) bool {
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case <-s.done:
+		return true
+	case <-timer.C:
+		return false
 	}
 }
 
@@ -349,8 +413,20 @@ func (s *shimUnderTest) probe(t *testing.T, marker string) probeResult {
 
 // send is probe for use outside the test goroutine.
 func (s *shimUnderTest) send(ctx context.Context, marker string) (probeResult, error) {
+	return s.sendTraced(ctx, marker, nil)
+}
+
+// sendTraced is send that calls wrote, when it is not nil, once the whole request has been written to the supervisor.
+func (s *shimUnderTest) sendTraced(ctx context.Context, marker string, wrote func()) (probeResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
+	if wrote != nil {
+		ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{WroteRequest: func(info httptrace.WroteRequestInfo) {
+			if info.Err == nil {
+				wrote()
+			}
+		}})
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+s.public+"/drain", strings.NewReader(`{"probe":"`+marker+`"}`))
 	if err != nil {
 		return probeResult{}, err
@@ -445,6 +521,37 @@ func (f *foreignService) traffic(token, marker string) (foreignTraffic, int) {
 	}, f.conns
 }
 
+// inFlight is a probe sent from another goroutine; answer delivers its result once, and cancel makes its client leave.
+type inFlight struct {
+	wrote  chan struct{}
+	answer chan probeAnswer
+	cancel context.CancelFunc
+}
+
+type probeAnswer struct {
+	result probeResult
+	err    error
+}
+
+// startProbe sends a probe from another goroutine and returns once the whole request is written to the supervisor.
+func (s *shimUnderTest) startProbe(t *testing.T, marker string) *inFlight {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	p := &inFlight{wrote: make(chan struct{}), answer: make(chan probeAnswer, 1), cancel: cancel}
+	t.Cleanup(cancel)
+	wrote := sync.OnceFunc(func() { close(p.wrote) })
+	go func() {
+		got, err := s.sendTraced(ctx, marker, wrote)
+		p.answer <- probeAnswer{got, err}
+	}()
+	select {
+	case <-p.wrote:
+	case a := <-p.answer:
+		t.Fatalf("probe ended before its request was written: %+v, %v", a.result, a.err)
+	}
+	return p
+}
+
 // freePort returns a loopback port that was free a moment ago.
 func freePort(t *testing.T) int {
 	t.Helper()
@@ -453,6 +560,16 @@ func freePort(t *testing.T) int {
 	_ = f.ln.Close()
 	f.wg.Wait()
 	return port
+}
+
+// otherFreePort returns a free loopback port other than port.
+func otherFreePort(t *testing.T, port int) int {
+	t.Helper()
+	for {
+		if other := freePort(t); other != port {
+			return other
+		}
+	}
 }
 
 // TestEndpointEligibility checks that the supervisor relays to a worker endpoint only after the current worker
@@ -477,11 +594,21 @@ func TestEndpointEligibility(t *testing.T) {
 			s.awaitReady(t)
 			s.nextChild(t)
 			marker := rand.Text()
-			if diff := gocmp.Diff(retryable, s.probe(t, marker)); diff != "" {
-				t.Errorf("request while no worker has reported (-want +got):\n%s", diff)
+			// The client gives up long before the relay's retries end or the report deadline passes; a relay to the
+			// configured port would happen at the first attempt.
+			ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+			got, err := s.send(ctx, marker)
+			switch {
+			case err == nil:
+				if diff := gocmp.Diff(retryable, got); diff != "" {
+					t.Errorf("request while no worker has reported (-want +got):\n%s", diff)
+				}
+			case ctx.Err() == nil:
+				t.Errorf("request while no worker has reported: %v", err)
 			}
-			got, conns := foreign.traffic(s.token, marker)
-			if diff := gocmp.Diff(foreignTraffic{}, got); diff != "" {
+			cancel()
+			traffic, conns := foreign.traffic(s.token, marker)
+			if diff := gocmp.Diff(foreignTraffic{}, traffic); diff != "" {
 				t.Errorf("traffic on the configured port held by another program (%d connections) (-want +got):\n%s", conns, diff)
 			}
 		}},
@@ -491,8 +618,31 @@ func TestEndpointEligibility(t *testing.T) {
 			s.awaitReady(t)
 			child := s.nextChild(t)
 			child.command(t, "listen", "listening "+strconv.Itoa(port))
-			if diff := gocmp.Diff(retryable, s.probe(t, rand.Text())); diff != "" {
-				t.Errorf("request while the child listens but has not reported (-want +got):\n%s", diff)
+			probe := s.startProbe(t, rand.Text())
+			defer probe.cancel()
+			// The child counts each request as arriving before or after its report, so the verdict does not depend on
+			// this window; the window only gives a supervisor that relays before the report the chance to do so.
+			window := time.NewTimer(300 * time.Millisecond)
+			var a probeAnswer
+			answered := false
+			select {
+			case a = <-probe.answer:
+				answered = true
+			case <-window.C:
+			}
+			window.Stop()
+			child.command(t, "report", "reported")
+			if !answered {
+				a = <-probe.answer
+			}
+			if a.err != nil {
+				t.Fatal(a.err)
+			}
+			if diff := gocmp.Diff(probeResult{Status: http.StatusOK, ChildPID: child.pid}, a.result); diff != "" {
+				t.Errorf("request sent before the report and answered after it (-want +got):\n%s", diff)
+			}
+			if diff := gocmp.Diff("requests 0 1", child.command(t, "requests", "requests ")); diff != "" {
+				t.Errorf("requests the child received before and after its report (-want +got):\n%s", diff)
 			}
 		}},
 		"success: configured port is relayed to once the child reports it": {func(t *testing.T) {
@@ -507,11 +657,104 @@ func TestEndpointEligibility(t *testing.T) {
 			}
 		}},
 		"success: request before the first report waits and gets the retryable 503": {func(t *testing.T) {
-			s := startShim(t, nil)
-			s.awaitReady(t)
-			s.nextChild(t)
+			// Until the first report the supervisor's endpoint is 0, as the other cases show. The public listener is
+			// served here with that endpoint directly, so the relay's wait never races the report deadline.
+			var cfg net.ListenConfig
+			ln, err := cfg.Listen(t.Context(), "tcp4", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var raw [32]byte
+			if _, err := rand.Read(raw[:]); err != nil {
+				t.Fatal(err)
+			}
+			s := &shimUnderTest{public: ln.Addr().String(), token: hex.EncodeToString(raw[:])}
+			h, err := supervisor.NewHandler(ln.Addr().(*net.TCPAddr).Port, func() int { return 0 }, s.token, fixtureVersion, os.Getpid())
+			if err != nil {
+				_ = ln.Close()
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			served := make(chan error, 1)
+			go func() { served <- supervisor.Serve(ctx, ln, h) }()
+			defer func() {
+				cancel()
+				if err := <-served; err != nil {
+					t.Errorf("public listener: %v", err)
+				}
+				_ = ln.Close()
+			}()
 			if diff := gocmp.Diff(retryable, s.probe(t, rand.Text())); diff != "" {
 				t.Errorf("request before any report (-want +got):\n%s", diff)
+			}
+		}},
+		"error: configured port whose child never reports stops the supervisor at the report deadline": {func(t *testing.T) {
+			port := freePort(t)
+			s := startShim(t, map[string]string{"CODEX_GATEWAY_WORKER_PORT": strconv.Itoa(port)})
+			s.awaitReady(t)
+			s.nextChild(t)
+			// The deadline counts from the worker's start, which follows the readiness line.
+			guard := 10 * time.Second
+			if !s.awaitStop(s.readyAt.Add(reportDeadline + guard)) {
+				t.Fatalf("supervisor still running %v after readiness although its current child never reported", reportDeadline+guard)
+			}
+			if s.result == nil {
+				t.Error("supervisor stopped with exit status 0; want 1 when its child never reported")
+			}
+			if elapsed := s.doneAt.Sub(s.readyAt); elapsed < reportDeadline-250*time.Millisecond {
+				t.Errorf("supervisor stopped %v after readiness, before the report deadline of %v", elapsed, reportDeadline)
+			}
+		}},
+		"error: configured port reported as another port stops the supervisor at once": {func(t *testing.T) {
+			port := freePort(t)
+			other := otherFreePort(t, port)
+			s := startShim(t, map[string]string{"CODEX_GATEWAY_WORKER_PORT": strconv.Itoa(port)})
+			s.awaitReady(t)
+			child := s.nextChild(t)
+			reportAt := time.Now()
+			child.command(t, "report "+strconv.Itoa(other), "reported")
+			// A supervisor that acts on the report stops within moments of it; the bound leaves room for a loaded venue.
+			const atOnce = 3 * time.Second
+			if !s.awaitStop(reportAt.Add(atOnce)) {
+				t.Fatalf("supervisor still running %v after its child reported port %d instead of the configured %d", atOnce, other, port)
+			}
+			// A supervisor that waits for the report deadline instead stops no earlier than readiness plus the deadline. A
+			// supervisor that acts on the report reaches that point only if its child took the whole deadline to start, and
+			// then its own deadline would have stopped it before the report.
+			if since := s.doneAt.Sub(s.readyAt); since >= reportDeadline-250*time.Millisecond {
+				t.Errorf("supervisor stopped %v after readiness and %v after the report: at the report deadline, not at the report", since, s.doneAt.Sub(reportAt))
+			}
+			if s.result == nil {
+				t.Error("supervisor stopped with exit status 0; want 1 when its child reported another port")
+			}
+		}},
+		"error: worker whose pid record cannot be published stops the supervisor and receives nothing": {func(t *testing.T) {
+			// A directory where the worker's pid record belongs makes every publication of that record fail.
+			s := startShim(t, nil, func(state string) {
+				if err := os.Mkdir(filepath.Join(state, "shim.pid.json"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			})
+			s.awaitReady(t)
+			child := s.nextChild(t)
+			child.command(t, "listen", "listening ")
+			probe := s.startProbe(t, rand.Text())
+			child.command(t, "report", "reported")
+			// The child says goodbye when its supervisor disconnects it; a supervisor that keeps serving the untracked
+			// worker never does, and the control connection's deadline ends the wait.
+			if diff := gocmp.Diff("parent gone 0 0", child.farewell(t)); diff != "" {
+				t.Errorf("requests the untracked worker received before and after its report (-want +got):\n%s", diff)
+			}
+			// The probe has no worker left to reach; its client leaves rather than wait out the relay's retries.
+			probe.cancel()
+			if !s.awaitStop(time.Now().Add(10 * time.Second)) {
+				t.Fatal("supervisor still running after it disconnected a worker whose pid record cannot be published")
+			}
+			if s.result == nil {
+				t.Error("supervisor stopped with exit status 0; want 1 when the worker's pid record cannot be published")
+			}
+			if a := <-probe.answer; a.err == nil && a.result != retryable {
+				t.Errorf("request in flight while the pid record could not be published: %+v; want the retryable 503 or no answer", a.result)
 			}
 		}},
 		"error: port of a child that exited receives nothing": {func(t *testing.T) {

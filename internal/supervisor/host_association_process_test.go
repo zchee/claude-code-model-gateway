@@ -18,6 +18,7 @@ package supervisor_test
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -58,9 +59,12 @@ const (
 	// still in flight when the peer half-closes). Any relay, refusal or close is acceptable; only another request's
 	// answer or a local success is not.
 	mayRelay
-	// abandoned: the peer closed before the request was complete. It never reaches the worker; how the server
-	// answers a request nobody finished is not a Host decision.
+	// abandoned: the peer closed before the request was complete. It never reaches the worker, and the connection
+	// ends without a single response byte: no answer, success or refusal, exists for a request nobody finished.
 	abandoned
+	// malformed: a header field name is not an HTTP token, so the field cannot be judged under the name a check looks
+	// for. The request is refused with 400, never relayed, and the connection closes after the refusal.
+	malformed
 )
 
 func (v verdict) String() string {
@@ -75,6 +79,8 @@ func (v verdict) String() string {
 		return "may relay"
 	case abandoned:
 		return "abandoned"
+	case malformed:
+		return "malformed"
 	}
 	return "unknown"
 }
@@ -102,16 +108,86 @@ const (
 	outRefused   outcome = "refused"
 	outAnswered  outcome = "answered locally with success"
 	outMisrouted outcome = "answered with another request's relay"
-	outClosed    outcome = "connection closed"
+	// outClosed means the connection ended before a single byte of this request's response arrived.
+	outClosed outcome = "connection closed"
+	// outPartial means response bytes arrived that do not form a complete response.
+	outPartial outcome = "partial or malformed response"
 )
 
-// recordingWorker is the loopback worker fixture. It records the X-Probe marker of every request the supervisor
-// relays and echoes it in its answer, so the client can tell which request a relayed answer belongs to. The general
-// OPTIONS handler is disabled so that a relayed OPTIONS * reaches the recorder.
+// ended reports whether the connection carried no complete response for the request, with or without stray bytes.
+func (o outcome) ended() bool { return o == outClosed || o == outPartial }
+
+// recordingWorker is the loopback worker fixture. It records the X-Probe marker of every request head the supervisor
+// writes to it, read from the connection's bytes rather than from the parsed request: the worker's HTTP server
+// refuses a head it cannot parse before any handler runs, and such a head still reached the worker. Its handler
+// echoes the marker, so the client can tell which request a relayed answer belongs to. The general OPTIONS handler is
+// disabled so that a relayed OPTIONS * reaches the handler.
 type recordingWorker struct {
 	port   int
 	mu     sync.Mutex
 	probes []string
+}
+
+// record adds the X-Probe markers found in the lines of one request head, whatever spacing its field names carry.
+func (w *recordingWorker) record(head []byte) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for line := range strings.SplitSeq(string(head), "\r\n") {
+		if name, value, ok := strings.Cut(line, ":"); ok && strings.EqualFold(strings.TrimSpace(name), "X-Probe") {
+			w.probes = append(w.probes, strings.TrimSpace(value))
+		}
+	}
+}
+
+// tapListener hands the worker's HTTP server connections that record their request head as it is read.
+type tapListener struct {
+	net.Listener
+	rec *recordingWorker
+}
+
+func (l tapListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return conn, err
+	}
+	return &tapConn{Conn: conn, rec: l.rec}, nil
+}
+
+// tapConn records the first request head on its connection: as soon as the head's blank line arrives, before the
+// server answers, or at close for a head that never ended. The relay sends one request per connection.
+type tapConn struct {
+	net.Conn
+	rec  *recordingWorker
+	mu   sync.Mutex
+	head []byte
+	done bool
+}
+
+func (c *tapConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.done && n > 0 {
+		c.head = append(c.head, b[:n]...)
+		if end := bytes.Index(c.head, []byte("\r\n\r\n")); end >= 0 {
+			c.done = true
+			c.rec.record(c.head[:end])
+		}
+	}
+	return n, err
+}
+
+func (c *tapConn) Close() error {
+	c.mu.Lock()
+	if !c.done && len(c.head) > 0 {
+		c.done = true
+		// Only complete lines of a head the relay never finished.
+		if end := bytes.LastIndex(c.head, []byte("\r\n")); end >= 0 {
+			c.rec.record(c.head[:end])
+		}
+	}
+	c.mu.Unlock()
+	return c.Conn.Close()
 }
 
 func (w *recordingWorker) seen(nonce string) map[string]int {
@@ -138,17 +214,13 @@ func startRecordingWorker(t *testing.T, env gatewaytest.Environment) *recordingW
 		DisableGeneralOptionsHandler: true,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			_, _ = io.Copy(io.Discard, r.Body)
-			probe := r.Header.Get("X-Probe")
-			rec.mu.Lock()
-			rec.probes = append(rec.probes, probe)
-			rec.mu.Unlock()
-			w.Header().Set("X-Probe-Echo", probe)
+			w.Header().Set("X-Probe-Echo", r.Header.Get("X-Probe"))
 			// Not a 2xx status: a 2xx answer to CONNECT or an upgrade would turn the connection into a tunnel.
 			w.WriteHeader(http.StatusTeapot)
 		}),
 	}
 	done := make(chan error, 1)
-	go func() { done <- srv.Serve(ln) }()
+	go func() { done <- srv.Serve(tapListener{Listener: ln, rec: rec}) }()
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
 		defer cancel()
@@ -220,6 +292,12 @@ func TestHostAssociationPerRequest(t *testing.T) {
 	}
 	ownGet := wireRequest{head: "GET /own HTTP/1.1\r\nHost: {own}\r\nX-Probe: {probe}\r\n\r\n", want: mustRelay}
 	foreignGet := wireRequest{head: "GET /foreign HTTP/1.1\r\nHost: {foreign}\r\nX-Probe: {probe}\r\n\r\n", want: mustRefuse}
+	// net/textproto keeps a field name with a space before the colon, space included, so a check that looks the field
+	// up by its name never sees it.
+	spacedOrigin := wireRequest{
+		head: "POST /origin HTTP/1.1\r\nHost: {own}\r\nOrigin : https://evil.example\r\nX-Probe: {probe}\r\nContent-Length: {len}\r\n\r\n",
+		body: "{}", want: malformed,
+	}
 
 	tests := map[string]struct {
 		requests  []wireRequest
@@ -383,6 +461,34 @@ func TestHostAssociationPerRequest(t *testing.T) {
 			},
 			pipelined: true,
 		},
+		"error: Origin spelled with a space before the colon": {
+			requests: []wireRequest{spacedOrigin},
+		},
+		"error: second Host spelled with a space before the colon": {
+			requests: []wireRequest{
+				{head: "GET /host HTTP/1.1\r\nHost: {own}\r\nHost : {foreign}\r\nX-Probe: {probe}\r\n\r\n", want: malformed},
+			},
+		},
+		"error: Transfer-Encoding spelled with a space before the colon": {
+			requests: []wireRequest{
+				{
+					head: "POST /te HTTP/1.1\r\nHost: {own}\r\nX-Probe: {probe}\r\nContent-Length: {len}\r\nTransfer-Encoding : chunked\r\n\r\n",
+					body: "0\r\n\r\n", want: malformed,
+				},
+			},
+		},
+		"error: Content-Length spelled with a space before the colon": {
+			requests: []wireRequest{
+				{
+					head: "POST /cl HTTP/1.1\r\nHost: {own}\r\nX-Probe: {probe}\r\nTransfer-Encoding: chunked\r\nContent-Length : 999\r\n\r\n",
+					body: "2\r\n{}\r\n0\r\n\r\n", want: malformed,
+				},
+			},
+		},
+		"error: field name with a space before the colon between pipelined requests": {
+			requests:  []wireRequest{ownPost("/a"), spacedOrigin, ownGet},
+			pipelined: true,
+		},
 		"error: own request with a large head arriving in many reads": {
 			requests: []wireRequest{
 				{head: largeHead, want: mustRelay},
@@ -405,6 +511,13 @@ func TestHostAssociationPerRequest(t *testing.T) {
 			requests: []wireRequest{
 				foreignPost("/a"),
 				{head: "POST /b HTTP/1.1\r\nHost: {own}\r\nX-Probe: {probe}\r\nContent-Length: 100\r\n\r\n", body: "0123456789", want: abandoned},
+			},
+			pipelined: true,
+			halfClose: true,
+		},
+		"error: peer closes in the middle of the only request's body": {
+			requests: []wireRequest{
+				{head: "POST /only HTTP/1.1\r\nHost: {own}\r\nX-Probe: {probe}\r\nContent-Length: 100\r\n\r\n", body: "0123456789", want: abandoned},
 			},
 			pipelined: true,
 			halfClose: true,
@@ -521,7 +634,7 @@ func checkAssociation(t *testing.T, worker *recordingWorker, requests []wireRequ
 				continue
 			}
 			outcomes[i], statuses[i] = readOutcome(br, requests[i].head, probes[i])
-			closed = outcomes[i] == outClosed
+			closed = outcomes[i].ended()
 		}
 	} else {
 		written <- nil
@@ -545,7 +658,7 @@ func checkAssociation(t *testing.T, worker *recordingWorker, requests []wireRequ
 		n := seen[probes[i]]
 		delete(seen, probes[i])
 		report[i] = fmt.Sprintf("request %d (%s): %s, status %d, worker received it %d times", i, r.want, outcomes[i], statuses[i], n)
-		fault := judge(requests, outcomes, i, n)
+		fault := judge(requests, outcomes, statuses, i, n)
 		if fault != "" {
 			faults = append(faults, fmt.Sprintf("request %d: %s", i, fault))
 		}
@@ -580,15 +693,19 @@ func sequentialExchange(conn *net.TCPConn, br *bufio.Reader, r wireRequest, head
 		return outClosed, 0, true
 	}
 	o, status := readOutcome(br, head, probe)
-	return o, status, o == outClosed
+	return o, status, o.ended()
 }
 
-// readOutcome reads the final answer to one request, skipping interim 100 responses.
+// readOutcome reads the final answer to one request, skipping interim 100 responses. A connection that ends before
+// any byte of the answer is outClosed; bytes that do not make a complete response are outPartial.
 func readOutcome(br *bufio.Reader, head, probe string) (outcome, int) {
 	for {
+		if _, err := br.Peek(1); err != nil {
+			return outClosed, 0
+		}
 		resp, err := http.ReadResponse(br, &http.Request{Method: method(head)})
 		if err != nil {
-			return outClosed, 0
+			return outPartial, 0
 		}
 		if resp.StatusCode == http.StatusContinue {
 			continue
@@ -596,7 +713,7 @@ func readOutcome(br *bufio.Reader, head, probe string) (outcome, int) {
 		o := classify(resp, probe)
 		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
 			_ = resp.Body.Close()
-			return outClosed, resp.StatusCode
+			return outPartial, resp.StatusCode
 		}
 		_ = resp.Body.Close()
 		return o, resp.StatusCode
@@ -622,27 +739,43 @@ func classify(resp *http.Response, probe string) outcome {
 }
 
 // judge returns why the observed outcome of request i violates its own Host's verdict, or "" when it does not.
-func judge(requests []wireRequest, outcomes []outcome, i, received int) string {
+func judge(requests []wireRequest, outcomes []outcome, statuses []int, i, received int) string {
 	o, want := outcomes[i], requests[i].want
 	switch {
 	case received > 1:
 		return fmt.Sprintf("the worker received it %d times", received)
 	case o == outMisrouted:
 		return "the client received the worker's answer to a different request"
-	case o == outAnswered && want != abandoned:
+	case o == outAnswered:
 		return "answered with a success status without being relayed"
 	case o == outRelayed && received == 0:
 		return "answered with its own marker although the worker never recorded it"
 	}
-	closedAfterPrevious := i > 0 && (outcomes[i-1] == outRefused || outcomes[i-1] == outClosed || requests[i-1].mayClose)
-	nextClosed := i+1 < len(outcomes) && outcomes[i+1] == outClosed
+	closedAfterPrevious := i > 0 && (outcomes[i-1] == outRefused || outcomes[i-1].ended() || requests[i-1].mayClose)
+	nextClosed := i+1 < len(outcomes) && outcomes[i+1].ended()
 	switch want {
-	case mustRefuse, abandoned:
+	case abandoned:
+		if received > 0 {
+			return "relayed to the worker although the client never finished it"
+		}
+		if o != outClosed {
+			return fmt.Sprintf("the client never finished it, yet the connection carried response bytes for it (%s, status %d)", o, statuses[i])
+		}
+	case malformed:
+		switch {
+		case received > 0:
+			return "relayed to the worker although a header field name is not a token"
+		case o != outRefused || statuses[i] != http.StatusBadRequest:
+			return fmt.Sprintf("not refused with 400 although a header field name is not a token (%s, status %d)", o, statuses[i])
+		case i+1 < len(outcomes) && !nextClosed:
+			return "refused, and the connection stayed open for the next request"
+		}
+	case mustRefuse:
 		if received > 0 {
 			return "relayed to the worker although its own Host does not allow it"
 		}
 	case mustRelay:
-		if o == outRelayed || (o == outClosed && closedAfterPrevious) {
+		if o == outRelayed || (o.ended() && closedAfterPrevious) {
 			return ""
 		}
 		return fmt.Sprintf("not relayed although its own Host allows it (%s)", o)
