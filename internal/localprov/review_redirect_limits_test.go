@@ -53,8 +53,8 @@ func (h handlerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 // first: nine redirects still reach the answer, while a tenth redirect fails the probe without an
 // eleventh request. A 3xx status outside those five is the answer even when it names a Location,
 // which is never requested. Each case runs in a synctest bubble with the chain served from memory: the
-// probe deadline runs on the bubble clock, and the answer arrives with no bubble time passed, so no
-// deadline decides an outcome.
+// probe deadline runs on the bubble clock, and every probe must end before that deadline, so the hop
+// limit and not the deadline ends a long chain.
 func TestProbeRedirectHopLimitAndUnfollowedStatus(t *testing.T) {
 	followed := []int{http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect}
 	tests := map[string]struct {
@@ -142,8 +142,8 @@ func TestProbeRedirectHopLimitAndUnfollowedStatus(t *testing.T) {
 				const port uint16 = 9
 				start := time.Now()
 				got := localprov.ProbeLlama(t.Context(), mapLookup(map[string]string{"CCP_LLAMA_PORT": strconv.Itoa(int(port))}), localprov.ProbeOptions{Client: &http.Client{Transport: handlerTransport{handler: handler}}})
-				if elapsed := time.Since(start); elapsed != 0 {
-					t.Errorf("test precondition: the probe took %v of bubble time, want none", elapsed)
+				if elapsed := time.Since(start); elapsed >= localprov.DefaultProbeTimeout {
+					t.Errorf("the probe took %v of bubble time, want it to end before the %v probe deadline", elapsed, localprov.DefaultProbeTimeout)
 				}
 				want := localprov.LlamaState{Port: port, Configured: true, Reachable: tt.wantError == "", ContextWindow: tt.wantWindow, Error: tt.wantError}
 				if diff := gocmp.Diff(want, got); diff != "" {

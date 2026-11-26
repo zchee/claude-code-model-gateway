@@ -52,8 +52,11 @@ func (rt redirectChainTransport) RoundTrip(req *http.Request) (*http.Response, e
 // a tenth redirect fails the check without an eleventh request. A 3xx status outside those five is
 // the answer even when it names a Location, which is never requested, and is not a ready proxy. Each
 // case runs in a synctest bubble with the chain served from memory: the check's deadline runs on the
-// bubble clock, and the answer arrives with no bubble time passed, so no deadline decides an outcome.
+// bubble clock, and every check must end before that deadline, so the hop limit and not the deadline
+// ends a long chain.
 func TestProxyCheckRedirectHopLimitAndUnfollowedStatus(t *testing.T) {
+	// proxyModelsDeadline is how long the check waits for the /v1/models answer.
+	const proxyModelsDeadline = 2 * time.Second
 	followed := []int{http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect}
 	tests := map[string]struct {
 		// redirects is how many followed redirects precede the answer.
@@ -132,8 +135,8 @@ func TestProxyCheckRedirectHopLimitAndUnfollowedStatus(t *testing.T) {
 					ProxyModelsURL: "http://127.0.0.1:19993/v1/models",
 					Client:         &http.Client{Transport: redirectChainTransport{handler: handler}},
 				})
-				if elapsed := time.Since(start); elapsed != 0 {
-					t.Errorf("test precondition: the check took %v of bubble time, want none", elapsed)
+				if elapsed := time.Since(start); elapsed >= proxyModelsDeadline {
+					t.Errorf("the check took %v of bubble time, want it to end before the %v /v1/models deadline", elapsed, proxyModelsDeadline)
 				}
 				want := readiness.ProxyAuthResult{ProxyBinary: true, ProxyModels: tt.wantModels}
 				if got != want {

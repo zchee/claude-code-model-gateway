@@ -38,6 +38,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/zchee/claude-code-model-gateway/internal/gatewaytest"
+	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
 	"github.com/zchee/claude-code-model-gateway/internal/paths"
 	"github.com/zchee/claude-code-model-gateway/internal/venue"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/modelcache"
@@ -53,14 +54,15 @@ const (
 	catalogWriteDone = "catalog write child refreshed the catalog"
 	// limitedArg makes the child lower its soft file size limit to catalogSaveLimit.
 	limitedArg = "limited"
-	// unlimitedArg makes the child keep its file size limit and check it has catalogHeadroom.
+	// unlimitedArg makes the child keep its file size limit and check it leaves room for the saved
+	// catalog plus catalogSaveMargin.
 	unlimitedArg = "unlimited"
 
 	// catalogSaveLimit is a file size limit far below the fetched catalog and far above the failure record.
 	catalogSaveLimit = 64 << 10
-	// catalogHeadroom is the file size the control needs: well over the fetched catalog, which the
-	// child checks, so a saved catalog cannot fail for lack of room.
-	catalogHeadroom = 16 << 20
+	// catalogSaveMargin is the room the control asks for beyond the saved catalog document the child
+	// encodes itself, so a small difference from the document the cache writes cannot fail the save.
+	catalogSaveMargin = 16 << 10
 	// catalogRowCount makes the fetched catalog page several times larger than catalogSaveLimit.
 	catalogRowCount = 2000
 
@@ -146,22 +148,23 @@ func redact(s string) string {
 	return strings.ReplaceAll(s, authBearerPayload, "<auth-bearer-marker>")
 }
 
-// setCatalogFileLimit applies the file size limit arg selects and returns the original limit. The
-// limited case lowers the soft limit to catalogSaveLimit and never raises one that is already lower;
-// the comparisons use untyped constants because the limit's field type differs between platforms.
-// A write past the soft limit fails with EFBIG; the Go runtime ignores the accompanying SIGXFSZ.
-func setCatalogFileLimit(t testing.TB, arg string, pageSize int) unix.Rlimit {
+// setCatalogFileLimit applies the file size limit arg selects and returns the original limit; it never
+// raises a limit. The unlimited case keeps the inherited limit and checks it leaves room for a saved
+// catalog of savedSize bytes plus catalogSaveMargin. The limited case lowers the soft limit to
+// catalogSaveLimit unless it is already lower, comparing with an untyped constant because the limit's
+// field type differs between platforms (uint64 on Linux and macOS, int64 on the BSDs). The unlimited
+// case compares with a size known only at run time, so it converts the limit to uint64, which keeps
+// every value: no platform has a negative soft limit, and the BSDs' unlimited value is the largest
+// int64. A write past the soft limit fails with EFBIG; the Go runtime ignores the accompanying SIGXFSZ.
+func setCatalogFileLimit(t testing.TB, arg string, savedSize int) unix.Rlimit {
 	var original unix.Rlimit
 	if err := unix.Getrlimit(unix.RLIMIT_FSIZE, &original); err != nil {
 		t.Fatalf("read the file size limit: %v", err)
 	}
 	switch arg {
 	case unlimitedArg:
-		if pageSize >= catalogHeadroom {
-			t.Fatalf("test precondition: the %d-byte page does not fit the %d-byte headroom", pageSize, catalogHeadroom)
-		}
-		if original.Cur < catalogHeadroom {
-			t.Fatalf("test precondition: soft file size limit %d is below the %d-byte headroom the saved catalog needs", original.Cur, catalogHeadroom)
+		if need := savedSize + catalogSaveMargin; uint64(original.Cur) < uint64(need) {
+			t.Fatalf("test precondition: soft file size limit %d is below the %d bytes the saved catalog needs (%d-byte document and %d-byte margin)", original.Cur, need, savedSize, catalogSaveMargin)
 		}
 	case limitedArg:
 		if original.Cur > catalogSaveLimit {
@@ -195,6 +198,15 @@ func runCatalogWriteChild(t testing.TB, args []string) {
 	}
 	if len(page) < 4*catalogSaveLimit {
 		t.Fatalf("test precondition: the %d-byte page is not far over the %d-byte limit", len(page), catalogSaveLimit)
+	}
+	// saved is the document a successful refresh saves, encoded the way the cache encodes it.
+	saved, err := jsonx.EncodeState(struct {
+		Data      []idDisplay `json:"data"`
+		UpdatedAt int64       `json:"updatedAt"`
+		Error     *string     `json:"error"`
+	}{Data: rows, UpdatedAt: staleCatalogNow})
+	if err != nil {
+		t.Fatalf("encode the saved catalog: %v", err)
 	}
 
 	dir, err := os.Getwd()
@@ -254,7 +266,7 @@ func runCatalogWriteChild(t testing.TB, args []string) {
 		t.Fatalf("New: %v", err)
 	}
 
-	original := setCatalogFileLimit(t, args[0], len(page))
+	original := setCatalogFileLimit(t, args[0], len(saved))
 	_, refreshErr := cache.ModelsResponse(t.Context(), http.Header{"Authorization": {"Bearer " + authBearerPayload}})
 	cache.Wait()
 	if err := unix.Setrlimit(unix.RLIMIT_FSIZE, &original); err != nil {

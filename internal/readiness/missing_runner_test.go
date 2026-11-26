@@ -36,11 +36,12 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/readiness"
 )
 
-// readyStatusScript stands in for claude-code-proxy: whatever it is asked, it records its arguments in
-// the file "ran" beside itself, prints a signed-in Codex account and exits 0, which every status check
-// reads as ready. It uses shell built-ins only, because the fixture environment carries no PATH.
+// readyStatusScript stands in for claude-code-proxy: whatever it is asked, it records its arguments and
+// then its working directory, one line each, in the file "ran" beside itself, prints a signed-in Codex
+// account and exits 0, which every status check reads as ready. It uses shell built-ins only, because
+// the fixture environment carries no PATH.
 const readyStatusScript = `#!/bin/sh
-printf '%s\n' "$*" > "${0%/*}/ran"
+{ printf '%s\n' "$*"; pwd -P; } > "${0%/*}/ran"
 printf 'Signed in with a ChatGPT account\n'
 exit 0
 `
@@ -61,23 +62,63 @@ func newReadyStatusFixture(t *testing.T) readyStatusFixture {
 	return readyStatusFixture{env: env, binary: binary}
 }
 
-// ran returns the arguments the fixture recorded, or "" when it never ran.
-func (f readyStatusFixture) ran(t *testing.T) string {
+// statusRecord is what the ready status fixture recorded about its run.
+type statusRecord struct {
+	// Args is the fixture's arguments joined by spaces; it is empty for a run with no arguments.
+	Args string
+	// Dir is the fixture's working directory with symbolic links resolved.
+	Dir string
+}
+
+// ran returns the fixture's record and whether the fixture ran, which the record's existence decides.
+func (f readyStatusFixture) ran(t *testing.T) (statusRecord, bool) {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join(filepath.Dir(f.binary), "ran"))
 	if errors.Is(err, fs.ErrNotExist) {
-		return ""
+		return statusRecord{}, false
 	}
 	if err != nil {
 		t.Fatalf("read the status fixture's record: %v", err)
 	}
-	return strings.TrimSuffix(string(data), "\n")
+	record, ok := strings.CutSuffix(string(data), "\n")
+	args, dir, found := strings.Cut(record, "\n")
+	if !ok || !found || strings.Contains(dir, "\n") {
+		t.Fatalf("the status fixture's record %q is not an argument line and a directory line", data)
+	}
+	return statusRecord{Args: args, Dir: dir}, true
+}
+
+// checkRan reports a mismatch between the fixture's run and wantRan, then between the recorded
+// arguments and wantArgs, and between the recorded working directory and the sandbox home.
+func (f readyStatusFixture) checkRan(t *testing.T, wantRan bool, wantArgs string) {
+	t.Helper()
+	got, ran := f.ran(t)
+	if ran != wantRan {
+		t.Errorf("the ready status fixture ran = %t, want %t (record %+v)", ran, wantRan, got)
+		return
+	}
+	if !ran {
+		return
+	}
+	if diff := gocmp.Diff(wantArgs, got.Args); diff != "" {
+		t.Errorf("arguments the ready status fixture ran with (-want +got):\n%s", diff)
+	}
+	// The fixture records its directory with symbolic links resolved, so the home is resolved too.
+	home, err := filepath.EvalSymlinks(f.env["HOME"])
+	if err != nil {
+		t.Fatalf("resolve the sandbox home: %v", err)
+	}
+	if got.Dir != home {
+		t.Errorf("the ready status fixture ran in %q, want the sandbox home %q", got.Dir, home)
+	}
 }
 
 // command prepares binary with args for the gatewaytest fixture runner, which checks that binary lies
-// inside the sandbox and starts it with the sandbox's environment only.
+// inside the sandbox and starts it with the sandbox's environment only. The runner does not choose a
+// working directory for such a command, so the command runs in the sandbox home.
 func (f readyStatusFixture) command(ctx context.Context, binary string, args []string, stdout, stderr *bytes.Buffer) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, binary, args...)
+	cmd.Dir = f.env["HOME"]
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	return cmd
 }
@@ -122,8 +163,9 @@ func TestProviderAuthStateWithoutStatusRunner(t *testing.T) {
 		env      map[string]string
 		runner   bool
 		want     string
-		// wantRan is the argument list the fixture recorded, or "" when it must not run.
-		wantRan string
+		// wantRan says the fixture must run; wantArgs is then the argument list it recorded.
+		wantRan  bool
+		wantArgs string
 	}{
 		"error: Kimi sign-in cannot be checked": {
 			provider: "kimi",
@@ -161,26 +203,30 @@ func TestProviderAuthStateWithoutStatusRunner(t *testing.T) {
 			provider: "kimi",
 			runner:   true,
 			want:     "ready",
-			wantRan:  "kimi auth status",
+			wantRan:  true,
+			wantArgs: "kimi auth status",
 		},
 		"success: Cursor sign-in is checked by a supplied runner": {
 			provider: "cursor",
 			runner:   true,
 			want:     "ready",
-			wantRan:  "cursor auth status",
+			wantRan:  true,
+			wantArgs: "cursor auth status",
 		},
 		"success: Muse sign-in is checked by a supplied runner": {
 			provider: "muse",
 			runner:   true,
 			want:     "ready",
-			wantRan:  "muse auth status",
+			wantRan:  true,
+			wantArgs: "muse auth status",
 		},
 		"success: Vertex with a project is checked by a supplied runner": {
 			provider: "vertex",
 			env:      map[string]string{"CCP_VERTEX_PROJECT": "runner-present-project"},
 			runner:   true,
 			want:     "ready",
-			wantRan:  "vertex auth status",
+			wantRan:  true,
+			wantArgs: "vertex auth status",
 		},
 		"error: Vertex without a project skips a supplied runner": {
 			provider: "vertex",
@@ -216,9 +262,7 @@ func TestProviderAuthStateWithoutStatusRunner(t *testing.T) {
 			if got != tt.want {
 				t.Errorf("ProviderAuthState(%q) with runner %t = %q, want %q", tt.provider, tt.runner, got, tt.want)
 			}
-			if diff := gocmp.Diff(tt.wantRan, fixture.ran(t)); diff != "" {
-				t.Errorf("arguments the ready status fixture ran with (-want +got; empty means not run):\n%s", diff)
-			}
+			fixture.checkRan(t, tt.wantRan, tt.wantArgs)
 		})
 	}
 }
@@ -252,10 +296,11 @@ func (l listingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 // binary unstarted. With a runner supplied, the same fixture runs and Codex is reported signed in.
 func TestProbeProxyAndAuthWithoutStatusRunner(t *testing.T) {
 	tests := map[string]struct {
-		status  int
-		runner  bool
-		want    readiness.ProxyAuthResult
-		wantRan string
+		status   int
+		runner   bool
+		want     readiness.ProxyAuthResult
+		wantRan  bool
+		wantArgs string
 	}{
 		"error: answering proxy without a runner is not signed in": {
 			status: http.StatusOK,
@@ -266,16 +311,18 @@ func TestProbeProxyAndAuthWithoutStatusRunner(t *testing.T) {
 			want:   readiness.ProxyAuthResult{ProxyBinary: true, ProxyModels: false, CodexAuth: false},
 		},
 		"success: answering proxy with a supplied runner is signed in": {
-			status:  http.StatusOK,
-			runner:  true,
-			want:    readiness.ProxyAuthResult{ProxyBinary: true, ProxyModels: true, CodexAuth: true},
-			wantRan: "codex auth status",
+			status:   http.StatusOK,
+			runner:   true,
+			want:     readiness.ProxyAuthResult{ProxyBinary: true, ProxyModels: true, CodexAuth: true},
+			wantRan:  true,
+			wantArgs: "codex auth status",
 		},
 		"success: failing proxy with a supplied runner is still signed in": {
-			status:  http.StatusBadGateway,
-			runner:  true,
-			want:    readiness.ProxyAuthResult{ProxyBinary: true, ProxyModels: false, CodexAuth: true},
-			wantRan: "codex auth status",
+			status:   http.StatusBadGateway,
+			runner:   true,
+			want:     readiness.ProxyAuthResult{ProxyBinary: true, ProxyModels: false, CodexAuth: true},
+			wantRan:  true,
+			wantArgs: "codex auth status",
 		},
 	}
 	for name, tt := range tests {
@@ -297,9 +344,7 @@ func TestProbeProxyAndAuthWithoutStatusRunner(t *testing.T) {
 			if n := modelHits.Load(); n != 1 {
 				t.Errorf("test precondition: /v1/models answered %d request(s), want 1", n)
 			}
-			if diff := gocmp.Diff(tt.wantRan, fixture.ran(t)); diff != "" {
-				t.Errorf("arguments the ready status fixture ran with (-want +got; empty means not run):\n%s", diff)
-			}
+			fixture.checkRan(t, tt.wantRan, tt.wantArgs)
 		})
 	}
 }
