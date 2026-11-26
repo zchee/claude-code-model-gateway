@@ -15,6 +15,7 @@
 package modelcache_test
 
 import (
+	"context"
 	json "encoding/json/v2"
 	"io"
 	"net"
@@ -23,9 +24,9 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -376,13 +377,13 @@ func discoveryCacheAtSize(t *testing.T, size int) string {
 
 // TestCatalogRefreshFailureMessages seeds a stale saved catalog and answers its refresh with a page
 // that has no data array or with a transport failure. The listing serves the cached rows, and the
-// saved catalog keeps them with the failure's classified message.
+// saved catalog keeps them with the failure's classified message. The refused connection comes from
+// a dialer that answers ECONNREFUSED inside a real HTTP transport, so no port is dialled.
 func TestCatalogRefreshFailureMessages(t *testing.T) {
-	refused := closedPort(t)
 	tests := map[string]struct {
 		page      string
 		transport http.RoundTripper
-		baseURL   string
+		refuse    bool
 		want      savedCatalog
 	}{
 		"error: a JSON null page is invalid catalog data": {
@@ -402,8 +403,8 @@ func TestCatalogRefreshFailureMessages(t *testing.T) {
 			want:      savedCatalog{IDs: []string{"claude-cached-1"}, Error: "catalog request failed"},
 		},
 		"error: a refused connection is a catalog request failure": {
-			baseURL: "http://127.0.0.1:" + strconv.Itoa(refused),
-			want:    savedCatalog{IDs: []string{"claude-cached-1"}, Error: "catalog request failed"},
+			refuse: true,
+			want:   savedCatalog{IDs: []string{"claude-cached-1"}, Error: "catalog request failed"},
 		},
 	}
 	for name, tt := range tests {
@@ -423,10 +424,19 @@ func TestCatalogRefreshFailureMessages(t *testing.T) {
 			if tt.transport != nil {
 				client = &http.Client{Transport: tt.transport}
 			}
-			baseURL := upstream.URL
-			if tt.baseURL != "" {
-				baseURL = tt.baseURL
+			var refusedDials atomic.Int32
+			if tt.refuse {
+				tr := &http.Transport{
+					Proxy: nil,
+					DialContext: func(context.Context, string, string) (net.Conn, error) {
+						refusedDials.Add(1)
+						return nil, &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}
+					},
+				}
+				t.Cleanup(tr.CloseIdleConnections)
+				client = &http.Client{Transport: tr}
 			}
+			baseURL := upstream.URL
 
 			_, lookup, resolver := newTestPaths(t, nil)
 			catalogPath := filepath.Join(stateDirOf(t, resolver), "anthropic-models.json")
@@ -459,23 +469,16 @@ func TestCatalogRefreshFailureMessages(t *testing.T) {
 			if tt.page != "" && pageHits.Load() != 1 {
 				t.Errorf("test precondition: the upstream answered %d page request(s), want 1", pageHits.Load())
 			}
+			if tt.refuse {
+				if got := refusedDials.Load(); got < 1 {
+					t.Errorf("test precondition: the refusing dialer ran %d time(s), want at least 1", got)
+				}
+				if got := pageHits.Load(); got != 0 {
+					t.Errorf("the upstream answered %d page request(s) through a refused connection, want 0", got)
+				}
+			}
 		})
 	}
-}
-
-// closedPort returns a loopback port with no listener.
-func closedPort(t *testing.T) int {
-	t.Helper()
-	var lc net.ListenConfig
-	ln, err := lc.Listen(t.Context(), "tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	if err := ln.Close(); err != nil {
-		t.Fatalf("close listener: %v", err)
-	}
-	return port
 }
 
 // TestCatalogRequestHeaderMerge hands the catalog refresh caller-built header maps with repeated
@@ -521,6 +524,25 @@ func TestCatalogRequestHeaderMerge(t *testing.T) {
 				"Anthropic-Version": {"2023-06-01"},
 				"Anthropic-Beta":    {"beta-lower"},
 				"User-Agent":        {"agent-lower"},
+			},
+		},
+		"success: of spellings that are not all lowercase the last in byte order wins": {
+			incoming: http.Header{
+				"AUTHORIZATION":  {"Bearer upper-merge-marker"},
+				"Authorization":  {"Bearer canonical-merge-marker"},
+				"Anthropic-Beta": {"beta-canonical"},
+				"Anthropic-beta": {"beta-mixed"},
+				"User-Agent":     {"agent-canonical"},
+				"User-agent":     {"agent-mixed"},
+				"X-API-KEY":      {"key-upper"},
+				"X-Api-KEY":      {"key-mixed"},
+			},
+			want: map[string][]string{
+				"Authorization":     {"Bearer canonical-merge-marker"},
+				"X-Api-Key":         {"key-mixed"},
+				"Anthropic-Version": {"2023-06-01"},
+				"Anthropic-Beta":    {"beta-mixed"},
+				"User-Agent":        {"agent-mixed"},
 			},
 		},
 		"success: the winning spelling's repeated values merge without the other spellings' values": {
@@ -605,7 +627,12 @@ func TestCatalogRequestHeaderMerge(t *testing.T) {
 }
 
 // TestDiscoveryCacheReplacementIsPrivate writes the discovery cache over no file and over files with
-// wider or equal permissions: the replaced file is private to its owner.
+// wider or equal permissions: the replaced file is private to its owner. It checks the plain mode under
+// the test process's own creation mask, which it does not change: the expected mode is the one a new
+// file created with 0600 receives in the cache's directory, which is 0600 under any mask that leaves the
+// owner's bits alone. Under such a mask a final 0600 cannot tell whether the destination name was also
+// changed with chmod. TestDiscoveryCacheModeFollowsCreationMask in the discoverymodetest package decides
+// that, by writing and replacing the cache in child processes under masks that remove owner bits.
 func TestDiscoveryCacheReplacementIsPrivate(t *testing.T) {
 	tests := map[string]struct {
 		// prior is the mode of a stale file present before the write; zero means no file.
@@ -635,8 +662,12 @@ func TestDiscoveryCacheReplacementIsPrivate(t *testing.T) {
 				if err := os.Chmod(cachePath, tt.prior); err != nil {
 					t.Fatalf("chmod the stale discovery cache: %v", err)
 				}
-				if info, err := os.Stat(cachePath); err != nil || info.Mode().Perm() != tt.prior {
-					t.Fatalf("test precondition: stale discovery cache mode = %v (err %v), want %v", info.Mode().Perm(), err, tt.prior)
+				info, err := os.Stat(cachePath)
+				if err != nil {
+					t.Fatalf("test precondition: stat the stale discovery cache: %v", err)
+				}
+				if info.Mode().Perm() != tt.prior {
+					t.Fatalf("test precondition: stale discovery cache mode = %v, want %v", info.Mode().Perm(), tt.prior)
 				}
 			}
 			cache := newBoundedReadCache(t, resolver, modelcache.Options{Lookup: lookup})
@@ -648,8 +679,13 @@ func TestDiscoveryCacheReplacementIsPrivate(t *testing.T) {
 			if err != nil {
 				t.Fatalf("stat the discovery cache: %v", err)
 			}
-			if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
-				t.Errorf("discovery cache after replacement = %v, want a regular file with mode %v", info.Mode(), os.FileMode(0o600))
+			want := privateCreateMode(t, filepath.Dir(cachePath))
+			if !info.Mode().IsRegular() || info.Mode().Perm() != want {
+				t.Errorf("discovery cache after replacement = %v, want a regular file with mode %v", info.Mode(), want)
+			}
+			if want&0o400 == 0 {
+				// The ambient mask removes the owner's read bit, so the content cannot be read back.
+				return
 			}
 			var doc struct {
 				BaseURL string `json:"baseUrl"`
@@ -663,4 +699,28 @@ func TestDiscoveryCacheReplacementIsPrivate(t *testing.T) {
 			}
 		})
 	}
+}
+
+// privateCreateMode returns the permission bits a new file created with mode 0600 in dir receives
+// under the process's current creation mask. The probe file is removed before it returns.
+func privateCreateMode(t *testing.T, dir string) os.FileMode {
+	t.Helper()
+	probe, err := os.CreateTemp(dir, "mode-probe-*")
+	if err != nil {
+		t.Fatalf("create a mode probe in %s: %v", dir, err)
+	}
+	name := probe.Name()
+	defer func() {
+		if err := os.Remove(name); err != nil {
+			t.Errorf("remove the mode probe: %v", err)
+		}
+	}()
+	if err := probe.Close(); err != nil {
+		t.Fatalf("close the mode probe: %v", err)
+	}
+	info, err := os.Lstat(name)
+	if err != nil {
+		t.Fatalf("stat the mode probe: %v", err)
+	}
+	return info.Mode().Perm()
 }

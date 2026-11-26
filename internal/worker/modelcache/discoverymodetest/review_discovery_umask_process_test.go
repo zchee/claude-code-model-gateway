@@ -49,6 +49,11 @@ const (
 	discoveryUmaskDone = "discovery umask child wrote state="
 	// gatewayURL is both the default and the effective base URL, so the cache counts as wired.
 	gatewayURL = "http://127.0.0.1:19999"
+	// replaceArg makes the child seed a stale private cache before the mask applies and force its
+	// replacement under the mask.
+	replaceArg = "replace"
+	// staleDiscoveryCache is a valid discovery cache for another base URL, so a sync replaces it.
+	staleDiscoveryCache = `{"baseUrl":"stale","fetchedAt":0,"models":[]}`
 )
 
 func TestMain(m *testing.M) {
@@ -79,12 +84,15 @@ func discoveryChildCachePath(dir string) string {
 }
 
 // runDiscoveryUmaskChild prepares a wired cache in its working directory, sets the creation mask
-// named by its single octal argument only around the discovery sync, and prints the sync state.
-// Every directory exists before the mask applies, so the mask can affect only the cache file.
+// named by its first argument (octal) only around the discovery sync, and prints the sync state.
+// Every directory exists before the mask applies, so the mask can affect only the cache file. With
+// a second argument replaceArg, a stale cache with mode 0600 exists before the mask applies and the
+// sync is forced, so the mask meets the replacement of an existing destination.
 func runDiscoveryUmaskChild(t testing.TB, args []string) {
-	if len(args) != 1 {
-		t.Fatalf("child arguments = %q, want one octal creation mask", args)
+	if len(args) != 1 && (len(args) != 2 || args[1] != replaceArg) {
+		t.Fatalf("child arguments = %q, want one octal creation mask, optionally followed by %q", args, replaceArg)
 	}
+	replace := len(args) == 2
 	mask, err := strconv.ParseUint(args[0], 8, 9)
 	if err != nil {
 		t.Fatalf("creation mask %q: %v", args[0], err)
@@ -116,6 +124,22 @@ func runDiscoveryUmaskChild(t testing.TB, args []string) {
 	if err := os.MkdirAll(filepath.Dir(cachePath), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	if replace {
+		if err := os.WriteFile(cachePath, []byte(staleDiscoveryCache), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// An explicit chmod sets the mode whatever creation mask the child inherited.
+		if err := os.Chmod(cachePath, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		info, err := os.Lstat(cachePath)
+		if err != nil {
+			t.Fatalf("test precondition: stat the stale discovery cache: %v", err)
+		}
+		if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+			t.Fatalf("test precondition: stale discovery cache = %v, want a regular file with mode 0600", info.Mode())
+		}
+	}
 	cache, err := modelcache.New(modelcache.Options{
 		Lookup:           lookup,
 		Paths:            resolver,
@@ -131,7 +155,7 @@ func runDiscoveryUmaskChild(t testing.TB, args []string) {
 		t.Fatalf("New: %v", err)
 	}
 	previous := unix.Umask(int(mask))
-	result, syncErr := cache.SyncDiscoveryCache(false)
+	result, syncErr := cache.SyncDiscoveryCache(replace)
 	unix.Umask(previous)
 	if syncErr != nil {
 		t.Fatalf("SyncDiscoveryCache under umask %s: %v", args[0], syncErr)
@@ -140,14 +164,16 @@ func runDiscoveryUmaskChild(t testing.TB, args []string) {
 }
 
 // TestDiscoveryCacheModeFollowsCreationMask writes the discovery cache in a child process under each
-// creation mask. The cache requests mode 0600 in its atomic replacement and changes the mode of the
-// destination name no further, so the creation mask removes permission bits from 0600: a mask that
-// removes the owner's write bit leaves a read-only 0400 file, where a later chmod of the destination
-// to 0600 would have restored the write bit.
+// creation mask, over no file and over a stale private file. The cache requests mode 0600 in its
+// atomic replacement and changes the mode of the destination name no further, so the creation mask
+// removes permission bits from 0600: a mask that removes the owner's write bit leaves a read-only
+// 0400 file, where a later chmod of the destination to 0600, or keeping the replaced file's mode,
+// would have left 0600.
 func TestDiscoveryCacheModeFollowsCreationMask(t *testing.T) {
 	tests := map[string]struct {
-		mask string
-		want fs.FileMode
+		mask    string
+		replace bool
+		want    fs.FileMode
 	}{
 		"success: permissive mask keeps 0600": {
 			mask: "0000",
@@ -169,11 +195,25 @@ func TestDiscoveryCacheModeFollowsCreationMask(t *testing.T) {
 			mask: "0400",
 			want: 0o200,
 		},
+		"success: replacing a stale 0600 cache under a mask without owner write leaves 0400": {
+			mask:    "0200",
+			replace: true,
+			want:    0o400,
+		},
+		"success: replacing a stale 0600 cache under a mask without owner read leaves 0200": {
+			mask:    "0400",
+			replace: true,
+			want:    0o200,
+		},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			env := gatewaytest.NewEnv(t.TempDir(), nil, nil, nil)
-			cmd, err := env.HelperCommand(t, discoveryUmaskHelper, tt.mask)
+			args := []string{tt.mask}
+			if tt.replace {
+				args = append(args, replaceArg)
+			}
+			cmd, err := env.HelperCommand(t, discoveryUmaskHelper, args...)
 			if err != nil {
 				t.Fatal(err)
 			}

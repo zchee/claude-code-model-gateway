@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/zchee/claude-code-model-gateway/internal/worker/modelcache"
@@ -33,7 +34,8 @@ import (
 // ten requests including the first: nine redirects still read the listing, while a tenth redirect
 // leaves the listing unread without an eleventh request. A 3xx status outside those five is the
 // answer even when it names a Location, which is never requested; an unread listing keeps the
-// built-in catalog.
+// built-in catalog. Each case runs in virtual time with an in-memory transport, and the refresh must
+// end before the listing deadline, so the hop limit and not the deadline ends a long chain.
 func TestListingRedirectHopLimitAndUnfollowedStatus(t *testing.T) {
 	followed := []int{http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect}
 	tests := map[string]struct {
@@ -80,65 +82,72 @@ func TestListingRedirectHopLimitAndUnfollowedStatus(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			var mu sync.Mutex
-			var seen []string
-			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				mu.Lock()
-				seen = append(seen, r.URL.Path)
-				mu.Unlock()
-				hop := 0
-				if rest, ok := strings.CutPrefix(r.URL.Path, "/hop/"); ok {
-					n, err := strconv.Atoi(rest)
-					if err != nil {
+			synctest.Test(t, func(t *testing.T) {
+				var mu sync.Mutex
+				var seen []string
+				handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					mu.Lock()
+					seen = append(seen, r.URL.Path)
+					mu.Unlock()
+					hop := 0
+					if rest, ok := strings.CutPrefix(r.URL.Path, "/hop/"); ok {
+						n, err := strconv.Atoi(rest)
+						if err != nil {
+							w.WriteHeader(http.StatusNotFound)
+							return
+						}
+						hop = n
+					} else if r.URL.Path != "/v1/models" {
 						w.WriteHeader(http.StatusNotFound)
 						return
 					}
-					hop = n
-				} else if r.URL.Path != "/v1/models" {
-					w.WriteHeader(http.StatusNotFound)
-					return
+					switch {
+					case hop < tt.redirects:
+						w.Header().Set("Location", "/hop/"+strconv.Itoa(hop+1))
+						w.WriteHeader(followed[hop%len(followed)])
+					case tt.finalStatus != http.StatusOK:
+						w.Header().Set("Location", "/unfollowed")
+						w.WriteHeader(tt.finalStatus)
+					default:
+						w.Header().Set("Content-Type", "application/json")
+						_, _ = w.Write([]byte(`{"data":[{"id":"gpt-6-astra","display_name":"gpt-6-astra (codex)"}]}`))
+					}
+				})
+				_, lookup, resolver := newTestPaths(t, nil)
+				cache, err := modelcache.New(modelcache.Options{
+					Lookup:         lookup,
+					Paths:          resolver,
+					ProxyBaseURL:   "http://127.0.0.1:19991",
+					DefaultBaseURL: discoveryGatewayURL,
+					Client:         &http.Client{Transport: handlerTransport{handler: handler}},
+					Clock:          time.Now,
+					Routes:         &route.Store{},
+					Sentry:         &sentry.State{},
+				})
+				if err != nil {
+					t.Fatalf("New: %v", err)
 				}
-				switch {
-				case hop < tt.redirects:
-					w.Header().Set("Location", "/hop/"+strconv.Itoa(hop+1))
-					w.WriteHeader(followed[hop%len(followed)])
-				case tt.finalStatus != http.StatusOK:
-					w.Header().Set("Location", "/unfollowed")
-					w.WriteHeader(tt.finalStatus)
-				default:
-					w.Header().Set("Content-Type", "application/json")
-					_, _ = w.Write([]byte(`{"data":[{"id":"gpt-6-astra","display_name":"gpt-6-astra (codex)"}]}`))
+				defer cache.Wait()
+				start := time.Now()
+				if err := cache.Refresh(t.Context()); err != nil {
+					t.Fatalf("Refresh: %v", err)
+				}
+				if elapsed := time.Since(start); elapsed >= modelcache.ProxyListingTimeout {
+					t.Errorf("refresh took %v of virtual time, want it to end before the %v listing deadline", elapsed, modelcache.ProxyListingTimeout)
+				}
+				if source, _ := cache.HealthCatalog(); source != tt.wantSource {
+					t.Errorf("catalog source after the refresh = %q, want %q", source, tt.wantSource)
+				}
+				mu.Lock()
+				paths := slices.Clone(seen)
+				mu.Unlock()
+				if len(paths) != tt.wantRequests {
+					t.Errorf("listing requests received = %d (%q), want %d", len(paths), paths, tt.wantRequests)
+				}
+				if slices.Contains(paths, "/unfollowed") {
+					t.Errorf("the listing requested the Location of an unfollowed status: %q", paths)
 				}
 			})
-			_, lookup, resolver := newTestPaths(t, nil)
-			cache, err := modelcache.New(modelcache.Options{
-				Lookup:         lookup,
-				Paths:          resolver,
-				ProxyBaseURL:   "http://127.0.0.1:19991",
-				DefaultBaseURL: discoveryGatewayURL,
-				Client:         &http.Client{Transport: handlerTransport{handler: handler}},
-				Clock:          time.Now,
-				Routes:         &route.Store{},
-				Sentry:         &sentry.State{},
-			})
-			if err != nil {
-				t.Fatalf("New: %v", err)
-			}
-			if err := cache.Refresh(t.Context()); err != nil {
-				t.Fatalf("Refresh: %v", err)
-			}
-			if source, _ := cache.HealthCatalog(); source != tt.wantSource {
-				t.Errorf("catalog source after the refresh = %q, want %q", source, tt.wantSource)
-			}
-			mu.Lock()
-			paths := slices.Clone(seen)
-			mu.Unlock()
-			if len(paths) != tt.wantRequests {
-				t.Errorf("listing requests received = %d (%q), want %d", len(paths), paths, tt.wantRequests)
-			}
-			if slices.Contains(paths, "/unfollowed") {
-				t.Errorf("the listing requested the Location of an unfollowed status: %q", paths)
-			}
 		})
 	}
 }

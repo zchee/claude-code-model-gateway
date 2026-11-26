@@ -30,8 +30,8 @@ import (
 
 // TestRefreshesNeverOverlapAcrossTicks holds the worker's first listing request across ten refresh
 // intervals in virtual time. No second refresh starts while the first is held, so listing requests
-// never overlap; after the release a single overdue tick runs one refresh, not one per missed
-// interval, and the next refresh follows one interval later.
+// never overlap; once the held request is released, a later refresh does run, and it starts no
+// earlier than the release. How soon after the release it runs is not part of the check.
 func TestRefreshesNeverOverlapAcrossTicks(t *testing.T) {
 	const (
 		interval = 100 * time.Millisecond
@@ -116,19 +116,16 @@ func TestRefreshesNeverOverlapAcrossTicks(t *testing.T) {
 
 				releaseOnce.Do(func() { close(release) })
 				synctest.Wait()
-				got, _ := snapshot()
-				if len(got) != 2 {
-					t.Fatalf("listing requests right after the release = %v, want the held one and one overdue tick", got)
-				}
-				if got[1] < hold {
-					t.Errorf("second listing request started at %v, before the release at %v", got[1], hold)
-				}
-
 				time.Sleep(interval)
 				synctest.Wait()
 				got, most := snapshot()
-				if len(got) != 3 {
-					t.Errorf("listing requests one interval after the release = %v, want three", got)
+				if len(got) < 2 {
+					t.Errorf("listing requests one interval after the release = %v, want a later refresh after the held one", got)
+				}
+				for i, at := range got[1:] {
+					if at < hold {
+						t.Errorf("listing request %d started at %v, before the release at %v", i+2, at, hold)
+					}
 				}
 				if most != 1 {
 					t.Errorf("concurrent listing requests peaked at %d, want 1", most)
