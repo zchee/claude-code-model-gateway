@@ -137,7 +137,7 @@ type EventObserver struct {
 // the original body, sets Body to nil, and sets Overflow to a non-nil pointer (which may hold zero
 // Counts when the overflow marker carried neither usable count). On an abnormal read error before
 // a first complete data event, PeekFirstEvent closes the original body, sets Body to nil, and sets
-// EarlyEndOverride to "upstream_error" or "upstream_aborted".
+// EarlyEndOverride to "upstream_aborted".
 type PeekResult struct {
 	Body             io.ReadCloser
 	Overflow         *sentry.Counts

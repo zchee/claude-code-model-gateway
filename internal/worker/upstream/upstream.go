@@ -170,7 +170,9 @@ type Client struct {
 //
 // For HTTPS the TLS settings and the dial function come from opts, captured at construction: the
 // returned transport's TLSClientConfig, TLSHandshakeTimeout and DialContext fields are not consulted
-// for HTTPS after construction, so changing them does not change how HTTPS connections are made.
+// for HTTPS after construction, so replacing these fields does not change how HTTPS connections are
+// made, though mutating the shared configuration object TLSClientConfig points to before first use
+// still takes effect because the dialer re-clones it for every dial.
 func NewTransport(opts Options) *http.Transport {
 	return newTransport(opts, nil)
 }
