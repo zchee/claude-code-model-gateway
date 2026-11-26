@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -89,23 +90,55 @@ func (s Store) SetBlocked(statusCode int, evidence string, headers http.Header) 
 }
 
 func rateLimitExpiry(headers http.Header, now float64) float64 {
-	if retryAfter := headers.Get("Retry-After"); retryAfter != "" {
-		if seconds := config.JSNumber(retryAfter); !math.IsNaN(seconds) && !math.IsInf(seconds, 0) {
-			return now + max(0, seconds)*1000
+	const retryAfterName = "Retry-After"
+	var retryKey string
+	var resetValues []string
+	for key, values := range headers {
+		if len(values) == 0 {
+			continue
 		}
-		if when, err := http.ParseTime(retryAfter); err == nil {
-			return float64(when.UnixMilli())
+		switch {
+		case strings.EqualFold(key, retryAfterName):
+			// A hand-built Header may split spellings across keys, losing wire order.
+			if retryKey == "" || key == retryAfterName || retryKey != retryAfterName && key < retryKey {
+				retryKey = key
+			}
+		case strings.EqualFold(key, "Anthropic-Ratelimit-Unified-Reset"):
+			resetValues = append(resetValues, values...)
 		}
-		for _, layout := range []string{time.RFC3339Nano, time.DateOnly, time.RFC1123Z} {
-			if when, err := time.Parse(layout, retryAfter); err == nil {
+	}
+	if retryKey != "" {
+		if retryAfter := headers[retryKey][0]; retryAfter != "" {
+			if seconds := config.JSNumber(retryAfter); !math.IsNaN(seconds) && !math.IsInf(seconds, 0) {
+				return now + max(0, seconds)*1000
+			}
+			if when, ok := retryAfterDate(retryAfter); ok {
 				return float64(when.UnixMilli())
 			}
 		}
 	}
-	if reset := config.JSNumber(headers.Get("Anthropic-Ratelimit-Unified-Reset")); reset > 0 {
+	// Node joins repeated custom header values with ", "; only a single
+	// occurrence can therefore produce a number.
+	if reset := config.JSNumber(strings.Join(resetValues, ", ")); reset > 0 {
 		return reset * 1000
 	}
 	return now + float64(rateLimitDefault.Milliseconds())
+}
+
+func retryAfterDate(value string) (time.Time, bool) {
+	if date, err := time.Parse("Monday, 02-Jan-06 15:04:05 GMT", value); err == nil {
+		// V8 rolls two-digit years back at 50, rather than Go's 69.
+		if date.Year() >= 2050 {
+			date = date.AddDate(-100, 0, 0)
+		}
+		return date, true
+	}
+	for _, layout := range []string{http.TimeFormat, time.ANSIC, time.RFC3339Nano, "2006-01-02T15:04Z07:00", time.DateOnly, time.RFC1123Z, "Mon, 02 Jan 2006 15:04:05 UTC"} {
+		if date, err := time.Parse(layout, value); err == nil {
+			return date, true
+		}
+	}
+	return time.Time{}, false
 }
 
 func isoTime(ms int64) string {
@@ -117,27 +150,36 @@ func isoTime(ms int64) string {
 }
 
 // ReadBlocked returns an active block, or nil for missing, unreadable or expired state.
-func (s Store) ReadBlocked() *Blocked { return s.readBlocked(s.Now().UnixMilli()) }
-
-func (s Store) readBlocked(now int64) *Blocked {
-	record := struct {
-		Blocked
-		Expiry jsontext.Value `json:"expiresAtMs"`
-	}{}
-	if !readState(s.statePath(blockedFile), &record) || record.State != blockedState {
+func (s Store) ReadBlocked() *Blocked {
+	now := s.Now().UnixMilli()
+	record := readState(s.statePath(blockedFile))
+	if stateMember[string](record["state"]) != blockedState {
 		return nil
 	}
+	var expiresAtMs *float64
 	// Missing expiry is indefinite; a present value participates in a JavaScript numeric comparison.
-	if record.Expiry != nil {
-		var expiry any
-		if err := json.Unmarshal(record.Expiry, &expiry, jsontext.AllowDuplicateNames(true)); err != nil || float64(now) >= config.JSNumber(expiry) {
-			return nil
-		}
-		if ms, ok := expiry.(float64); ok {
-			record.ExpiresAtMs = new(ms)
+	if expiry := record["expiresAtMs"]; expiry != nil {
+		if expiry.Kind() == jsontext.KindNumber {
+			ms := config.JSNumber(string(expiry))
+			if float64(now) >= ms {
+				return nil
+			}
+			expiresAtMs = new(ms)
+		} else {
+			var value any
+			if err := json.Unmarshal(expiry, &value, jsontext.AllowDuplicateNames(true), jsontext.AllowInvalidUTF8(true)); err == nil && float64(now) >= config.JSNumber(value) {
+				return nil
+			}
 		}
 	}
-	return &record.Blocked
+	return &Blocked{
+		State:       blockedState,
+		ObservedAt:  stateMember[string](record["observedAt"]),
+		StatusCode:  stateMember[int](record["statusCode"]),
+		Evidence:    stateMember[string](record["evidence"]),
+		ExpiresAt:   stateMember[string](record["expiresAt"]),
+		ExpiresAtMs: expiresAtMs,
+	}
 }
 
 // ClearBlocked removes the recorded rejection if present.
@@ -146,7 +188,7 @@ func (s Store) ClearBlocked() { _ = syscall.Unlink(s.statePath(blockedFile)) }
 // SetUnavailable records a transient failure unless a block is active.
 func (s Store) SetUnavailable(statusCode int) (*Unavailable, error) {
 	now := s.Now().UnixMilli()
-	if s.readBlocked(now) != nil {
+	if s.ReadBlocked() != nil {
 		return nil, nil
 	}
 	u := &Unavailable{
@@ -165,18 +207,22 @@ func (s Store) SetUnavailable(statusCode int) (*Unavailable, error) {
 // ReadUnavailable returns an active transient failure, or nil if none can be read.
 func (s Store) ReadUnavailable() *Unavailable {
 	now := s.Now().UnixMilli()
-	record := struct {
-		Unavailable
-		Observed *float64 `json:"observedAtMs"`
-	}{}
-	if !readState(s.statePath(unavailableFile), &record) || record.State != unavailableState || record.Observed == nil {
+	record := readState(s.statePath(unavailableFile))
+	observed := record["observedAtMs"]
+	if stateMember[string](record["state"]) != unavailableState || observed.Kind() != jsontext.KindNumber {
 		return nil
 	}
-	if float64(now)-*record.Observed >= float64(unavailableTTL.Milliseconds()) {
+	observedAtMs := config.JSNumber(string(observed))
+	if math.IsInf(observedAtMs, 0) || float64(now)-observedAtMs >= float64(unavailableTTL.Milliseconds()) {
 		return nil
 	}
-	record.ObservedAtMs = int64(*record.Observed)
-	return &record.Unavailable
+	return &Unavailable{
+		State:        unavailableState,
+		ObservedAt:   stateMember[string](record["observedAt"]),
+		ObservedAtMs: int64(observedAtMs),
+		ExpiresAt:    stateMember[string](record["expiresAt"]),
+		StatusCode:   stateMember[int](record["statusCode"]),
+	}
 }
 
 // ClearUnavailable removes the recorded transient failure if present.
@@ -189,9 +235,27 @@ func (s Store) statePath(name string) string {
 	return filepath.Join(s.Dir, name)
 }
 
-func readState(file string, dst any) bool {
+func readState(file string) map[string]jsontext.Value {
 	data, err := os.ReadFile(file)
-	return err == nil && json.Unmarshal(data, dst, jsontext.AllowDuplicateNames(true), jsontext.AllowInvalidUTF8(true)) == nil
+	if err != nil {
+		return nil
+	}
+	// Decode raw members first so duplicates are last-wins even if an earlier
+	// value has a different type, and unrelated metadata cannot erase a hold.
+	var record map[string]jsontext.Value
+	if err := json.Unmarshal(data, &record, jsontext.AllowDuplicateNames(true), jsontext.AllowInvalidUTF8(true)); err != nil {
+		return nil
+	}
+	return record
+}
+
+func stateMember[T any](raw jsontext.Value) T {
+	var value T
+	if err := json.Unmarshal(raw, &value, jsontext.AllowInvalidUTF8(true)); err != nil {
+		var zero T
+		return zero
+	}
+	return value
 }
 
 func writeState(file string, state any) error {

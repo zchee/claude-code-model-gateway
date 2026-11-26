@@ -114,22 +114,57 @@ func RequestHeaders(file string) (http.Header, error) {
 }
 
 // LocalRequestAllowed reports whether the request has an allowed Host and no Origin.
+// The caller must put the Host header as received in req.Host, not the authority
+// of an absolute-form request target. req.Header must retain every Origin
+// occurrence, including an Origin with an empty value.
 func LocalRequestAllowed(req *http.Request, hosts []string) bool {
-	_, originPresent := req.Header["Origin"]
-	return !originPresent && req.Host != "" && slices.Contains(hosts, req.Host)
+	return req.Host != "" && slices.Contains(hosts, req.Host) && !hasOrigin(req.Header)
 }
 
-// Authenticated reports whether a lifecycle request is authorized for the listener.
-func Authenticated(req *http.Request, token string, ports []int, compatibilityListener bool) bool {
-	if compatibilityListener || req.Method != http.MethodPost || req.Header.Get("Content-Type") != "application/json" {
-		return false
-	}
-	for _, port := range ports {
-		if port > 0 && LocalRequestAllowed(req, []string{"127.0.0.1:" + strconv.Itoa(port)}) {
-			supplied := req.Header.Values(controlHeader)
-			return len(supplied) == 1 && validToken(token) && validToken(supplied[0]) &&
-				subtle.ConstantTimeCompare([]byte(supplied[0]), []byte(token)) == 1
+func hasOrigin(headers http.Header) bool {
+	for key := range headers {
+		if strings.EqualFold(key, "Origin") {
+			return true
 		}
 	}
 	return false
+}
+
+// Authenticated reports whether a lifecycle request is authorized for the listener.
+// In addition to the header requirements of [LocalRequestAllowed], req.Header
+// must retain the exact Content-Type value, without media type normalization.
+// ports must contain the listener's actual local port, not a port provided by
+// the request. The caller must load a valid, non-empty token before serving.
+func Authenticated(req *http.Request, token string, ports []int, compatibilityListener bool) bool {
+	if compatibilityListener || req.Method != http.MethodPost || !validToken(token) || hasOrigin(req.Header) {
+		return false
+	}
+	if !slices.ContainsFunc(ports, func(port int) bool {
+		return port > 0 && req.Host == "127.0.0.1:"+strconv.Itoa(port)
+	}) {
+		return false
+	}
+
+	const contentType = "Content-Type"
+	var typeKey string
+	var supplied []string
+	for key, values := range req.Header {
+		if len(values) == 0 {
+			continue
+		}
+		switch {
+		case strings.EqualFold(key, contentType):
+			// A hand-built Header with separate spellings has no wire order.
+			if typeKey == "" || key == contentType || typeKey != contentType && key < typeKey {
+				typeKey = key
+			}
+		case strings.EqualFold(key, controlHeader):
+			if supplied != nil || len(values) != 1 {
+				return false
+			}
+			supplied = values
+		}
+	}
+	return typeKey != "" && req.Header[typeKey][0] == "application/json" && supplied != nil && validToken(supplied[0]) &&
+		subtle.ConstantTimeCompare([]byte(supplied[0]), []byte(token)) == 1
 }
