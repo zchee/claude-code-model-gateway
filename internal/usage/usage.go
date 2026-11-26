@@ -39,7 +39,8 @@ type Request struct {
 	Headers         http.Header
 	StatusCode      int
 	ResponseHeaders http.Header
-	Usage           map[string]any
+	// Usage is a legacy input that loses JSON object insertion order. Response capture must use WireUsage.
+	Usage map[string]any
 	// WireUsage takes precedence over Usage and preserves member order across response observations.
 	WireUsage      jsonx.WireValue
 	TicketRef      string
@@ -108,6 +109,7 @@ type Options struct {
 // NewBuilder creates an independent record builder without a network transport.
 // It panics if Options.Now is nil. Project lookup requires a clean absolute ProjectsDir;
 // transcript symlinks leaving that directory are ignored, leaving the project name unset.
+// Unlike the source's unbounded Git pointer reads, this lookup accepts .git and commondir files of at most 64 KiB.
 func NewBuilder(options Options) *Builder {
 	if options.Now == nil {
 		panic("usage: missing observation clock")

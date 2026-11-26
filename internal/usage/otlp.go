@@ -68,6 +68,8 @@ func otlpValue(value any) (jsonx.WireValue, error) {
 }
 
 // OTLP encodes this record as an OTLP/HTTP JSON log export payload.
+// Built records preserve their construction order; adding keys to Attributes after Build does not extend the export.
+// Legacy records constructed from an Attributes map alone lose source order and emit keys in sorted order.
 func (r Record) OTLP() (jsontext.Value, error) {
 	order := r.order
 	if len(order) == 0 { // Records created from a bare map have no source insertion order.

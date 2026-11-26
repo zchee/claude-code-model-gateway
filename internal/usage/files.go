@@ -145,12 +145,14 @@ func (b *Builder) projectName(session string) string {
 	return ""
 }
 
+const maxProjectLookupBytes = 64 << 10
+
 func transcriptCWD(f *os.File) string {
 	info, e := f.Stat()
 	if e != nil || !info.Mode().IsRegular() {
 		return ""
 	}
-	data, e := io.ReadAll(io.LimitReader(f, 64<<10))
+	data, e := io.ReadAll(io.LimitReader(f, maxProjectLookupBytes))
 	if e != nil {
 		return ""
 	}
@@ -164,6 +166,24 @@ func transcriptCWD(f *os.File) string {
 		return ""
 	}
 	return cwd
+}
+
+func readGitPointer(f *os.File, info fs.FileInfo) (string, bool) {
+	if !info.Mode().IsRegular() || info.Size() > maxProjectLookupBytes {
+		return "", false
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxProjectLookupBytes))
+	if err != nil {
+		return "", false
+	}
+	if len(data) == maxProjectLookupBytes {
+		// Check the opened file again: it may have grown between stat and read.
+		after, err := f.Stat()
+		if err != nil || after.Size() != maxProjectLookupBytes {
+			return "", false
+		}
+	}
+	return string(data), true
 }
 
 func projectFromCWD(cwd string) string {
@@ -188,11 +208,9 @@ func projectFromCWD(cwd string) string {
 			if e == nil {
 				if info.IsDir() {
 					path = p
-				} else if info.Mode().IsRegular() {
-					if data, e := io.ReadAll(marker); e == nil {
-						if repo := worktreeRoot(p, string(data)); repo != "" {
-							path = repo
-						}
+				} else if data, ok := readGitPointer(marker, info); ok {
+					if repo := worktreeRoot(p, data); repo != "" {
+						path = repo
 					}
 				}
 			}
@@ -230,11 +248,11 @@ func worktreeRoot(dir, pointer string) string {
 			return ""
 		}
 		if info.Mode().IsRegular() {
-			data, err := io.ReadAll(common)
-			if err != nil {
+			data, ok := readGitPointer(common, info)
+			if !ok {
 				return ""
 			}
-			p = resolve(p, config.JSTrim(string(data)))
+			p = resolve(p, config.JSTrim(data))
 		}
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return ""

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/zchee/claude-code-model-gateway/internal/config"
+	"github.com/zchee/claude-code-model-gateway/internal/jsdate"
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
 )
 
@@ -77,7 +78,8 @@ func exactWireUsage(raw jsonx.WireValue) map[string]any {
 	return a
 }
 
-// MergeUsage merges numeric usage maps. Use MergeWireUsage when source member order is known.
+// MergeUsage merges legacy map inputs and cannot recover their original member order.
+// Response capture must use MergeWireUsage on decoded wire values instead: order affects floating-point sums.
 func MergeUsage(current, next map[string]any) map[string]any {
 	tree := MergeWireUsage(legacyWire(current), legacyWire(next))
 	raw, _ := jsonx.EncodeWire(tree)
@@ -97,22 +99,8 @@ func timestamp(s string) (float64, bool) {
 		}
 		return n, true
 	}
-	if len(s) > 10 && s[10] == 't' {
-		s = s[:10] + "T" + s[11:]
-	}
-	if before, ok := strings.CutSuffix(s, "z"); ok {
-		s = before + "Z"
-	}
-	for _, layout := range []string{time.RFC3339Nano, time.DateOnly, time.DateTime, "2006-01-02T15:04:05", time.RFC1123Z, time.RFC822Z, http.TimeFormat, "Monday, 02-Jan-06 15:04:05 GMT", time.ANSIC} {
-		if t, err := time.Parse(layout, s); err == nil {
-			// Date.parse places two-digit years 50..99 in the twentieth century.
-			if (layout == time.RFC822Z || layout == "Monday, 02-Jan-06 15:04:05 GMT") && t.Year() >= 2050 {
-				t = t.AddDate(-100, 0, 0)
-			}
-			return float64(t.UnixMilli()), true
-		}
-	}
-	return 0, false
+	millis, ok := jsdate.Parse(s)
+	return float64(millis), ok
 }
 
 func header(h http.Header, key string) (string, bool) {

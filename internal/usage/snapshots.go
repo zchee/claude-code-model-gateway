@@ -136,6 +136,9 @@ func (b *Builder) toolRecords(r Record, key identity, body jsonx.WireValue) []Re
 	if prev != nil && expired(prev) {
 		cache.pop(prev)
 		prev = nil
+	} else if prev != nil {
+		// A fresh front entry must not shield expired entries behind it after a wall-clock rollback.
+		cache.order.MoveToBack(prev)
 	}
 	for front := cache.order.Front(); front != nil && expired(front); front = cache.order.Front() {
 		cache.pop(front)

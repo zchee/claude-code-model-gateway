@@ -17,6 +17,7 @@ package usage
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	gocmp "github.com/google/go-cmp/cmp"
@@ -41,6 +42,47 @@ func TestTranscriptCWDUnicode(t *testing.T) {
 			}
 			defer func() { _ = f.Close() }()
 			if diff := gocmp.Diff(tt.want, transcriptCWD(f)); diff != "" {
+				t.Error(diff)
+			}
+		})
+	}
+}
+
+func TestProjectPointerSize(t *testing.T) {
+	const limit = 64 << 10
+	tests := map[string]struct {
+		common bool
+		size   int
+		want   string
+	}{
+		"success: git pointer at limit":                       {size: limit, want: "main"},
+		"success: oversized git pointer falls back to cwd":    {size: limit + 1, want: "checkout"},
+		"success: common pointer at limit":                    {common: true, size: limit, want: "main"},
+		"success: oversized common pointer falls back to cwd": {common: true, size: limit + 1, want: "checkout"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			cwd := filepath.Join(root, "checkout")
+			git := filepath.Join(root, "main", ".git", "worktrees", "topic")
+			for _, dir := range []string{cwd, git} {
+				if err := os.MkdirAll(dir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			path := filepath.Join(cwd, ".git")
+			value := "gitdir: " + git
+			if tt.common {
+				if err := os.WriteFile(path, []byte(value), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				path = filepath.Join(git, "commondir")
+				value = "../.."
+			}
+			if err := os.WriteFile(path, []byte(value+strings.Repeat(" ", tt.size-len(value))), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if diff := gocmp.Diff(tt.want, projectFromCWD(cwd)); diff != "" {
 				t.Error(diff)
 			}
 		})

@@ -32,29 +32,22 @@ func TestTimestampFamilies(t *testing.T) {
 		want float64
 		ok   bool
 	}{
-		"success: numeric seconds":                      {raw: "0.125", want: 125, ok: true},
-		"success: numeric milliseconds":                 {raw: "1000000000000", want: 1e12, ok: true},
-		"success: UTC timestamp":                        {raw: "1970-01-01T00:00:01.234Z", want: 1234, ok: true},
-		"success: lowercase RFC separators":             {raw: "1970-01-01t00:00:01.234z", want: 1234, ok: true},
-		"success: UTC offset":                           {raw: "1970-01-01t01:00:01+01:00", want: 1000, ok: true},
-		"success: date only":                            {raw: "1970-01-02", want: 86400000, ok: true},
-		"success: space separated datetime":             {raw: "1970-01-01 00:00:01", want: 1000, ok: true},
-		"success: ISO datetime":                         {raw: "1970-01-01T00:00:01", want: 1000, ok: true},
-		"success: RFC numeric offset":                   {raw: "Thu, 01 Jan 1970 01:00:01 +0100", want: 1000, ok: true},
-		"success: RFC short year":                       {raw: "01 Jan 70 01:00 +0100", ok: true},
-		"success: HTTP date":                            {raw: "Thu, 01 Jan 1970 00:00:01 GMT", want: 1000, ok: true},
-		"success: obsolete HTTP date":                   {raw: "Thursday, 01-Jan-70 00:00:01 GMT", want: 1000, ok: true},
-		"success: asctime":                              {raw: "Thu Jan  1 00:00:01 1970", want: 1000, ok: true},
-		"success: BOM trimmed":                          {raw: string(rune(0xfeff)) + "1", want: 1000, ok: true},
-		"error: next line is not ECMAScript whitespace": {raw: string(rune(0x85)) + "1"},
-		"error: unsupported local spelling":             {raw: "January 1st, 1970"},
-		"error: unsupported named zone":                 {raw: "Thu, 01 Jan 1970 00:00:00 XYZ"},
+		"success: numeric seconds":                            {raw: "0.125", want: 125, ok: true},
+		"success: numeric milliseconds":                       {raw: "1000000000000", want: 1e12, ok: true},
+		"error: zone-less calendar time is not a measurement": {raw: "1970-01-01T00:00:01"},
+		"success: BOM trimmed":                                {raw: string(rune(0xfeff)) + "1", want: 1000, ok: true},
+		"error: next line is not ECMAScript whitespace":       {raw: string(rune(0x85)) + "1"},
+		"error: unsupported local spelling":                   {raw: "January 1st, 1970"},
+		"error: unsupported named zone":                       {raw: "Thu, 01 Jan 1970 00:00:00 XYZ"},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			n, ok := timestamp(tt.raw)
-			if ok != tt.ok || n != tt.want {
-				t.Errorf("timestamp = (%v,%v), want (%v,%v)", n, ok, tt.want, tt.ok)
+			if diff := gocmp.Diff(tt.ok, ok); diff != "" {
+				t.Errorf("availability (-want +got): %s", diff)
+			}
+			if diff := gocmp.Diff(tt.want, n); diff != "" {
+				t.Errorf("milliseconds (-want +got): %s", diff)
 			}
 		})
 	}
@@ -121,6 +114,32 @@ func TestSafeHighWater(t *testing.T) {
 	}
 }
 
+func TestUnsafeHighWaterObservation(t *testing.T) {
+	tests := map[string]struct{ size int64 }{
+		"error: first integer outside safe range": {size: 1 << 53},
+		"error: maximum int64":                    {size: math.MaxInt64},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			h := NewHighWater(dir, options(t).Now)
+			if diff := gocmp.Diff((*int64)(nil), h.Record("s", tt.size)); diff != "" {
+				t.Fatal(diff)
+			}
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if diff := gocmp.Diff(0, len(entries)); diff != "" {
+				t.Errorf("files created (-want +got): %s", diff)
+			}
+			if diff := gocmp.Diff(map[string]int64{}, h.maxima); diff != "" {
+				t.Errorf("cached maxima (-want +got): %s", diff)
+			}
+		})
+	}
+}
+
 func TestLargeAllocation(t *testing.T) {
 	tests := map[string]struct {
 		total int64
@@ -139,20 +158,28 @@ func TestLargeAllocation(t *testing.T) {
 }
 
 func TestSnapshotWithClockRollback(t *testing.T) {
-	tests := map[string]struct{ first, second, last time.Duration }{"success: older identity behind a fresh front entry expires": {first: 20 * time.Second, second: 0, last: 15 * time.Second}}
+	tests := map[string]struct{ refreshFront bool }{
+		"success: older identity behind a fresh front entry expires":                       {},
+		"success: accessing the front exposes an expired identity before another rollback": {refreshFront: true},
+	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			o := options(t)
 			o.SnapshotTTL = 10 * time.Second
-			stamp := time.Unix(0, int64(tt.first))
+			stamp := time.Unix(20, 0)
 			o.Now = func() time.Time { return stamp }
 			b := NewBuilder(o)
 			observe(t, b, exactBase, "s", "front", "", "", 1)
-			stamp = time.Unix(0, int64(tt.second))
+			stamp = time.Unix(0, 0)
 			observe(t, b, exactBase, "s", "back", "", "", 2)
-			stamp = time.Unix(0, int64(tt.last))
-			if got := events(observe(t, b, exactNext, "s", "back", "", "", 4), toolEvent); len(got) != 0 {
-				t.Fatalf("expired identity produced %d derived records", len(got))
+			stamp = time.Unix(15, 0)
+			if tt.refreshFront {
+				observe(t, b, exactBase, "s", "front", "", "", 1)
+				stamp = time.Unix(5, 0)
+			}
+			got := events(observe(t, b, exactNext, "s", "back", "", "", 4), toolEvent)
+			if diff := gocmp.Diff(0, len(got)); diff != "" {
+				t.Errorf("derived records (-want +got): %s", diff)
 			}
 		})
 	}

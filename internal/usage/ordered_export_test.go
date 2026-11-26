@@ -41,7 +41,7 @@ func TestOrderedExportBytes(t *testing.T) {
 		"success: primary includes ranked server keys between tool and system measurements": {index: 0, event: primary, fields: []string{
 			// lib/usage-observability.js:835-864: source identity, request identity, status, quality and sequence.
 			s("source", "codex_gateway"), s("source_event_id", "gateway-usage-"+id), s("source_schema", "gateway-usage-v1"), s("event.name", primary), s("event_name", primary),
-			s("request_id", "req"), s("request_id_source", "response_header"), s("agent_role", "orchestrator"), s("status", "ok"), n("status_code", "200"), s("token_estimator", "utf8_bytes_div_4_normalized"), s("cache_attribution", "prefix_order_estimate"), n("request_sequence", "1"),
+			s("request_id", "req"), s("request_id_source", "response_header"), s("agent_role", "orchestrator"), s("status", "ok"), n("status_code", "200"), s("response_mode", "sse"), s("token_estimator", "utf8_bytes_div_4_normalized"), s("cache_attribution", "prefix_order_estimate"), n("request_sequence", "1"),
 			// lib/usage-observability.js:825-832,569-594: elapsed time, response bytes, then available limits.
 			n("duration_ms", "0"), n("response_body_bytes", "0"), n("rate_limit_requests_limit", "9"), n("retry_after_ms", "1000"),
 			// lib/usage-observability.js:247-257,455-468: composition precedes exact usage; null measurements are omitted.
@@ -61,7 +61,7 @@ func TestOrderedExportBytes(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			req := Request{Body: wire(t, `{"tools":[{"name":"mcp__z__t"},{"name":"mcp__aa__t"}]}`), StatusCode: 200, ResponseHeaders: http.Header{"Request-Id": {"req"}, "Retry-After": {"1"}, "Anthropic-Ratelimit-Requests-Limit": {"9"}}, WireUsage: wire(t, `{"input_tokens":41}`)}
+			req := Request{Body: wire(t, `{"tools":[{"name":"mcp__z__t"},{"name":"mcp__aa__t"}]}`), StatusCode: 200, ResponseMode: "sse", ResponseHeaders: http.Header{"Request-Id": {"req"}, "Retry-After": {"1"}, "Anthropic-Ratelimit-Requests-Limit": {"9"}}, WireUsage: wire(t, `{"input_tokens":41}`)}
 			records := NewBuilder(options(t)).Build(req)
 			if len(records) != 3 {
 				t.Fatalf("got %d records, want primary and two footprints", len(records))
