@@ -339,8 +339,17 @@ func (s *shim) reportExpired(epoch uint64) {
 	}
 }
 
+// awaitExit retires an exited worker, journals its exit, tells its waiters and schedules its replacement. The worker's
+// port may already belong to another program when Wait returns, so the worker stops being current and its port stops
+// being eligible before any of the slower steps run; a relay that loads the port afterwards finds no worker.
 func (s *shim) awaitExit(w *workerProc) {
 	err := w.cmd.Wait()
+	s.mu.Lock()
+	if s.current == w {
+		s.current = nil
+		s.endpoint.Store(0)
+	}
+	s.mu.Unlock()
 	fields := map[string]any{"component": "supervisor", "pid": s.pid, "startedAt": s.startedAt, "child": map[string]any{"component": "worker", "pid": w.pid}}
 	fields["exitCode"], fields["signal"] = exitStatus(w.cmd.ProcessState, err)
 	s.files.Record("worker-exit", fields)
@@ -348,10 +357,6 @@ func (s *shim) awaitExit(w *workerProc) {
 	close(w.exited)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.current == w {
-		s.current = nil
-		s.endpoint.Store(0)
-	}
 	if !s.stopped {
 		s.respawn = time.AfterFunc(respawnDelay, s.startWorker)
 	}
