@@ -168,9 +168,12 @@ func TestTransportNoAutoDecompression(t *testing.T) {
 
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			var seenAcceptEncoding []string
+			seenAcceptEncoding := make(chan []string, 1)
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				seenAcceptEncoding = r.Header.Values("Accept-Encoding")
+				select {
+				case seenAcceptEncoding <- slices.Clone(r.Header.Values("Accept-Encoding")):
+				default:
+				}
 				w.Header().Set("Content-Type", "application/json")
 				w.Header().Set("Content-Encoding", "gzip")
 				w.Header().Set("Content-Length", strconv.Itoa(len(wantBytes)))
@@ -202,8 +205,14 @@ func TestTransportNoAutoDecompression(t *testing.T) {
 			if err != nil {
 				t.Fatalf("reading response body: %v", err)
 			}
-			if tt.clientAcceptEncoding == "" && len(seenAcceptEncoding) != 0 {
-				t.Errorf("transport synthesized Accept-Encoding: %v", seenAcceptEncoding)
+			var gotAcceptEncoding []string
+			select {
+			case gotAcceptEncoding = <-seenAcceptEncoding:
+			default:
+				t.Fatal("upstream handler did not record request headers")
+			}
+			if tt.clientAcceptEncoding == "" && len(gotAcceptEncoding) != 0 {
+				t.Errorf("transport synthesized Accept-Encoding: %v", gotAcceptEncoding)
 			}
 			if diff := gocmp.Diff("gzip", resp.Header.Get("Content-Encoding")); diff != "" {
 				t.Errorf("Header Content-Encoding (-want +got):\n%s", diff)
@@ -219,9 +228,10 @@ func TestTransportNoAutoDecompression(t *testing.T) {
 }
 
 func TestTransportHTTP11Only(t *testing.T) {
-	var protoMajor, protoMinor int
+	var protoMajor, protoMinor atomic.Int32
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		protoMajor, protoMinor = r.ProtoMajor, r.ProtoMinor
+		protoMajor.Store(int32(r.ProtoMajor))
+		protoMinor.Store(int32(r.ProtoMinor))
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, `{"ok":true}`)
@@ -231,6 +241,7 @@ func TestTransportHTTP11Only(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	tlsCfg := srv.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	tlsCfg.NextProtos = []string{"h2", "http/1.1"}
 	client := upstream.NewClient(upstream.Options{TLSConfig: tlsCfg})
 	t.Cleanup(func() { _ = client.Close() })
 
@@ -248,8 +259,8 @@ func TestTransportHTTP11Only(t *testing.T) {
 	if _, err := io.ReadAll(resp.Body); err != nil {
 		t.Fatalf("reading response body: %v", err)
 	}
-	if protoMajor != 1 || protoMinor != 1 {
-		t.Fatalf("upstream received HTTP/%d.%d, want HTTP/1.1", protoMajor, protoMinor)
+	if protoMajor.Load() != 1 || protoMinor.Load() != 1 {
+		t.Fatalf("upstream received HTTP/%d.%d, want HTTP/1.1", protoMajor.Load(), protoMinor.Load())
 	}
 }
 
@@ -1364,6 +1375,18 @@ func TestLiveUpstreamHeadersToUpstreamState(t *testing.T) {
 			wantCaptureReset: []string{"1790597700", "1790597715"},
 			wantRelayReset:   []string{"1790597700, 1790597715"},
 		},
+		"success: boundary non-ASCII space in Retry-After stays untrimmed in Header and falls through to reset header": {
+			headers: http.Header{
+				"X-Openai-Request-Id":               {"req_5"},
+				"Retry-After":                       {"\xc2\xa0Mon, 28 Sep 2026 10:05:00 GMT\xc2\xa0"},
+				"Anthropic-Ratelimit-Unified-Reset": {"1790597700"},
+			},
+			wantExp:          "2026-09-28T12:15:00.000Z",
+			wantCaptureRetry: []string{"\xc2\xa0Mon, 28 Sep 2026 10:05:00 GMT\xc2\xa0"},
+			wantRelayRetry:   []string{"\xc2\xa0Mon, 28 Sep 2026 10:05:00 GMT\xc2\xa0"},
+			wantCaptureReset: []string{"1790597700"},
+			wantRelayReset:   []string{"1790597700"},
+		},
 	}
 
 	for name, tt := range tests {
@@ -1454,8 +1477,18 @@ func TestLiveUpstreamHeadersToUpstreamState(t *testing.T) {
 			headerSnapshot := resp.Header.Clone()
 			resp.RelayHeader.Set("Upgrade", "mutated")
 			resp.RelayHeader.Set("X-Relay-Only", "mutated")
-			if vals := resp.RelayHeader.Values("Set-Cookie"); len(vals) > 0 {
-				vals[0] = "mutated=1"
+			mutatedCookies := false
+			for k, vals := range resp.RelayHeader {
+				if strings.EqualFold(k, "Set-Cookie") {
+					if len(vals) != 2 {
+						t.Fatalf("RelayHeader %q values = %v, want 2 values", k, vals)
+					}
+					vals[0] = "mutated=1"
+					mutatedCookies = true
+				}
+			}
+			if !mutatedCookies {
+				t.Fatal("RelayHeader missing Set-Cookie entry")
 			}
 			if diff := gocmp.Diff(headerSnapshot, resp.Header); diff != "" {
 				t.Fatalf("mutating RelayHeader altered Header (-want +got):\n%s", diff)
@@ -1505,11 +1538,6 @@ func TestNewTransport(t *testing.T) {
 		}
 		if diff := gocmp.Diff(64, tr1.MaxConnsPerHost); diff != "" {
 			t.Errorf("NewTransport MaxConnsPerHost (-want +got):\n%s", diff)
-		}
-		h2Disabled := (tr1.Protocols != nil && tr1.Protocols.HTTP1() && !tr1.Protocols.HTTP2() && !tr1.Protocols.UnencryptedHTTP2()) ||
-			(!tr1.ForceAttemptHTTP2 && tr1.TLSNextProto != nil && len(tr1.TLSNextProto) == 0)
-		if !h2Disabled {
-			t.Errorf("NewTransport did not disable HTTP/2 (Protocols=%v, ForceAttemptHTTP2=%v, TLSNextProto=%v)", tr1.Protocols, tr1.ForceAttemptHTTP2, tr1.TLSNextProto)
 		}
 	})
 
@@ -1689,6 +1717,7 @@ func TestNewTransport(t *testing.T) {
 		t.Cleanup(srv.Close)
 
 		tlsCfg := srv.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+		tlsCfg.NextProtos = []string{"h2", "http/1.1"}
 		tr := upstream.NewTransport(upstream.Options{TLSConfig: tlsCfg})
 		if tr == nil {
 			t.Fatal("NewTransport returned nil")

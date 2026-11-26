@@ -197,17 +197,14 @@ func TestRequestHeaders(t *testing.T) {
 			if diff := gocmp.Diff(before, tt.in); diff != "" {
 				t.Fatalf("RequestHeaders mutated input (-before +after):\n%s", diff)
 			}
-			// Mutating a returned value slice must not alias any input slice.
-			for k, vals := range got {
-				if len(vals) > 0 {
-					vals[0] = "mutated"
-					for inK, inVals := range tt.in {
-						if strings.EqualFold(inK, k) && len(inVals) > 0 && inVals[0] == "mutated" {
-							t.Fatalf("RequestHeaders aliased input value slice for %q", inK)
-						}
-					}
-					break
+			// Mutating returned value slices must not alias any input slice.
+			for _, vals := range got {
+				for i := range vals {
+					vals[i] = "mutated"
 				}
+			}
+			if diff := gocmp.Diff(before, tt.in); diff != "" {
+				t.Fatalf("mutating RequestHeaders output altered input (-before +after):\n%s", diff)
 			}
 		})
 	}
