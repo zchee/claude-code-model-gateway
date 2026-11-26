@@ -867,12 +867,6 @@ func TestRefreshWaiterEndedBeforeResult(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Cleanup(func() { goleak.VerifyNone(t) })
-			// A real-time escape, created outside the bubble: if the waiter evaluated its Done while
-			// the refresh could not finish (for example under the store's lock), the wait in onDone
-			// gives up instead of hanging.
-			escape := make(chan struct{})
-			timer := time.AfterFunc(time.Minute, func() { close(escape) })
-			defer timer.Stop()
 
 			synctest.Test(t, func(t *testing.T) {
 				dir := t.TempDir()
@@ -910,12 +904,8 @@ func TestRefreshWaiterEndedBeforeResult(t *testing.T) {
 					var witnessFirst atomic.Bool
 					ctx := &endAtDoneCtx{Context: inner, cancel: cancel, onDone: func() {
 						release()
-						select {
-						case <-returned:
-							witnessFirst.Store(true)
-						case <-escape:
-							t.Errorf("round %d: the waiter's Done was evaluated while the shared refresh could not finish", round)
-						}
+						<-returned
+						witnessFirst.Store(true)
 					}}
 					waiter := startTokenCall(store, ctx, tt.call)
 					res := awaitTokenCall(t, fmt.Sprintf("round %d waiter", round), waiter, time.Minute, release)

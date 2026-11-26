@@ -50,6 +50,7 @@ const upstreamTimeoutBody = `{"type":"error","error":{"type":"api_error","messag
 type headerProbe struct {
 	mu           sync.Mutex
 	header       http.Header
+	committed    http.Header
 	status       int
 	headerWrites int
 	body         bytes.Buffer
@@ -65,6 +66,7 @@ func (p *headerProbe) WriteHeader(status int) {
 	p.headerWrites++
 	if p.status == 0 {
 		p.status = status
+		p.committed = p.header.Clone()
 	}
 }
 
@@ -74,6 +76,7 @@ func (p *headerProbe) Write(b []byte) (int, error) {
 	if p.status == 0 {
 		p.headerWrites++
 		p.status = http.StatusOK
+		p.committed = p.header.Clone()
 	}
 	return p.body.Write(b)
 }
@@ -82,6 +85,12 @@ func (p *headerProbe) snapshot() (status, headerWrites int, body string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.status, p.headerWrites, p.body.String()
+}
+
+func (p *headerProbe) committedHeader() http.Header {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.committed.Clone()
 }
 
 // serveUpstreamHead answers one request on conn with head (a status line, headers and the start of
@@ -533,14 +542,15 @@ func TestBranchStreamTimeoutBeforeHeaders(t *testing.T) {
 					if status != http.StatusOK || headerWrites != 1 {
 						t.Errorf("present client status = %d after %d header writes, want the stream's 200 written once", status, headerWrites)
 					}
-					if diff := gocmp.Diff("text/event-stream", w.Header().Get("Content-Type")); diff != "" {
+					committed := w.committedHeader()
+					if diff := gocmp.Diff("text/event-stream", committed.Get("Content-Type")); diff != "" {
 						t.Errorf("committed stream Content-Type (-want +got):\n%s", diff)
 					}
-					if got := w.Header().Get("Content-Length"); got != "" {
-						t.Errorf("committed stream carries Content-Length %q, want none", got)
+					if cl := committed.Get("Content-Length"); cl != "" {
+						t.Errorf("committed stream carries Content-Length %q, want none", cl)
 					}
-					if strings.Contains(got, "Grok upstream timeout") {
-						t.Error("the timeout reply was written after the stream's headers were committed")
+					if got != "" {
+						t.Errorf("committed stream received %d body bytes (%q), want empty", len(got), got)
 					}
 				}
 
