@@ -37,8 +37,11 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/policy"
 	"github.com/zchee/claude-code-model-gateway/internal/venue"
 	"github.com/zchee/claude-code-model-gateway/internal/worker"
+	"github.com/zchee/claude-code-model-gateway/internal/worker/outcome"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/route"
 )
+
+type admission = func(outcome.Route, *outcome.Audit)
 
 func TestMain(m *testing.M) {
 	venue.Require()
@@ -108,12 +111,13 @@ func TestClassificationRefusalHTTP(t *testing.T) {
 	const modelMessage = "model-gateway: model identifier contains an unpaired surrogate"
 	tests := map[string]struct {
 		body, branch, model, reason, message string
-		local                                bool
+		local, sentry                        bool
 	}{
 		"error: nesting exceeds decoder limit":              {body: prefix + strings.Repeat("[", 10000) + "0" + strings.Repeat("]", 10000) + "}", reason: "nesting-depth", message: depthMessage},
 		"error: depth exceeded immediately before EOF":      {body: prefix + strings.Repeat("[", 10000), reason: "nesting-depth", message: depthMessage},
 		"error: unpaired model surrogate":                   {body: `{"note":"private-body-marker","model":"claude-grok-private-model-marker\ud800"}`, reason: "ill-formed-model", message: modelMessage},
 		"error: branch refuses before forwarding":           {body: `{"model":"claude-gpt-9"}`, branch: "proxy", local: true},
+		"error: request sentry refuses after admission":     {body: `{"model":"claude-gpt-9"}`, branch: "proxy", sentry: true},
 		"success: malformed name at deepest object":         {body: prefix + strings.Repeat("[", 9998) + "{[]:0}" + strings.Repeat("]", 9998) + "}", branch: "anthropic"},
 		"success: non-JSON keeps its original bytes":        {body: " \xffnot JSON\r\n", branch: "anthropic"},
 		"success: Claude model selects Anthropic":           {body: `{"model":"claude-opus-5-5"}`, branch: "anthropic"},
@@ -146,22 +150,44 @@ func TestClassificationRefusalHTTP(t *testing.T) {
 					t.Fatal(err)
 				}
 				proxy := &httputil.ReverseProxy{Transport: transport, Rewrite: func(r *httputil.ProxyRequest) { r.SetURL(u) }}
-				branches[branch] = func(w http.ResponseWriter, r *http.Request, _ route.Snapshot, d route.Decision, raw []byte) worker.ForwardResult {
+				branches[branch] = func(w http.ResponseWriter, r *http.Request, _ route.Snapshot, d route.Decision, raw []byte, admit admission) (outcome.Result, error) {
+					backend := d.Provider
+					if backend == "" {
+						backend = branch
+					}
+					selected := outcome.Route{Backend: backend, EffectiveModel: d.Model, Via: "direct"}
 					if tt.local {
 						w.Header().Set("X-Fixture-Refused", branch)
 						w.WriteHeader(http.StatusBadRequest)
-						return worker.ForwardResult{}
+						return outcome.Result{Route: selected, Status: http.StatusBadRequest}, nil
+					}
+					admit(selected, nil)
+					if tt.sentry {
+						w.WriteHeader(http.StatusRequestEntityTooLarge)
+						return outcome.Result{Route: selected, Status: http.StatusRequestEntityTooLarge}, nil
 					}
 					out := r.Clone(r.Context())
 					out.Body = io.NopCloser(bytes.NewReader(raw))
 					out.ContentLength = int64(len(raw))
 					out.Header.Set("X-Fixture-Decision", d.Model)
 					proxy.ServeHTTP(w, out)
-					return worker.ForwardResult{Forwarded: true}
+					return outcome.Result{Route: selected, Contacted: true, Status: http.StatusOK}, nil
 				}
 			}
 			var diagnostics bytes.Buffer
-			h := handler(t, worker.Options{Diagnostics: &diagnostics, Anthropic: branches["anthropic"], Proxy: branches["proxy"], Grok: branches["grok"]})
+			var probes atomic.Int64
+			var terminal []outcome.Result
+			h := handler(t, worker.Options{
+				Diagnostics: &diagnostics, Anthropic: branches["anthropic"], Proxy: branches["proxy"], Grok: branches["grok"],
+				BeforeBody: func(*http.Request) func(outcome.Result) {
+					return func(result outcome.Result) { terminal = append(terminal, result) }
+				},
+				Models: func(context.Context, http.Header) (jsontext.Value, error) {
+					probes.Add(1)
+					return jsontext.Value(`{"data":[],"has_more":false}`), nil
+				},
+				RefreshAnthropic: func(context.Context, http.Header) { probes.Add(1) },
+			})
 			srv := httptest.NewServer(h)
 			defer srv.Close()
 			secrets := http.Header{"Authorization": {"Bearer private-auth-marker"}, "X-Api-Key": {"private-key-marker"}, "X-Model-Gateway-Control-Token": {"private-control-marker"}}
@@ -169,11 +195,19 @@ func TestClassificationRefusalHTTP(t *testing.T) {
 			healthStatus, _, health := request(t, srv.Client(), "GET", srv.URL+"/healthz", "", nil)
 			srv.Close() // All handlers have returned before inspecting their diagnostics and counts.
 			equal(t, 200, healthStatus)
+			equal(t, 1, len(terminal))
+			equal(t, status, terminal[0].Status)
+			equal(t, tt.branch != "" && !tt.local && !tt.sentry, terminal[0].Contacted)
+			if tt.reason != "" {
+				equal(t, int64(0), probes.Load())
+			}
 			served := map[string]any{"models": float64(0), "codex": float64(0), "grok": float64(0), "anthropic": float64(0)}
 			for branch, count := range counts {
 				var want int64
 				if branch == tt.branch && !tt.local {
-					want = 1
+					if !tt.sentry {
+						want = 1
+					}
 					provider := branch
 					if provider == "proxy" {
 						provider = "codex"
@@ -199,6 +233,8 @@ func TestClassificationRefusalHTTP(t *testing.T) {
 						t.Errorf("refusal log contains %q", forbidden)
 					}
 				}
+			case tt.sentry:
+				equal(t, http.StatusRequestEntityTooLarge, status)
 			case tt.local:
 				equal(t, 400, status)
 				equal(t, tt.branch, headers.Get("X-Fixture-Refused"))
@@ -214,7 +250,10 @@ func TestClassificationRefusalHTTP(t *testing.T) {
 }
 
 func TestLocalEndpoints(t *testing.T) {
-	srv := httptest.NewServer(handler(t, worker.Options{}))
+	srv := httptest.NewServer(handler(t, worker.Options{BeforeBody: func(*http.Request) func(outcome.Result) {
+		t.Error("local endpoint started request observation")
+		return nil
+	}}))
 	defer srv.Close()
 	status, h, body := request(t, srv.Client(), "GET", srv.URL+"/v1/models?limit=1", "", nil)
 	equal(t, 200, status)
@@ -255,14 +294,16 @@ func TestPublishedCatalog(t *testing.T) {
 	const rows = `[{"type":"model","id":"claude-grok-private-2","display_name":"Private"}]`
 	var store route.Store
 	called := false
-	h := handler(t, worker.Options{Routes: &store, Grok: func(w http.ResponseWriter, _ *http.Request, snap route.Snapshot, d route.Decision, _ []byte) worker.ForwardResult {
+	h := handler(t, worker.Options{Routes: &store, Grok: func(w http.ResponseWriter, _ *http.Request, snap route.Snapshot, d route.Decision, _ []byte, admit admission) (outcome.Result, error) {
 		called = true
 		source, catalog := snap.Catalog()
 		equal(t, "proxy", source)
 		equal(t, rows, string(catalog))
 		equal(t, route.Decision{Branch: "grok", Provider: "grok", Model: "grok-private.2"}, d)
+		selected := outcome.Route{Backend: d.Provider, EffectiveModel: d.Model}
+		admit(selected, nil)
 		w.WriteHeader(http.StatusNoContent)
-		return worker.ForwardResult{Forwarded: true}
+		return outcome.Result{Route: selected, Status: http.StatusNoContent, Contacted: true}, nil
 	}})
 	store.Publish(route.NewSnapshot(policy.Resolver{}, "proxy", jsontext.Value(rows), []string{"grok-private.2"}))
 	serve := func(method, path, body string) *httptest.ResponseRecorder {
@@ -282,27 +323,105 @@ func TestPublishedCatalog(t *testing.T) {
 	equal(t, true, called)
 }
 
+type readFunc func([]byte) (int, error)
+
+func (read readFunc) Read(p []byte) (int, error) { return read(p) }
+
 func TestRequestStartBeforeBody(t *testing.T) {
-	type contextKey struct{}
-	const body = "request bytes"
-	reader := strings.NewReader(body)
-	var started *http.Request
-	h := handler(t, worker.Options{StartRequest: func(r *http.Request) *http.Request {
-		equal(t, len(body), reader.Len())
-		started = r.WithContext(context.WithValue(r.Context(), contextKey{}, "route record"))
-		return started
-	}, Anthropic: func(w http.ResponseWriter, r *http.Request, _ route.Snapshot, _ route.Decision, raw []byte) worker.ForwardResult {
-		if r != started {
-			t.Fatal("branch did not receive the request returned by StartRequest")
-		}
-		equal(t, any("route record"), r.Context().Value(contextKey{}))
-		equal(t, body, string(raw))
-		w.WriteHeader(http.StatusNoContent)
-		return worker.ForwardResult{Forwarded: true}
-	}})
-	result := httptest.NewRecorder()
-	h.ServeHTTP(result, httptest.NewRequestWithContext(t.Context(), "POST", "/v1/messages", reader))
-	equal(t, 204, result.Code)
+	tests := map[string]struct{ cancelRead, abort bool }{
+		"success: branch returns terminal facts":             {},
+		"error: client cancels during first read":            {cancelRead: true},
+		"error: committed stream aborts at handler boundary": {abort: true},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			const body = "request bytes"
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			var events []string
+			var results []outcome.Result
+			first := sync.OnceFunc(func() { events = append(events, "first read") })
+			reader := strings.NewReader(body)
+			r := httptest.NewRequestWithContext(ctx, "POST", "/v1/messages", readFunc(func(p []byte) (int, error) {
+				first()
+				if tt.cancelRead {
+					cancel()
+					return 0, ctx.Err()
+				}
+				return reader.Read(p)
+			}))
+			r.Header.Set("X-Fixture-Request", "body observation")
+			facts := outcome.Result{Route: outcome.Route{Backend: "anthropic", Via: "direct"}, Status: 200, Contacted: true}
+			h := handler(t, worker.Options{BeforeBody: func(req *http.Request) func(outcome.Result) {
+				equal(t, "body observation", req.Header.Get("X-Fixture-Request"))
+				events = append(events, "start")
+				return func(result outcome.Result) {
+					events = append(events, "finalize")
+					results = append(results, result)
+				}
+			}, Anthropic: func(w http.ResponseWriter, _ *http.Request, _ route.Snapshot, _ route.Decision, raw []byte, admit admission) (outcome.Result, error) {
+				events = append(events, "forward")
+				equal(t, body, string(raw))
+				admit(facts.Route, nil)
+				_, _ = io.WriteString(w, "committed")
+				if tt.abort {
+					facts.StatusOverride = "upstream_aborted"
+					return facts, http.ErrAbortHandler
+				}
+				return facts, nil
+			}})
+			w := httptest.NewRecorder()
+			aborted := func() (p any) {
+				defer func() { p = recover() }()
+				h.ServeHTTP(w, r)
+				return nil
+			}()
+			isAbort := aborted == http.ErrAbortHandler //nolint:errorlint // net/http requires the exact panic sentinel, not a wrapped error.
+			equal(t, 1, len(results))
+			if tt.cancelRead {
+				equal(t, []string{"start", "first read", "finalize"}, events)
+				equal(t, true, results[0].Cancelled)
+				equal(t, false, results[0].Contacted)
+				if results[0].Status == 499 || w.Code == 499 || (aborted != nil && !isAbort) {
+					t.Fatalf("cancelled read: result=%+v HTTP=%d panic=%v", results[0], w.Code, aborted)
+				}
+				return
+			}
+			equal(t, []string{"start", "first read", "forward", "finalize"}, events)
+			equal(t, facts, results[0])
+			equal(t, "committed", w.Body.String())
+			if (tt.abort && !isAbort) || (!tt.abort && aborted != nil) {
+				t.Fatalf("branch abort=%t, handler panic=%v", tt.abort, aborted)
+			}
+		})
+	}
+}
+
+func TestAbsoluteRequestTarget(t *testing.T) {
+	tests := map[string]struct{ method, path string }{
+		"success: drain is not local":           {"POST", "/drain"},
+		"success: health is not local":          {"GET", "/healthz"},
+		"success: catalog is not local":         {"GET", "/v1/models"},
+		"success: messages prefix is not local": {"POST", "/v1/messages/count_tokens"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			target := "http://fixture.invalid" + tt.path + "?detail=1"
+			h := handler(t, worker.Options{BeginDrain: func() { t.Error("unexpected drain") }, Anthropic: func(w http.ResponseWriter, r *http.Request, _ route.Snapshot, d route.Decision, _ []byte, admit admission) (outcome.Result, error) {
+				equal(t, target, r.RequestURI)
+				equal(t, route.Decision{Branch: "anthropic"}, d)
+				selected := outcome.Route{Backend: "anthropic"}
+				admit(selected, nil)
+				w.WriteHeader(http.StatusNoContent)
+				return outcome.Result{Route: selected, Status: http.StatusNoContent, Contacted: true}, nil
+			}})
+			r := httptest.NewRequestWithContext(t.Context(), tt.method, target, strings.NewReader(`{"model":"claude-gpt-9"}`))
+			r.Host = "other.invalid"
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			equal(t, http.StatusNoContent, w.Code)
+		})
+	}
 }
 
 func TestRejectMissingControlToken(t *testing.T) {
@@ -321,14 +440,22 @@ func TestDrainWhileForwarding(t *testing.T) {
 	entered, release := make(chan struct{}), make(chan struct{})
 	var calls atomic.Int64
 	drained := make(chan struct{})
-	h := handler(t, worker.Options{Anthropic: func(w http.ResponseWriter, r *http.Request, _ route.Snapshot, _ route.Decision, _ []byte) worker.ForwardResult {
+	h := handler(t, worker.Options{BeforeBody: func(r *http.Request) func(outcome.Result) {
+		if r.RequestURI != "/v1/messages" {
+			t.Errorf("unexpected observation for %s", r.RequestURI)
+		}
+		return nil
+	}, Anthropic: func(w http.ResponseWriter, r *http.Request, _ route.Snapshot, _ route.Decision, _ []byte, admit admission) (outcome.Result, error) {
+		selected := outcome.Route{Backend: "anthropic", Via: "direct"}
+		admit(selected, nil)
+		_, _ = io.WriteString(w, "start ")
 		close(entered)
 		select {
 		case <-release:
 			_, _ = io.WriteString(w, "finished")
 		case <-r.Context().Done():
 		}
-		return worker.ForwardResult{Forwarded: true}
+		return outcome.Result{Route: selected, Status: http.StatusOK, Contacted: true}, nil
 	}, BeginDrain: func() {
 		if calls.Add(1) == 1 {
 			close(drained)
@@ -372,16 +499,6 @@ func TestDrainWhileForwarding(t *testing.T) {
 		equal(t, 403, r.StatusCode)
 		equal(t, int64(0), calls.Load())
 	})
-	t.Run("error: absolute target does not authorize a different Host", func(t *testing.T) {
-		ctx := context.WithValue(t.Context(), http.LocalAddrContextKey, srv.Listener.Addr())
-		req := httptest.NewRequestWithContext(ctx, "POST", srv.URL+"/drain", strings.NewReader("{}"))
-		req.Host = "wrong.invalid"
-		req.Header = headers.Clone()
-		result := httptest.NewRecorder()
-		h.ServeHTTP(result, req)
-		equal(t, 403, result.Code)
-		equal(t, int64(0), calls.Load())
-	})
 	// No network operation in the blocked request needs a timer: either the forwarder enters or the handler returns.
 	req := httptest.NewRequestWithContext(t.Context(), "POST", "/v1/messages", strings.NewReader("plain"))
 	result := httptest.NewRecorder()
@@ -409,13 +526,14 @@ func TestDrainWhileForwarding(t *testing.T) {
 	health := jsonObject(t, b)
 	equal(t, any(true), health["draining"])
 	equal(t, any(float64(1)), health["activeRequests"])
+	equal(t, any(map[string]any{"anthropic": float64(1), "models": float64(0), "codex": float64(0), "grok": float64(0)}), health["served"])
 	s, respHeaders, b = request(t, srv.Client(), "GET", srv.URL+"/v1/models", "", nil)
 	equal(t, 503, s)
 	equal(t, "application/json", respHeaders.Get("Content-Type"))
 	equal(t, jsonObject(t, `{"type":"error","error":{"type":"api_error","message":"model-gateway shim is restarting; retry this request shortly"}}`), jsonObject(t, b))
 	unblock()
 	<-done
-	equal(t, "finished", result.Body.String())
+	equal(t, "start finished", result.Body.String())
 	_, _, b = request(t, srv.Client(), "GET", srv.URL+"/healthz", "", nil)
 	equal(t, any(float64(0)), jsonObject(t, b)["activeRequests"])
 }
