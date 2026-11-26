@@ -131,6 +131,11 @@ type Request struct {
 	SentryTarget sentry.Target
 	// Usage optionally records response metadata, byte counts, and translated usage.
 	Usage UsageObserver
+	// ServiceContext, when non-nil, is the worker-lifetime context: Handle waits for the access token
+	// and runs the upstream exchange under it, so the end of the worker ends both. It never decides
+	// what is written to the client. When nil, both run on the client context without its
+	// cancellation.
+	ServiceContext context.Context
 }
 
 // route is the route the source publishes for a Grok request (lib/request-worker.js:2604-2629).
@@ -189,15 +194,17 @@ func (b *Branch) Prepare(w http.ResponseWriter, r *http.Request, req Request) (o
 // client response: Handle returns the outcome facts alongside an error wrapping
 // http.ErrAbortHandler.
 //
-// Handle asks the auth store for the access token on a context without r.Context()'s
-// cancellation, so a stalled token issuer is bounded only by the store's two 30-second request
-// deadlines (discovery and exchange), and those hold only with an auth transport that honours
-// request cancellation.
+// Handle asks the auth store for the access token on req.ServiceContext, or, when that is nil, on a
+// context without r.Context()'s cancellation, so a stalled token issuer is bounded only by the end
+// of the service and the store's two 30-second request deadlines (discovery and exchange), and
+// those hold only with an auth transport that honours request cancellation. When the service ends
+// first, Handle stops waiting and answers as for a failed refresh; an exchange already sent still
+// completes inside the store (see Wait).
 //
 // After r.Context() is canceled, Handle writes nothing more to w but continues consuming
-// the upstream stream; the configured Client governs its lifetime. outcome.Result.Cancelled
-// is always false here and is decided by the worker root. Handle never panics with
-// http.ErrAbortHandler itself.
+// the upstream stream; the configured Client and req.ServiceContext govern its lifetime.
+// outcome.Result.Cancelled is always false here and is decided by the worker root. Handle never
+// panics with http.ErrAbortHandler itself.
 func (b *Branch) Handle(w http.ResponseWriter, r *http.Request, req Request) (outcome.Result, error) {
 	payload, decodeErr := jsonx.DecodeWire(req.RawBody)
 	if decodeErr != nil {
@@ -206,9 +213,12 @@ func (b *Branch) Handle(w http.ResponseWriter, r *http.Request, req Request) (ou
 	res := outcome.Result{Route: route(payload, req)}
 	client := r.Context()
 	// The client's departure decides only whether anything more is written to w. Credential
-	// refresh and the upstream exchange run on the Client's lifetime, as the source keeps them
-	// running after the client left.
-	service := context.WithoutCancel(client)
+	// refresh and the upstream exchange run on the service's and the Client's lifetime, as the
+	// source keeps them running after the client left.
+	service := req.ServiceContext
+	if service == nil {
+		service = context.WithoutCancel(client)
+	}
 
 	token, err := b.accessToken(service)
 	if err != nil {
@@ -269,6 +279,17 @@ func (b *Branch) Handle(w http.ResponseWriter, r *http.Request, req Request) (ou
 		return h.stream(resp)
 	default:
 		return h.json(resp)
+	}
+}
+
+// Wait blocks until the credential refresh in flight, if any, has ended. A refresh whose token
+// exchange was already sent finishes under its own deadline and stores what the issuer returned; one
+// that has not reached its exchange ends once every caller waiting for it has left, which a caller
+// whose ServiceContext ended has done. The worker calls Wait at shutdown, after its request
+// handlers have returned, so no credential write outlives the worker.
+func (b *Branch) Wait() {
+	if b.auth != nil {
+		b.auth.waitIdle()
 	}
 }
 

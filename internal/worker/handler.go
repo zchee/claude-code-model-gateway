@@ -97,7 +97,7 @@ func newHandler(options Options) *handler {
 			Retries:          config.CompactRetries.Get(options.Lookup),
 			MaxBufferedBytes: config.CompactMax.Get(options.Lookup),
 		},
-		usage: usageHealth{MaxResponseBytes: config.UsageMaxResponse.Get(options.Lookup)},
+		usage: usageHealth{MaxResponseBytes: config.UsageMaxResponse.Get(options.Lookup), SettingsLevelBaseURL: options.SettingsLevelBaseURL},
 		// The source's counters start with these four providers; others are added in admission order.
 		served: []servedCount{{name: "models"}, {name: "codex"}, {name: "grok"}, {name: "anthropic"}},
 	}

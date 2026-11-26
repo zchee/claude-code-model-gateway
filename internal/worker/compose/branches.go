@@ -16,6 +16,7 @@ package compose
 
 import (
 	"context"
+	"io"
 	"math"
 	"net/http"
 	"slices"
@@ -46,7 +47,8 @@ type admitFunc = func(outcome.Route, *outcome.Audit)
 // proxy prepares a proxy request, admits it, applies the request-side sentry to the original bytes
 // and forwards the prepared bytes, through the compaction guard when the request is eligible
 // (lib/request-worker.js:2430-2588).
-func (c *composer) proxy(w http.ResponseWriter, r *http.Request, snap route.Snapshot, d route.Decision, original []byte, admit admitFunc) (outcome.Result, error) {
+func (c *composer) proxy(client http.ResponseWriter, r *http.Request, snap route.Snapshot, d route.Decision, original []byte, admit admitFunc) (outcome.Result, error) {
+	w := newClientWriter(client, r.Context().Done())
 	prep, err := c.opts.ProxyReq.Prepare(w, r, snap, d, original)
 	if err != nil {
 		return outcome.Result{}, err
@@ -119,12 +121,14 @@ func (c *composer) proxy(w http.ResponseWriter, r *http.Request, snap route.Snap
 		Usage:           optional[reply.UsageCapture](capture),
 		Diagnostics:     c.diagnostics,
 	}
+	// The prepared body is classified once; the guard's eligibility reuses the classification.
+	compaction := compactguard.IsCompactionRequest(prep.Body)
 	stream := sse.ProxyOptions{
 		Provider:          provider,
 		AdvertisedModel:   prep.Route.SelectedModel,
 		BackendModel:      model,
 		FilterPlanTools:   c.filterPlanTools,
-		IsCompaction:      compactguard.IsCompactionRequest(prep.Body),
+		IsCompaction:      compaction,
 		HeartbeatInterval: c.heartbeat,
 		FirstEventWait:    c.firstEventWait,
 		ClientDone:        r.Context().Done(),
@@ -135,7 +139,8 @@ func (c *composer) proxy(w http.ResponseWriter, r *http.Request, snap route.Snap
 	}
 
 	var res outcome.Result
-	if compactguard.ShouldGuard(c.opts.CompactGuard.Settings, provider, path, prep.Body) {
+	// The conditions of compactguard.ShouldGuard, over the classification above.
+	if compaction && c.opts.CompactGuard.Settings.StreamGuard && provider != "" && path == messagesPath {
 		// Every attempt of a guarded request reports its failures as compaction outcomes.
 		req.Compaction = true
 		stream.OnOverflow = overflowResponder(req)
@@ -162,13 +167,14 @@ func (c *composer) proxy(w http.ResponseWriter, r *http.Request, snap route.Snap
 			SentryTarget:  prep.Target,
 		})
 	}
-	c.delivered(r, err, capture)
+	c.delivered(w, err, capture)
 	return settle(prep.Route, res), err
 }
 
 // anthropic forwards the original bytes to the default upstream untouched and relays its reply as
 // it arrives (lib/request-worker.js:2649-2677).
-func (c *composer) anthropic(w http.ResponseWriter, r *http.Request, _ route.Snapshot, _ route.Decision, original []byte, admit admitFunc) (outcome.Result, error) {
+func (c *composer) anthropic(client http.ResponseWriter, r *http.Request, _ route.Snapshot, _ route.Decision, original []byte, admit admitFunc) (outcome.Result, error) {
+	w := newClientWriter(client, r.Context().Done())
 	path := pathOnly(r)
 	var (
 		payload  jsonx.WireValue
@@ -226,7 +232,7 @@ func (c *composer) anthropic(w http.ResponseWriter, r *http.Request, _ route.Sna
 		Diagnostics: c.diagnostics,
 	}
 	res, err := c.reply(w, r, req, send, sse.ProxyOptions{}, sse.PassthroughOptions{})
-	c.delivered(r, err, capture)
+	c.delivered(w, err, capture)
 	return settle(rt, res), err
 }
 
@@ -234,7 +240,8 @@ func (c *composer) anthropic(w http.ResponseWriter, r *http.Request, _ route.Sna
 // bytes before any credential or upstream contact, and hands it to the Grok branch. The branch
 // observes usage, but no usage record is emitted for Grok, as in the source
 // (lib/request-worker.js:2590-2647).
-func (c *composer) grok(w http.ResponseWriter, r *http.Request, snap route.Snapshot, d route.Decision, original []byte, admit admitFunc) (outcome.Result, error) {
+func (c *composer) grok(client http.ResponseWriter, r *http.Request, snap route.Snapshot, d route.Decision, original []byte, admit admitFunc) (outcome.Result, error) {
+	w := newClientWriter(client, r.Context().Done())
 	payload, _ := jsonx.DecodeWire(original)
 	req := grok.Request{
 		RawBody:         original,
@@ -243,6 +250,8 @@ func (c *composer) grok(w http.ResponseWriter, r *http.Request, snap route.Snaps
 		BackendModel:    d.Model,
 		SessionKey:      sentry.SessionKey(c.opts.SentryEnabled, headerValue(r.Header, sessionHeader), optionalHeader(r.Header, agentHeader)),
 		SentryTarget:    c.target(snap, d.Model),
+		// The credential wait and the upstream exchange end with the worker.
+		ServiceContext: c.opts.ServiceContext,
 	}
 	prepared, refused := c.opts.Grok.Prepare(w, r, req)
 	if refused {
@@ -304,20 +313,52 @@ func usageOf(req reply.Request) *usage.Capture {
 	return capture
 }
 
-// delivered exports the usage record once the reply reached a client that is still there, as the
-// source does on the response's finish event (lib/request-worker.js:1824-1825).
-func (c *composer) delivered(r *http.Request, err error, capture *usage.Capture) {
-	if err == nil && r.Context().Err() == nil {
+// delivered exports the usage record exactly once, and only when both halves the source waits for
+// have happened (lib/request-worker.js:1824-1825,2190-2207): the branch observed the whole upstream
+// reply (it returned no error), and the response was delivered to a client that was still there.
+func (c *composer) delivered(w *clientWriter, err error, capture *usage.Capture) {
+	if capture != nil && err == nil && w.delivered() {
 		c.finishUsage(capture)
 	}
 }
 
 // send binds one immutable upstream request to the service context: an attempt ends with the
-// worker, never with the client.
+// worker, never with the client. The response body is handed on as a serviceBody.
 func (c *composer) send(req upstream.Request) upstream.Send {
 	return func(context.Context) (*upstream.Response, error) {
-		return c.opts.Upstream.Do(c.opts.ServiceContext, req)
+		resp, err := c.opts.Upstream.Do(c.opts.ServiceContext, req)
+		if err == nil && resp != nil && resp.Body != nil {
+			resp.Body = &serviceBody{ReadCloser: resp.Body, service: c.opts.ServiceContext, reading: make(chan struct{}, 1)}
+		}
+		return resp, err
 	}
+}
+
+// serviceBody orders the end of a response body read against its close once the service has
+// ended. The guard and the relays close the body from one goroutine while another may still be
+// reading it. net/http answers a body closed before its read ended by draining the rest of it,
+// bounded only by its own short timer, and only a closed connection ends the read that is in
+// flight meanwhile. Once the service context has ended, the transport's cancellation closes the
+// connection and ends that read by itself, so a close made then first waits for the read to return
+// and net/http never starts the drain. A close made while the service runs is not delayed.
+type serviceBody struct {
+	io.ReadCloser
+	service context.Context
+	reading chan struct{} // holds a token while a Read runs
+}
+
+func (b *serviceBody) Read(p []byte) (int, error) {
+	b.reading <- struct{}{}
+	defer func() { <-b.reading }()
+	return b.ReadCloser.Read(p)
+}
+
+func (b *serviceBody) Close() error {
+	if b.service.Err() != nil {
+		b.reading <- struct{}{}
+		defer func() { <-b.reading }()
+	}
+	return b.ReadCloser.Close()
 }
 
 // overflowResponder answers an engine overflow found by the first-event peek of an LM Studio stream.

@@ -96,8 +96,9 @@ type Options struct {
 	ModelCache *modelcache.Cache
 	// Sentry holds shared live session latches and learned ceilings across all branches.
 	Sentry *sentry.State
-	// Upstream executes pooled HTTP/1.1 inference requests for Anthropic, proxy, and Grok.
-	// It is closed when ServiceContext ends, so no connection or timer of it outlives the worker.
+	// Upstream executes pooled HTTP/1.1 inference requests for Anthropic, proxy, and Grok, each bound
+	// to ServiceContext. The owner of the worker lifetime closes it after the request handlers have
+	// returned; New never closes it.
 	Upstream *upstream.Client
 	// UpstreamState persists Codex blocked and unavailable state across turns.
 	UpstreamState *upstreamstate.Store
@@ -117,6 +118,9 @@ type Options struct {
 	// ReadinessCheck optionally supplies the latest shared proxy and Codex auth check for /healthz.
 	// When nil, worker.Options.CodexReadiness is left nil.
 	ReadinessCheck *readiness.SharedCheck
+	// SettingsLevelBaseURL is the startup fact /healthz reports as usage.settingsLevelBaseUrl: the
+	// gateway's base URL was wired when the worker started.
+	SettingsLevelBaseURL bool
 
 	// Now returns the current time for readiness and upstream-state timestamps; nil defaults to time.Now.
 	Now func() time.Time
@@ -136,25 +140,21 @@ type Options struct {
 
 // New validates opts and returns the worker.Options wired to all live branches, telemetry,
 // usage observation, catalog hooks, and readiness reporting. New starts no goroutines, timers,
-// or catalog refreshes; the caller owns ModelCache.Start and ServiceContext cancellation.
+// or catalog refreshes and registers no callback; the caller owns ModelCache.Start, ServiceContext
+// cancellation, the closing of Upstream and every join at shutdown.
 //
 // The composed branches enforce the worker lifetime contract: every upstream send and SSE relay
 // runs under ServiceContext, reply and compactguard receive the client request context, relays
 // receive ClientDone bound to the client context, usage capture starts before branch execution
-// and finishes after observation (except Grok, which observes usage and finishes its route span
-// without emitting a usage record), and request-side context-sentry refusals are written only by
-// reply.WriteSentry after admission.
-//
-// New registers the closing of Upstream on the end of ServiceContext; that callback is the only
-// work it leaves behind, and it runs only once ServiceContext is done.
+// and is exported once both the upstream reply was observed and the response was delivered (except
+// Grok, which observes usage and finishes its route span without emitting a usage record), every
+// output operation toward a client that has left is dropped, and request-side context-sentry
+// refusals are written only by reply.WriteSentry after admission.
 func New(opts Options) (worker.Options, error) {
 	if err := validate(opts); err != nil {
 		return worker.Options{}, err
 	}
 	c := newComposer(opts)
-	// The upstream client's pooled connections and inactivity timers end with the worker; a Grok
-	// exchange, which the Grok branch runs without the client's context, ends here as well.
-	context.AfterFunc(opts.ServiceContext, func() { _ = opts.Upstream.Close() })
 
 	out := worker.Options{
 		Version:      opts.Version,
@@ -175,7 +175,8 @@ func New(opts Options) (worker.Options, error) {
 		RefreshAnthropic: func(_ context.Context, incoming http.Header) {
 			opts.ModelCache.TriggerAnthropicRefresh(incoming)
 		},
-		LogRoute: opts.Telemetry.LogRoute,
+		LogRoute:             opts.Telemetry.LogRoute,
+		SettingsLevelBaseURL: opts.SettingsLevelBaseURL,
 	}
 	if check := opts.ReadinessCheck; check != nil {
 		store := *opts.UpstreamState
@@ -260,7 +261,7 @@ func newComposer(opts Options) *composer {
 		retries:         opts.ReplyRetries,
 		retryDelay:      opts.ReplyRetryDelay,
 		firstEventWait:  nodeTimer(config.LMStudioFirstWait.Get(opts.Lookup)),
-		maxObserveBytes: int(min(config.UsageMaxResponse.Get(opts.Lookup), math.MaxInt32)),
+		maxObserveBytes: clampInt(config.UsageMaxResponse.Get(opts.Lookup)),
 		filterPlanTools: !config.KeepPlanTools.Get(opts.Lookup),
 	}
 	if c.diagnostics.w == nil {
@@ -277,7 +278,7 @@ func newComposer(opts Options) *composer {
 		}
 	}
 	if c.retries == nil {
-		c.retries = new(int(min(config.WSRetries.Get(opts.Lookup), math.MaxInt32)))
+		c.retries = new(clampInt(config.WSRetries.Get(opts.Lookup)))
 	}
 	if c.retryDelay == nil {
 		// An explicit zero retries at once; reply documents that as its own rule.
@@ -288,6 +289,16 @@ func newComposer(opts Options) *composer {
 		c.retryDelay = &delay
 	}
 	return c
+}
+
+// clampInt converts a validated count or byte setting to the platform int, saturating at the largest
+// representable value. The JavaScript timer cap applies to delays only, never to counts.
+func clampInt(v float64) int {
+	// float64(math.MaxInt) rounds up to a power of two that int cannot hold.
+	if v >= float64(math.MaxInt) {
+		return math.MaxInt
+	}
+	return int(v)
 }
 
 // maxTimerMillis is the largest delay a JavaScript timer accepts.
@@ -325,8 +336,9 @@ func (c *composer) beforeBody(r *http.Request) func(outcome.Result) {
 		if res.Cancelled {
 			return
 		}
-		span.Finish(res.Route, res.Status, res.StatusOverride)
+		// The Codex state is updated before the span is queued for export (lib/request-worker.js:1156-1167).
 		c.noteCodex(res)
+		span.Finish(res.Route, res.Status, res.StatusOverride)
 	}
 }
 

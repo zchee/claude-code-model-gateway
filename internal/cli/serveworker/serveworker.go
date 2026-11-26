@@ -70,8 +70,10 @@ func Run(ctx context.Context, options Options) error {
 	if lookup == nil {
 		lookup = func(string) (string, bool) { return "", false }
 	}
-	// Request handlers and background catalog work write to the same streams as Run itself.
-	stdout, stderr := &syncWriter{w: writerOr(options.Stdout)}, &syncWriter{w: writerOr(options.Stderr)}
+	// Request handlers and background catalog work write to the same streams as Run itself. One lock
+	// covers both streams, so lines never interleave when the caller passes the same sink twice.
+	var output sync.Mutex
+	stdout, stderr := &syncWriter{mu: &output, w: writerOr(options.Stdout)}, &syncWriter{mu: &output, w: writerOr(options.Stderr)}
 
 	control, err := supervisedDescriptors(lookup)
 	if err != nil {
@@ -121,8 +123,8 @@ func Run(ctx context.Context, options Options) error {
 	if err != nil {
 		return err
 	}
-	// Runs after the servers have stopped: the worker context ends and its background work is joined.
-	defer life.stop()
+	// The lifetime ends exactly once: below after serving, or here on an early return.
+	defer life.stop(stop)
 
 	port, err := workerPort(lookup)
 	if err != nil {
@@ -152,19 +154,13 @@ func Run(ctx context.Context, options Options) error {
 		return err
 	}
 	life.start()
-	servers := make([]*http.Server, len(listeners))
-	served := make(chan error, len(listeners))
-	for i, ln := range listeners {
-		// The general OPTIONS handler would answer "OPTIONS *" itself, past the handler's checks.
-		servers[i] = &http.Server{Handler: handler, ReadHeaderTimeout: headersTimeout, IdleTimeout: keepAliveTimeout, DisableGeneralOptionsHandler: true}
-		go func() { served <- servers[i].Serve(ln) }()
-	}
+	life.serve(listeners, handler)
 
 	bound := tcp.Addr().(*net.TCPAddr).Port
 	if control != nil {
 		if err := control.report(bound); err != nil {
 			stop.signal(stopNow)
-			shutdown(servers, served, stop, 0)
+			life.stop(stop)
 			return err
 		}
 	}
@@ -181,14 +177,12 @@ func Run(ctx context.Context, options Options) error {
 		watchers.Go(func() { awaitEOF(channel); stop.signal(stopNow) })
 	}
 	var serveErr error
-	received := 0
 	select {
-	case serveErr = <-served:
-		received++
+	case serveErr = <-life.served:
 		stop.signal(stopNow)
 	case <-stop.done:
 	}
-	shutdown(servers, served, stop, received)
+	life.stop(stop)
 	// Closing the descriptors ends a watcher that is still reading them.
 	if control != nil {
 		control.close()
@@ -245,37 +239,6 @@ func (s *stopper) mode() stopMode {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.which
-}
-
-// shutdown stops every server at the same time. A drain closes all listeners together and lets in-flight requests
-// finish (lib/request-worker.js:1235-1258) until an immediate stop arrives: the parent's or the fixture's end of file,
-// or cancellation. That closes every connection, as the source's exit on disconnect does (lib/request-worker.js:1210).
-// Any other stop closes the connections at once.
-// received is the number of Serve results the caller has already taken from served.
-func shutdown(servers []*http.Server, served chan error, stop *stopper, received int) {
-	if stop.mode() == stopDrain {
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		var draining sync.WaitGroup
-		for _, srv := range servers {
-			draining.Go(func() { _ = srv.Shutdown(ctx) })
-		}
-		drained := make(chan struct{})
-		go func() { draining.Wait(); close(drained) }()
-		select {
-		case <-drained:
-		case <-stop.now:
-			cancel()
-			<-drained
-		}
-	}
-	for _, srv := range servers {
-		_ = srv.Close()
-	}
-	// Every Serve call has returned once its server is closed; collect them so no goroutine outlives Run.
-	for range len(servers) - received {
-		<-served
-	}
 }
 
 func workerPort(lookup config.LookupEnv) (int, error) {

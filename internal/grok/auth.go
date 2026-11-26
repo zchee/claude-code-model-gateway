@@ -379,6 +379,19 @@ func (s *AuthStore) wait(ctx context.Context, f *flight) (string, bool, error) {
 	}
 }
 
+// waitIdle returns once no flight is in progress, waiting for each one it finds to end.
+func (s *AuthStore) waitIdle() {
+	for {
+		s.mu.Lock()
+		f := s.flight
+		s.mu.Unlock()
+		if f == nil {
+			return
+		}
+		<-f.done
+	}
+}
+
 // start begins a flight with one waiter. The flight's context keeps ctx's values but not its
 // cancellation, so the first caller leaving does not fail the others. s.mu must be held.
 func (s *AuthStore) start(ctx context.Context, forced bool) *flight {

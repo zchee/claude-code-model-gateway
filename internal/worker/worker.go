@@ -61,6 +61,9 @@ type Options struct {
 	// CodexReadiness computes the /healthz codexReadiness summary when non-nil.
 	// When nil, /healthz reports the default checking summary.
 	CodexReadiness func() readiness.CodexReadiness
+	// SettingsLevelBaseURL is reported by /healthz as usage.settingsLevelBaseUrl: whether the gateway's
+	// base URL was wired, through a settings file or the environment, when the worker started.
+	SettingsLevelBaseURL bool
 }
 
 // NewHandler constructs the handler shared by the TCP and Unix listeners.
