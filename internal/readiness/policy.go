@@ -17,6 +17,9 @@ package readiness
 
 import "github.com/zchee/claude-code-model-gateway/internal/config"
 
+// compatBaseURL is the remote-control compatibility endpoint (lib/runtime.js:44,50).
+const compatBaseURL = "http://api.anthropic.com"
+
 // Settings contains the settings members consulted by the recovery policy. Non-boolean plugin entries do not participate.
 type Settings struct {
 	BaseURL        *string
@@ -24,4 +27,39 @@ type Settings struct {
 }
 
 // Policy returns unwired, disabled or recover using settings in decreasing precedence order.
-func Policy(lookup config.LookupEnv, settings []Settings, pluginID string) string { return "" }
+func Policy(lookup config.LookupEnv, settings []Settings, pluginID string) string {
+	// The launcher compares the raw port spelling, with no numeric conversion (lib/recovery-policy.js:29).
+	endpoint, ok := recoveryEndpoint(lookup, settings)
+	if !ok || (endpoint != "http://127.0.0.1:"+config.RecoveryPublicPort(lookup) && endpoint != compatBaseURL) {
+		return "unwired"
+	}
+	if enabled, ok := pluginEnabled(settings, pluginID); ok && !enabled {
+		return "disabled"
+	}
+	return "recover"
+}
+
+// recoveryEndpoint prefers a process value, even an empty one, over the first settings file that defines one
+// (lib/recovery-policy.js:22-25).
+func recoveryEndpoint(lookup config.LookupEnv, settings []Settings) (string, bool) {
+	if value := config.AnthropicBaseURL.Get(lookup); value != nil {
+		return *value, true
+	}
+	for _, s := range settings {
+		if s.BaseURL != nil {
+			return *s.BaseURL, true
+		}
+	}
+	return "", false
+}
+
+// pluginEnabled returns the first boolean entry for the plugin; other value types are skipped
+// (lib/recovery-policy.js:17-20).
+func pluginEnabled(settings []Settings, pluginID string) (enabled, ok bool) {
+	for _, s := range settings {
+		if v, isBool := s.EnabledPlugins[pluginID].(bool); isBool {
+			return v, true
+		}
+	}
+	return false, false
+}
