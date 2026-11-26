@@ -392,6 +392,11 @@ func (s *Span) attributes(route Route, status string, statusCode int, durationMi
 	num := func(key string, value float64) {
 		attrs.Elements = append(attrs.Elements, attribute(key, numeric(value)))
 	}
+	// A typed integer is spelled as its exact decimal; converting it to float64 first would round
+	// values beyond 2^53.
+	integer := func(key string, value int64) {
+		attrs.Elements = append(attrs.Elements, attribute(key, object(member("intValue", wireString(strconv.FormatInt(value, 10))))))
+	}
 	boolean := func(key string, value bool) {
 		kind := jsontext.Kind('f')
 		if value {
@@ -419,12 +424,12 @@ func (s *Span) attributes(route Route, status string, statusCode int, durationMi
 	str("via", allowed(route.Via, vias))
 	str("status", status)
 	if statusCode != 0 {
-		num("status_code", float64(statusCode))
+		integer("status_code", int64(statusCode))
 	}
 	if c := route.Compaction; c != nil {
 		str("compaction_outcome", cmp.Or(allowed(c.Outcome, outcomes), "unknown_error"))
 		if c.UpstreamStatus != nil {
-			num("upstream_status_code", float64(*c.UpstreamStatus))
+			integer("upstream_status_code", int64(*c.UpstreamStatus))
 		}
 		if c.TerminalCode == "message_stop" {
 			str("compaction_terminal_code", c.TerminalCode)
@@ -442,7 +447,7 @@ func (s *Span) attributes(route Route, status string, statusCode int, durationMi
 	if o := route.Overflow; o != nil {
 		str("overflow_phase", o.Phase)
 		str("overflow_refused_by", o.RefusedBy)
-		num("overflow_request_bytes", float64(o.RequestBytes))
+		integer("overflow_request_bytes", o.RequestBytes)
 		if o.Tokens != nil {
 			num("overflow_tokens", *o.Tokens)
 		}
@@ -474,8 +479,8 @@ func attribute(key string, value jsonx.WireValue) jsonx.WireValue {
 	return object(member("key", wireString(key)), member("value", value))
 }
 
-// numeric spells an integral number as an OTLP intValue string and any other number, including a
-// non-finite one that JSON encodes as null, as a doubleValue.
+// numeric spells an integral floating-point number as an OTLP intValue string and any other
+// number, including a non-finite one that JSON encodes as null, as a doubleValue.
 func numeric(n float64) jsonx.WireValue {
 	if !math.IsInf(n, 0) && n == math.Trunc(n) {
 		raw, _ := jsonx.EncodeWire(number(n))

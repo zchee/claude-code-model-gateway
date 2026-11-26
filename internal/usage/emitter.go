@@ -95,7 +95,8 @@ func (e *Emitter) Enabled() bool { return e.endpoint != nil }
 // Start allocates a request sequence in arrival order, not completion order, and fixes the
 // request's tool-block evidence. The capture works whether or not export is enabled. Its one
 // eligible Finish exports the primary record first; for token usage it then exports the MCP
-// footprint records and advances the emitter's tool-result snapshots exactly once.
+// footprint records and advances the emitter's tool-result snapshots exactly once. A panic in
+// that handling is not recovered: it reaches the caller of Finish.
 func (e *Emitter) Start(req Request) *Capture {
 	e.mu.Lock()
 	e.sequence++
@@ -107,12 +108,16 @@ func (e *Emitter) Start(req Request) *Capture {
 	if key.session != "" {
 		blocks = messageBlocks(req.Body)
 	}
-	return NewCapture(e.builder, req, e.maxBytes, func(primary Record) { e.emit(primary, key, blocks) })
+	c := NewCapture(e.builder, req, e.maxBytes, nil)
+	c.handle = func(primary Record) { e.emit(primary, key, blocks) }
+	return c
 }
 
 // emit schedules the primary record and the records derived from it without waiting for the
-// collector. It recovers nothing itself: the capture's callback boundary is the only recover on
-// this path, and the export goroutines have none, so a defect in the emitter is not hidden.
+// collector. Nothing on this path recovers: the capture runs emit outside the recovery it keeps
+// for caller-supplied callbacks, and the export goroutines have none, so a panic in the emitter
+// reaches the caller of Finish instead of being hidden. Each lock it takes is released by a
+// deferred unlock, so the emitter and its builder stay usable after such a panic.
 func (e *Emitter) emit(primary Record, key identity, blocks []block) {
 	e.schedule(primary)
 	if primary.EventName != tokenUsageEvent {

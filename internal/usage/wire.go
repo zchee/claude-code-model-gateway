@@ -128,8 +128,9 @@ func conversionFails(v jsonx.WireValue) bool {
 }
 
 // MergeWireUsage combines numeric observations without discarding the source's
-// object-property order. The inputs are not modified, and the result shares no storage
-// with next: changing next afterwards, including a member name, does not change it.
+// object-property order. The inputs are not modified. When current and next share no
+// storage, the result shares none with next either: changing next afterwards, including a
+// member name, does not change it. The result may share storage with current.
 func MergeWireUsage(current, next jsonx.WireValue) jsonx.WireValue {
 	return mergeWire(current, next, 0)
 }

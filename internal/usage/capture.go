@@ -38,7 +38,8 @@ type Capture struct {
 	req           Request
 	maxBytes      int
 	evidence      requestEvidence
-	emit          func(Record)
+	emit          func(Record) // caller-supplied; a panic in it is recovered
+	handle        func(Record) // an Emitter's own handler; a panic in it reaches the caller of Finish
 	usage         jsonx.WireValue
 	id            string
 	model         string
@@ -58,7 +59,7 @@ type Capture struct {
 // The response fields of req are replaced by the observations. The request evidence is fixed here:
 // changing the body, the headers or the sequence of req afterwards does not change the record.
 // The capture reports no sequence unless req supplies one, as an Emitter's captures do. It derives
-// no footprint or tool-result records, which an Emitter derives in its emit callback, and it leaves
+// no footprint or tool-result records, which an Emitter derives in its own handler, and it leaves
 // the builder's request numbering and tool-result baseline unchanged. It shares the builder's
 // project lookup cache and random source, as the source's captures share a project resolver and
 // the process's randomness: a project name it resolves is cached for later Build calls, and its
@@ -226,7 +227,9 @@ func (c *Capture) SetResponseComplete(complete bool) {
 }
 
 // Finish emits at most once and returns the primary record, or nil if none was built or Finish
-// was called before. A panic in the emit callback is recovered: the record is still returned.
+// was called before. A panic in a callback supplied to NewCapture is recovered and the record is
+// still returned. A capture from Emitter.Start has no such callback: a panic in the emitter's own
+// handling of the record reaches the caller, and a later Finish returns nil.
 func (c *Capture) Finish() *Record {
 	c.mu.Lock()
 	if c.finished || c.builder == nil {
@@ -256,6 +259,9 @@ func (c *Capture) Finish() *Record {
 	}()
 	if !ok {
 		return nil
+	}
+	if c.handle != nil {
+		c.handle(record)
 	}
 	if c.emit != nil {
 		func() {
