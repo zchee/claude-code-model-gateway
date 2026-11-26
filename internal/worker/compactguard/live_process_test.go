@@ -29,6 +29,7 @@ import (
 
 	gocmp "github.com/google/go-cmp/cmp"
 
+	"github.com/zchee/claude-code-model-gateway/internal/usage"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/compactguard"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/outcome"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/sse"
@@ -150,54 +151,173 @@ func checkLive(t *testing.T, provider string, enabled bool) {
 	}
 }
 
+type syncRecorder struct {
+	*httptest.ResponseRecorder
+	mu sync.Mutex
+}
+
+func (r *syncRecorder) WriteHeader(code int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ResponseRecorder.WriteHeader(code)
+}
+
+func (r *syncRecorder) Write(b []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.ResponseRecorder.Write(b)
+}
+
+func (r *syncRecorder) Flush() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.ResponseRecorder.Flush()
+}
+
+func (r *syncRecorder) bodyString() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.Body.String()
+}
+
 func TestGuardClientDisconnectStopsRetry(t *testing.T) {
 	service, stop := context.WithTimeout(t.Context(), 5*time.Second)
 	defer stop()
 	client, disconnect := context.WithCancel(t.Context())
 	defer disconnect()
+	chunk1 := truncatedStream()
+	chunk2 := frameTextDelta("still streaming")
+	afterDisconnect := make(chan struct{})
+	proceed := sync.OnceFunc(func() { close(afterDisconnect) })
 	releaseCh := make(chan struct{})
 	release := sync.OnceFunc(func() { close(releaseCh) })
+	upstreamCanceled := make(chan struct{})
+	markCanceled := sync.OnceFunc(func() { close(upstreamCanceled) })
 	var sends atomic.Int32
 	waiting := make(chan struct{})
+	closeWaiting := sync.OnceFunc(func() { close(waiting) })
+	readAfter := make(chan struct{})
+	closeReadAfter := sync.OnceFunc(func() { close(readAfter) })
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if sends.Add(1) > 1 {
 			http.Error(w, "unexpected retry", 500)
 			return
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, truncatedStream())
+		_, _ = io.WriteString(w, chunk1)
 		w.(http.Flusher).Flush()
-		close(waiting)
+		select {
+		case <-afterDisconnect:
+		case <-service.Done():
+			return
+		case <-r.Context().Done():
+			markCanceled()
+			return
+		}
+		_, _ = io.WriteString(w, chunk2)
+		w.(http.Flusher).Flush()
 		select {
 		case <-releaseCh:
 		case <-service.Done():
 		case <-r.Context().Done():
+			markCanceled()
 		}
 	}))
 	defer srv.Close()
 	defer release()
+	defer proceed()
 	req := guardRequest()
+	req.Usage = &observedCapture{
+		Capture: usage.NewCapture(usage.NewBuilder(usage.Options{Now: time.Now}), usage.Request{Backend: "codex"}, 0, nil),
+		onRead: func(total int64) {
+			if total >= int64(len(chunk1)) {
+				closeWaiting()
+			}
+			if total >= int64(len(chunk1)+len(chunk2)) {
+				closeReadAfter()
+			}
+		},
+	}
 	bindLoopback(t, service, srv.URL, &req, nil)
-	done := make(chan error, 1)
-	go func() { _, err := guardRunner(service, 2).Serve(client, httptest.NewRecorder(), req); done <- err }()
+	w := &syncRecorder{ResponseRecorder: httptest.NewRecorder()}
+	type serveResult struct {
+		res outcome.Result
+		err error
+	}
+	done := make(chan serveResult, 1)
+	joined := false
+	go func() {
+		res, err := guardRunner(service, 2).Serve(client, w, req)
+		done <- serveResult{res: res, err: err}
+	}()
+	defer func() {
+		if !joined {
+			proceed()
+			release()
+			stop()
+			<-done
+		}
+	}()
 	select {
 	case <-waiting:
-	case err := <-done:
-		t.Fatalf("Serve ended before provider streamed: %v", err)
+	case got := <-done:
+		joined = true
+		t.Fatalf("Serve ended before provider streamed: %v", got.err)
 	case <-service.Done():
 		t.Fatal("provider did not stream")
 	}
 	disconnect()
-	release()
 	select {
-	case err := <-done:
-		if err != nil && !errors.Is(err, context.Canceled) {
-			t.Error(err)
-		}
+	case got := <-done:
+		joined = true
+		t.Fatalf("Serve returned before upstream ended: %v", got.err)
+	case <-upstreamCanceled:
+		t.Fatal("client disconnect cancelled the in-flight upstream read")
+	default:
+	}
+	if body := w.bodyString(); body != "" {
+		t.Fatalf("wrote body before upstream ended: %q", body)
+	}
+	proceed()
+	select {
+	case <-readAfter:
+	case got := <-done:
+		joined = true
+		t.Fatalf("Serve returned before reading post-disconnect upstream chunk: %v", got.err)
+	case <-upstreamCanceled:
+		t.Fatal("client disconnect cancelled the in-flight upstream read")
+	case <-service.Done():
+		t.Fatal("in-flight upstream read did not continue after client disconnect")
+	}
+	select {
+	case got := <-done:
+		joined = true
+		t.Fatalf("Serve returned before upstream ended: %v", got.err)
+	case <-upstreamCanceled:
+		t.Fatal("client disconnect cancelled the in-flight upstream read")
+	default:
+	}
+	if body := w.bodyString(); body != "" {
+		t.Fatalf("wrote body after client disconnect: %q", body)
+	}
+	release()
+	var got serveResult
+	select {
+	case got = <-done:
+		joined = true
 	case <-service.Done():
 		t.Fatal("Serve did not return after provider ended")
 	}
+	if got.err != nil {
+		t.Errorf("Serve error = %v, want nil", got.err)
+	}
+	if got.res.Cancelled {
+		t.Errorf("Serve set Cancelled = true, want false")
+	}
 	if sends.Load() != 1 {
 		t.Errorf("unexpected retry after disconnect: %d", sends.Load())
+	}
+	if body := w.bodyString(); body != "" {
+		t.Errorf("wrote body bytes after client disconnect: %q", body)
 	}
 }

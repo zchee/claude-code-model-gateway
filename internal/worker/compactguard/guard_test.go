@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -80,6 +81,13 @@ func sseResponse(body io.ReadCloser) *upstream.Response {
 	return &upstream.Response{StatusCode: 200, Header: h, RelayHeader: h.Clone(), Body: body}
 }
 
+type countedBody struct {
+	io.ReadCloser
+	closes atomic.Int32
+}
+
+func (b *countedBody) Close() error { b.closes.Add(1); return b.ReadCloser.Close() }
+
 type headRecorder struct {
 	*httptest.ResponseRecorder
 	heads []int
@@ -108,13 +116,25 @@ func TestGuardSettledVerdict(t *testing.T) {
 			defer cancel()
 			cap := usage.NewCapture(usage.NewBuilder(usage.Options{Now: time.Now}), usage.Request{Backend: "codex"}, 0, nil)
 			req.Usage = cap
-			verdict := outcome.Result{Status: tt.status, Contacted: true, Route: outcome.Route{Backend: "codex", Via: "proxy", Overflow: &outcome.Overflow{Phase: "upstream"}}}
-			if tt.err != nil {
-				verdict.StatusOverride = "upstream_error"
+			makeVerdict := func() outcome.Result {
+				v := outcome.Result{Status: tt.status, Contacted: true, Route: outcome.Route{Backend: "codex", Via: "proxy", Overflow: &outcome.Overflow{Phase: "upstream"}}}
+				if tt.err != nil {
+					v.StatusOverride = "upstream_error"
+				}
+				if tt.retry {
+					v.Route.Compaction = &outcome.Compaction{Outcome: "upstream_error", ErrorCode: "upstream_http_error", UpstreamStatus: new(tt.status)}
+				}
+				return v
 			}
+			want := makeVerdict()
+			var heads []int
+			wantCalls := 1
 			if tt.retry {
-				verdict.Route.Compaction = &outcome.Compaction{Outcome: "upstream_error", ErrorCode: "upstream_http_error", UpstreamStatus: new(tt.status)}
+				wantCalls++
+				heads = []int{200}
+				want.Route.Compaction.InputTokens = new(19.0)
 			}
+			var firstBody *countedBody
 			calls := 0
 			req.Next = func(c context.Context, head bool) (*upstream.Response, outcome.Result, error) {
 				if c.Done() != ctx.Done() {
@@ -125,23 +145,21 @@ func TestGuardSettledVerdict(t *testing.T) {
 				}
 				calls++
 				if tt.retry && calls == 1 {
-					return sseResponse(io.NopCloser(strings.NewReader("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":19}}}\n\n"))), outcome.Result{Contacted: true}, nil
+					firstBody = &countedBody{ReadCloser: io.NopCloser(strings.NewReader("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":19}}}\n\n"))}
+					return sseResponse(firstBody), outcome.Result{Contacted: true}, nil
 				}
-				return nil, verdict, tt.err
+				return nil, makeVerdict(), tt.err
 			}
 			got, err := guardRunner(t.Context(), 1).Serve(ctx, w, req)
 			if !errors.Is(err, tt.err) {
 				t.Fatalf("Serve: %v, want %v", err, tt.err)
 			}
-			want := verdict
-			var heads []int
-			wantCalls := 1
 			if tt.retry {
-				wantCalls++
-				heads = []int{200}
-				d := *verdict.Route.Compaction
-				d.InputTokens = new(19.0)
-				want.Route.Compaction = &d
+				if firstBody == nil {
+					t.Error("attempt 1 body was not created")
+				} else if n := firstBody.closes.Load(); n != 1 {
+					t.Errorf("attempt 1 body closed %d times, want 1", n)
+				}
 			}
 			if calls != wantCalls {
 				t.Errorf("Next called %d times, want %d", calls, wantCalls)

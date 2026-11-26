@@ -87,6 +87,20 @@ func TestLoadSettings(t *testing.T) {
 			},
 			wantJSON: `{"streamGuard":true,"retries":0,"maxBufferedBytes":4096}`,
 		},
+		"success: empty numeric strings coerce to zero": {
+			env: map[string]string{
+				"CODEX_GATEWAY_COMPACT_STREAM_RETRIES":        "",
+				"CODEX_GATEWAY_COMPACT_STREAM_RETRY_DELAY_MS": "",
+				"CODEX_GATEWAY_COMPACT_STREAM_MAX_BYTES":      "",
+			},
+			expected: compactguard.Settings{
+				StreamGuard:      true,
+				Retries:          0,
+				MaxBufferedBytes: 16 * 1024 * 1024,
+				RetryDelayMillis: 0,
+			},
+			wantJSON: `{"streamGuard":true,"retries":0,"maxBufferedBytes":16777216}`,
+		},
 		"success: explicit retries four": {
 			env: map[string]string{
 				"CODEX_GATEWAY_COMPACT_STREAM_RETRIES":        "4",

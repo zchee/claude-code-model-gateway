@@ -58,8 +58,18 @@ type Request struct {
 }
 
 // Serve consumes one stream per attempt and returns the terminal response facts.
-// The client context ends retry waits, not upstream reads already in flight.
 // The caller dispatches unguarded requests directly to their ordinary relay.
+//
+// The ctx parameter tracks client liveness. Once ctx is done, Serve starts no
+// new attempt (before any attempt or during a retry wait), stops heartbeats,
+// and writes nothing more to w; it does not end a peek or read already in
+// flight. Once in-flight upstream work finishes on its own (or if no attempt
+// was in flight), Serve returns with a nil error and Result.Cancelled false.
+//
+// Runner.ServiceContext bounds upstream peeking and reads. When it is done,
+// Serve closes any in-flight peek or stream body exactly once, writes nothing
+// more to w, and returns promptly with an error matching context.Canceled (or
+// the service context's cause).
 func (r Runner) Serve(ctx context.Context, w http.ResponseWriter, req Request) (outcome.Result, error) {
 	return outcome.Result{}, errors.New("not implemented")
 }

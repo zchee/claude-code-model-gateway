@@ -20,6 +20,7 @@ import (
 	"errors"
 	"io"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -80,14 +81,24 @@ func TestGuardPeekLifetime(t *testing.T) {
 			}
 			return sseResponse(body), outcome.Result{Contacted: true}, nil
 		}
+		w := httptest.NewRecorder()
 		done := make(chan error, 1)
-		go func() { _, err := guardRunner(service, 1).Serve(client, httptest.NewRecorder(), req); done <- err }()
+		joined := false
+		go func() { _, err := guardRunner(service, 1).Serve(client, w, req); done <- err }()
+		defer func() {
+			if !joined {
+				stop()
+				_ = wr.Close()
+				<-done
+			}
+		}()
+		synctest.Wait()
 		select {
 		case <-body.started:
 		case err := <-done:
+			joined = true
 			t.Fatalf("Serve ended before peek started: %v", err)
-		case <-time.After(time.Second):
-			_ = wr.Close()
+		default:
 			t.Fatal("peek did not start")
 		}
 		disconnect()
@@ -95,16 +106,29 @@ func TestGuardPeekLifetime(t *testing.T) {
 		if n := body.closes.Load(); n != 0 {
 			t.Errorf("client disconnect closed the in-flight peek %d times", n)
 		}
+		select {
+		case err := <-done:
+			joined = true
+			t.Fatalf("client disconnect ended in-flight peek: %v", err)
+		default:
+		}
 		stop()
 		synctest.Wait()
+		var err error
 		select {
-		case <-done:
-		case <-time.After(time.Second):
-			_ = wr.Close()
+		case err = <-done:
+			joined = true
+		default:
 			t.Fatal("worker shutdown did not stop the peek")
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("worker shutdown error = %v, want %v", err, context.Canceled)
 		}
 		if n := body.closes.Load(); n != 1 || calls != 1 {
 			t.Errorf("body closes=%d, attempts=%d; want one each", n, calls)
+		}
+		if w.Body.Len() != 0 {
+			t.Errorf("wrote body on shutdown: %q", w.Body.String())
 		}
 	})
 }
@@ -150,9 +174,12 @@ func TestGuardRetryDelaySynctest(t *testing.T) {
 					defer timer.Stop()
 				}
 				w := httptest.NewRecorder()
-				_, err := r.Serve(client, w, req)
-				if err != nil && (!tt.cancel || !errors.Is(err, context.Canceled)) {
+				res, err := r.Serve(client, w, req)
+				if err != nil {
 					t.Fatalf("Serve: %v", err)
+				}
+				if res.Cancelled {
+					t.Errorf("Serve set Cancelled = true, want false")
 				}
 				wantTimes := []time.Duration{0}
 				wantHeads := []bool{false}
@@ -162,6 +189,8 @@ func TestGuardRetryDelaySynctest(t *testing.T) {
 					if diff := gocmp.Diff(delivered(completeStream("delayed ok")), w.Body.String()); diff != "" {
 						t.Error(diff)
 					}
+				} else if w.Body.Len() != 0 {
+					t.Errorf("wrote body after client cancel: %q", w.Body.String())
 				}
 				if diff := gocmp.Diff(wantTimes, times); diff != "" {
 					t.Error(diff)
@@ -197,6 +226,18 @@ func (r *heartbeatRecorder) Flush() {
 	for n := bytes.Count(r.Body.Bytes(), []byte(": ping\n\n")); len(r.flushed) < n; {
 		r.flushed = append(r.flushed, time.Since(r.start))
 	}
+}
+
+func (r *heartbeatRecorder) snapshotFlushed() []time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.flushed)
+}
+
+func (r *heartbeatRecorder) bodyString() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.Body.String()
 }
 
 func TestGuardHeartbeatSynctest(t *testing.T) {
@@ -242,6 +283,116 @@ func TestGuardHeartbeatSynctest(t *testing.T) {
 		}
 		if diff := gocmp.Diff(strings.Repeat(": ping\n\n", 4)+advertisedStart+frameTextDelta("still alive")+frameMessageStop, w.Body.String()); diff != "" {
 			t.Error(diff)
+		}
+	})
+}
+
+func TestGuardHeartbeatStopsOnClientDisconnect(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		service, stop := context.WithCancel(t.Context())
+		defer stop()
+		client, disconnect := context.WithCancel(t.Context())
+		defer disconnect()
+		r := guardRunner(service, 1)
+		r.Settings.RetryDelayMillis = 250
+		req := guardRequest()
+		req.Stream.HeartbeatInterval = 20 * time.Second
+		w := &heartbeatRecorder{ResponseRecorder: httptest.NewRecorder(), start: time.Now()}
+		rd, wr := io.Pipe()
+		defer func() { _ = wr.Close() }()
+		body := &countedBody{ReadCloser: rd}
+		var calls atomic.Int32
+		req.Next = func(ctx context.Context, head bool) (*upstream.Response, outcome.Result, error) {
+			if ctx.Done() != client.Done() {
+				t.Error("Next did not receive client liveness")
+			}
+			if calls.Add(1) > 1 || head {
+				t.Errorf("unexpected Next call %d head=%v", calls.Load(), head)
+				return nil, outcome.Result{}, errors.New("unexpected retry")
+			}
+			return sseResponse(body), outcome.Result{Contacted: true}, nil
+		}
+		type serveResult struct {
+			res outcome.Result
+			err error
+		}
+		done := make(chan serveResult, 1)
+		joined := false
+		go func() {
+			res, err := r.Serve(client, w, req)
+			done <- serveResult{res: res, err: err}
+		}()
+		defer func() {
+			if !joined {
+				stop()
+				_ = wr.Close()
+				<-done
+			}
+		}()
+		time.Sleep(25 * time.Second)
+		synctest.Wait()
+		select {
+		case got := <-done:
+			joined = true
+			t.Fatalf("Serve ended before client disconnect: %v", got.err)
+		default:
+		}
+		if diff := gocmp.Diff([]time.Duration{20 * time.Second}, w.snapshotFlushed()); diff != "" {
+			t.Fatalf("heartbeats before disconnect (-want +got):\n%s", diff)
+		}
+		disconnect()
+		synctest.Wait()
+		if n := body.closes.Load(); n != 0 {
+			t.Errorf("client disconnect closed upstream body %d times", n)
+		}
+		select {
+		case got := <-done:
+			joined = true
+			t.Fatalf("Serve returned before upstream ended: %v", got.err)
+		default:
+		}
+		time.Sleep(35 * time.Second)
+		synctest.Wait()
+		if n := body.closes.Load(); n != 0 {
+			t.Errorf("upstream body closed %d times while still open", n)
+		}
+		select {
+		case got := <-done:
+			joined = true
+			t.Fatalf("Serve returned while upstream was still silent: %v", got.err)
+		default:
+		}
+		if diff := gocmp.Diff([]time.Duration{20 * time.Second}, w.snapshotFlushed()); diff != "" {
+			t.Errorf("heartbeats after disconnect (-want +got):\n%s", diff)
+		}
+		if diff := gocmp.Diff(": ping\n\n", w.bodyString()); diff != "" {
+			t.Errorf("body after disconnect (-want +got):\n%s", diff)
+		}
+		if err := wr.Close(); err != nil {
+			t.Fatalf("close upstream pipe: %v", err)
+		}
+		synctest.Wait()
+		var got serveResult
+		select {
+		case got = <-done:
+			joined = true
+		default:
+			t.Fatal("Serve did not return after upstream ended")
+		}
+		if got.err != nil {
+			t.Errorf("Serve error = %v, want nil", got.err)
+		}
+		if got.res.Cancelled {
+			t.Errorf("Serve set Cancelled = true, want false")
+		}
+		if n := body.closes.Load(); n != 1 || calls.Load() != 1 {
+			t.Errorf("body closes=%d, attempts=%d; want one each", n, calls.Load())
+		}
+		if diff := gocmp.Diff([]time.Duration{20 * time.Second}, w.snapshotFlushed()); diff != "" {
+			t.Errorf("final heartbeats (-want +got):\n%s", diff)
+		}
+		if diff := gocmp.Diff(": ping\n\n", w.bodyString()); diff != "" {
+			t.Errorf("final body (-want +got):\n%s", diff)
 		}
 	})
 }

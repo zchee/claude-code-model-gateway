@@ -25,6 +25,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -55,24 +56,24 @@ func incompleteFrame(provider string, n int) string {
 // Count only calls at the capture boundary; the real capture interprets the events.
 type observedCapture struct {
 	*usage.Capture
-	raw      int64
+	raw      atomic.Int64
 	resets   int
 	complete []bool
+	onRead   func(int64)
 }
 
-func (c *observedCapture) NoteResponseBytes(n int64) { c.raw += n; c.Capture.NoteResponseBytes(n) }
-func (c *observedCapture) ResetUsage()               { c.resets++; c.Capture.ResetUsage() }
+func (c *observedCapture) NoteResponseBytes(n int64) {
+	total := c.raw.Add(n)
+	c.Capture.NoteResponseBytes(n)
+	if n > 0 && c.onRead != nil {
+		c.onRead(total)
+	}
+}
+func (c *observedCapture) ResetUsage() { c.resets++; c.Capture.ResetUsage() }
 func (c *observedCapture) SetResponseComplete(b bool) {
 	c.complete = append(c.complete, b)
 	c.Capture.SetResponseComplete(b)
 }
-
-type countedBody struct {
-	io.ReadCloser
-	closes atomic.Int32
-}
-
-func (b *countedBody) Close() error { b.closes.Add(1); return b.ReadCloser.Close() }
 
 func bindLoopback(t *testing.T, service context.Context, origin string, req *compactguard.Request, before func(bool)) {
 	t.Helper()
@@ -80,9 +81,15 @@ func bindLoopback(t *testing.T, service context.Context, origin string, req *com
 	t.Cleanup(func() { _ = client.Close() })
 	prepared := upstream.Request{Target: upstream.TargetProxy, Method: http.MethodPost, BaseURL: origin, RequestURI: req.PathOnly, Body: req.Body}
 	req.UpstreamOrigin = origin
-	var bodies []*countedBody
+	var (
+		mu     sync.Mutex
+		bodies []*countedBody
+	)
 	t.Cleanup(func() {
-		for i, b := range bodies {
+		mu.Lock()
+		list := slices.Clone(bodies)
+		mu.Unlock()
+		for i, b := range list {
 			if n := b.closes.Load(); n != 1 {
 				t.Errorf("attempt %d body closed %d times, want once", i, n)
 				if n == 0 {
@@ -99,7 +106,9 @@ func bindLoopback(t *testing.T, service context.Context, origin string, req *com
 		if err == nil {
 			b := &countedBody{ReadCloser: resp.Body}
 			resp.Body = b
+			mu.Lock()
 			bodies = append(bodies, b)
+			mu.Unlock()
 		}
 		return resp, outcome.Result{Contacted: true}, err
 	}
@@ -121,7 +130,7 @@ func TestGuardRetryAndDelivery(t *testing.T) {
 	}{
 		"success: healthy proxy advertises the client model":                  {attempts: []string{success}, retries: 2, body: delivered(success), label: "completed", terminal: "message_stop"},
 		"success: inferred terminal appended once":                            {attempts: []string{strings.TrimSuffix(success, frameMessageStop)}, retries: 2, body: delivered(success), label: "completed"},
-		"success: empty summary is complete":                                  {attempts: []string{frameMessageStart + frameMessageStop}, body: advertisedStart + frameMessageStop, label: "empty_summary", terminal: "message_stop"},
+		"success: empty summary is complete":                                  {attempts: []string{frameMessageStart + frameMessageStop}, retries: 1, body: advertisedStart + frameMessageStop, label: "empty_summary", terminal: "message_stop"},
 		"success: discarded error contributes no usage to a successful retry": {attempts: []string{firstUsage + truncatedStream() + missingTerminal, lastUsage + success}, retries: 2, body: lastUsage + delivered(success), label: "completed", terminal: "message_stop", output: new(0.0)},
 		"success: transformed ceiling stays buffered and replacement fits":    {attempts: []string{first, success}, retries: 1, cap: len(delivered(first)), body: delivered(success), label: "completed", terminal: "message_stop"},
 		"error: one transformed byte over loses retry cover":                  {attempts: []string{first}, retries: 1, cap: len(delivered(first)) - 1, body: delivered(first) + incompleteFrame("Codex", 1), label: "incomplete", override: "upstream_error", warn: true},
@@ -199,8 +208,8 @@ func TestGuardRetryAndDelivery(t *testing.T) {
 			if !res.Contacted || res.Status != 200 || res.StatusOverride != tt.override {
 				t.Errorf("terminal result: %+v", res)
 			}
-			if obs.raw != total || obs.resets != len(tt.attempts)-1 {
-				t.Errorf("capture observed bytes=%d resets=%d; want %d/%d", obs.raw, obs.resets, total, len(tt.attempts)-1)
+			if obs.raw.Load() != total || obs.resets != len(tt.attempts)-1 {
+				t.Errorf("capture observed bytes=%d resets=%d; want %d/%d", obs.raw.Load(), obs.resets, total, len(tt.attempts)-1)
 			}
 			if diff := gocmp.Diff([]bool{tt.label == "completed" || tt.label == "empty_summary"}, obs.complete); diff != "" {
 				t.Error(diff)
@@ -253,7 +262,13 @@ func TestGuardLMStudioPeek(t *testing.T) {
 			req.ProxyProvider = tt.provider
 			req.Stream.Provider = tt.provider
 			w := &headRecorder{ResponseRecorder: httptest.NewRecorder()}
-			bindLoopback(t, service, srv.URL, &req, nil)
+			var heads []bool
+			bindLoopback(t, service, srv.URL, &req, func(head bool) {
+				if head != (len(w.heads) > 0) {
+					t.Errorf("head=%v at Next, writes=%v", head, w.heads)
+				}
+				heads = append(heads, head)
+			})
 			var peeks, overflows int
 			req.Stream.OnPeek = func() {
 				peeks++
@@ -276,8 +291,20 @@ func TestGuardLMStudioPeek(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Serve: %v", err)
 			}
-			if tt.broken && (res.Status != 200 || (res.StatusOverride != "upstream_aborted" && res.StatusOverride != "upstream_error")) {
-				t.Errorf("broken peek result: %+v", res)
+			wantHeads := make([]bool, len(tt.attempts))
+			for i := range tt.attempts {
+				wantHeads[i] = i > 0
+			}
+			if diff := gocmp.Diff(wantHeads, heads); diff != "" {
+				t.Error(diff)
+			}
+			if tt.broken {
+				if res.Status != 200 || (res.StatusOverride != "upstream_aborted" && res.StatusOverride != "upstream_error") {
+					t.Errorf("broken peek result: %+v", res)
+				}
+				if gotCT := w.Header().Get("Content-Type"); gotCT != "application/json" {
+					t.Errorf("502 Content-Type = %q, want %q", gotCT, "application/json")
+				}
 			}
 			if tt.overflows > 0 && res.Status != 413 {
 				t.Errorf("overflow result lost: %+v", res)
