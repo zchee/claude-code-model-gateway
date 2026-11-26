@@ -22,6 +22,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"syscall"
+	"time"
 
 	"github.com/zchee/claude-code-model-gateway/internal/config"
 	"github.com/zchee/claude-code-model-gateway/internal/readiness"
@@ -61,7 +64,65 @@ type Options struct {
 }
 
 // NewHandler constructs the handler shared by the TCP and Unix listeners.
-func NewHandler(options Options) (http.Handler, error) { return nil, errors.New("not implemented") }
+//
+// The handler answers the drain, health and catalog endpoints and HEAD locally, matched on the raw request target cut
+// at '?'. Every other request is buffered, classified against the published route snapshot (or the fallback catalog
+// before the first publication) and handed to the branch the classification selects. A classifier refusal is answered
+// here with HTTP 400 and never reaches a branch. Served counters count admissions, not completions.
+func NewHandler(options Options) (http.Handler, error) {
+	if !validToken(options.ControlToken) {
+		return nil, errors.New("model-gateway: the worker needs a valid local control token before serving")
+	}
+	if options.Lookup == nil {
+		options.Lookup = func(string) (string, bool) { return "", false }
+	}
+	return newHandler(options), nil
+}
+
+func validToken(token string) bool {
+	if len(token) != 64 {
+		return false
+	}
+	for i := range len(token) {
+		if b := token[i]; (b < '0' || b > '9') && (b < 'a' || b > 'f') {
+			return false
+		}
+	}
+	return true
+}
 
 // ListenUnix binds path, reclaiming a refused socket but never a live owner or non-socket file.
-func ListenUnix(path string) (net.Listener, error) { return nil, errors.New("not implemented") }
+//
+// A worker that died without closing leaves its socket file behind, and binding over it fails with EADDRINUSE although
+// nothing answers there. Only a refused connection to an actual socket proves that no process owns the path
+// (lib/request-worker.js:1180-1206). Any other bind failure is returned unchanged.
+func ListenUnix(path string) (net.Listener, error) {
+	addr := &net.UnixAddr{Name: path, Net: "unix"}
+	ln, err := net.ListenUnix("unix", addr)
+	if err == nil {
+		return ln, nil
+	}
+	if !errors.Is(err, syscall.EADDRINUSE) || !removeStaleSocket(path) {
+		return nil, err
+	}
+	return net.ListenUnix("unix", addr)
+}
+
+// staleProbeTimeout bounds the connection attempt that decides whether a socket file still has an owner.
+const staleProbeTimeout = 2 * time.Second
+
+func removeStaleSocket(path string) bool {
+	conn, err := (&net.Dialer{Timeout: staleProbeTimeout}).Dial("unix", path)
+	if err == nil {
+		_ = conn.Close()
+		return false
+	}
+	if !errors.Is(err, syscall.ECONNREFUSED) {
+		return false
+	}
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode()&os.ModeSocket == 0 {
+		return false
+	}
+	return os.Remove(path) == nil
+}
