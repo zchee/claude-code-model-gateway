@@ -139,8 +139,14 @@ type peekOutcome struct {
 
 // peekFirst reads r up to the first complete SSE frame that carries data, the wait deadline,
 // or the end of the body. On an overflow or an abnormal end it closes r; otherwise r stays open
-// and may still have the read that was in flight when the wait ran out.
+// and may still have the read that was in flight when the wait ran out. A service context that
+// has ended closes r and returns its error: on entry (whatever the wait), before each read, and
+// over a read error, since closing the transport on shutdown also fails the read in flight.
 func peekFirst(ctx context.Context, r *asyncReader, wait time.Duration) (peekOutcome, error) {
+	if err := ctx.Err(); err != nil {
+		_ = r.close()
+		return peekOutcome{}, err
+	}
 	if wait == 0 {
 		wait = DefaultFirstEventWait
 	}
@@ -154,6 +160,10 @@ func peekFirst(ctx context.Context, r *asyncReader, wait time.Duration) (peekOut
 	var prefix []byte
 	buf := make([]byte, readBufferSize)
 	for {
+		if err := ctx.Err(); err != nil {
+			_ = r.close()
+			return peekOutcome{}, err
+		}
 		r.request(buf)
 		select {
 		case res := <-r.results:
@@ -171,6 +181,9 @@ func peekFirst(ctx context.Context, r *asyncReader, wait time.Duration) (peekOut
 				return peekOutcome{prefix: prefix, termErr: res.err}, nil
 			case res.err != nil:
 				_ = r.close()
+				if err := ctx.Err(); err != nil {
+					return peekOutcome{}, err
+				}
 				return peekOutcome{earlyEnd: overrideAborted}, nil
 			}
 		case <-timer.C:
@@ -261,7 +274,8 @@ func (b *replayBody) Close() error { return b.r.close() }
 // On wait expiration, PeekFirstEvent does not close the usable stream and does not leave a goroutine
 // racing a second reader; the single reader transfers to the returned Body whose Close unblocks and
 // joins it. On ctx cancellation, PeekFirstEvent closes body, joins its reader goroutine, and returns
-// ctx.Err().
+// ctx.Err(); so does a ctx that has already ended on entry (whatever the wait), and a ctx that has
+// ended by the time a read error arrives, which then reports no EarlyEndOverride.
 func PeekFirstEvent(ctx context.Context, body io.ReadCloser, wait time.Duration) (PeekResult, error) {
 	if body == nil {
 		return PeekResult{}, errNilBody

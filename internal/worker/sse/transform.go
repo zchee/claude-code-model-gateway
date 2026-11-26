@@ -352,7 +352,11 @@ func (o *EventObserver) Write(chunk []byte) {
 		o.inspect(rest[:start])
 		rest, from = rest[end:], 0
 	}
-	o.pending = append(o.pending[:0], rest...)
+	// Without a complete frame rest is all of pending; copying it onto itself on every chunk of a
+	// long frame would cost time quadratic in the frame's length.
+	if len(rest) != len(o.pending) {
+		o.pending = append(o.pending[:0], rest...)
+	}
 	o.scanFrom = max(len(o.pending)-3, 0)
 }
 

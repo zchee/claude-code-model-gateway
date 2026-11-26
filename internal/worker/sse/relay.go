@@ -15,6 +15,7 @@
 package sse
 
 import (
+	"bufio"
 	"compress/gzip"
 	"compress/zlib"
 	"context"
@@ -71,10 +72,11 @@ func copyRelayHeaders(dst http.Header, resp *upstream.Response, dropContentLengt
 // relayHeader returns a response header value as the source runtime's parsed header object
 // holds it: repeated fields joined with ", ".
 func relayHeader(resp *upstream.Response, name string) string {
-	if resp.RelayHeader != nil {
-		return resp.RelayHeader.Get(name)
+	src := resp.RelayHeader
+	if src == nil {
+		src = resp.Header
 	}
-	return strings.Join(resp.Header.Values(name), ", ")
+	return strings.Join(src.Values(name), ", ")
 }
 
 // heartbeatInterval resolves a configured interval: zero is the default, negative disables.
@@ -100,8 +102,12 @@ type streamer struct {
 	heartbeat  *time.Timer
 }
 
+// newStreamer starts the heartbeat only for a client that is still there.
 func newStreamer(w http.ResponseWriter, clientDone <-chan struct{}, interval time.Duration) *streamer {
 	s := &streamer{w: w, rc: http.NewResponseController(w), clientDone: clientDone, interval: interval}
+	if s.clientGone() {
+		return s
+	}
 	if interval > 0 {
 		s.heartbeat = time.NewTimer(interval)
 	}
@@ -138,19 +144,27 @@ func (s *streamer) markGone() {
 	s.stop()
 }
 
+// closed reports, without blocking, whether done has been closed; a nil channel never is.
+func closed(done <-chan struct{}) bool {
+	select {
+	case <-done:
+		return true
+	default:
+		return false
+	}
+}
+
 // clientGone reports whether the client is gone, checking ClientDone without blocking so that
 // no write races a disconnect the select loop has not yet seen.
 func (s *streamer) clientGone() bool {
 	if s.gone {
 		return true
 	}
-	select {
-	case <-s.clientDone:
+	if closed(s.clientDone) {
 		s.markGone()
 		return true
-	default:
-		return false
 	}
+	return false
 }
 
 // write sends b to the client unless the client is gone. A response status that allows no body
@@ -170,7 +184,7 @@ func (s *streamer) write(b []byte) {
 
 // flush pushes written bytes to the client; nothing is flushed before the first write.
 func (s *streamer) flush() {
-	if !s.unflushed || s.gone {
+	if !s.unflushed || s.clientGone() {
 		return
 	}
 	s.unflushed = false
@@ -189,6 +203,16 @@ func (s *streamer) beat() {
 	if !s.gone {
 		s.arm()
 	}
+}
+
+// shutdownBeforeHead reports a service shutdown seen before the relay wrote the response head:
+// nothing reached the client, so the context's error is returned unless the client is gone.
+func shutdownBeforeHead(ctx context.Context, status int, clientGone bool) (outcome.Result, error) {
+	res := outcome.Result{Status: status, StatusOverride: overrideAborted}
+	if clientGone {
+		return res, nil
+	}
+	return res, ctx.Err()
 }
 
 // abortResult reports a relay ended by service shutdown: nil error once the client is gone,
@@ -220,8 +244,15 @@ func brokenResult(status int, clientGone bool) (outcome.Result, error) {
 // It copies relay headers from resp.RelayHeader (or resp.Header if RelayHeader is nil) minus
 // hop-by-hop and Content-Length headers without mutating resp.Header or resp.RelayHeader.
 // It takes ownership of resp.Body and closes it before returning.
+// A client that is already gone when the head would be written gets nothing, not even the head
+// (no early-end 502 either), and no heartbeat. A ctx that has ended before RelayProxy writes the
+// head closes resp.Body and returns ctx.Err() (nil once the client is gone); with HeadWritten it
+// returns the abort described next. ctx is checked again before every upstream read.
 // If the upstream breaks after response headers are committed, RelayProxy returns the terminal
 // outcome facts alongside http.ErrAbortHandler rather than panicking.
+// When the first-event peek finds an engine overflow, OnOverflow is called even if the client is
+// already gone, because the refusal must still reach the sentry; what it writes to w then is the
+// responder's contract.
 func RelayProxy(ctx context.Context, w http.ResponseWriter, resp *upstream.Response, opts ProxyOptions) (outcome.Result, error) {
 	if resp == nil || resp.Body == nil {
 		return outcome.Result{}, errNilResponse
@@ -239,27 +270,36 @@ func RelayProxy(ctx context.Context, w http.ResponseWriter, resp *upstream.Respo
 		peeked, err := peekFirst(ctx, body, opts.FirstEventWait)
 		switch {
 		case err != nil:
-			return outcome.Result{Status: status, StatusOverride: overrideAborted}, err
+			return shutdownBeforeHead(ctx, status, closed(opts.ClientDone))
 		case peeked.overflow != nil:
 			if opts.OnOverflow == nil {
 				return outcome.Result{Status: status}, errNoOverflowResponder
 			}
 			return opts.OnOverflow(w, status, *peeked.overflow)
 		case peeked.earlyEnd != "":
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadGateway)
-			_, _ = io.WriteString(w, earlyEndBody)
+			if !closed(opts.ClientDone) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadGateway)
+				_, _ = io.WriteString(w, earlyEndBody)
+			}
 			return outcome.Result{Status: status, StatusOverride: peeked.earlyEnd}, nil
 		}
 		prefix, termErr = peeked.prefix, peeked.termErr
 	}
 
-	if !opts.HeadWritten {
+	s := newStreamer(w, opts.ClientDone, heartbeatInterval(opts.HeartbeatInterval))
+	defer s.stop()
+	if ctx.Err() != nil {
+		_ = body.close()
+		if opts.HeadWritten {
+			return abortResult(ctx, status, s.clientGone())
+		}
+		return shutdownBeforeHead(ctx, status, s.clientGone())
+	}
+	if !opts.HeadWritten && !s.clientGone() {
 		copyRelayHeaders(w.Header(), resp, true)
 		w.WriteHeader(status)
 	}
-	s := newStreamer(w, opts.ClientDone, heartbeatInterval(opts.HeartbeatInterval))
-	defer s.stop()
 
 	var attempt Attempt
 	transformer := NewTransformer(TransformerConfig{
@@ -298,6 +338,10 @@ func RelayProxy(ctx context.Context, w http.ResponseWriter, resp *upstream.Respo
 	}
 	buf := make([]byte, readBufferSize)
 	for termErr == nil {
+		if ctx.Err() != nil {
+			_ = body.close()
+			return abortResult(ctx, status, s.clientGone())
+		}
 		body.request(buf)
 		select {
 		case res := <-body.results:
@@ -465,26 +509,35 @@ func startSideDecoder(encoding string, events *EventObserver, onFailure func()) 
 	return d
 }
 
-// decodeInto feeds the decompressed stream to events until the compressed stream ends.
+// decodeInto feeds the decompressed stream to events until the compressed stream ends. An empty
+// compressed body decodes to nothing for every encoding, as brotli and the source runtime's
+// decompressors treat it; the gzip and zlib readers would report a missing header instead.
 func decodeInto(encoding string, r io.Reader, events *EventObserver) error {
+	br := bufio.NewReader(r)
+	if _, err := br.Peek(1); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		return err
+	}
 	var decoded io.Reader
 	switch encoding {
 	case "gzip":
-		zr, err := gzip.NewReader(r)
+		zr, err := gzip.NewReader(br)
 		if err != nil {
 			return err
 		}
 		defer func() { _ = zr.Close() }()
 		decoded = zr
 	case "deflate":
-		zr, err := zlib.NewReader(r)
+		zr, err := zlib.NewReader(br)
 		if err != nil {
 			return err
 		}
 		defer func() { _ = zr.Close() }()
 		decoded = zr
 	case "br":
-		decoded = brotli.NewReader(r)
+		decoded = brotli.NewReader(br)
 	default:
 		return errUnsupportedEncoding
 	}
@@ -530,9 +583,14 @@ func (d *sideDecoder) abandon() {
 // updates sentry state, and pauses reading resp.Body for back-pressure without eagerly closing the
 // provider until ctx is canceled. When ctx ends after the client is gone, RelayPassthrough closes
 // resp.Body and returns a nil error (neither ctx.Err() nor http.ErrAbortHandler). RelayPassthrough
-// never sets outcome.Result.Cancelled. If the upstream breaks after response headers are committed,
-// RelayPassthrough returns the terminal outcome facts alongside http.ErrAbortHandler rather than
-// panicking.
+// never sets outcome.Result.Cancelled. A client that is already gone on entry gets nothing, not even
+// the head, no heartbeat and no upstream read. A ctx that has ended before the head is written closes
+// resp.Body and returns ctx.Err() (nil once the client is gone); ctx is checked again before every
+// upstream read. At a clean end of the body, observation finishes whenever every chunk read was
+// observed, even when the client left after the last one; it is abandoned only when a chunk that
+// arrived after the client left was discarded. If the upstream breaks after response headers are
+// committed, RelayPassthrough returns the terminal outcome facts alongside http.ErrAbortHandler
+// rather than panicking.
 func RelayPassthrough(ctx context.Context, w http.ResponseWriter, resp *upstream.Response, opts PassthroughOptions) (outcome.Result, error) {
 	if resp == nil || resp.Body == nil {
 		return outcome.Result{}, errNilResponse
@@ -541,30 +599,47 @@ func RelayPassthrough(ctx context.Context, w http.ResponseWriter, resp *upstream
 	body := newAsyncReader(resp.Body)
 	defer func() { _ = body.close() }()
 
-	copyRelayHeaders(w.Header(), resp, false)
-	w.WriteHeader(status)
-
-	observer := newPassthroughObserver(resp, opts)
-	defer observer.abandon()
 	var interval time.Duration
 	if opts.ProxyProvider != "" && isEventStream(resp) {
 		interval = heartbeatInterval(opts.HeartbeatInterval)
 	}
 	s := newStreamer(w, opts.ClientDone, interval)
 	defer s.stop()
+	if ctx.Err() != nil {
+		_ = body.close()
+		return shutdownBeforeHead(ctx, status, s.clientGone())
+	}
+	if !s.clientGone() {
+		copyRelayHeaders(w.Header(), resp, false)
+		w.WriteHeader(status)
+	}
+
+	observer := newPassthroughObserver(resp, opts)
+	defer observer.abandon()
 
 	buf := make([]byte, readBufferSize)
 	var termErr error
+	// discarded records a chunk that arrived after the client left and was never observed.
+	discarded := false
 	for termErr == nil {
+		if ctx.Err() != nil {
+			observer.abandon()
+			_ = body.close()
+			return abortResult(ctx, status, s.clientGone())
+		}
 		// A client that is gone gets no further reads: the provider is held by back-pressure.
-		if !s.gone {
+		if !s.clientGone() {
 			body.request(buf)
 		}
 		select {
 		case res := <-body.results:
 			body.got(res)
 			termErr = res.err
-			if s.clientGone() || len(res.data) == 0 {
+			if len(res.data) == 0 {
+				continue
+			}
+			if s.clientGone() {
+				discarded = true
 				continue
 			}
 			s.arm()
@@ -581,7 +656,7 @@ func RelayPassthrough(ctx context.Context, w http.ResponseWriter, resp *upstream
 			return abortResult(ctx, status, s.clientGone())
 		}
 	}
-	if !errors.Is(termErr, io.EOF) || s.clientGone() {
+	if !errors.Is(termErr, io.EOF) || discarded {
 		observer.abandon()
 		_ = body.close()
 		switch {
