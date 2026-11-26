@@ -183,6 +183,7 @@ type PeekResult struct {
 }
 
 // PeekFirstEvent inspects body up to its first complete SSE data event or wait deadline.
+// The ctx parameter is the service-owned lifetime context, not the client request context.
 // PeekFirstEvent takes ownership of body on entry. A zero wait uses DefaultFirstEventWait;
 // a negative wait times out immediately.
 //
@@ -207,8 +208,9 @@ type ProxyOptions struct {
 	FilterPlanTools   bool
 	IsCompaction      bool
 	HeadWritten       bool
-	HeartbeatInterval time.Duration // Zero uses DefaultHeartbeatInterval; negative disables heartbeats.
-	FirstEventWait    time.Duration // Zero uses DefaultFirstEventWait; negative times out immediately.
+	HeartbeatInterval time.Duration   // Zero uses DefaultHeartbeatInterval; negative disables heartbeats.
+	FirstEventWait    time.Duration   // Zero uses DefaultFirstEventWait; negative times out immediately.
+	ClientDone        <-chan struct{} // Optional signal closed when the client disconnects (nil means never).
 	SessionKey        string
 	Sentry            *sentry.State
 	SentryTarget      sentry.Target
@@ -219,6 +221,10 @@ type ProxyOptions struct {
 
 // RelayProxy relays a 2xx proxy SSE response to w with model rewriting, plan-tool filtering,
 // heartbeats, sentry observation, and (for eligible LM Studio streams) first-event overflow peeking.
+// The ctx parameter is the service-owned lifetime context, not the client request context.
+// When opts.ClientDone closes or a write to w fails, RelayProxy stops heartbeats and writes nothing
+// more to w, then drains the finite upstream tail (observing usage and sentry) until EOF or ctx
+// cancellation. It never sets outcome.Result.Cancelled.
 // It copies relay headers from resp.RelayHeader (or resp.Header if RelayHeader is nil) minus
 // hop-by-hop and Content-Length headers without mutating resp.Header or resp.RelayHeader.
 // It takes ownership of resp.Body and closes it before returning.
@@ -235,24 +241,28 @@ func RelayProxy(ctx context.Context, w http.ResponseWriter, resp *upstream.Respo
 // PassthroughOptions configures untouched streaming relay for Anthropic responses
 // and non-2xx or non-rewritten responses.
 type PassthroughOptions struct {
-	ProxyProvider     string        // Empty for Anthropic passthrough; non-empty enables proxy heartbeat and eligible sentry observation on 2xx SSE.
-	HeartbeatInterval time.Duration // Used only when ProxyProvider is nonempty; zero uses DefaultHeartbeatInterval; negative disables.
-	MaxObserveBytes   int           // Pending-frame byte budget for side-branch SSE observation; non-positive uses DefaultMaxObserveBytes.
-	SessionKey        string        // Used only when ProxyProvider is nonempty; Anthropic passthrough never touches Sentry.
-	Sentry            *sentry.State // Used only when ProxyProvider is nonempty; Anthropic passthrough never touches Sentry.
-	SentryTarget      sentry.Target // Used only when ProxyProvider is nonempty; Anthropic passthrough never touches Sentry.
+	ProxyProvider     string          // Empty for Anthropic passthrough; non-empty enables proxy heartbeat and eligible sentry observation on 2xx SSE.
+	HeartbeatInterval time.Duration   // Used only when ProxyProvider is nonempty; zero uses DefaultHeartbeatInterval; negative disables.
+	MaxObserveBytes   int             // Pending-frame byte budget for side-branch SSE observation; non-positive uses DefaultMaxObserveBytes.
+	ClientDone        <-chan struct{} // Optional signal closed when the client disconnects (nil means never).
+	SessionKey        string          // Used only when ProxyProvider is nonempty; Anthropic passthrough never touches Sentry.
+	Sentry            *sentry.State   // Used only when ProxyProvider is nonempty; Anthropic passthrough never touches Sentry.
+	SentryTarget      sentry.Target   // Used only when ProxyProvider is nonempty; Anthropic passthrough never touches Sentry.
 	Usage             UsageCapture
 }
 
 // RelayPassthrough forwards upstream status, relay headers minus hop-by-hop headers, and raw body bytes
-// unchanged, flushing each chunk. It copies headers from resp.RelayHeader (or resp.Header if RelayHeader
-// is nil) without mutating resp.Header or resp.RelayHeader, and owns resp.Body. For 2xx SSE responses
-// with Usage or eligible proxy Sentry set, it decodes gzip, deflate, or br on a side branch subject to
-// MaxObserveBytes without altering delivered bytes. Anthropic passthrough (ProxyProvider == "") never
-// sends heartbeats and never updates sentry state; on client write failure it pauses reading resp.Body
-// for back-pressure without eagerly closing the provider until ctx (the service-owned lifetime context)
-// is canceled. If the upstream breaks after response headers are committed, RelayPassthrough returns
-// the terminal outcome facts alongside http.ErrAbortHandler rather than panicking.
+// unchanged, flushing each chunk. The ctx parameter is the service-owned lifetime context, not the
+// client request context. It copies headers from resp.RelayHeader (or resp.Header if RelayHeader is nil)
+// without mutating resp.Header or resp.RelayHeader, takes ownership of resp.Body, and closes it before
+// returning. For 2xx SSE responses with Usage or eligible proxy Sentry set, it decodes gzip, deflate,
+// or br on a side branch subject to MaxObserveBytes without altering delivered bytes. When
+// opts.ClientDone closes or a write to w fails, RelayPassthrough stops heartbeats (if enabled) and
+// writes nothing more to w; Anthropic passthrough (ProxyProvider == "") never sends heartbeats, never
+// updates sentry state, and pauses reading resp.Body for back-pressure without eagerly closing the
+// provider until ctx is canceled. RelayPassthrough never sets outcome.Result.Cancelled. If the upstream
+// breaks after response headers are committed, RelayPassthrough returns the terminal outcome facts
+// alongside http.ErrAbortHandler rather than panicking.
 func RelayPassthrough(ctx context.Context, w http.ResponseWriter, resp *upstream.Response, opts PassthroughOptions) (outcome.Result, error) {
 	_ = ctx
 	_ = w

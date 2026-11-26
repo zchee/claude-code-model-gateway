@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -131,14 +132,16 @@ func TestForwardMalformedUTF8Unchanged(t *testing.T) {
 			h := startRelayServer(t, upSrv.URL, func(serviceCtx context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
 				if tt.passthrough {
 					return sse.RelayPassthrough(serviceCtx, w, up, sse.PassthroughOptions{
-						Usage: &usageSpy{},
+						ClientDone: r.Context().Done(),
+						Usage:      &usageSpy{},
 					})
 				}
-				return sse.RelayProxy(r.Context(), w, up, sse.ProxyOptions{
+				return sse.RelayProxy(serviceCtx, w, up, sse.ProxyOptions{
 					Provider:          "codex",
 					AdvertisedModel:   "claude-gpt-5.6-sol",
 					BackendModel:      "gpt-5.6-sol",
 					HeartbeatInterval: -1,
+					ClientDone:        r.Context().Done(),
 				})
 			})
 
@@ -230,20 +233,24 @@ func TestLocalNonStudioNoPeek(t *testing.T) {
 			var peekCalls atomic.Int64
 			var mu sync.Mutex
 			var overflows []recordedOverflow
+			var wantOverflowRes outcome.Result
 
-			h := startRelayServer(t, upSrv.URL, func(_ context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
-				return sse.RelayProxy(r.Context(), w, up, sse.ProxyOptions{
+			h := startRelayServer(t, upSrv.URL, func(serviceCtx context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
+				return sse.RelayProxy(serviceCtx, w, up, sse.ProxyOptions{
 					Provider:          tt.provider,
 					AdvertisedModel:   tt.advertisedModel,
 					BackendModel:      tt.backendModel,
 					HeartbeatInterval: -1,
 					FirstEventWait:    10 * time.Second,
+					ClientDone:        r.Context().Done(),
 					OnPeek:            func() { peekCalls.Add(1) },
 					OnOverflow: func(w http.ResponseWriter, upstreamStatus int, counts sentry.Counts) (outcome.Result, error) {
+						outRes, outErr := testEngineOverflowResponder(w, upstreamStatus, counts)
 						mu.Lock()
 						overflows = append(overflows, recordedOverflow{Counts: counts, UpstreamStatus: upstreamStatus})
+						wantOverflowRes = outRes
 						mu.Unlock()
-						return testEngineOverflowResponder(w, upstreamStatus, counts)
+						return outRes, outErr
 					},
 				})
 			})
@@ -277,6 +284,7 @@ func TestLocalNonStudioNoPeek(t *testing.T) {
 			}
 			mu.Lock()
 			gotOverflows := append([]recordedOverflow(nil), overflows...)
+			gotWantRes := wantOverflowRes
 			mu.Unlock()
 			if len(gotOverflows) != tt.wantOverflow {
 				t.Fatalf("overflow callbacks = %d, want %d", len(gotOverflows), tt.wantOverflow)
@@ -293,6 +301,9 @@ func TestLocalNonStudioNoPeek(t *testing.T) {
 				if diff := gocmp.Diff(want, gotOverflows[0]); diff != "" {
 					t.Errorf("overflow details mismatch (-want +got):\n%s", diff)
 				}
+				if diff := gocmp.Diff(gotWantRes, res); diff != "" {
+					t.Errorf("outcome.Result propagated from OnOverflow (-want +got):\n%s", diff)
+				}
 			}
 		})
 	}
@@ -301,12 +312,13 @@ func TestLocalNonStudioNoPeek(t *testing.T) {
 	t.Run("success: non-studio route commits status without peeking and flushes only on output", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			pr, pw := io.Pipe()
+			src := &trackedReadCloser{ReadCloser: pr}
 			rec := newStreamingRecorder()
 			up := &upstream.Response{
 				StatusCode:  http.StatusOK,
 				Header:      http.Header{"Content-Type": []string{"text/event-stream"}},
 				RelayHeader: http.Header{"Content-Type": []string{"text/event-stream"}},
-				Body:        pr,
+				Body:        src,
 			}
 			var peekCalls atomic.Int64
 			done := make(chan handlerOutcome, 1)
@@ -318,8 +330,7 @@ func TestLocalNonStudioNoPeek(t *testing.T) {
 					HeartbeatInterval: -1,
 					OnPeek:            func() { peekCalls.Add(1) },
 				})
-				_ = pr.Close()
-				done <- handlerOutcome{res: res, err: err}
+				done <- handlerOutcome{res: res, err: err, bodyClosed: src.closed.Load()}
 			}()
 			joined := false
 			defer func() {
@@ -362,10 +373,19 @@ func TestLocalNonStudioNoPeek(t *testing.T) {
 			}
 
 			_ = pw.Close()
-			out := <-done
-			joined = true
+			synctest.Wait()
+			var out handlerOutcome
+			select {
+			case out = <-done:
+				joined = true
+			default:
+				t.Fatal("RelayProxy did not return after upstream EOF")
+			}
 			if out.err != nil {
 				t.Fatalf("RelayProxy returned %v, want nil", out.err)
+			}
+			if !out.bodyClosed {
+				t.Errorf("RelayProxy returned without closing owned resp.Body")
 			}
 		})
 	})
@@ -404,12 +424,13 @@ func TestProxyRelayFlushAndHeaders(t *testing.T) {
 		t.Cleanup(releaseSecond)
 
 		usage := &usageSpy{}
-		h := startRelayServer(t, upSrv.URL, func(_ context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
-			return sse.RelayProxy(r.Context(), w, up, sse.ProxyOptions{
+		h := startRelayServer(t, upSrv.URL, func(serviceCtx context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
+			return sse.RelayProxy(serviceCtx, w, up, sse.ProxyOptions{
 				Provider:          "codex",
 				AdvertisedModel:   "claude-gpt-5.6-sol",
 				BackendModel:      "gpt-5.6-sol",
 				HeartbeatInterval: -1,
+				ClientDone:        r.Context().Done(),
 				Usage:             usage,
 			})
 		})
@@ -486,12 +507,13 @@ func TestProxyRelayFlushAndHeaders(t *testing.T) {
 	t.Run("success: deterministic pipe proves each completed proxy frame is flushed before next arrives", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			pr, pw := io.Pipe()
+			src := &trackedReadCloser{ReadCloser: pr}
 			rec := newStreamingRecorder()
 			up := &upstream.Response{
 				StatusCode:  http.StatusOK,
 				Header:      http.Header{"Content-Type": []string{"text/event-stream"}, "Content-Length": []string{strconv.Itoa(len(firstFrame) + len(secondFrame))}},
 				RelayHeader: http.Header{"Content-Type": []string{"text/event-stream"}, "Content-Length": []string{strconv.Itoa(len(firstFrame) + len(secondFrame))}},
-				Body:        pr,
+				Body:        src,
 			}
 			done := make(chan handlerOutcome, 1)
 			go func() {
@@ -501,8 +523,7 @@ func TestProxyRelayFlushAndHeaders(t *testing.T) {
 					BackendModel:      "gpt-5.6-sol",
 					HeartbeatInterval: -1,
 				})
-				_ = pr.Close()
-				done <- handlerOutcome{res: res, err: err}
+				done <- handlerOutcome{res: res, err: err, bodyClosed: src.closed.Load()}
 			}()
 			joined := false
 			defer func() {
@@ -549,10 +570,19 @@ func TestProxyRelayFlushAndHeaders(t *testing.T) {
 			}
 
 			_ = pw.Close()
-			out := <-done
-			joined = true
+			synctest.Wait()
+			var out handlerOutcome
+			select {
+			case out = <-done:
+				joined = true
+			default:
+				t.Fatal("RelayProxy did not return after upstream EOF")
+			}
 			if out.err != nil {
 				t.Fatalf("RelayProxy error = %v, want nil", out.err)
+			}
+			if !out.bodyClosed {
+				t.Errorf("RelayProxy returned without closing owned resp.Body")
 			}
 			if diff := gocmp.Diff(outcome.Result{Status: http.StatusOK}, out.res); diff != "" {
 				t.Errorf("outcome.Result (-want +got):\n%s", diff)
@@ -613,12 +643,13 @@ func TestProxyRelayCompletionAndMessageStop(t *testing.T) {
 			}))
 			t.Cleanup(upSrv.Close)
 
-			h := startRelayServer(t, upSrv.URL, func(_ context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
-				return sse.RelayProxy(r.Context(), w, up, sse.ProxyOptions{
+			h := startRelayServer(t, upSrv.URL, func(serviceCtx context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
+				return sse.RelayProxy(serviceCtx, w, up, sse.ProxyOptions{
 					Provider:          "codex",
 					AdvertisedModel:   "claude-gpt-5.6-sol",
 					BackendModel:      "gpt-5.6-sol",
 					HeartbeatInterval: -1,
+					ClientDone:        r.Context().Done(),
 				})
 			})
 
@@ -686,12 +717,13 @@ func TestProxyRelaySentryAccounting(t *testing.T) {
 					input, cacheRead, cacheCreate, literalMessageStop)
 			}))
 			defer upSrv.Close()
-			h := startRelayServer(t, upSrv.URL, func(_ context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
-				return sse.RelayProxy(r.Context(), w, up, sse.ProxyOptions{
+			h := startRelayServer(t, upSrv.URL, func(serviceCtx context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
+				return sse.RelayProxy(serviceCtx, w, up, sse.ProxyOptions{
 					Provider:          "codex",
 					AdvertisedModel:   "claude-gpt-5.6-sol",
 					BackendModel:      "gpt-5.6-sol",
 					HeartbeatInterval: -1,
+					ClientDone:        r.Context().Done(),
 					SessionKey:        session,
 					Sentry:            &state,
 					SentryTarget:      target,
@@ -758,12 +790,13 @@ func TestProxyRelaySentryAccounting(t *testing.T) {
 		}))
 		t.Cleanup(upSrv.Close)
 
-		h := startRelayServer(t, upSrv.URL, func(_ context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
-			return sse.RelayProxy(r.Context(), w, up, sse.ProxyOptions{
+		h := startRelayServer(t, upSrv.URL, func(serviceCtx context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
+			return sse.RelayProxy(serviceCtx, w, up, sse.ProxyOptions{
 				Provider:          "local",
 				AdvertisedModel:   "claude-local/gguf",
 				BackendModel:      "local/gguf",
 				HeartbeatInterval: -1,
+				ClientDone:        r.Context().Done(),
 				SessionKey:        session,
 				Sentry:            &state,
 				SentryTarget:      target,
@@ -819,13 +852,14 @@ func TestProxyRelaySentryAccounting(t *testing.T) {
 		}))
 		t.Cleanup(upSrv.Close)
 
-		h := startRelayServer(t, upSrv.URL, func(_ context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
-			return sse.RelayProxy(r.Context(), w, up, sse.ProxyOptions{
+		h := startRelayServer(t, upSrv.URL, func(serviceCtx context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
+			return sse.RelayProxy(serviceCtx, w, up, sse.ProxyOptions{
 				Provider:          sse.LMStudioProvider,
 				AdvertisedModel:   "claude-lmstudio/qwen3-coder-30b",
 				BackendModel:      "lmstudio/qwen3-coder-30b",
 				HeartbeatInterval: -1,
 				FirstEventWait:    5 * time.Second,
+				ClientDone:        r.Context().Done(),
 				SessionKey:        session,
 				Sentry:            &state,
 				SentryTarget:      target,
@@ -896,12 +930,13 @@ func TestProxyRelaySentryAccounting(t *testing.T) {
 		t.Cleanup(upSrv.Close)
 		t.Cleanup(release)
 
-		h := startRelayServer(t, upSrv.URL, func(_ context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
-			return sse.RelayProxy(r.Context(), w, up, sse.ProxyOptions{
+		h := startRelayServer(t, upSrv.URL, func(serviceCtx context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
+			return sse.RelayProxy(serviceCtx, w, up, sse.ProxyOptions{
 				Provider:          "codex",
 				AdvertisedModel:   "claude-gpt-6.1-sol[1m]",
 				BackendModel:      "gpt-6.1-sol",
 				HeartbeatInterval: -1,
+				ClientDone:        r.Context().Done(),
 				SessionKey:        session,
 				Sentry:            &state,
 				SentryTarget:      target,
@@ -972,13 +1007,14 @@ func TestProxyRelaySentryAccounting(t *testing.T) {
 		}))
 		t.Cleanup(upSrv.Close)
 
-		h := startRelayServer(t, upSrv.URL, func(_ context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
-			return sse.RelayProxy(r.Context(), w, up, sse.ProxyOptions{
+		h := startRelayServer(t, upSrv.URL, func(serviceCtx context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
+			return sse.RelayProxy(serviceCtx, w, up, sse.ProxyOptions{
 				Provider:          "codex",
 				AdvertisedModel:   "claude-gpt-6.1-sol[1m]",
 				BackendModel:      "gpt-6.1-sol",
 				IsCompaction:      true,
 				HeartbeatInterval: -1,
+				ClientDone:        r.Context().Done(),
 				SessionKey:        session,
 				Sentry:            &state,
 				SentryTarget:      target,
@@ -1044,12 +1080,13 @@ func TestProxyRelaySentryAccounting(t *testing.T) {
 			}))
 			t.Cleanup(upSrv.Close)
 
-			h := startRelayServer(t, upSrv.URL, func(_ context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
-				return sse.RelayProxy(r.Context(), w, up, sse.ProxyOptions{
+			h := startRelayServer(t, upSrv.URL, func(serviceCtx context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
+				return sse.RelayProxy(serviceCtx, w, up, sse.ProxyOptions{
 					Provider:          "codex",
 					AdvertisedModel:   "claude-gpt-6.1-sol[1m]",
 					BackendModel:      "gpt-6.1-sol",
 					HeartbeatInterval: -1,
+					ClientDone:        r.Context().Done(),
 					SessionKey:        session,
 					Sentry:            &state,
 					SentryTarget:      target,
@@ -1215,25 +1252,29 @@ func TestLMStudioFirstEventPeek(t *testing.T) {
 			var peekCalls atomic.Int64
 			var mu sync.Mutex
 			var overflows []recordedOverflow
+			var wantOverflowRes outcome.Result
 
-			h := startRelayServer(t, upSrv.URL, func(_ context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
+			h := startRelayServer(t, upSrv.URL, func(serviceCtx context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
 				if tt.headWritten {
 					w.Header().Set("Content-Type", "text/event-stream")
 					w.WriteHeader(http.StatusOK)
 				}
-				return sse.RelayProxy(r.Context(), w, up, sse.ProxyOptions{
+				return sse.RelayProxy(serviceCtx, w, up, sse.ProxyOptions{
 					Provider:          sse.LMStudioProvider,
 					AdvertisedModel:   "claude-lmstudio/qwen3-coder-30b",
 					BackendModel:      "lmstudio/qwen3-coder-30b",
 					HeadWritten:       tt.headWritten,
 					HeartbeatInterval: -1,
 					FirstEventWait:    5 * time.Second,
+					ClientDone:        r.Context().Done(),
 					OnPeek:            func() { peekCalls.Add(1) },
 					OnOverflow: func(w http.ResponseWriter, upstreamStatus int, counts sentry.Counts) (outcome.Result, error) {
+						outRes, outErr := testEngineOverflowResponder(w, upstreamStatus, counts)
 						mu.Lock()
 						overflows = append(overflows, recordedOverflow{Counts: counts, UpstreamStatus: upstreamStatus})
+						wantOverflowRes = outRes
 						mu.Unlock()
-						return testEngineOverflowResponder(w, upstreamStatus, counts)
+						return outRes, outErr
 					},
 				})
 			})
@@ -1266,6 +1307,7 @@ func TestLMStudioFirstEventPeek(t *testing.T) {
 			}
 			mu.Lock()
 			gotOverflows := append([]recordedOverflow(nil), overflows...)
+			gotWantRes := wantOverflowRes
 			mu.Unlock()
 			if tt.wantOverflow == nil {
 				if len(gotOverflows) != 0 {
@@ -1284,12 +1326,75 @@ func TestLMStudioFirstEventPeek(t *testing.T) {
 				if got := resp.Header.Get("X-Model-Gateway-Upstream-Status"); got != "200" {
 					t.Errorf("X-Model-Gateway-Upstream-Status = %q, want 200", got)
 				}
-				if res.Route.Overflow == nil {
-					t.Errorf("outcome.Route.Overflow = nil, want non-nil propagated from OnOverflow")
+				if diff := gocmp.Diff(gotWantRes, res); diff != "" {
+					t.Errorf("outcome.Result propagated from OnOverflow (-want +got):\n%s", diff)
 				}
 			}
 		})
 	}
+
+	t.Run("error: OnOverflow result and error propagate verbatim from RelayProxy", func(t *testing.T) {
+		errOverflowWrite := errors.New("overflow responder failed")
+		wantRes := outcome.Result{
+			Status:         http.StatusRequestEntityTooLarge,
+			StatusOverride: "context_overflow",
+			Route: outcome.Route{
+				Overflow: &outcome.Overflow{
+					Phase:        "first_turn",
+					RefusedBy:    "upstream",
+					TokensFrom:   "upstream",
+					RequestBytes: 1234,
+					Tokens:       new(float64(6017)),
+					LimitTokens:  new(float64(4096)),
+				},
+			},
+		}
+
+		src := &trackedChunkBody{chunks: [][]byte{[]byte(overflowFrame)}}
+		rec := newStreamingRecorder()
+		up := &upstream.Response{
+			StatusCode:  http.StatusOK,
+			Header:      http.Header{"Content-Type": []string{"text/event-stream"}},
+			RelayHeader: http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:        src,
+		}
+		var calls int
+		var gotCounts sentry.Counts
+		var gotUpstreamStatus int
+		res, err := sse.RelayProxy(t.Context(), rec, up, sse.ProxyOptions{
+			Provider:          sse.LMStudioProvider,
+			AdvertisedModel:   "claude-lmstudio/qwen3-coder-30b",
+			BackendModel:      "lmstudio/qwen3-coder-30b",
+			HeartbeatInterval: -1,
+			FirstEventWait:    5 * time.Second,
+			OnOverflow: func(w http.ResponseWriter, upstreamStatus int, counts sentry.Counts) (outcome.Result, error) {
+				calls++
+				gotUpstreamStatus = upstreamStatus
+				gotCounts = counts
+				_, _ = testEngineOverflowResponder(w, upstreamStatus, counts)
+				return wantRes, errOverflowWrite
+			},
+		})
+		if calls != 1 {
+			t.Fatalf("OnOverflow calls = %d, want 1", calls)
+		}
+		if gotUpstreamStatus != http.StatusOK {
+			t.Errorf("OnOverflow upstreamStatus = %d, want 200", gotUpstreamStatus)
+		}
+		wantCounts := sentry.Counts{Tokens: new(float64(6017)), Limit: new(float64(4096))}
+		if diff := gocmp.Diff(wantCounts, gotCounts); diff != "" {
+			t.Errorf("OnOverflow counts (-want +got):\n%s", diff)
+		}
+		if !errors.Is(err, errOverflowWrite) {
+			t.Errorf("RelayProxy error = %v, want %v", err, errOverflowWrite)
+		}
+		if diff := gocmp.Diff(wantRes, res); diff != "" {
+			t.Errorf("RelayProxy result (-want +got):\n%s", diff)
+		}
+		if !src.closed.Load() {
+			t.Errorf("RelayProxy returned without closing owned resp.Body")
+		}
+	})
 
 	t.Run("error: upstream socket broken before first complete frame returns 502 early-end JSON", func(t *testing.T) {
 		var lc net.ListenConfig
@@ -1309,19 +1414,21 @@ func TestLMStudioFirstEventPeek(t *testing.T) {
 				return
 			}
 			defer func() { _ = conn.Close() }()
+			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 			buf := make([]byte, 4096)
 			_, _ = conn.Read(buf)
 			// Truncated chunked stream before any complete frame.
 			_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n: hi\n\r\n")
 		})
 
-		h := startRelayServer(t, "http://"+ln.Addr().String(), func(_ context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
-			return sse.RelayProxy(r.Context(), w, up, sse.ProxyOptions{
+		h := startRelayServer(t, "http://"+ln.Addr().String(), func(serviceCtx context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
+			return sse.RelayProxy(serviceCtx, w, up, sse.ProxyOptions{
 				Provider:          sse.LMStudioProvider,
 				AdvertisedModel:   "claude-lmstudio/qwen3-coder-30b",
 				BackendModel:      "lmstudio/qwen3-coder-30b",
 				HeartbeatInterval: -1,
 				FirstEventWait:    5 * time.Second,
+				ClientDone:        r.Context().Done(),
 			})
 		})
 
@@ -1357,16 +1464,21 @@ func TestLMStudioFirstEventPeek(t *testing.T) {
 
 func TestProxyTimers(t *testing.T) {
 	const literalMessageStop = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	const literalHeartbeat = ": ping\n\n"
+	if sse.HeartbeatComment != literalHeartbeat {
+		t.Errorf("HeartbeatComment = %q, want %q", sse.HeartbeatComment, literalHeartbeat)
+	}
 
 	t.Run("success: default 20s heartbeat emits ping while idle and resets on upstream data", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			pr, pw := io.Pipe()
+			src := &trackedReadCloser{ReadCloser: pr}
 			rec := newStreamingRecorder()
 			up := &upstream.Response{
 				StatusCode:  http.StatusOK,
 				Header:      http.Header{"Content-Type": []string{"text/event-stream"}},
 				RelayHeader: http.Header{"Content-Type": []string{"text/event-stream"}},
-				Body:        pr,
+				Body:        src,
 			}
 			done := make(chan handlerOutcome, 1)
 			go func() {
@@ -1375,8 +1487,7 @@ func TestProxyTimers(t *testing.T) {
 					AdvertisedModel: "claude-gpt-5.6-terra",
 					BackendModel:    "gpt-5.6-terra",
 				})
-				_ = pr.Close()
-				done <- handlerOutcome{res: res, err: err}
+				done <- handlerOutcome{res: res, err: err, bodyClosed: src.closed.Load()}
 			}()
 			joined := false
 			defer func() {
@@ -1405,7 +1516,7 @@ func TestProxyTimers(t *testing.T) {
 			time.Sleep(19 * time.Second)
 			synctest.Wait()
 			_, _, body19, _, _ := rec.snapshot()
-			if strings.Contains(body19, sse.HeartbeatComment) {
+			if strings.Contains(body19, literalHeartbeat) {
 				t.Fatalf("heartbeat fired before 20s: %q", body19)
 			}
 
@@ -1413,7 +1524,7 @@ func TestProxyTimers(t *testing.T) {
 			time.Sleep(1 * time.Second)
 			synctest.Wait()
 			_, _, body20, _, _ := rec.snapshot()
-			if got := strings.Count(body20, sse.HeartbeatComment); got != 1 {
+			if got := strings.Count(body20, literalHeartbeat); got != 1 {
 				t.Fatalf("heartbeats at 20s = %d, want 1; body=%q", got, body20)
 			}
 
@@ -1429,7 +1540,7 @@ func TestProxyTimers(t *testing.T) {
 			time.Sleep(15 * time.Second)
 			synctest.Wait()
 			_, _, bodyReset, _, _ := rec.snapshot()
-			if got := strings.Count(bodyReset, sse.HeartbeatComment); got != 1 {
+			if got := strings.Count(bodyReset, literalHeartbeat); got != 1 {
 				t.Fatalf("heartbeat did not reset on upstream data; count=%d body=%q", got, bodyReset)
 			}
 
@@ -1437,7 +1548,7 @@ func TestProxyTimers(t *testing.T) {
 			time.Sleep(5 * time.Second)
 			synctest.Wait()
 			_, _, bodySecond, _, _ := rec.snapshot()
-			if got := strings.Count(bodySecond, sse.HeartbeatComment); got != 2 {
+			if got := strings.Count(bodySecond, literalHeartbeat); got != 2 {
 				t.Fatalf("heartbeats after second 20s silence = %d, want 2; body=%q", got, bodySecond)
 			}
 
@@ -1445,16 +1556,25 @@ func TestProxyTimers(t *testing.T) {
 				t.Fatalf("write stop: %v", err)
 			}
 			_ = pw.Close()
-			out := <-done
-			joined = true
+			synctest.Wait()
+			var out handlerOutcome
+			select {
+			case out = <-done:
+				joined = true
+			default:
+				t.Fatal("RelayProxy did not return after upstream EOF")
+			}
 			if out.err != nil {
 				t.Fatalf("RelayProxy returned %v, want nil", out.err)
+			}
+			if !out.bodyClosed {
+				t.Errorf("RelayProxy returned without closing owned resp.Body")
 			}
 			if diff := gocmp.Diff(outcome.Result{Status: http.StatusOK}, out.res); diff != "" {
 				t.Errorf("outcome.Result (-want +got):\n%s", diff)
 			}
 			_, _, finalBody, _, _ := rec.snapshot()
-			if diff := gocmp.Diff(first+mid+literalMessageStop, strings.ReplaceAll(finalBody, sse.HeartbeatComment, "")); diff != "" {
+			if diff := gocmp.Diff(first+mid+literalMessageStop, strings.ReplaceAll(finalBody, literalHeartbeat, "")); diff != "" {
 				t.Errorf("stream without heartbeats (-want +got):\n%s", diff)
 			}
 		})
@@ -1463,12 +1583,13 @@ func TestProxyTimers(t *testing.T) {
 	t.Run("success: negative HeartbeatInterval disables heartbeats across 60s of silence", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			pr, pw := io.Pipe()
+			src := &trackedReadCloser{ReadCloser: pr}
 			rec := newStreamingRecorder()
 			up := &upstream.Response{
 				StatusCode:  http.StatusOK,
 				Header:      http.Header{"Content-Type": []string{"text/event-stream"}},
 				RelayHeader: http.Header{"Content-Type": []string{"text/event-stream"}},
-				Body:        pr,
+				Body:        src,
 			}
 			done := make(chan handlerOutcome, 1)
 			go func() {
@@ -1478,8 +1599,7 @@ func TestProxyTimers(t *testing.T) {
 					BackendModel:      "gpt-5.6-terra",
 					HeartbeatInterval: -1,
 				})
-				_ = pr.Close()
-				done <- handlerOutcome{res: res, err: err}
+				done <- handlerOutcome{res: res, err: err, bodyClosed: src.closed.Load()}
 			}()
 			joined := false
 			defer func() {
@@ -1501,16 +1621,25 @@ func TestProxyTimers(t *testing.T) {
 			time.Sleep(60 * time.Second)
 			synctest.Wait()
 			_, _, body, _, _ := rec.snapshot()
-			if strings.Contains(body, sse.HeartbeatComment) {
+			if strings.Contains(body, literalHeartbeat) {
 				t.Fatalf("unexpected heartbeat when disabled: %q", body)
 			}
 
 			_, _ = io.WriteString(pw, literalMessageStop)
 			_ = pw.Close()
-			out := <-done
-			joined = true
+			synctest.Wait()
+			var out handlerOutcome
+			select {
+			case out = <-done:
+				joined = true
+			default:
+				t.Fatal("RelayProxy did not return after upstream EOF")
+			}
 			if out.err != nil {
 				t.Fatalf("RelayProxy returned %v, want nil", out.err)
+			}
+			if !out.bodyClosed {
+				t.Errorf("RelayProxy returned without closing owned resp.Body")
 			}
 			if diff := gocmp.Diff(outcome.Result{Status: http.StatusOK}, out.res); diff != "" {
 				t.Errorf("outcome.Result (-want +got):\n%s", diff)
@@ -1522,12 +1651,13 @@ func TestProxyTimers(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			ordinary := lmStudioOrdinaryStream(19, 0)
 			pr, pw := io.Pipe()
+			src := &trackedReadCloser{ReadCloser: pr}
 			rec := newStreamingRecorder()
 			up := &upstream.Response{
 				StatusCode:  http.StatusOK,
 				Header:      http.Header{"Content-Type": []string{"text/event-stream"}},
 				RelayHeader: http.Header{"Content-Type": []string{"text/event-stream"}},
-				Body:        pr,
+				Body:        src,
 			}
 			done := make(chan handlerOutcome, 1)
 			go func() {
@@ -1536,8 +1666,7 @@ func TestProxyTimers(t *testing.T) {
 					AdvertisedModel: "claude-lmstudio/qwen3-coder-30b",
 					BackendModel:    "lmstudio/qwen3-coder-30b",
 				})
-				_ = pr.Close()
-				done <- handlerOutcome{res: res, err: err}
+				done <- handlerOutcome{res: res, err: err, bodyClosed: src.closed.Load()}
 			}()
 			joined := false
 			defer func() {
@@ -1581,7 +1710,7 @@ func TestProxyTimers(t *testing.T) {
 			time.Sleep(20 * time.Second)
 			synctest.Wait()
 			_, _, bodyAt30, _, _ := rec.snapshot()
-			if !strings.HasPrefix(bodyAt30, sse.HeartbeatComment) {
+			if !strings.HasPrefix(bodyAt30, literalHeartbeat) {
 				t.Fatalf("expected heartbeat before stalled first frame; body=%q", bodyAt30)
 			}
 
@@ -1590,19 +1719,28 @@ func TestProxyTimers(t *testing.T) {
 				t.Fatalf("write rest of stream: %v", err)
 			}
 			_ = pw.Close()
-			out := <-done
-			joined = true
+			synctest.Wait()
+			var out handlerOutcome
+			select {
+			case out = <-done:
+				joined = true
+			default:
+				t.Fatal("RelayProxy did not return after upstream EOF")
+			}
 			if out.err != nil {
 				t.Fatalf("RelayProxy returned %v, want nil", out.err)
+			}
+			if !out.bodyClosed {
+				t.Errorf("RelayProxy returned without closing owned resp.Body")
 			}
 			if diff := gocmp.Diff(outcome.Result{Status: http.StatusOK}, out.res); diff != "" {
 				t.Errorf("outcome.Result (-want +got):\n%s", diff)
 			}
 			_, _, finalBody, _, _ := rec.snapshot()
-			if !strings.HasPrefix(finalBody, sse.HeartbeatComment) {
+			if !strings.HasPrefix(finalBody, literalHeartbeat) {
 				t.Errorf("final body did not start with heartbeat: %q", finalBody)
 			}
-			if diff := gocmp.Diff(ordinary, strings.ReplaceAll(finalBody, sse.HeartbeatComment, "")); diff != "" {
+			if diff := gocmp.Diff(ordinary, strings.ReplaceAll(finalBody, literalHeartbeat, "")); diff != "" {
 				t.Errorf("stream with heartbeats stripped (-want +got):\n%s", diff)
 			}
 		})
@@ -1612,12 +1750,13 @@ func TestProxyTimers(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			overflowFrame := lmStudioOverflowFrame(6017, 4096)
 			pr, pw := io.Pipe()
+			src := &trackedReadCloser{ReadCloser: pr}
 			rec := newStreamingRecorder()
 			up := &upstream.Response{
 				StatusCode:  http.StatusOK,
 				Header:      http.Header{"Content-Type": []string{"text/event-stream"}},
 				RelayHeader: http.Header{"Content-Type": []string{"text/event-stream"}},
-				Body:        pr,
+				Body:        src,
 			}
 			overflowCalls := 0
 			done := make(chan handlerOutcome, 1)
@@ -1633,8 +1772,7 @@ func TestProxyTimers(t *testing.T) {
 						return testEngineOverflowResponder(w, upstreamStatus, counts)
 					},
 				})
-				_ = pr.Close()
-				done <- handlerOutcome{res: res, err: err}
+				done <- handlerOutcome{res: res, err: err, bodyClosed: src.closed.Load()}
 			}()
 			joined := false
 			defer func() {
@@ -1660,10 +1798,19 @@ func TestProxyTimers(t *testing.T) {
 				t.Fatalf("write late overflow: %v", err)
 			}
 			_ = pw.Close()
-			out := <-done
-			joined = true
+			synctest.Wait()
+			var out handlerOutcome
+			select {
+			case out = <-done:
+				joined = true
+			default:
+				t.Fatal("RelayProxy did not return after upstream EOF")
+			}
 			if out.err != nil {
 				t.Fatalf("RelayProxy returned %v, want nil", out.err)
+			}
+			if !out.bodyClosed {
+				t.Errorf("RelayProxy returned without closing owned resp.Body")
 			}
 			status, _, finalBody, _, _ := rec.snapshot()
 			if status != http.StatusOK {

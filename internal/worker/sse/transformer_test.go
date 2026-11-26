@@ -630,12 +630,16 @@ func TestEventObserver(t *testing.T) {
 	}
 
 	t.Run("success: zero maxPendingBytes defaults to 4 MiB exact boundary", func(t *testing.T) {
+		const fourMiB = 4 * 1024 * 1024
+		if sse.DefaultMaxObserveBytes != fourMiB {
+			t.Errorf("DefaultMaxObserveBytes = %d, want %d", sse.DefaultMaxObserveBytes, fourMiB)
+		}
 		const prefix = `data: {"type":"big","pad":"`
 		const suffix = "\"}\n\n"
-		padLen := sse.DefaultMaxObserveBytes - len(prefix) - len(suffix)
+		padLen := fourMiB - len(prefix) - len(suffix)
 		exact4MiB := prefix + strings.Repeat("a", padLen) + suffix
-		if len(exact4MiB) != sse.DefaultMaxObserveBytes {
-			t.Fatalf("fixture len = %d, want %d", len(exact4MiB), sse.DefaultMaxObserveBytes)
+		if len(exact4MiB) != fourMiB {
+			t.Fatalf("fixture len = %d, want %d", len(exact4MiB), fourMiB)
 		}
 
 		// Exact 4 MiB fits without overflow.
@@ -662,9 +666,20 @@ func TestEventObserver(t *testing.T) {
 	})
 
 	t.Run("success: nil callbacks do not panic on normal events or overflow", func(t *testing.T) {
-		obs := sse.NewEventObserver(16, nil, nil)
-		obs.Write([]byte("data: {\"type\":\"ok\"}\n\n"))
+		const normalFrame = "data: {\"type\":\"ok\"}\n\n"
+		const unterminated = "data: {\"type\":\"tail\"}"
+		if len(exactLimitFrame) <= len(normalFrame)+8 {
+			t.Fatalf("fixture precondition: exactLimitFrame (%d) must exceed limit (%d)", len(exactLimitFrame), len(normalFrame)+8)
+		}
+		// Limit accommodates normalFrame (exercising nil observe) and overflows on exactLimitFrame (exercising nil onOverflow).
+		obs := sse.NewEventObserver(len(normalFrame)+8, nil, nil)
+		obs.Write([]byte(normalFrame))
 		obs.Write([]byte(exactLimitFrame))
 		obs.End()
+
+		// Exercise nil observe callback during End flush on an unterminated frame within budget.
+		obsTail := sse.NewEventObserver(len(unterminated)+8, nil, nil)
+		obsTail.Write([]byte(unterminated))
+		obsTail.End()
 	})
 }

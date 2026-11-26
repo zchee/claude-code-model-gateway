@@ -19,10 +19,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -71,16 +73,29 @@ func mustEncodeWire(t *testing.T, v jsonx.WireValue) string {
 
 type usageSpy struct {
 	mu        sync.Mutex
-	events    []jsonx.WireValue
+	events    []string
+	encodeErr error
 	chunks    []byte
 	bytes     int64
 	overflows int
 }
 
+// ObserveEvent snapshots the decoded wire value at callback time so later in-place rewrites
+// by the transformer cannot alias or race with recorded observations.
 func (u *usageSpy) ObserveEvent(event jsonx.WireValue) {
+	var encoded string
+	var err error
+	if event.Kind != 0 {
+		var b []byte
+		b, err = jsonx.EncodeWire(event)
+		encoded = string(b)
+	}
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	u.events = append(u.events, event)
+	if err != nil && u.encodeErr == nil {
+		u.encodeErr = err
+	}
+	u.events = append(u.events, encoded)
 }
 
 func (u *usageSpy) ObserveChunk(chunk []byte) {
@@ -104,18 +119,27 @@ func (u *usageSpy) MarkOverflow() {
 func (u *usageSpy) snapshot(t *testing.T) (events []string, chunks []byte, totalBytes int64, overflows int) {
 	t.Helper()
 	u.mu.Lock()
-	rawEvents := slices.Clone(u.events)
+	encodeErr := u.encodeErr
+	events = slices.Clone(u.events)
 	chunks = slices.Clone(u.chunks)
 	totalBytes = u.bytes
 	overflows = u.overflows
 	u.mu.Unlock()
-	if len(rawEvents) > 0 {
-		events = make([]string, len(rawEvents))
-		for i, ev := range rawEvents {
-			events[i] = mustEncodeWire(t, ev)
-		}
+	if encodeErr != nil {
+		t.Fatalf("EncodeWire in ObserveEvent: %v", encodeErr)
 	}
 	return events, chunks, totalBytes, overflows
+}
+
+// trackedReadCloser records whether the relay that owns an upstream Body closed it before returning.
+type trackedReadCloser struct {
+	io.ReadCloser
+	closed atomic.Bool
+}
+
+func (b *trackedReadCloser) Close() error {
+	b.closed.Store(true)
+	return b.ReadCloser.Close()
 }
 
 type recordedOverflow struct {
@@ -218,8 +242,9 @@ func (r *streamingRecorder) snapshot() (status int, wroteHeader bool, body strin
 }
 
 type handlerOutcome struct {
-	res outcome.Result
-	err error
+	res        outcome.Result
+	err        error
+	bodyClosed bool
 }
 
 type relayHarness struct {
@@ -234,6 +259,9 @@ func (h *relayHarness) waitResult(t *testing.T) (outcome.Result, error) {
 	t.Helper()
 	select {
 	case out := <-h.results:
+		if !out.bodyClosed {
+			t.Errorf("relay returned without closing owned resp.Body")
+		}
 		return out.res, out.err
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for relay handler completion")
@@ -251,6 +279,7 @@ func relayHeadersFrom(in http.Header) http.Header {
 
 // startRelayServer wraps a relay function behind a real httptest server with an independent
 // service-owned upstream context so client disconnects do not implicitly cancel the provider.
+// The relay owns up.Body; the harness never closes it on the relay's behalf while the request is live.
 func startRelayServer(t *testing.T, upstreamURL string, relay func(serviceCtx context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error)) *relayHarness {
 	t.Helper()
 	serviceCtx, cancelService := context.WithCancel(t.Context())
@@ -258,29 +287,47 @@ func startRelayServer(t *testing.T, upstreamURL string, relay func(serviceCtx co
 	upClient := &http.Client{Transport: upTransport}
 	results := make(chan handlerOutcome, 16)
 
+	var fallbackMu sync.Mutex
+	var fallbackBodies []io.ReadCloser
+	closeFallbackBodies := func() {
+		fallbackMu.Lock()
+		bodies := slices.Clone(fallbackBodies)
+		fallbackBodies = nil
+		fallbackMu.Unlock()
+		for _, b := range bodies {
+			_ = b.Close()
+		}
+	}
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upReq, err := http.NewRequestWithContext(serviceCtx, r.Method, upstreamURL+r.URL.RequestURI(), r.Body)
 		if err != nil {
-			results <- handlerOutcome{err: err}
+			results <- handlerOutcome{err: err, bodyClosed: true}
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		upResp, err := upClient.Do(upReq)
+		upResp, err := upClient.Do(upReq) //nolint:bodyclose // Owned by the relay under test; fallback cleanup closes any unclosed body on failure.
 		if err != nil {
-			results <- handlerOutcome{err: err}
+			results <- handlerOutcome{err: err, bodyClosed: true}
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
-		defer func() { _ = upResp.Body.Close() }()
+		trackedBody := &trackedReadCloser{ReadCloser: upResp.Body}
 		up := &upstream.Response{
 			StatusCode:  upResp.StatusCode,
 			Header:      upResp.Header.Clone(),
 			RelayHeader: relayHeadersFrom(upResp.Header),
-			Body:        upResp.Body,
+			Body:        trackedBody,
 		}
 
 		res, err := relay(serviceCtx, w, r, up)
-		results <- handlerOutcome{res: res, err: err}
+		closedByRelay := trackedBody.closed.Load()
+		if !closedByRelay {
+			fallbackMu.Lock()
+			fallbackBodies = append(fallbackBodies, upResp.Body)
+			fallbackMu.Unlock()
+		}
+		results <- handlerOutcome{res: res, err: err, bodyClosed: closedByRelay}
 		if errors.Is(err, http.ErrAbortHandler) {
 			panic(http.ErrAbortHandler)
 		}
@@ -293,9 +340,10 @@ func startRelayServer(t *testing.T, upstreamURL string, relay func(serviceCtx co
 	client := &http.Client{Transport: clientTransport}
 
 	// LIFO cleanup order: close client idle conns -> cancel serviceCtx (unblocking paused relays)
-	// -> close relay server -> close upstream idle conns.
+	// -> close any body left open by a failing relay -> close relay server -> close upstream idle conns.
 	t.Cleanup(upTransport.CloseIdleConnections)
 	t.Cleanup(srv.Close)
+	t.Cleanup(closeFallbackBodies)
 	t.Cleanup(cancelService)
 	t.Cleanup(clientTransport.CloseIdleConnections)
 

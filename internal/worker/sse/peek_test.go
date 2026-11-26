@@ -92,6 +92,51 @@ func (b *singleReaderPipeBody) Close() error {
 	return b.pr.Close()
 }
 
+// gatedReadBody blocks Read until Close is called and then waits on allowReadReturn
+// before letting Read exit so tests can prove join-before-return rather than eventual exit.
+type gatedReadBody struct {
+	readEntered     chan struct{}
+	readEnteredOnce sync.Once
+	closeCalled     chan struct{}
+	closeOnce       sync.Once
+	allowReadReturn chan struct{}
+	allowOnce       sync.Once
+	closed          atomic.Bool
+	readReturned    atomic.Bool
+	inFlight        atomic.Int32
+	overlapReads    atomic.Int32
+}
+
+func newGatedReadBody() *gatedReadBody {
+	return &gatedReadBody{
+		readEntered:     make(chan struct{}),
+		closeCalled:     make(chan struct{}),
+		allowReadReturn: make(chan struct{}),
+	}
+}
+
+func (b *gatedReadBody) Read(_ []byte) (int, error) {
+	if b.inFlight.Add(1) > 1 {
+		b.overlapReads.Add(1)
+	}
+	defer b.inFlight.Add(-1)
+	b.readEnteredOnce.Do(func() { close(b.readEntered) })
+	<-b.closeCalled
+	<-b.allowReadReturn
+	b.readReturned.Store(true)
+	return 0, io.ErrClosedPipe
+}
+
+func (b *gatedReadBody) Close() error {
+	b.closed.Store(true)
+	b.closeOnce.Do(func() { close(b.closeCalled) })
+	return nil
+}
+
+func (b *gatedReadBody) allowReturn() {
+	b.allowOnce.Do(func() { close(b.allowReadReturn) })
+}
+
 func TestPeekFirstEvent(t *testing.T) {
 	overflowFrame := lmStudioOverflowFrame(6017, 4096)
 	wordedFrame := lmStudioWordedOverflowFrame(6017, 4096)
@@ -256,10 +301,22 @@ func TestPeekFirstEvent(t *testing.T) {
 				res, err := sse.PeekFirstEvent(t.Context(), src, 50*time.Millisecond)
 				done <- peekOut{res: res, err: err}
 			}()
+			joined := false
+			defer func() {
+				if !joined {
+					_ = pw.Close()
+					_ = pr.Close()
+					out := <-done
+					if out.res.Body != nil {
+						_ = out.res.Body.Close()
+					}
+				}
+			}()
 
 			synctest.Wait()
 			select {
 			case out := <-done:
+				joined = true
 				if out.res.Body != nil {
 					_ = out.res.Body.Close()
 				}
@@ -268,16 +325,36 @@ func TestPeekFirstEvent(t *testing.T) {
 			default:
 			}
 
-			// Send partial first frame, then stall past wait.
+			// Send partial first frame, then stall until the 50ms wait boundary.
 			if _, err := io.WriteString(pw, ordinary[:30]); err != nil {
 				t.Fatalf("write prefix: %v", err)
 			}
 			synctest.Wait()
 
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(49 * time.Millisecond)
+			synctest.Wait()
+			select {
+			case out := <-done:
+				joined = true
+				if out.res.Body != nil {
+					_ = out.res.Body.Close()
+				}
+				_ = pw.Close()
+				t.Fatalf("PeekFirstEvent timed out early at 49ms: res=%+v err=%v", out.res, out.err)
+			default:
+			}
+
+			time.Sleep(1 * time.Millisecond)
 			synctest.Wait()
 
-			out := <-done
+			// Non-blocking receive at the 50ms boundary so synctest cannot advance fake time past it.
+			var out peekOut
+			select {
+			case out = <-done:
+				joined = true
+			default:
+				t.Fatal("PeekFirstEvent did not return at the 50ms wait boundary")
+			}
 			if out.err != nil {
 				_ = pw.Close()
 				_ = pr.Close()
@@ -330,9 +407,7 @@ func TestPeekFirstEvent(t *testing.T) {
 
 	t.Run("success: closing replay Body after timeout unblocks and joins stalled reader", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
-			pr, pw := io.Pipe()
-			defer func() { _ = pw.Close() }()
-			src := &singleReaderPipeBody{pr: pr}
+			src := newGatedReadBody()
 
 			type peekOut struct {
 				res sse.PeekResult
@@ -343,39 +418,110 @@ func TestPeekFirstEvent(t *testing.T) {
 				res, err := sse.PeekFirstEvent(t.Context(), src, 50*time.Millisecond)
 				done <- peekOut{res: res, err: err}
 			}()
+			peekJoined := false
+			var closeDone chan error
+			closeJoined := true
+			defer func() {
+				src.allowReturn()
+				_ = src.Close()
+				if !peekJoined {
+					out := <-done
+					if out.res.Body != nil {
+						_ = out.res.Body.Close()
+					}
+				}
+				if !closeJoined {
+					<-closeDone
+				}
+			}()
 
 			synctest.Wait()
 			select {
 			case out := <-done:
+				peekJoined = true
 				if out.res.Body != nil {
 					_ = out.res.Body.Close()
 				}
 				t.Fatalf("PeekFirstEvent returned early: res=%+v err=%v", out.res, out.err)
 			default:
 			}
+			select {
+			case <-src.readEntered:
+			default:
+				t.Fatal("PeekFirstEvent did not start reading source body")
+			}
 
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(49 * time.Millisecond)
+			synctest.Wait()
+			select {
+			case out := <-done:
+				peekJoined = true
+				if out.res.Body != nil {
+					_ = out.res.Body.Close()
+				}
+				t.Fatalf("PeekFirstEvent timed out early at 49ms: res=%+v err=%v", out.res, out.err)
+			default:
+			}
+
+			time.Sleep(1 * time.Millisecond)
 			synctest.Wait()
 
-			out := <-done
+			var out peekOut
+			select {
+			case out = <-done:
+				peekJoined = true
+			default:
+				t.Fatal("PeekFirstEvent did not return at the 50ms wait boundary")
+			}
 			if out.err != nil || out.res.Body == nil {
 				t.Fatalf("expected replay body on timeout, got res=%+v err=%v", out.res, out.err)
 			}
-			if err := out.res.Body.Close(); err != nil {
-				t.Fatalf("Close(replay): %v", err)
+			if src.closed.Load() {
+				t.Fatal("timeout closed the underlying source body")
 			}
+
+			// Start Close on the replay Body while the stalled reader is gated inside Read.
+			closeDone = make(chan error, 1)
+			closeJoined = false
+			go func() {
+				closeDone <- out.res.Body.Close()
+			}()
+			synctest.Wait()
+
 			if !src.closed.Load() {
-				t.Errorf("Close(replay) did not close underlying body")
+				t.Fatal("Close(replay) did not close underlying body")
 			}
-			// Returning from synctest.Test verifies no reader goroutine was left running.
+			select {
+			case err := <-closeDone:
+				closeJoined = true
+				t.Fatalf("Close(replay) returned before joining the stalled reader (err=%v, readReturned=%t)", err, src.readReturned.Load())
+			default:
+			}
+
+			// Release the reader's Read return and verify Close now completes immediately.
+			src.allowReturn()
+			synctest.Wait()
+			select {
+			case err := <-closeDone:
+				closeJoined = true
+				if err != nil {
+					t.Fatalf("Close(replay): %v", err)
+				}
+			default:
+				t.Fatal("Close(replay) did not return after stalled reader exited")
+			}
+			if !src.readReturned.Load() {
+				t.Errorf("underlying Read did not exit before Close(replay) returned")
+			}
+			if overlaps := src.overlapReads.Load(); overlaps != 0 {
+				t.Errorf("detected %d overlapping concurrent Read calls", overlaps)
+			}
 		})
 	})
 
 	t.Run("error: context cancellation while peeking closes body and joins reader", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
-			pr, pw := io.Pipe()
-			defer func() { _ = pw.Close() }()
-			src := &singleReaderPipeBody{pr: pr}
+			src := newGatedReadBody()
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 
@@ -388,21 +534,63 @@ func TestPeekFirstEvent(t *testing.T) {
 				res, err := sse.PeekFirstEvent(ctx, src, 5*time.Second)
 				done <- peekOut{res: res, err: err}
 			}()
+			joined := false
+			defer func() {
+				cancel()
+				src.allowReturn()
+				_ = src.Close()
+				if !joined {
+					out := <-done
+					if out.res.Body != nil {
+						_ = out.res.Body.Close()
+					}
+				}
+			}()
 
 			synctest.Wait()
 			select {
 			case out := <-done:
+				joined = true
 				if out.res.Body != nil {
 					_ = out.res.Body.Close()
 				}
 				t.Fatalf("PeekFirstEvent returned early: res=%+v err=%v", out.res, out.err)
 			default:
 			}
+			select {
+			case <-src.readEntered:
+			default:
+				t.Fatal("PeekFirstEvent did not start reading source body")
+			}
 
+			// Cancel ctx while the reader is gated inside Read: PeekFirstEvent must close src
+			// and block until the reader exits rather than returning immediately.
 			cancel()
 			synctest.Wait()
 
-			out := <-done
+			if !src.closed.Load() {
+				t.Fatal("cancellation did not close underlying body")
+			}
+			select {
+			case out := <-done:
+				joined = true
+				if out.res.Body != nil {
+					_ = out.res.Body.Close()
+				}
+				t.Fatalf("PeekFirstEvent returned before joining its reader goroutine (res=%+v err=%v readReturned=%t)", out.res, out.err, src.readReturned.Load())
+			default:
+			}
+
+			// Release the reader's Read return and verify PeekFirstEvent returns immediately with ctx.Err().
+			src.allowReturn()
+			synctest.Wait()
+			var out peekOut
+			select {
+			case out = <-done:
+				joined = true
+			default:
+				t.Fatal("PeekFirstEvent did not return after reader exited on cancellation")
+			}
 			if !errors.Is(out.err, context.Canceled) {
 				t.Fatalf("PeekFirstEvent error = %v, want context.Canceled", out.err)
 			}
@@ -410,10 +598,12 @@ func TestPeekFirstEvent(t *testing.T) {
 				_ = out.res.Body.Close()
 				t.Fatalf("PeekResult.Body = non-nil on cancellation, want nil")
 			}
-			if !src.closed.Load() {
-				t.Errorf("cancellation did not close underlying body")
+			if !src.readReturned.Load() {
+				t.Errorf("underlying Read did not exit before PeekFirstEvent returned")
 			}
-			// Returning from synctest.Test verifies the reader goroutine exited before PeekFirstEvent returned.
+			if overlaps := src.overlapReads.Load(); overlaps != 0 {
+				t.Errorf("detected %d overlapping concurrent Read calls", overlaps)
+			}
 		})
 	})
 }
