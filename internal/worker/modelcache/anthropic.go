@@ -104,20 +104,34 @@ func (c *Cache) anthropicRows(incoming http.Header) (jsontext.Value, int, *catal
 	if c.flight != nil {
 		return rows, count, c.flight
 	}
-	// After the worker context ends nothing new starts, so no goroutine races Wait.
-	if !c.admitted() {
+	if !c.register() {
 		return rows, count, nil
 	}
 	flight := &catalogFlight{done: make(chan struct{})}
 	c.flight = flight
-	c.wg.Go(func() {
+	go func() {
+		defer c.wg.Done()
 		flight.rows = c.refreshCatalog(headers, cached)
 		c.catalogMu.Lock()
 		c.flight = nil
 		c.catalogMu.Unlock()
 		close(flight.done)
-	})
+	}()
 	return rows, count, flight
+}
+
+// register admits one background catalog refresh and adds it to the wait group in one step under
+// c.mu, the gate Wait crosses before joining. A refresh admitted before shutdown is therefore counted
+// before Wait joins, and none is admitted after the worker context was cancelled or Wait was called.
+// Nothing under the gate does I/O or waits.
+func (c *Cache) register() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || !c.liveLocked() {
+		return false
+	}
+	c.wg.Add(1)
+	return true
 }
 
 func (c *Cache) catalogPath() string {
@@ -127,13 +141,17 @@ func (c *Cache) catalogPath() string {
 	return filepath.Join(c.stateDir, "anthropic-models.json")
 }
 
-// admitted reports whether background catalog work may still start or write: neither the worker
-// context from Start nor the catalog lifetime has ended.
+// admitted reports whether a running catalog refresh may still write: neither the worker context
+// from Start nor the catalog lifetime has ended.
 func (c *Cache) admitted() bool {
 	c.mu.Lock()
-	worker := c.worker
-	c.mu.Unlock()
-	return c.life.Err() == nil && (worker == nil || worker.Err() == nil)
+	defer c.mu.Unlock()
+	return c.liveLocked()
+}
+
+// liveLocked reports, with c.mu held, that neither the worker context nor the catalog lifetime ended.
+func (c *Cache) liveLocked() bool {
+	return c.life.Err() == nil && (c.worker == nil || c.worker.Err() == nil)
 }
 
 // refreshCatalog fetches every page and records the outcome against the snapshot that triggered it.

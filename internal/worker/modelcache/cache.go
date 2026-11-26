@@ -191,10 +191,14 @@ type Cache struct {
 	catalogMu sync.Mutex
 	flight    *catalogFlight
 
+	// mu guards worker, started and closed, and is the gate between registering background work with
+	// wg and Wait: registration checks and adds under it, and Wait crosses it before joining.
 	mu      sync.Mutex
 	worker  context.Context
 	started bool
-	wg      sync.WaitGroup
+	// closed is set by Wait; no background work is registered afterwards.
+	closed bool
+	wg     sync.WaitGroup
 }
 
 // New initializes the fallback model catalog and publishes generation 1 to Routes and Sentry.
@@ -310,7 +314,7 @@ func nodeTimerDelay(ms float64) time.Duration {
 func (c *Cache) Start(ctx context.Context) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.started || ctx == nil {
+	if c.started || c.closed || ctx == nil {
 		return
 	}
 	c.started = true
@@ -362,7 +366,13 @@ func (c *Cache) run(ctx context.Context) {
 }
 
 // Wait blocks until all background refresh, retry, and Anthropic catalog goroutines have exited.
-func (c *Cache) Wait() { c.wg.Wait() }
+// No background work starts once Wait has been called, so none is running after it returns.
+func (c *Cache) Wait() {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	c.wg.Wait()
+}
 
 // Refresh fetches the proxy listing and probes live local providers without holding commit locks across
 // network calls, then commits in order: obtain the next generation once, publish Sentry first with the
@@ -515,11 +525,12 @@ const (
 func (c *Cache) commit(ctx context.Context, ticket uint64, base, next *committed) commitResult {
 	c.commitMu.Lock()
 	defer c.commitMu.Unlock()
+	// An ended context wins over supersession, so the caller always learns that its context ended.
 	switch {
-	case ticket < c.committedTicket:
-		return superseded
 	case ctx.Err() != nil:
 		return canceled
+	case ticket < c.committedTicket:
+		return superseded
 	case c.current.Load() != base:
 		return rebased
 	}

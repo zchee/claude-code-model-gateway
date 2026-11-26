@@ -20,8 +20,8 @@ import (
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
 	"errors"
+	"io"
 	"math"
-	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -125,11 +125,29 @@ func numberInput(v jsonx.WireValue) (any, bool) {
 	}
 }
 
+// readRegular reads path, following symlinks, only when the opened handle is a regular file. The open
+// never waits on a FIFO, so a reader that holds a lock across this read is never parked by one.
+func readRegular(path string) ([]byte, error) {
+	f, err := openForRead(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("anthropiccatalog: not a regular file")
+	}
+	return io.ReadAll(f)
+}
+
 // Read returns a normalized cache object, retaining unknown fields and their ordering.
-// A missing or malformed cache supplies empty data and a zero update time.
+// A missing, non-regular or malformed cache supplies empty data and a zero update time.
 func Read(path string) Snapshot {
 	empty := Snapshot{Object: jsontext.Value(`{"data":[],"updatedAt":0}`)}
-	data, err := os.ReadFile(path)
+	data, err := readRegular(path)
 	if err != nil {
 		return empty
 	}
