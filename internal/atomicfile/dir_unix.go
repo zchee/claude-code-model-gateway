@@ -56,11 +56,26 @@ func OpenDirCreate(path string, perm fs.FileMode) (*Dir, error) {
 }
 
 func openDirCreate(path string, perm fs.FileMode, afterOpen func(string)) (*Dir, error) {
-	if path == "" {
-		return OpenDir(path)
+	f, err := openDirectoryFile(path, perm, afterOpen)
+	if err != nil {
+		return nil, err
 	}
+	return &Dir{root: directory{f}}, nil
+}
+
+// OpenDirectoryFile opens or creates path with the same traversal and permission
+// rules as [OpenDirCreate], and returns the final directory as a readable file.
+// The caller owns the file and must close it. Use this for directory-relative
+// system calls not offered by [Dir]; otherwise prefer [OpenDirCreate].
+func OpenDirectoryFile(path string, perm fs.FileMode) (*os.File, error) {
+	return openDirectoryFile(path, perm, nil)
+}
+
+func openDirectoryFile(path string, perm fs.FileMode, afterOpen func(string)) (*os.File, error) {
 	start := "."
-	if strings.HasPrefix(path, "/") {
+	if path == "" {
+		start = "" // Preserve the kernel's empty-path error.
+	} else if strings.HasPrefix(path, "/") {
 		start = "/"
 	}
 	remaining := strings.Trim(path, "/")
@@ -93,9 +108,9 @@ func openDirCreate(path string, perm fs.FileMode, afterOpen func(string)) (*Dir,
 			afterOpen(component)
 		}
 	}
-	d := &Dir{root: directory{os.NewFile(uintptr(fd), path)}}
-	fd = -1 // Ownership transferred to d.
-	return d, nil
+	f := os.NewFile(uintptr(fd), path)
+	fd = -1 // Ownership transferred to f.
+	return f, nil
 }
 
 // ReadFile reads a regular file named by one component. It does not follow

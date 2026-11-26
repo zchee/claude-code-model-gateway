@@ -26,9 +26,11 @@ import (
 )
 
 // RewriteFile rewrites an existing regular diagnostics file in place, not atomically.
-// It accepts the same names as [Dir.AppendFile], does not follow a leaf symlink,
-// and returns an error matching fs.ErrNotExist for a missing file. The inode,
-// owner, and read, write, and execute permissions are preserved.
+// It accepts the same names as [Dir.AppendFile]. Unlike an ordinary truncating
+// write, it neither follows a leaf symlink nor creates a missing file (the error
+// matches fs.ErrNotExist). If the entry changes after the preliminary type check,
+// a device or FIFO may be opened, but a nonregular file is never truncated or
+// written. The inode, owner, and read, write, and execute permissions are preserved.
 //
 // Readers may see an empty or incomplete file. A write error reports how many
 // bytes were written after truncation; they are not rolled back. A crash may also
@@ -41,7 +43,7 @@ func (d *Dir) RewriteFile(name string, data []byte) error {
 	return d.rewriteFile(name, data, unix.Write)
 }
 
-func (d *Dir) rewriteFile(name string, data []byte, write func(int, []byte) (int, error)) (err error) {
+func (d *Dir) rewriteFile(name string, data []byte, write func(int, []byte) (int, error)) error {
 	if d.root.handle == nil {
 		return fs.ErrClosed
 	}
@@ -56,9 +58,14 @@ func (d *Dir) rewriteFile(name string, data []byte, write func(int, []byte) (int
 	if st.Mode&unix.S_IFMT != unix.S_IFREG {
 		return &NonRegularError{d.root.path(name)}
 	}
-	f, err := d.root.OpenFile(name, unix.O_WRONLY|unix.O_NONBLOCK|unix.O_NOCTTY, 0)
+	return d.root.openAndRewrite(name, data, write)
+}
+
+// openAndRewrite checks the descriptor before modifying it, independent of the earlier lstat.
+func (d *directory) openAndRewrite(name string, data []byte, write func(int, []byte) (int, error)) (err error) {
+	f, err := d.OpenFile(name, unix.O_WRONLY|unix.O_NONBLOCK|unix.O_NOCTTY, 0)
 	if errors.Is(err, unix.ELOOP) || errors.Is(err, unix.EISDIR) || errors.Is(err, unix.ENXIO) {
-		return &NonRegularError{d.root.path(name)}
+		return &NonRegularError{d.path(name)}
 	}
 	if err != nil {
 		return err
