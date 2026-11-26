@@ -221,8 +221,8 @@ func reclaimStarter(t testing.TB, args []string) {
 // startInOwnDirectory runs the package's reclaim starter on name in a working directory of its own and returns that
 // directory, the starter's result line, "owner PID" or "refused PID", and join. The starter lives until join, so an
 // owner keeps answering connections on name with its process ID. join ends the starter's stdin, reads its remaining
-// output and waits for it, and returns an error naming that output when the starter failed; the test calls it before
-// it ends. A test that ends without calling it still has the starter stopped and waited for, but its exit status is
+// output and waits for it. If the starter or the scan fails, join reports the output read so far. The test calls join
+// before it ends. A test that ends without calling it still has the starter stopped and waited for, but its exit status is
 // discarded then: the command runs under the test's context, which is cancelled before cleanup and can kill it.
 func startInOwnDirectory(t *testing.T, env gatewaytest.Environment, name string) (dir, result string, join func() error) {
 	t.Helper()
@@ -258,8 +258,11 @@ func startInOwnDirectory(t *testing.T, env gatewaytest.Environment, name string)
 		for lines.Scan() {
 			rest = append(rest, lines.Text())
 		}
+		_ = outR.Close() // Release a blocked writer if the scanner stopped before EOF.
 		err := <-done
-		_ = outR.Close()
+		if scanErr := lines.Err(); scanErr != nil && !errors.Is(err, scanErr) {
+			err = errors.Join(err, scanErr)
+		}
 		if err != nil {
 			return fmt.Errorf("the starter on %q failed: %w; its output after the result: %q", name, err, rest)
 		}
