@@ -111,11 +111,11 @@ func (e *Emitter) Start(req Request) *Capture {
 }
 
 // emit schedules the primary record and the records derived from it without waiting for the
-// collector. A failure here never escapes into the request.
+// collector. It recovers nothing itself: the capture's callback boundary is the only recover on
+// this path, and the export goroutines have none, so a defect in the emitter is not hidden.
 func (e *Emitter) emit(primary Record, key identity, blocks []block) {
-	defer func() { _ = recover() }()
 	e.schedule(primary)
-	if primary.EventName != "gateway.token.usage" {
+	if primary.EventName != tokenUsageEvent {
 		return
 	}
 	for _, record := range e.builder.emitterRecords(primary, e.advanceTools(primary, key, blocks)) {
@@ -161,10 +161,7 @@ func (e *Emitter) schedule(record Record) {
 	if err != nil {
 		return
 	}
-	e.pending.Go(func() {
-		defer func() { _ = recover() }()
-		e.post(payload)
-	})
+	e.pending.Go(func() { e.post(payload) })
 }
 
 func (e *Emitter) post(payload []byte) {

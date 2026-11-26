@@ -22,13 +22,13 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json/jsontext"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -39,6 +39,7 @@ import (
 	"unicode/utf16"
 	"uuid"
 
+	"github.com/zchee/claude-code-model-gateway/internal/atomicfile"
 	"github.com/zchee/claude-code-model-gateway/internal/config"
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/outcome"
@@ -122,7 +123,11 @@ func (r *Recorder) LogRoute(request *http.Request, entry LogEntry) {
 	var path string
 	sessionID := entry.SessionID
 	if request != nil {
-		path, _, _ = strings.Cut(cmp.Or(request.RequestURI, request.URL.RequestURI()), "?")
+		target := request.RequestURI
+		if target == "" && request.URL != nil {
+			target = request.URL.RequestURI()
+		}
+		path, _, _ = strings.Cut(target, "?")
 		if sessionID == "" {
 			sessionID, _ = headerValue(request.Header, "X-Claude-Code-Session-Id")
 		}
@@ -159,20 +164,24 @@ func (r *Recorder) LogRoute(request *http.Request, entry LogEntry) {
 	}
 }
 
-// appendLine creates the log's directory and file if needed and appends one complete record.
+// errLogPath reports a log path that is not clean and absolute; its diagnostic names no path.
+var errLogPath = errors.New("route log path is not clean and absolute")
+
+// appendLine creates the log's directory if needed and appends one complete record to a regular
+// file in it. The directory is opened once and both the creation and the append use that handle,
+// so the directory checked is the directory written; the path must therefore be clean and
+// absolute. A final symbolic link is not followed and a special file, such as a FIFO, is refused
+// without waiting for a reader, because the caller holds the log lock.
 func appendLine(path string, line []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return errLogPath
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o600)
+	dir, err := atomicfile.OpenDirCreate(filepath.Dir(path), 0o700)
 	if err != nil {
 		return err
 	}
-	_, err = f.Write(line)
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	return err
+	defer func() { _ = dir.Close() }()
+	return dir.AppendFile(filepath.Base(path), line, 0o600)
 }
 
 // Enabled reports whether a local route span destination is configured.
@@ -205,10 +214,12 @@ func (r *Recorder) Start(headers http.Header) *Span {
 	var traceID [16]byte
 	var spanID [8]byte
 	var routeID uuid.UUID
-	r.randomMu.Lock()
-	ok := s.linked || readFull(r.random, traceID[:])
-	ok = ok && readFull(r.random, spanID[:]) && readFull(r.random, routeID[:])
-	r.randomMu.Unlock()
+	ok := func() bool {
+		// The entropy source is injected; release the lock even if it panics.
+		r.randomMu.Lock()
+		defer r.randomMu.Unlock()
+		return (s.linked || readFull(r.random, traceID[:])) && readFull(r.random, spanID[:]) && readFull(r.random, routeID[:])
+	}()
 	if !ok {
 		return &Span{}
 	}
