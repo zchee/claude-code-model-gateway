@@ -38,15 +38,19 @@ func startChild(t *testing.T, path string, files ...*os.File) int {
 	t.Helper()
 	cmd := exec.CommandContext(t.Context(), path, "-")
 	cmd.ExtraFiles = files
-	in, err := cmd.StdinPipe()
+	stdin, in, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = stdin.Close() }()
+	cmd.Stdin = stdin
 	out, err := cmd.StdoutPipe()
 	if err != nil {
+		_ = in.Close()
 		t.Fatal(err)
 	}
 	if err := cmd.Start(); err != nil {
+		_ = in.Close()
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = in.Close(); _ = cmd.Wait() })

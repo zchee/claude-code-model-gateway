@@ -31,50 +31,56 @@ func objectWithMemberAtDepth(depth int, member string) []byte {
 	return []byte(strings.Repeat("[", depth-1) + "{" + member + ":1}" + strings.Repeat("]", depth-1))
 }
 
-// TestDecodeWireMalformedMemberName checks that a non-string token in an object member-name position is rejected
-// with the tokenizer's structured *jsontext.SyntacticError wrapping jsontext.ErrNonStringName before reading a
-// value there, so it never triggers a container-depth error unless the enclosing object itself already crossed
-// the nesting limit.
+// TestDecodeWireMalformedMemberName checks that malformed member-name syntax in an object is rejected with the
+// tokenizer's structured *jsontext.SyntacticError before reading a value there, wrapping jsontext.ErrNonStringName
+// when a non-string token appears as the name and never triggering a container-depth error unless the enclosing
+// object itself already crossed the nesting limit.
 func TestDecodeWireMalformedMemberName(t *testing.T) {
 	const limit = 10000
+	open, closeArrays := strings.Repeat("[", limit-1), strings.Repeat("]", limit-1)
 	tests := map[string]struct {
 		input             []byte
 		wantDepth         bool
+		wantSyntactic     bool
 		wantNonStringName bool
 	}{
-		"error: shallow numeric member name":                                {[]byte(`{0:1}`), false, true},
-		"error: array opener as member name at the nesting limit":           {objectWithMemberAtDepth(limit, "[0]"), false, true},
-		"error: object opener as member name at the nesting limit":          {objectWithMemberAtDepth(limit, `{"k":0}`), false, true},
-		"error: number as member name at the nesting limit":                 {objectWithMemberAtDepth(limit, "0"), false, true},
-		"error: true literal as member name at the nesting limit":           {objectWithMemberAtDepth(limit, "true"), false, true},
-		"error: false literal as member name at the nesting limit":          {objectWithMemberAtDepth(limit, "false"), false, true},
-		"error: null literal as member name at the nesting limit":           {objectWithMemberAtDepth(limit, "null"), false, true},
-		"error: array opener as second member name at the nesting limit":    {[]byte(strings.Repeat("[", limit-1) + `{"k":0,[0]:1}` + strings.Repeat("]", limit-1)), false, true},
-		"error: truncated array opener as member name at the nesting limit": {[]byte(strings.Repeat("[", limit-1) + `{[`), false, true},
-		"error: over-limit array in a top-level member name":                {[]byte(`{` + strings.Repeat("[", limit+1) + strings.Repeat("]", limit+1) + `:1}`), false, true},
-		"error: array opener as member name past the nesting limit":         {objectWithMemberAtDepth(limit+1, "[0]"), true, false},
-		"error: object opener as member name past the nesting limit":        {objectWithMemberAtDepth(limit+1, `{"k":0}`), true, false},
-		"error: number as member name past the nesting limit":               {objectWithMemberAtDepth(limit+1, "0"), true, false},
-		"error: literal as member name past the nesting limit":              {objectWithMemberAtDepth(limit+1, "true"), true, false},
+		"error: shallow numeric member name":                                {[]byte(`{0:1}`), false, true, true},
+		"error: array opener as member name at the nesting limit":           {objectWithMemberAtDepth(limit, "[0]"), false, true, true},
+		"error: object opener as member name at the nesting limit":          {objectWithMemberAtDepth(limit, `{"k":0}`), false, true, true},
+		"error: number as member name at the nesting limit":                 {objectWithMemberAtDepth(limit, "0"), false, true, true},
+		"error: true literal as member name at the nesting limit":           {objectWithMemberAtDepth(limit, "true"), false, true, true},
+		"error: false literal as member name at the nesting limit":          {objectWithMemberAtDepth(limit, "false"), false, true, true},
+		"error: null literal as member name at the nesting limit":           {objectWithMemberAtDepth(limit, "null"), false, true, true},
+		"error: array opener as second member name at the nesting limit":    {[]byte(open + `{"k":0,[0]:1}` + closeArrays), false, true, true},
+		"error: truncated array opener as member name at the nesting limit": {[]byte(open + `{[`), false, true, true},
+		"error: mismatched closing bracket at the nesting limit":            {[]byte(open + `{]`), false, true, false},
+		"error: invalid byte in member name at the nesting limit":           {[]byte(open + `{x:1}` + closeArrays), false, true, false},
+		"error: missing member name at end of input at the nesting limit":   {[]byte(open + `{`), false, true, false},
+		"error: trailing comma at the nesting limit":                        {[]byte(open + `{"k":0,}` + closeArrays), false, true, false},
+		"error: over-limit array in a top-level member name":                {[]byte(`{` + strings.Repeat("[", limit+1) + strings.Repeat("]", limit+1) + `:1}`), false, true, true},
+		"error: array opener as member name past the nesting limit":         {objectWithMemberAtDepth(limit+1, "[0]"), true, false, false},
+		"error: object opener as member name past the nesting limit":        {objectWithMemberAtDepth(limit+1, `{"k":0}`), true, false, false},
+		"error: number as member name past the nesting limit":               {objectWithMemberAtDepth(limit+1, "0"), true, false, false},
+		"error: literal as member name past the nesting limit":              {objectWithMemberAtDepth(limit+1, "true"), true, false, false},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			_, err := jsonx.DecodeWire(tt.input)
 			if err == nil {
-				t.Fatal("accepted object with non-string member name")
+				t.Fatal("accepted object with malformed member name")
 			}
 			_, gotDepth := errors.AsType[*jsonx.WireDepthError](err)
 			if diff := gocmp.Diff(tt.wantDepth, gotDepth); diff != "" {
 				t.Errorf("WireDepthError (-want +got) for err=%v:\n%s", err, diff)
 			}
 			synErr, gotSyntactic := errors.AsType[*jsontext.SyntacticError](err)
-			if diff := gocmp.Diff(tt.wantNonStringName, gotSyntactic); diff != "" {
+			if diff := gocmp.Diff(tt.wantSyntactic, gotSyntactic); diff != "" {
 				t.Errorf("SyntacticError (-want +got) for err=%v:\n%s", err, diff)
 			}
 			if diff := gocmp.Diff(tt.wantNonStringName, errors.Is(err, jsontext.ErrNonStringName)); diff != "" {
 				t.Errorf("errors.Is(err, ErrNonStringName) (-want +got) for err=%v:\n%s", err, diff)
 			}
-			if tt.wantNonStringName && synErr.ByteOffset <= 0 {
+			if gotSyntactic && synErr.ByteOffset <= 0 {
 				t.Errorf("SyntacticError.ByteOffset = %d, want > 0", synErr.ByteOffset)
 			}
 		})

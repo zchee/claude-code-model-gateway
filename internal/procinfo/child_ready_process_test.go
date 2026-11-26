@@ -18,28 +18,42 @@ package procinfo
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"os/exec"
 	"testing"
+	"time"
 )
 
 func TestChildWithoutReadyEcho(t *testing.T) {
 	const fixture = "PROCINFO_TEST_NO_ECHO"
-	if os.Getenv(fixture) == "1" {
-		path, err := exec.LookPath("true")
+	const returned = "returned PID without acknowledgement"
+	tests := map[string]struct{ program, diagnostic string }{
+		"error: no echo":    {"true", "child readiness:"},
+		"error: wrong echo": {"yes", `child readiness: read "-" (1 bytes): <nil>`},
+	}
+	if tt, ok := tests[os.Getenv(fixture)]; ok {
+		path, err := exec.LookPath(tt.program)
 		if err != nil {
 			t.Fatal(err)
 		}
 		startChild(t, path)
-		t.Fatal("returned PID without acknowledgement")
+		t.Fatal(returned)
 	}
 	binary, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.CommandContext(t.Context(), binary, "-test.run=^TestChildWithoutReadyEcho$")
-	cmd.Env = append(cmd.Environ(), fixture+"=1")
-	if out, err := cmd.CombinedOutput(); err == nil || !bytes.Contains(out, []byte("child readiness:")) {
-		t.Fatalf("child without echo: want readiness failure, got %v\n%s", err, out)
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, binary, "-test.run=^TestChildWithoutReadyEcho$")
+			cmd.Env = []string{"LC_ALL=C", "PATH=/usr/bin:/bin", fixture + "=" + name}
+			out, err := cmd.CombinedOutput()
+			if ctx.Err() != nil || err == nil || !bytes.Contains(out, []byte(tt.diagnostic)) || bytes.Contains(out, []byte(returned)) {
+				t.Fatalf("want %q without %q, got %v (context: %v)\n%s", tt.diagnostic, returned, err, ctx.Err(), out)
+			}
+		})
 	}
 }
