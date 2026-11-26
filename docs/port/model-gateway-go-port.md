@@ -552,8 +552,21 @@ A design rule keeps most tests free of processes: packages take process identity
 interfaces that `procinfo` and the commands implement (the lifecycle lock decides staleness with a pure function over an
 injected identity source), so their tests need no `process` tag.
 
-The Darwin halves of T0.5 and T0.6 run on the `xcode-27` CI runner through pushed phase branches (OD-8). A build on the
-developer machine is not evidence for a Darwin process test; the phase 3 gate requires the macOS venue results.
+The macOS process-identity tests (T0.5) ran on the hosted `xcode-27` runner in phase 0 (OD-8). A build on the developer
+machine is not evidence for a Darwin process test; the phase-3 gate requires the macOS venue results.
+
+**macOS Node baseline.** The pinned Node baseline runs on hosted `xcode-27` through a pushed phase branch by the phase-3
+gate (T3.9, OD-19). The runner is discarded after the job. Before upload the benchmark sweeps for its own marked
+processes and records the result as “containment by runner teardown and marker sweep; absence of unmarked detached
+descendants not proven”.
+
+Linux `hack/bench` publishes evidence only after its child subreaper proves no detached descendant survives. It reads
+`/proc/thread-self/children` to enumerate children and requires `waitpid` to return `ECHILD` (`hack/bench:46-63,87-151,725-729`).
+The pinned identity probe starts detached children (`lib/process-supervision.js:456`), and the interruption control uses
+an unmarked descendant in another process group (`docs/port/baseline-node.md:229-248`). macOS reparents orphans to
+`launchd` and has no caller-selected subreaper; a process-group kill or `ps` sweep cannot provide the Linux proof. The
+Linux run records every observation required by T0.6; the performance criterion compares both runtimes in one job at the
+phase-4 gate. The macOS baseline waits for the phase-3 process layer to design and test detached-descendant cleanup.
 
 ### 3.9 Windows
 
@@ -680,7 +693,7 @@ source as `hack/pinned-source` materializes it (`.cache/model-gateway-js/plugins
 | 0 | Foundations, isolation, identity seam, test inventory | AC-1, AC-2; test inventory (T0.7) reviewed and landed | 🔶 in progress |
 | 1 | Pure logic packages | AC-3 (tables), AC-8 for phase 1 rows | 🔜 not started |
 | 2 | Walking skeleton, launch adapter, worker | AC-3 (HTTP), AC-4, AC-5 (worker paths), AC-11 for tests assigned to phase 2 | 🔜 not started |
-| 3 | Supervisor and process layer | AC-5 (supervisor paths), AC-6 (start/stop/recover), AC-14, security review 1 (AC-13) | 🔜 not started |
+| 3 | Supervisor and process layer | AC-5 (supervisor paths), AC-6 (start/stop/recover), AC-14, macOS Node baseline (T3.9), security review 1 (AC-13) | 🔜 not started |
 | 4 | CLI and settings | AC-6 (ensure/setup), AC-9, AC-12, AC-11 for the CLI set | 🔜 not started |
 | 5 | Packaging, migration, shadow mode | AC-7, AC-15a, AC-16, security review 2 (AC-13) | 🔜 not started |
 | 6 | Rehearsal, shadow soak and cutover | AC-10, AC-15b; phase 6 after the rehearsal is run by the user | 🔜 not started |
@@ -710,7 +723,7 @@ Phase 0 works on branch `port/phase-0` in the main checkout until T0.0 is commit
 | T0.3 | `jsonx` (the wire encoder and decoder, the settings file policy, the state-file writer of section 3.5) and `atomicfile` (D1). The Node-generated corpora are produced in the venue by a committed generator script that runs plain Node on JSON inputs (no plugin code), and are committed | L / astra | T0.1, T0.4, T0.9 | wire and state-file goldens match byte for byte; the authored settings pairs pass; a 60 s fuzz run of "settings parse, no edit, write" changes no byte |
 | T0.4b | `gatewaytest` environment and fakes as real HTTP servers and helper processes; the product guard of section 3.8 | L / astra | T0.2, T0.4, T0.9 | in the venue: with the guard set, binding 18764, 18765 or 80, running a real `claude` and writing a settings file outside the sandbox each fail with a named error; a helper process started with an empty environment finds no gateway home and no listener; one sample process test runs |
 | T0.5 | `procinfo` (argv, birth time, parent, table, liveness, port owner with the probe budget `CODEX_GATEWAY_PROBE_TIMEOUT_MS`, default 2 s) and the pid-record schema of section 3.4 with its atomic writer and reader. Venue tests: renamed, replaced and unlinked running binary; record crash points (after spawn, between the JSON and the decimal file); a non-UTC time zone; an injected start date with a single-digit day | M / astra | T0.3, T0.4b | tests pass on Linux; the Darwin run on `xcode-27` is recorded |
-| T0.6 | Measurements of the pinned Node gateway in the venue, with machine, commands and raw samples in `docs/port/baseline-node.md`; `hack/bench`. (a) the three baselines of AC-9; (b) behavior probes: what happens to the provider request on a client disconnect at each stage, direct and relayed (section 3.10); how a client `Upgrade:` request is answered (INV-02 §14 item 21). What the real `claude -p` returns during the pin probe (INV-04 §13 item 4) is not measured: a fake CLI returns only the status it was programmed with, so `pin` is ported from the source's branches, both statuses are unit-tested, and the question stays open (appendix B) | M / sol | T0.4b | every probe has a recorded observation that later tasks cite |
+| T0.6 | Measurements of the pinned Node gateway in the venue, with machine, commands and raw samples in `docs/port/baseline-node.md`; `hack/bench`. (a) the three baselines of AC-9; (b) behavior probes: what happens to the provider request on a client disconnect at each stage, direct and relayed (section 3.10); how a client `Upgrade:` request is answered (INV-02 §14 item 21). What the real `claude -p` returns during the pin probe (INV-04 §13 item 4) is not measured: a fake CLI returns only the status it was programmed with, so `pin` is ported from the source's branches, both statuses are unit-tested, and the question stays open (appendix B) | M / sol | T0.4b | the Linux venue run satisfies phase 0: every probe has a recorded observation that later tasks cite; the macOS Node baseline is due at the phase-3 gate (T3.9) |
 
 ### Phase 1: pure logic (packages are disjoint; two venue-only jobs are named)
 
@@ -765,8 +778,9 @@ pushed before the phase-0 gate passes.
 | T3.4 | `supervisor/workerproc`: respawn with D5, restart with drain and kill at the drain timeout, `/restart` with the candidate rule (D11), birth records and orphan reaping (D6) | L / astra | T3.1, T3.3 |
 | T3.5 | `supervisor/rclistener` and control endpoints: `/internal/rc-compatibility` probe and reconcile (D3), compatibility listener, failure file | M / astra | T3.3 |
 | T3.6 | `launch`, `shimstate`, and the commands `start`, `stop` (D9), `recover`: the plan table of INV-01 §3.3, readiness wait (300 ms poll; 12 s quiet, 42 s otherwise) | L / astra | T3.2, T3.4, T3.5 |
-| T3.7 | Phase gate (Tier 2): conformance set or fallback tests for the lifecycle files; ownership matrix of AC-6 for `start`, `stop`, `recover`; relay counts of AC-14 | M / astra | T3.6 |
+| T3.7 | Phase gate (Tier 2): conformance set or fallback tests for the lifecycle files; ownership matrix of AC-6 for `start`, `stop`, `recover`; relay counts of AC-14; macOS Node baseline (T3.9) | M / astra | T3.6, T3.9 |
 | T3.8 | Security review 1 (grok lane): control token, Host/Origin gate, relay, RC endpoint, pid-record trust | review | T3.7 |
+| T3.9 | Node baseline on macOS. Port the Linux-only gate and ephemeral-port checks to Darwin (`sysctl net.inet.ip.portrange.*`; `hack/bench:8-13,250,316-318,347`); adapt invocation metadata, machine inventory (`lscpu`), timestamps and GNU `timeout` (`hack/bench:203-216,226,625-628,686-700`). Replace `ss` and `/proc` listener, liveness, parent and `VmRSS` reads with macOS probes (`lsof` field mode with a canary, `ps -o ppid=`, and separately labelled `ps` RSS if measured; `hack/bench:390,413,440-446,500-502`); fit paths to Darwin's 104-byte Unix socket limit (`hack/bench:352,723`), and publish the evidence frame only after the required cleanup checks (`hack/bench:663-665,685-705`). Acceptance: hosted `xcode-27` run through the guarded `bench` target with exactly Node v24.11.1 and verified pinned tree hashes; retain raw samples and the machine description as an attempt-specific artifact even on failure. Commit macOS samples under `docs/port/baseline-node-samples/darwin/` with their checksum in `docs/port/baseline-node.md`; label the macOS resident-memory metric or record it as not measured, and state the §3.8 containment contract in the record. | M / sol | T3.4 |
 
 ### Phase 4: CLI and settings
 
@@ -1056,6 +1070,7 @@ The defaults are what the plan assumes unless a row records the user's decision.
 | OD-16 | Clock-independent process start token in the pid record | decided 2026-11-26: add the token before phase 3; the phase-3 test-first handoff fixes its representation (§3.4) | — |
 | OD-17 | Early phase-1 test-first handoffs | decided 2026-11-26: approve the recorded deviation for test-only lanes independent of `procinfo` that began before all phase-0 prerequisites had merged (§4) | — |
 | OD-18 | Additional deliberate differences | decided 2026-11-26: accept the added §3.10 rows and launcher-guidance coverage, separately from D1–D13 | — |
+| OD-19 | macOS half of the Node baseline | decided by the lead 2026-11-26; reported to the user: require the macOS Node baseline at the phase-3 gate, not phase 0 (§3.8, T3.9) | To require it at phase 0, first agree on a macOS containment contract, then port `hack/bench` under that contract before closing the phase-0 gate. |
 
 Follow-ups, not part of this plan: F1 decide whether the relay should never resend after delivery (availability cost: a
 worker replaced mid-request yields a 503 instead of a transparent resend); F2 cancel the upstream request when the client
