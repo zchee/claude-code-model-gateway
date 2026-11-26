@@ -187,15 +187,20 @@ type Cache struct {
 	// started before Start ends with the worker too.
 	life     context.Context
 	stopLife context.CancelFunc
+	// lifeDone is life's Done channel, read once so that no context method is called under mu.
+	lifeDone <-chan struct{}
 	// catalogMu makes the catalog read and the election of the one refresh in flight one operation.
 	catalogMu sync.Mutex
 	flight    *catalogFlight
 
-	// mu guards worker, started and closed, and is the gate between registering background work with
-	// wg and Wait: registration checks and adds under it, and Wait crosses it before joining.
-	mu      sync.Mutex
-	worker  context.Context
-	started bool
+	// mu guards workerDone, started and closed, and is the gate between registering background work
+	// with wg and Wait: registration checks and adds under it, and Wait crosses it before joining.
+	// Nothing under it calls into a context or another caller-supplied value, so Wait always crosses it.
+	mu sync.Mutex
+	// workerDone is the Done channel of the worker context from Start, captured before mu is taken;
+	// nil until Start.
+	workerDone <-chan struct{}
+	started    bool
 	// closed is set by Wait; no background work is registered afterwards.
 	closed bool
 	wg     sync.WaitGroup
@@ -228,6 +233,7 @@ func New(opts Options) (*Cache, error) {
 		logf:          opts.Logf,
 	}
 	c.life, c.stopLife = context.WithCancel(context.Background())
+	c.lifeDone = c.life.Done()
 	if c.lookup == nil {
 		c.lookup = func(string) (string, bool) { return "", false }
 	}
@@ -312,16 +318,22 @@ func nodeTimerDelay(ms float64) time.Duration {
 // Start runs the initial refresh and schedules periodic refreshes, exponential retries, and
 // background Anthropic catalog refreshes under ctx until ctx is canceled.
 func (c *Cache) Start(ctx context.Context) {
+	if ctx == nil {
+		return
+	}
+	// The context is called only outside mu, so a context that blocks in a method cannot hold up Wait.
+	done := ctx.Done()
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.started || c.closed || ctx == nil {
+	if c.started || c.closed {
+		c.mu.Unlock()
 		return
 	}
 	c.started = true
-	c.worker = ctx
+	c.workerDone = done
+	c.wg.Go(func() { c.run(ctx) })
+	c.mu.Unlock()
 	// A catalog refresh already running, or started later, ends with the worker.
 	context.AfterFunc(ctx, c.stopLife)
-	c.wg.Go(func() { c.run(ctx) })
 }
 
 // run owns the periodic and retry timers. The interval timer starts with the worker, independent of

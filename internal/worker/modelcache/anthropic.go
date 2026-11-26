@@ -123,7 +123,7 @@ func (c *Cache) anthropicRows(incoming http.Header) (jsontext.Value, int, *catal
 // register admits one background catalog refresh and adds it to the wait group in one step under
 // c.mu, the gate Wait crosses before joining. A refresh admitted before shutdown is therefore counted
 // before Wait joins, and none is admitted after the worker context was cancelled or Wait was called.
-// Nothing under the gate does I/O or waits.
+// Nothing under the gate does I/O, waits, or calls a method of a context.
 func (c *Cache) register() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -150,8 +150,17 @@ func (c *Cache) admitted() bool {
 }
 
 // liveLocked reports, with c.mu held, that neither the worker context nor the catalog lifetime ended.
+// It only polls the Done channels captured outside the lock; a nil workerDone (before Start) never
+// fires.
 func (c *Cache) liveLocked() bool {
-	return c.life.Err() == nil && (c.worker == nil || c.worker.Err() == nil)
+	select {
+	case <-c.lifeDone:
+		return false
+	case <-c.workerDone:
+		return false
+	default:
+		return true
+	}
 }
 
 // refreshCatalog fetches every page and records the outcome against the snapshot that triggered it.
