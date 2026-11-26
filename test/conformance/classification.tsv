@@ -810,7 +810,7 @@ test/wiring-mode.test.js	558	1	doctor explains the no-model-fallback diagnostic 
 test/wiring-mode.test.js	568	1	effectiveBaseUrl follows Claude Code precedence and reports shadowed definitions	go-port	phase-1	internal/wiring	task	Exercise ownership and preservation of settings in Go.
 test/wiring-mode.test.js	600	1	effectiveBaseUrl skips absent, unparsable, and env-less settings files	go-port	phase-1	internal/wiring	task	Exercise ownership and preservation of settings in Go.
 test/wiring-mode.test.js	619	1	effectiveBaseUrl is re-exported through commands	js-only:js-source-lint				Only checks that lib/commands.js re-exports a function from lib/settings-wiring.js (exit 0, output function). test/wiring-mode.test.js:568 and :600 cover the function’s behavior; no Go export is created.
-test/wiring-mode.test.js	626	1	unsafe RC preflight recognizes normalized HTTPS Anthropic process overrides only	go-port	phase-1	internal/rccompat	task	Exercise hosts compatibility decisions in Go.
+test/wiring-mode.test.js	626	1	unsafe RC preflight recognizes normalized HTTPS Anthropic process overrides only	go-port	phase-1	internal/wiring	task	Exercise normalized HTTPS process overrides with the wiring resolver.
 test/wiring-mode.test.js	642	1	doctor fails on a selected-mode contradiction and passes when modes agree	go-port	phase-4	internal/doctor	task	Exercise diagnostics output in Go.
 test/wiring-mode.test.js	663	1	doctor retains a process-env gateway mode conflict	go-port	phase-4	internal/doctor	task	Exercise diagnostics output in Go.
 test/wiring-mode.test.js	677	1	syncCompatMode makes verified settings authoritative after migrating legacy wiring	go-port	phase-1	internal/wiring	task	Exercise ownership and preservation of settings in Go.

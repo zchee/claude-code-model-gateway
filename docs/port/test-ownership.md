@@ -18,11 +18,11 @@ In [classification.tsv](../../test/conformance/classification.tsv), `package` is
 | phase-1 | `internal/policy` | T1.1 | T2.0b | 15 | 0 |
 | phase-1 | `internal/proxyconfig` | T1.3 | T2.0b | 2 | 0 |
 | phase-1 | `internal/proxymodels` | T1.2 | T2.0b | 5 | 0 |
-| phase-1 | `internal/rccompat` | T1.12b | T2.0b | 7 | 0 |
+| phase-1 | `internal/rccompat` | T1.12b | T2.0b | 6 | 0 |
 | phase-1 | `internal/toolschema` | T1.5b | T2.0b | 10 | 0 |
 | phase-1 | `internal/upstreamstate` | T1.12a | T2.0b | 0 | 0 |
 | phase-1 | `internal/usage` | T1.12d | T2.0b | 12 | 0 |
-| phase-1 | `internal/wiring` | T1.10 | T2.0b | 24 | 0 |
+| phase-1 | `internal/wiring` | T1.10 | T2.0b | 25 | 0 |
 | phase-1 | `internal/worker/dispatch` | T1.8 | T2.0b | 3 | 0 |
 | phase-1 | `internal/worker/route` | T1.7 | T2.0b | 3 | 0 |
 | phase-1 | `internal/worker/sentry` | T1.6 | T2.0b | 1 | 0 |
