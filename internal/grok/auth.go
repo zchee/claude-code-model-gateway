@@ -17,10 +17,18 @@ package grok
 import (
 	"context"
 	"errors"
+	"io"
+	"math"
 	"net/http"
+	"strings"
 	"time"
+	"unicode/utf16"
+
+	"golang.org/x/sync/singleflight"
 
 	"github.com/zchee/claude-code-model-gateway/internal/catalog"
+	"github.com/zchee/claude-code-model-gateway/internal/jsdate"
+	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
 )
 
 // DefaultRefreshSkew is the lead time before token expiry at which a refresh is triggered.
@@ -35,15 +43,84 @@ var (
 	ErrAuthCannotRefresh = errors.New("Grok CLI auth cannot refresh. Run `grok` and log in again.") //nolint:staticcheck // The message is the source's user-facing wording.
 	// ErrAuthRefreshFailed reports a failed OIDC discovery or token refresh exchange.
 	ErrAuthRefreshFailed = errors.New("Grok CLI auth refresh failed. Run `grok` and log in again.") //nolint:staticcheck // The message is the source's user-facing wording.
-
-	errNotImplemented = errors.New("not implemented")
 )
+
+// authEntryPrefix starts the name of the auth file member that holds the x.ai credentials.
+const authEntryPrefix = "https://auth.x.ai::"
+
+// unavailableMessage is the readiness message when no auth check is available.
+const unavailableMessage = "Grok CLI auth is unavailable. Run `grok` and log in again."
+
+// authFile is a parsed auth file and the position of its first x.ai entry.
+type authFile struct {
+	root  jsonx.WireValue
+	entry int
+}
+
+func (a *authFile) value() jsonx.WireValue { return a.root.Members[a.entry].Value }
+
+// readAuth follows readGrokAuth (lib/grok-backend.js:34-50): the first member whose name starts
+// with the x.ai prefix and whose value is an object or array must hold a non-empty string key.
+// Errors are the bare sentinels, so they carry nothing from the file.
+func readAuth(file string) (*authFile, error) {
+	root, ok := readJSONFile(file)
+	if !ok {
+		return nil, ErrAuthMissing
+	}
+	if root.Kind == '{' {
+		for i, m := range root.Members {
+			if !hasUnitsPrefix(m.Name, authEntryPrefix) || m.Value.Kind != '{' && m.Value.Kind != '[' {
+				continue
+			}
+			if key := get(m.Value, "key"); key.Kind != '"' || len(key.Text) == 0 {
+				return nil, ErrAuthInvalid
+			}
+			return &authFile{root: root, entry: i}, nil
+		}
+	}
+	return nil, ErrAuthInvalid
+}
+
+func hasUnitsPrefix(name []uint16, prefix string) bool {
+	return len(name) >= len(prefix) && nameIs(name[:len(prefix)], prefix)
+}
+
+// nonEmptyString reports the text of a non-empty string value.
+func nonEmptyString(v jsonx.WireValue) (string, bool) {
+	if v.Kind != '"' || len(v.Text) == 0 {
+		return "", false
+	}
+	return string(utf16.Decode(v.Text)), true
+}
+
+// expiresAtMillis follows lib/grok-backend.js:52-59: a string is a date, anything else a number of
+// seconds below 1e11 and of milliseconds from there on. Where the source's Number() would throw,
+// the expiry is unverifiable, as an unparseable date is.
+func expiresAtMillis(v jsonx.WireValue) float64 {
+	if v.Kind == '"' {
+		if ms, ok := jsdate.Parse(string(utf16.Decode(v.Text))); ok {
+			return float64(ms)
+		}
+		return math.NaN()
+	}
+	if coercionThrows(v) {
+		return math.NaN()
+	}
+	n := jsNumber(v)
+	if n < 100000000000 {
+		return n * 1000
+	}
+	return n
+}
+
+func finite(n float64) bool { return !math.IsNaN(n) && !math.IsInf(n, 0) }
 
 // CheckAuth verifies that file contains a parseable Grok CLI auth object with a non-empty
 // access key under an https://auth.x.ai:: entry, without returning any credential,
 // refreshing tokens, or writing to disk.
 func CheckAuth(file string) error {
-	return errNotImplemented
+	_, err := readAuth(file)
+	return err
 }
 
 // Readiness reports Grok CLI authentication readiness using check without refreshing tokens.
@@ -51,7 +128,31 @@ func CheckAuth(file string) error {
 // (ASCII case-insensitive) maps to "auth-invalid" and any other error maps to "auth-missing".
 // A nil check reports "auth-missing" with the unavailable fallback message.
 func Readiness(check func() error) catalog.Readiness {
-	return catalog.Readiness{}
+	if check == nil {
+		return catalog.Readiness{State: "auth-missing", Message: unavailableMessage}
+	}
+	err := check()
+	if err == nil {
+		return catalog.Readiness{Ready: true, State: "ready", Message: "Grok CLI auth is present."}
+	}
+	message := err.Error()
+	state := "auth-missing"
+	if strings.Contains(asciiLower(message), "invalid") {
+		state = "auth-invalid"
+	}
+	return catalog.Readiness{State: state, Message: message}
+}
+
+// asciiLower folds only ASCII letters, as a JavaScript regular expression with the i flag and
+// without the u flag matches the ASCII pattern "invalid".
+func asciiLower(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + 'a' - 'A'
+		}
+	}
+	return string(b)
 }
 
 // AuthOptions configures an AuthStore without reading ambient environment or files.
@@ -73,14 +174,32 @@ type AuthOptions struct {
 
 // AuthStore reads and refreshes Grok CLI credentials with single-flight deduplication.
 // It is safe for concurrent use and must not be copied after first use.
-type AuthStore struct{}
+type AuthStore struct {
+	file      string
+	transport http.RoundTripper
+	now       func() time.Time
+	skew      time.Duration
+	shadow    bool
+	refreshes singleflight.Group
+}
 
 // NewAuthStore constructs an AuthStore for the configured auth file and transport.
 // It returns an error when opts.Transport is nil.
 func NewAuthStore(opts AuthOptions) (*AuthStore, error) {
-	_ = opts
-	return &AuthStore{}, nil
+	if opts.Transport == nil {
+		return nil, errors.New("grok: auth store requires an explicit transport")
+	}
+	s := &AuthStore{file: opts.File, transport: opts.Transport, now: opts.Now, skew: opts.Skew, shadow: opts.Shadow}
+	if s.now == nil {
+		s.now = time.Now
+	}
+	if s.skew <= 0 {
+		s.skew = DefaultRefreshSkew
+	}
+	return s, nil
 }
+
+func (s *AuthStore) nowMillis() float64 { return float64(s.now().UnixMilli()) }
 
 // AccessToken returns a valid Grok access token, refreshing once across concurrent callers
 // when the stored token is expired, unparseable, or within the refresh skew window.
@@ -88,12 +207,208 @@ func NewAuthStore(opts AuthOptions) (*AuthStore, error) {
 // window), refuses expired or unverifiable tokens with ErrAuthCannotRefresh, and never
 // refreshes or writes the auth file.
 func (s *AuthStore) AccessToken(ctx context.Context) (string, error) {
-	return "", errNotImplemented
+	current, err := readAuth(s.file)
+	if err != nil {
+		return "", err
+	}
+	expires := expiresAtMillis(get(current.value(), "expires_at"))
+	if s.shadow {
+		if !finite(expires) || expires <= s.nowMillis() {
+			return "", ErrAuthCannotRefresh
+		}
+		return keyOf(current), nil
+	}
+	if !s.expiresSoon(expires) {
+		return keyOf(current), nil
+	}
+	return s.shared(ctx, func(ctx context.Context) (string, error) {
+		// A refresh that finished while this caller read the file has already rotated the
+		// refresh token, so the file is read again before deciding to exchange it.
+		current, err := readAuth(s.file)
+		if err != nil {
+			return "", err
+		}
+		if !s.expiresSoon(expiresAtMillis(get(current.value(), "expires_at"))) {
+			return keyOf(current), nil
+		}
+		return s.refresh(ctx, current)
+	})
+}
+
+func (s *AuthStore) expiresSoon(expires float64) bool {
+	return !finite(expires) || expires <= s.nowMillis()+float64(s.skew.Milliseconds())
+}
+
+func keyOf(a *authFile) string {
+	key, _ := nonEmptyString(get(a.value(), "key")) // readAuth checked it.
+	return key
 }
 
 // Refresh exchanges the stored refresh_token for a new access token, persists the updated auth file
 // atomically with mode 0600, and deduplicates concurrent refreshes.
 // In shadow mode it returns ErrAuthCannotRefresh without network requests or disk writes.
 func (s *AuthStore) Refresh(ctx context.Context) (string, error) {
-	return "", errNotImplemented
+	return s.shared(ctx, func(ctx context.Context) (string, error) {
+		current, err := readAuth(s.file)
+		if err != nil {
+			return "", err
+		}
+		return s.refresh(ctx, current)
+	})
+}
+
+// shared runs one refresh for all concurrent callers. The refresh runs on a context that keeps
+// ctx's values but not its cancellation, so one caller leaving does not fail the others; each
+// caller stops waiting when its own ctx ends.
+func (s *AuthStore) shared(ctx context.Context, run func(context.Context) (string, error)) (string, error) {
+	work := context.WithoutCancel(ctx)
+	ch := s.refreshes.DoChan("refresh", func() (any, error) { return run(work) })
+	select {
+	case res := <-ch:
+		if res.Err != nil {
+			return "", res.Err
+		}
+		return res.Val.(string), nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+// refresh follows refreshGrokAuth (lib/grok-backend.js:83-113).
+func (s *AuthStore) refresh(ctx context.Context, current *authFile) (string, error) {
+	if s.shadow {
+		return "", ErrAuthCannotRefresh
+	}
+	entry := current.value()
+	refreshToken, ok := nonEmptyString(get(entry, "refresh_token"))
+	if !ok {
+		return "", ErrAuthCannotRefresh
+	}
+	clientID, ok := nonEmptyString(get(entry, "oidc_client_id"))
+	if !ok {
+		return "", ErrAuthCannotRefresh
+	}
+	endpoint := s.tokenEndpoint(ctx, entry)
+	form := formEncode([][2]string{{"grant_type", "refresh_token"}, {"refresh_token", refreshToken}, {"client_id", clientID}})
+	status, body, err := s.requestJSON(ctx, http.MethodPost, endpoint, form)
+	if err != nil || status < 200 || status >= 300 {
+		return "", ErrAuthRefreshFailed
+	}
+	accessToken := get(body, "access_token")
+	if accessToken.Kind != '"' || len(accessToken.Text) == 0 {
+		return "", ErrAuthRefreshFailed
+	}
+	setMember(&entry, "key", accessToken)
+	if rotated := get(body, "refresh_token"); rotated.Kind == '"' && len(rotated.Text) > 0 {
+		setMember(&entry, "refresh_token", rotated)
+	}
+	// Where the source's Number() would throw, the lifetime is unusable and expires_at stays.
+	if lifetime := get(body, "expires_in"); !coercionThrows(lifetime) {
+		if seconds := jsNumber(lifetime); finite(seconds) && seconds > 0 {
+			setMember(&entry, "expires_at", num(s.nowMillis()+seconds*1000))
+		}
+	}
+	root := current.root
+	root.Members = append([]jsonx.Member(nil), root.Members...)
+	root.Members[current.entry].Value = entry
+	if err := jsonx.WriteState(s.file, root, 0o600); err != nil {
+		return "", ErrAuthRefreshFailed
+	}
+	return string(utf16.Decode(accessToken.Text)), nil
+}
+
+// tokenEndpoint follows oidcTokenEndpoint (lib/grok-backend.js:70-81): the issuer's discovery
+// document names the endpoint, and any failure falls back to the conventional path.
+func (s *AuthStore) tokenEndpoint(ctx context.Context, entry jsonx.WireValue) string {
+	issuer := DefaultIssuer
+	if custom, ok := nonEmptyString(get(entry, "oidc_issuer")); ok {
+		issuer = strings.TrimSuffix(custom, "/")
+	}
+	status, body, err := s.requestJSON(ctx, http.MethodGet, issuer+"/.well-known/openid-configuration", "")
+	if err == nil && status >= 200 && status < 300 {
+		if endpoint := get(body, "token_endpoint"); endpoint.Kind == '"' {
+			return string(utf16.Decode(endpoint.Text))
+		}
+	}
+	if issuer == DefaultIssuer {
+		return DefaultTokenEndpoint
+	}
+	return issuer + "/oauth/token"
+}
+
+// requestJSON follows the source's requestJson (lib/grok-backend.js:393-408): it sends no headers
+// besides the form content type, and a body that is not JSON reads as null.
+func (s *AuthStore) requestJSON(ctx context.Context, method, target, form string) (int, jsonx.WireValue, error) {
+	var body io.Reader
+	if method == http.MethodPost {
+		body = strings.NewReader(form)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, target, body)
+	if err != nil {
+		return 0, jsonx.WireValue{}, err
+	}
+	// An empty User-Agent entry stops net/http from sending its own; the source sends none.
+	req.Header["User-Agent"] = []string{""}
+	if method == http.MethodPost {
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
+	resp, err := s.transport.RoundTrip(req)
+	if err != nil {
+		return 0, jsonx.WireValue{}, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, jsonx.WireValue{}, err
+	}
+	parsed, err := jsonx.DecodeWire(raw)
+	if err != nil {
+		parsed = null()
+	}
+	return resp.StatusCode, parsed, nil
+}
+
+// formEncode is URLSearchParams.toString(): the application/x-www-form-urlencoded serializer
+// keeps the pairs in order, leaves ASCII alphanumerics and *-._ as they are, writes a space as +
+// and percent-encodes every other UTF-8 byte.
+func formEncode(pairs [][2]string) string {
+	const hex = "0123456789ABCDEF"
+	var b strings.Builder
+	write := func(s string) {
+		for i := range len(s) {
+			switch c := s[i]; {
+			case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '*', c == '-', c == '.', c == '_':
+				b.WriteByte(c)
+			case c == ' ':
+				b.WriteByte('+')
+			default:
+				b.WriteByte('%')
+				b.WriteByte(hex[c>>4])
+				b.WriteByte(hex[c&0xf])
+			}
+		}
+	}
+	for i, p := range pairs {
+		if i > 0 {
+			b.WriteByte('&')
+		}
+		write(p[0])
+		b.WriteByte('=')
+		write(p[1])
+	}
+	return b.String()
+}
+
+// setMember assigns obj[name] as JavaScript does: an existing member keeps its position and a new
+// one is appended. obj gets its own member slice, so the parsed tree it came from is unchanged.
+func setMember(obj *jsonx.WireValue, name string, v jsonx.WireValue) {
+	members := append([]jsonx.Member(nil), obj.Members...)
+	for i := range members {
+		if nameIs(members[i].Name, name) {
+			members[i].Value = v
+			obj.Members = members
+			return
+		}
+	}
+	obj.Members = append(members, member(name, v))
 }
