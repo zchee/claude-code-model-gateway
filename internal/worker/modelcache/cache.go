@@ -690,14 +690,20 @@ func displayName(id, backend string) string {
 func (c *Cache) logSentryPolicies() {
 	for _, m := range policy.Rows() {
 		s, err := policy.EffectiveSentry(&m, c.env, c.windows.Cap(m.Backend), c.windows[m.Backend].CompactAt)
+		// A row marks an absent backend window with zero; the source prints its null window as "null"
+		// (lib/request-worker.js:1454).
+		window := "null"
+		if m.BackendWindow != 0 {
+			window = strconv.FormatInt(m.BackendWindow, 10)
+		}
 		switch {
 		case err != nil:
 			continue
 		case s == nil:
-			c.logf("model-gateway: sentry policy id=%s backendWindow=%d sentry=none", m.BackendID, m.BackendWindow)
+			c.logf("model-gateway: sentry policy id=%s backendWindow=%s sentry=none", m.BackendID, window)
 		default:
-			c.logf("model-gateway: sentry policy id=%s backendWindow=%d sentry=%s effectiveTrigger=%s source=%s",
-				m.BackendID, m.BackendWindow, m.Sentry, strconv.FormatFloat(s.CompactTrigger, 'f', -1, 64), s.Source)
+			c.logf("model-gateway: sentry policy id=%s backendWindow=%s sentry=%s effectiveTrigger=%s source=%s",
+				m.BackendID, window, m.Sentry, strconv.FormatFloat(s.CompactTrigger, 'f', -1, 64), s.Source)
 		}
 	}
 }
