@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Copyright 2026 The claude-code-model-gateway Authors.
+# SPDX-License-Identifier: Apache-2.0
+set -euo pipefail
+shell=(hack/conformance hack/conformance-containment-check hack/conformance-job hack/conformance-selection hack/conformance-static hack/remote)
+python=(hack/conformance-owner.py hack/conformance-supervise hack/conformance-transport.py)
+for file in "${shell[@]}"; do bash -n "$file"; done
+if [[ -n ${XDG_CACHE_HOME:-} ]]; then export PATH="$XDG_CACHE_HOME/adapter-static-tools/bin:$PATH"; fi
+shellcheck -x "${shell[@]}"
+ruff format --check "${python[@]}"
+ruff check "${python[@]}"
+if command -v mypy >/dev/null; then
+    mypy --strict --platform linux "${python[@]}"
+else
+    uvx mypy --strict --platform linux "${python[@]}"
+fi

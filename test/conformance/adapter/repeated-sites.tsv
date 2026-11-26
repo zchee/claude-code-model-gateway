@@ -1,0 +1,8 @@
+site	count
+test/context-sentry-lifecycle.test.js:158	2
+test/gateway-process-isolation.test.js:1363	5
+test/readiness-fast-path.test.js:66	2
+test/readiness-gate.test.js:60	2
+test/readiness-gate.test.js:90	2
+test/readiness-gate.test.js:162	3
+test/wiring-mode.test.js:137	3

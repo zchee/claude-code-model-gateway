@@ -65,8 +65,12 @@ test('mixed-target control: one redirected launch, decoys on Node, alternate spe
     /conformance adapter: unsupported Node options before product entry/,
   );
 
+  fs.symlinkSync('/bin/echo', path.join(foreignDir, 'node'));
+  const firstMatch = cp.spawnSync('node', [entry], { env: { ...env, PATH: `${foreignDir}:${env.PATH}` }, encoding: 'utf8' });
+  assert.equal(firstMatch.stdout.trim(), entry);
+  assert.equal(cp.execSync(`printf %s "$ENTRY"`, { env: { ...env, ENTRY: entry }, encoding: 'utf8' }), entry);
   assert.throws(
-    () => cp.spawnSync(process.execPath, ['--unknown-node-flag', 'val', entry, 'status'], { env }),
+    () => cp.spawnSync(process.execPath, ['--require', './test/isolate-home.js', entry, 'status'], { env }),
     /conformance adapter: unsupported Node option/,
   );
 

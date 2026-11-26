@@ -1,5 +1,17 @@
 # Running the launch adapter
 
+## What a verdict means
+
+**Attribution.** In a passing binary run of the pinned source tests, each selected product launch at an inventoried site ran the selected executable, and each site ran the expected number of times. Missing executions, recognized but unattributed launches, and source-runtime records in a binary run fail the comparison. This proof does not cover a shell starting the runtime, a worker thread, a copied runtime binary, or process-image replacement. The reviewed test-source fingerprint must match before the suite starts; re-pinning requires checking the launch forms and counts again. A copied runtime used as a fixture proxy is not a product launch.
+
+**Venue hygiene.** Before allowing another run on the dedicated venue, the owner must verify that the prior run has no live processes (and therefore no listeners). A reservation on disk prevents a new run even if the kernel lock is free. If the outside owner dies or its watchdog expires, the reservation stays. The refusal names the reservation. Recovery is an explicit `hack/remote provision` or `deprovision` that verifies termination before clearing it.
+
+**Verdicts through `hack/remote run conformance`.** `0` means pass, `1` means comparison or test failure, `2` means invalid request, and `124` means timeout. Other statuses are not verdicts: `97` is a venue refusal, `255` is a transport failure, and `128+signal` means interruption. Failure to establish cleanup is not evidence of a product mismatch.
+
+**Non-goals.** The adapter does not defend against tests deliberately evading interception or automatically recover a dead outside owner. Standalone containment is best effort: a process group cannot contain detached children. Dispose of the runner after use; an in-group timeout control does not establish detached-child cleanup.
+
+## Invocation
+
 From the worktree root, run `VENUE_HOST=debian-13-trixie.gaudiy-platform ./hack/remote run conformance`. Without selectors the default `TARGET=identity` compares the entire pinned suite to the baseline, by file, registration line and column, full name, and outcome. It never edits the source tests or harness.
 
 Append these make arguments to the same venue invocation:
@@ -15,30 +27,19 @@ Append these make arguments to the same venue invocation:
 | `CLASS=conformance` | Run all conformance rows against the chosen target. |
 | `PHASE=… PACKAGE=… GATE=…` | Select conformance rows by their exact inventory values. Omit any column to leave it unrestricted. |
 
-## Exit statuses
+## Attribution evidence
 
-Both `hack/conformance` and `hack/remote` distinguish runtime/parity failures, usage errors, and infrastructure timeouts:
-
-| Exit status | Meaning |
-| --- | --- |
-| `0` | Success. |
-| `1` | Parity, test, target, or runtime failure (including detached survivors, unattributed launches, or unverified teardown). |
-| `2` | Usage, argument, selector, or timeout-configuration error. |
-| `124` | Infrastructure timeout (either `TIMEOUT_SECONDS` in `hack/conformance-supervise` or `RuntimeMaxSec` on the venue scope). |
-
-(`97` is reserved for `hack/venue-check` attestation/environment refusals; `255` indicates an SSH transport failure.)
-
-## Launch attribution contract
-
-`test/conformance/launch-sites.tsv` records launch sites (`case`, `site`, `role`), not loop iteration counts. A selected run rejects an empty selection, a missing or nonpassing case, missing/inconsistent/out-of-order file or suite summaries, or any due `(case, site, role)` row that lacks at least one valid attributed launch for the selected target and measured digest. A nested launch counts for its parent only if the inventory explicitly lists that child under the parent.
-
-Per-execution enforcement is provided by fail-closed interception in `preload.cjs` and record-level validation in `evidence.cjs`: every execution of a repeated site (such as the three iterations at `test/wiring-mode.test.js:136–139`) emits its own launch record and is validated against `target`, measured SHA-256 `build`, positive `pid`, and `!unattributed`. Product entry paths are classified independently of Node executable spelling (`process.execPath`, symlinks, `node`, `env node`) and leading Node options; any product invocation through `child_process` that cannot be attributed or uses an unsupported option layout fails closed with an `unattributed` record rather than falling back to Node, while known decoys stay on Node.
+The launch inventory defaults to one execution per `(case, site, role)` row. `adapter/repeated-sites.tsv` lists the exceptions. Nested launches credit their parent only through an explicit inventory edge. Passing tests must also have complete, consistent file and suite summaries. A record must match the selected target and digest and identify a successful process launch. Before running the suite, `checkPinnedLaunchForms` scans all JS/CJS/MJS files under the pinned plugin's `test/` for out-of-scope forms (`worker_threads`, `cluster`, `shell:` options, uninventoried `child_process` APIs, and unreviewed `process.execPath` copies) and checks the full tree SHA-256 digest; changing a fixture or re-pinning fails until reviewed.
 
 ## Containment and recovery
 
 On the shared Linux venue, `hack/remote` is the single owner of OS containment: it runs **every** `run` invocation (regardless of Make goals or their order) inside one user systemd scope (`RuntimeMaxSec` = `TIMEOUT_SECONDS + 90` when `conformance` is among the goals, `600` seconds otherwise; `KillMode=control-group`) without installing a subreaper, so detached children remain in the scope cgroup while keeping normal `ppid=1` orphan parentage. Before releasing the launcher into `systemd-run`, `hack/remote` persists the scope unit name together with the launcher's PID and kernel start tick to `active-scope` while holding the venue `flock` outside the scope. It clears `active-scope` and releases the lock only after outside verification confirms both that the launcher is dead and that the scope is `inactive` with an empty `cgroup.procs`. If verification fails or the outer lock owner dies abruptly, `hack/remote status` reports the venue unavailable instead of free until `hack/remote provision` stops and verifies the recorded launcher and scope (before running the clean-state and port checks) and recovers it.
 
-Outside `hack/remote` (disposable hosted runners, macOS, or Linux hosts without a user systemd instance), `hack/conformance` runs with non-reaping (`waitid(WNOWAIT)`) process-group containment without requiring a user systemd bus, and scope-only controls in `hack/conformance-containment-check` report `not applicable on this host` by name.
+The independent outside watchdog covers startup, verification, and pruning, including a stopped owner. It kills the owner's process group, not the reserved scope; the latter has its own systemd deadline. After a watchdog expiry or an unverifiable launcher identity, the next run refuses and names `active-scope`. Recover with `VENUE_HOST=debian-13-trixie.gaudiy-platform ./hack/remote provision`; after a deliberate control, append the printed unit name to require an exact match under the lock. Never remove the marker manually. A passing recovery checks the recorded launcher, scope membership and service state before reuse.
+
+The self-test runs its three named controls in the production scope; it creates no sibling units. Two lifecycle controls are separate invocations because they intentionally end their own run: `hack/remote check-cancellation` cancels while its fixture listener is live (expect `143`, then a free venue); `hack/remote check-owner-deadline` freezes its own outside owner (expect no verdict, then refusal until recovery). Neither is part of a product comparison. On standalone hosts only the process-group check applies.
+
+The owner publishes the final class and status only after verified drain and a pruning attempt. Among completed comparisons, timeout takes precedence over failure, and failure over pass. A prune error is reported without changing that result; unverified teardown or a failed outcome write means **no verdict**, not a failed comparison. `70` denotes an infrastructure error.
 
 ## Evidence output
 

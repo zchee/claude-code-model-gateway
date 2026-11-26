@@ -8,7 +8,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const [root, plugin, work, target, mode, phase, pkg, gate, requestedLog, classification, site] = process.argv.slice(2);
-const { PROBE_FILE, REQUIRED_PROBES, createLog, evaluateSuite, tsv, validLaunch } = require('./evidence.cjs');
+const { PROBE_FILE, REQUIRED_PROBES, checkPinnedLaunchForms, createLog, evaluateSuite, tsv, validLaunch } = require('./evidence.cjs');
 const data = path.join(root, 'test/conformance');
 const inventory = file => tsv(path.join(data, file));
 const ndjson = file => fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line));
@@ -47,6 +47,8 @@ if (probes) {
   expectedFiles.push(PROBE_FILE);
   pattern.push(...REQUIRED_PROBES.map(p => escapeRE(p.name)));
 }
+// Verify the pinned test tree uses only inventoried launch forms and matches the reviewed pin.
+checkPinnedLaunchForms(plugin);
 const manifest = require(path.join(plugin, 'package.json')).scripts.test;
 assert.equal(manifest, 'node --require ./test/isolate-home.js --test --test-concurrency=2 --test-timeout=300000 "test/*.test.js"', 'unexpected pinned test command');
 const eventsFile = path.join(work, 'events.jsonl');
@@ -124,6 +126,8 @@ if (mode === 'self-test') {
     'control: unattributed, alternate-node, and extra-option product launches fail closed while decoys stay on Node',
     'control: real product launch falling back to Node inside a passing case fails the run',
     'control: passing two-launch case fails when only one inventoried launch is redirected',
+    'control: withholding one execution of a passing repeated site fails attribution',
+    'control: static launch-form check rejects out-of-scope forms in pinned sources',
     'control: premature suite summary before remaining events fails',
     'control: withholding one required probe fails run.cjs',
   ];

@@ -129,6 +129,10 @@ toolschema-goldens toolschema-supplement:
 fuzz-settings:
 	@$(require_test_venue) && go test -run='^$$' -fuzz='^FuzzSettingsNoEdit$$' -parallel=4 -fuzztime=60s -fuzzminimizetime=1s ./internal/jsonx
 
+.PHONY: conformance-static
+conformance-static:
+	@bash hack/conformance-static
+
 conformance baseline-node assertion-sites bench:
 	@$(require_test_venue) && $(run_script)
 

@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Copyright 2026 The claude-code-model-gateway Authors.
+# SPDX-License-Identifier: Apache-2.0
+set -eu
+file=$1; shift
+mode=suite target=identity class='' phase='' package='' gate='' site=''
+for arg do
+    case $arg in
+        MODE=*) mode=${arg#*=} ;; TARGET=*) target=${arg#*=} ;; CLASS=*) class=${arg#*=} ;;
+        PHASE=*) phase=${arg#*=} ;; PACKAGE=*) package=${arg#*=} ;; GATE=*) gate=${arg#*=} ;; SITE=*) site=${arg#*=} ;;
+    esac
+done
+usage() { printf 'conformance: %s\n' "$1" >&2; exit 2; }
+[[ $target == identity || $target == binary:/* ]] || usage 'invalid target'
+[[ ! $class || $class == conformance ]] || usage 'invalid class'
+filters=$class$phase$package$gate
+case $mode in
+    suite) ;;
+    probes) [[ ! $filters && ! $site ]] || usage 'probe mode does not accept case selectors'; exit 0 ;;
+    self-test) [[ $target == identity && ! $filters ]] || usage 'self-test requires identity without conformance filters' ;;
+    *) usage 'invalid mode' ;;
+esac
+[[ ! $site || ( $target == identity && ! $filters ) ]] || usage 'SITE is an identity diagnostic, not a conformance gate'
+if [[ $site || $filters || $target != identity ]]; then
+    if ! LC_ALL=C awk -F '\t' -v s="$site" -v p="$phase" -v k="$package" -v g="$gate" '
+        NR > 1 && (s ? $1 ":" $2 == s : $5 == "conformance" && (!p || $6 == p) && (!k || $7 == k) && (!g || $8 == g)) { found=1; exit }
+        END { exit !found }' "$file"; then usage 'empty conformance selection'; fi
+fi

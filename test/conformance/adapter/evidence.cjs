@@ -3,9 +3,58 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+
+const PINNED_TEST_DIGEST = '4a10b3bb214b5ecc779c18fa1ba16ff0943168ec00ed881d358449a147b0ca06';
+const ALLOWED_PROXY_NODE_COPIES = new Set([
+  'codex-upstream-cases.test.js:240',
+  'discovery-cache.test.js:75',
+  'discovery-cache.test.js:77',
+  'gateway-process-isolation.test.js:201',
+  'gateway-process-isolation.test.js:1189',
+  'recovery-lifecycle.test.js:66',
+  'recovery-lifecycle.test.js:96',
+  'recovery-lifecycle.test.js:132',
+]);
+
+function checkPinnedLaunchForms(plugin) {
+  const testRoot = path.join(plugin, 'test');
+  const sourceDigest = crypto.createHash('sha256');
+  const violations = [];
+  const entries = fs.readdirSync(testRoot, { recursive: true }).map(n => n.replaceAll('\\', '/')).sort();
+  for (const name of entries) {
+    const file = path.join(testRoot, name);
+    const stat = fs.lstatSync(file);
+    if (stat.isDirectory()) continue;
+    assert(stat.isFile(), `unexpected pinned test entry: ${name}`);
+    const bytes = fs.readFileSync(file);
+    sourceDigest.update(`${name}\0`).update(crypto.createHash('sha256').update(bytes).digest());
+    if (!/\.(?:c|m)?js$/.test(name)) continue;
+    const lines = bytes.toString('utf8').split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const loc = `${name}:${i + 1}`;
+      if (/\bworker_threads\b/.test(line)) violations.push(`${loc}: worker_threads`);
+      if (/\bnode:cluster\b|require\(['"]cluster['"]\)/.test(line)) violations.push(`${loc}: cluster`);
+      if (/\bshell\s*:/.test(line)) violations.push(`${loc}: shell option`);
+      if (/\b(?:execSync|execFile|execFileSync|fork)\s*\(/.test(line) ||
+          (/(?:^|[^/])\bexec\s*\(/.test(line) && !/\.exec\(/.test(line))) {
+        violations.push(`${loc}: uninventoried child_process API`);
+      }
+      if (/(?:copyFileSync|linkSync|symlinkSync)\s*\([^)]*process\.execPath/.test(line) &&
+          !ALLOWED_PROXY_NODE_COPIES.has(loc)) {
+        violations.push(`${loc}: unreviewed copy of process.execPath`);
+      }
+    }
+  }
+  assert.equal(violations.length, 0,
+    `out-of-scope launch forms in pinned test sources: ${violations.join('; ')}`);
+  assert.equal(sourceDigest.digest('hex'), PINNED_TEST_DIGEST,
+    'pinned test sources changed: review launch forms and execution counts');
+}
 
 const PROBE_FILE = 'test/conformance/probes/launch.test.js';
 const REQUIRED_PROBES = [
@@ -59,6 +108,7 @@ function evaluateSuite({
   const error = message => { failed = true; errors.push(message); };
   if (runnerError) error(runnerError);
 
+  const repeated = new Map(tsv(path.join(__dirname, 'repeated-sites.tsv')).map(r => [r.site, Number(r.count)]));
   const parent = parentCredits(sites, baseline);
   const validLaunches = [];
   const credited = new Set();
@@ -193,15 +243,14 @@ function evaluateSuite({
     }
     for (const s of obligations) {
       const launchSite = `${s.path}:${s.line}`;
-      if (s.via.startsWith('subtest: ')) {
-        const childName = `${s.case} > ${s.via.slice(9)}`;
-        const matched = validLaunches.some(l => l.path === s.path && l.name === childName && l.kind === s.kind &&
-          (l.site === launchSite || l.callers?.includes(launchSite)) && parent(l) && key(parent(l)) === id);
-        if (!matched) error(`missing attributed nested launch at ${launchSite} (${s.kind}) for ${id}`);
-      } else {
-        const matched = validLaunches.some(l => key(l) === id && l.kind === s.kind &&
-          (l.site === launchSite || l.callers?.includes(launchSite)));
-        if (!matched) error(`missing attributed launch at ${launchSite} (${s.kind}) for ${id}`);
+      const nested = s.via.startsWith('subtest: ');
+      const matches = validLaunches.filter(l => l.kind === s.kind &&
+        (l.site === launchSite || l.callers?.includes(launchSite)) && (nested ?
+          l.path === s.path && l.name === `${s.case} > ${s.via.slice(9)}` && parent(l) && key(parent(l)) === id : key(l) === id));
+      const expectedCount = repeated.get(launchSite) ?? 1;
+      const count = new Set(matches.map(l => l.pid)).size;
+      if (count !== expectedCount || matches.length !== expectedCount) {
+        error(`${count ? 'wrong number of' : 'missing'} attributed launch at ${launchSite} (${s.kind}) for ${id}: expected ${expectedCount}, got ${count} distinct PIDs in ${matches.length} records`);
       }
     }
   }
@@ -234,4 +283,4 @@ function evaluateSuite({
   return { failed, errors, counts, observed, validLaunches };
 }
 
-module.exports = { PROBE_FILE, REQUIRED_PROBES, createLog, evaluateSuite, key, parentCredits, tsv, validLaunch };
+module.exports = { PROBE_FILE, REQUIRED_PROBES, checkPinnedLaunchForms, createLog, evaluateSuite, key, parentCredits, tsv, validLaunch };

@@ -19,41 +19,12 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then set -euo pipefail; fi
 # shellcheck source-path=SCRIPTDIR source=venue-check
 source "$(dirname "${BASH_SOURCE[0]}")/venue-check"
 
-fail() { printf 'remote: %s\n' "$*" >&2; exit 1; }
+fail() { printf 'remote: %s\n' "$*" >&2; exit 97; }
 usage_fail() { printf 'remote: %s\n' "$*" >&2; exit 2; }
 
 # Check the OpenSSH expansion as well as the alias; no connection is needed.
 reject_local() {
-    python3 -I - "$@" <<'PY'
-import ipaddress, socket, subprocess, sys
-from sys import platform
-command = ['/sbin/ifconfig', '-a'] if platform == 'darwin' else ['ip', '-o', 'address']
-lines = subprocess.check_output(command, text=True).splitlines()
-def addr(value):
-    ip = ipaddress.ip_address(value.split('/')[0].split('%')[0])
-    return getattr(ip, 'ipv4_mapped', None) or ip
-ours = set()
-for line in lines:
-    fields = line.split()
-    family = 0 if platform == 'darwin' else 2
-    if len(fields) > family + 1 and fields[family] in ('inet', 'inet6'):
-        ours.add(addr(fields[family+1]))
-if not ours:
-    print('remote: cannot determine local interface addresses', file=sys.stderr)
-    sys.exit(2)
-names = {socket.gethostname().lower(), socket.getfqdn().lower()}
-names |= {n.split('.')[0] for n in names}
-for name in sys.argv[1:]:
-    name = name.strip('[]').rstrip('.').lower()
-    if name in names or name == 'localhost' or name.endswith('.localhost'):
-        print('remote: refusing local destination', file=sys.stderr)
-        sys.exit(2)
-for result in socket.getaddrinfo(sys.argv[-1].strip('[]'), None, type=socket.SOCK_STREAM):
-    ip = addr(result[4][0])
-    if ip.is_loopback or ip.is_unspecified or ip in ours:
-        print('remote: refusing local destination', file=sys.stderr)
-        sys.exit(2)
-PY
+    python3 -I "$root/hack/conformance-transport.py" destination "$@"
 }
 
 archive_tree() {
@@ -102,7 +73,7 @@ install_tools() (
         mkdir "$stage/$kind"
         if [[ $kind == go ]]; then
             fetch 'https://go.dev/dl/?mode=json&include=all' "$stage/go.json"
-            sum=$(python3 -I -c 'import json,sys; print(next(f["sha256"] for v in json.load(open(sys.argv[1])) for f in v["files"] if f["filename"] == sys.argv[2]))' "$stage/go.json" "$archive")
+            sum=$(python3 -I -c "$transport_source" checksum "$stage/go.json" "$archive")
             fetch "https://go.dev/dl/$archive" "$stage/$archive"
         else
             fetch "https://nodejs.org/dist/$nodever/SHASUMS256.txt" "$stage/node.sums"
@@ -180,454 +151,17 @@ negative_control() (
     restore_attestation "$failed"
 )
 
-venue_stop_verify_scope() {
-    local spec=$1
-    python3 -I - "$spec" <<'PY'
-import os, signal, subprocess, sys, time
-from pathlib import Path
-
-spec = Path(sys.argv[1])
-uid = os.getuid()
-runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{uid}"
-env = dict(os.environ, XDG_RUNTIME_DIR=runtime_dir)
-env.pop("DBUS_SESSION_BUS_ADDRESS", None)
-
-units = []
-launcher_pid = None
-launcher_start = None
-if spec.is_file():
-    for raw in spec.read_text(encoding="utf-8").splitlines():
-        if "=" not in raw:
-            continue
-        k, v = raw.split("=", 1)
-        if k in ("unit", "outer", "job") and v:
-            units.append(v)
-        elif k == "launcher_pid" and v.isdigit():
-            launcher_pid = int(v)
-        elif k == "launcher_start" and v.isdigit():
-            launcher_start = int(v)
-else:
-    units.append(sys.argv[1])
-
-if not units:
-    sys.exit(1)
-
-def run_sc(args):
-    try:
-        return subprocess.run(["systemctl", "--user", *args], env=env, capture_output=True, text=True, timeout=10, check=False)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-
-def proc_alive(pid, start_tick):
-    try:
-        fields = Path(f"/proc/{pid}/stat").read_bytes().rsplit(b")", 1)[1].split()
-    except (FileNotFoundError, ProcessLookupError, PermissionError, IndexError):
-        return False
-    return fields[0] != b"Z" and int(fields[19]) == start_tick
-
-def signal_verified_pid(pid, start_tick, sig):
-    if not proc_alive(pid, start_tick):
-        return
-    pidfd = None
-    try:
-        pidfd = os.pidfd_open(pid, 0)
-        if not proc_alive(pid, start_tick):
-            return
-        signal.pidfd_send_signal(pidfd, sig)
-    except (ProcessLookupError, FileNotFoundError):
-        return
-    finally:
-        if pidfd is not None:
-            os.close(pidfd)
-
-def stop_launcher():
-    if launcher_pid is None or launcher_start is None:
-        return True
-    if not proc_alive(launcher_pid, launcher_start):
-        return True
-    for sig, limit in ((signal.SIGTERM, 3.0), (signal.SIGKILL, 5.0)):
-        signal_verified_pid(launcher_pid, launcher_start, sig)
-        deadline = time.monotonic() + limit
-        while time.monotonic() < deadline:
-            if not proc_alive(launcher_pid, launcher_start):
-                return True
-            time.sleep(0.05)
-    return not proc_alive(launcher_pid, launcher_start)
-
-def cg_dir(unit):
-    res = run_sc(["show", "-p", "ControlGroup", "--value", unit])
-    if res is None or res.returncode != 0:
-        return None
-    cg = res.stdout.strip() or f"/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/{unit}"
-    return Path("/sys/fs/cgroup") / cg.lstrip("/")
-
-def state(unit):
-    res = run_sc(["show", "-p", "ActiveState", "--value", unit])
-    return None if (res is None or res.returncode != 0) else res.stdout.strip()
-
-def pids(cg):
-    try:
-        return [int(x) for x in (cg / "cgroup.procs").read_text(encoding="utf-8").splitlines() if x.strip()]
-    except FileNotFoundError:
-        return []
-    except OSError:
-        return None
-
-def wait_clear(unit, cg, limit):
-    deadline = time.monotonic() + limit
-    while True:
-        p, s = pids(cg), state(unit)
-        if p == [] and s in ("inactive", "failed"):
-            if s == "failed":
-                run_sc(["reset-failed", unit])
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.05)
-
-def stop_unit(unit):
-    cg = cg_dir(unit)
-    if cg is None:
-        return False
-    cur, st = pids(cg), state(unit)
-    if cur is None or st is None:
-        return False
-    if cur or st not in ("inactive", "failed"):
-        if cur:
-            run_sc(["kill", "-s", "SIGTERM", "--kill-who=all", unit])
-        if not wait_clear(unit, cg, 3.0):
-            try:
-                (cg / "cgroup.kill").write_text("1\n", encoding="utf-8")
-            except OSError:
-                pass
-            run_sc(["kill", "-s", "SIGKILL", "--kill-who=all", unit])
-            run_sc(["stop", unit])
-            if not wait_clear(unit, cg, 5.0):
-                return False
-    elif st == "failed":
-        run_sc(["reset-failed", unit])
-    return pids(cg) == [] and state(unit) == "inactive"
-
-# Stop any live launcher BEFORE trusting unit state, so a launcher killed
-# mid-startup cannot create the unit after verification declares it empty.
-if not stop_launcher():
-    sys.exit(1)
-for u in units:
-    if not stop_unit(u):
-        sys.exit(1)
-if launcher_pid is not None and launcher_start is not None and proc_alive(launcher_pid, launcher_start):
-    sys.exit(1)
-for u in units:
-    cg = cg_dir(u)
-    if cg is None or pids(cg) != [] or state(u) != "inactive":
-        sys.exit(1)
-sys.exit(0)
-PY
-}
-
-venue_scope_state() {
-    local file=$1
-    python3 -I - "$file" <<'PY'
-import os, subprocess, sys
-from pathlib import Path
-
-uid = os.getuid()
-runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{uid}"
-env = dict(os.environ, XDG_RUNTIME_DIR=runtime_dir)
-env.pop("DBUS_SESSION_BUS_ADDRESS", None)
-parts = []
-launcher_pid = None
-launcher_start = None
-for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
-    if "=" not in raw:
-        continue
-    k, v = raw.split("=", 1)
-    if k == "launcher_pid" and v.isdigit():
-        launcher_pid = int(v)
-    elif k == "launcher_start" and v.isdigit():
-        launcher_start = int(v)
-    elif k in ("unit", "outer", "job") and v:
-        try:
-            cg_res = subprocess.run(["systemctl", "--user", "show", "-p", "ControlGroup", "--value", v], env=env, capture_output=True, text=True, timeout=5, check=False)
-            st_res = subprocess.run(["systemctl", "--user", "show", "-p", "ActiveState", "--value", v], env=env, capture_output=True, text=True, timeout=5, check=False)
-            st = st_res.stdout.strip() if st_res.returncode == 0 else "unknown"
-            cg_val = (cg_res.stdout.strip() if cg_res.returncode == 0 else "") or f"/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/{v}"
-            procs = Path("/sys/fs/cgroup") / cg_val.lstrip("/") / "cgroup.procs"
-            try:
-                live = [int(x) for x in procs.read_text(encoding="utf-8").splitlines() if x.strip()]
-            except FileNotFoundError:
-                live = []
-            parts.append(f"{k}={v} state={st} pids={live}")
-        except (OSError, subprocess.TimeoutExpired):
-            parts.append(f"{k}={v} state=unreadable")
-if launcher_pid is not None and launcher_start is not None:
-    alive = False
-    try:
-        fields = Path(f"/proc/{launcher_pid}/stat").read_bytes().rsplit(b")", 1)[1].split()
-        alive = fields[0] != b"Z" and int(fields[19]) == launcher_start
-    except (FileNotFoundError, ProcessLookupError, PermissionError, IndexError):
-        alive = False
-    parts.append(f"launcher={launcher_pid}:{'alive' if alive else 'dead'}")
-print("; ".join(parts) or "unverified prior scope")
-PY
-}
-
-venue_run_in_scope() {
-    local base=$1 unit=$2 scope_limit=$3 status_file=$4 py_script; shift 4
-    IFS='' read -r -d '' py_script <<'PY' || :
-import os, signal, subprocess, sys, time
-from pathlib import Path
-
-base = Path(sys.argv[1])
-unit = sys.argv[2]
-scope_limit = int(sys.argv[3])
-status_file = Path(sys.argv[4])
-payload = sys.argv[5:]
-
-uid = os.getuid()
-runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{uid}"
-sc_env = dict(os.environ, XDG_RUNTIME_DIR=runtime_dir)
-sc_env.pop("DBUS_SESSION_BUS_ADDRESS", None)
-scope_file = base / "active-scope"
-unavail_file = base / "unavailable"
-
-interrupted = False
-def on_sig(_sig, _frame):
-    global interrupted
-    interrupted = True
-
-for s in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
-    signal.signal(s, on_sig)
-
-def run_sc(args):
-    try:
-        return subprocess.run(["systemctl", "--user", *args], env=sc_env, capture_output=True, text=True, timeout=10, check=False)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-
-ver = run_sc(["show", "-p", "Version", "--value"])
-if ver is None or ver.returncode != 0:
-    print("remote: OS-owned user systemd scope is required on this Linux venue", file=sys.stderr)
-    sys.exit(1)
-
-def cg_dir():
-    res = run_sc(["show", "-p", "ControlGroup", "--value", unit])
-    if res is None or res.returncode != 0:
-        return None
-    cg = res.stdout.strip() or f"/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/{unit}"
-    return Path("/sys/fs/cgroup") / cg.lstrip("/")
-
-def unit_prop(prop):
-    res = run_sc(["show", "-p", prop, "--value", unit])
-    return None if (res is None or res.returncode != 0) else res.stdout.strip()
-
-def read_pids(cg):
-    try:
-        return [int(x) for x in (cg / "cgroup.procs").read_text(encoding="utf-8").splitlines() if x.strip()]
-    except FileNotFoundError:
-        return []
-    except OSError:
-        return None
-
-def proc_alive(pid, start_tick):
-    try:
-        fields = Path(f"/proc/{pid}/stat").read_bytes().rsplit(b")", 1)[1].split()
-    except (FileNotFoundError, ProcessLookupError, PermissionError, IndexError):
-        return False
-    return fields[0] != b"Z" and int(fields[19]) == start_tick
-
-def signal_verified_pid(pid, start_tick, sig):
-    if not proc_alive(pid, start_tick):
-        return
-    pidfd = None
-    try:
-        pidfd = os.pidfd_open(pid, 0)
-        if not proc_alive(pid, start_tick):
-            return
-        signal.pidfd_send_signal(pidfd, sig)
-    except (ProcessLookupError, FileNotFoundError):
-        return
-    finally:
-        if pidfd is not None:
-            os.close(pidfd)
-
-saw_timeout = False
-
-def wait_clear(cg, limit, proc):
-    global saw_timeout
-    deadline = time.monotonic() + limit
-    while True:
-        proc.poll()
-        p, st = read_pids(cg), unit_prop("ActiveState")
-        if p == [] and st in ("inactive", "failed"):
-            if unit_prop("Result") == "timeout":
-                saw_timeout = True
-            if st == "failed":
-                run_sc(["reset-failed", unit])
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.05)
-
-def stop_and_verify(proc, lpid, lstart):
-    global saw_timeout
-    if unit_prop("Result") == "timeout":
-        saw_timeout = True
-    if proc_alive(lpid, lstart):
-        for sig, lim in ((signal.SIGTERM, 3.0), (signal.SIGKILL, 5.0)):
-            signal_verified_pid(lpid, lstart, sig)
-            dl = time.monotonic() + lim
-            while time.monotonic() < dl:
-                proc.poll()
-                if not proc_alive(lpid, lstart):
-                    break
-                time.sleep(0.05)
-            if not proc_alive(lpid, lstart):
-                break
-        if proc_alive(lpid, lstart):
-            return False, saw_timeout
-    cg = cg_dir()
-    if cg is None:
-        return False, saw_timeout
-    cur, st = read_pids(cg), unit_prop("ActiveState")
-    if cur is None or st is None:
-        return False, saw_timeout
-    if unit_prop("Result") == "timeout":
-        saw_timeout = True
-    if cur or st not in ("inactive", "failed"):
-        if cur:
-            run_sc(["kill", "-s", "SIGTERM", "--kill-who=all", unit])
-        if not wait_clear(cg, 3.0, proc):
-            try:
-                (cg / "cgroup.kill").write_text("1\n", encoding="utf-8")
-            except OSError:
-                pass
-            run_sc(["kill", "-s", "SIGKILL", "--kill-who=all", unit])
-            run_sc(["stop", unit])
-            if not wait_clear(cg, 5.0, proc):
-                return False, saw_timeout
-    elif st == "failed":
-        if unit_prop("Result") == "timeout":
-            saw_timeout = True
-        run_sc(["reset-failed", unit])
-    proc.wait()
-    if proc_alive(lpid, lstart):
-        return False, saw_timeout
-    return read_pids(cg) == [] and unit_prop("ActiveState") == "inactive", saw_timeout
-
-# Gate launcher startup behind a one-byte token so active-scope always records
-# (unit, launcher_pid, launcher_start) before systemd-run can invoke StartTransientUnit.
-r_fd, w_fd = os.pipe()
-os.set_inheritable(r_fd, True)
-launcher_stub = (
-    "import os, sys; fd = int(sys.argv[1]); tok = os.read(fd, 1); os.close(fd); "
-    "sys.exit(1) if tok != b'G' else os.execvp(sys.argv[2], sys.argv[2:])"
-)
-scope_cmd = [
-    "systemd-run",
-    "--user",
-    "--scope",
-    f"--unit={unit}",
-    f"--property=RuntimeMaxSec={scope_limit}",
-    "--property=TimeoutStopSec=5",
-    "--property=KillMode=control-group",
-    "--property=CollectMode=inactive",
-    "--quiet",
-    "--",
-    "env",
-    "-u",
-    "XDG_RUNTIME_DIR",
-    "-u",
-    "DBUS_SESSION_BUS_ADDRESS",
-    "CONFORMANCE_VENUE_SCOPED=1",
-    f"CONFORMANCE_STATUS_FILE={status_file}",
-    *payload,
-]
-# close_fds=True keeps the venue flock (FD 9) out of the scoped job.
-launcher = subprocess.Popen(
-    [sys.executable, "-I", "-c", launcher_stub, str(r_fd), *scope_cmd],
-    env=sc_env,
-    close_fds=True,
-    pass_fds=(r_fd,),
-)
-os.close(r_fd)
-
-try:
-    lstart = int(Path(f"/proc/{launcher.pid}/stat").read_bytes().rsplit(b")", 1)[1].split()[19])
-except Exception:
-    os.close(w_fd)
-    launcher.wait()
-    print("remote: failed to record launcher start tick", file=sys.stderr)
-    sys.exit(1)
-
-tmp_scope = base / f"active-scope.tmp.{os.getpid()}"
-tmp_scope.write_text(
-    f"unit={unit}\nlauncher_pid={launcher.pid}\nlauncher_start={lstart}\n",
-    encoding="utf-8",
-)
-fd = os.open(tmp_scope, os.O_RDONLY)
-try:
-    os.fsync(fd)
-finally:
-    os.close(fd)
-os.replace(tmp_scope, scope_file)
-
-os.write(w_fd, b"G")
-os.close(w_fd)
-
-while not interrupted and launcher.poll() is None:
-    time.sleep(0.05)
-
-# Capture Result and any lingering scope PIDs before stop_and_verify resets the unit.
-unit_result = unit_prop("Result")
-pre_cg = cg_dir()
-initial_survivors = read_pids(pre_cg) if pre_cg is not None else None
-
-verified, saw_timeout = stop_and_verify(launcher, launcher.pid, lstart)
-if not verified:
-    unavail_file.write_text(f"unverified scope termination: {unit}\n", encoding="utf-8")
-    print(f"remote: could not verify termination of {unit}; venue marked unavailable", file=sys.stderr)
-    sys.exit(1)
-
-scope_file.unlink(missing_ok=True)
-
-if interrupted:
-    sys.exit(1)
-
-if unit_result == "timeout" or saw_timeout:
-    print(f"remote: scope {unit} reached wall-clock limit {scope_limit}s (infrastructure timeout)", file=sys.stderr)
-    sys.exit(124)
-
-conf_status = None
-if status_file.is_file():
-    raw = status_file.read_text(encoding="utf-8").strip()
-    if raw.isdigit():
-        conf_status = int(raw)
-
-if conf_status == 124:
-    sys.exit(124)
-if conf_status == 2:
-    sys.exit(2)
-
-if initial_survivors:
-    print(f"remote: detached survivor(s) in scope {unit}: {sorted(initial_survivors)}", file=sys.stderr)
-    if launcher.returncode == 0:
-        sys.exit(1)
-
-if launcher.returncode == 0:
-    sys.exit(0)
-if launcher.returncode == 97:
-    sys.exit(97)
-sys.exit(1)
-PY
-    python3 -I -c "$py_script" "$base" "$unit" "$scope_limit" "$status_file" "$@"
-}
+venue_owner() { python3 -I -c "$owner_source" "$@"; }
+venue_scope_state() { venue_owner status "$1"; }
 
 venue_recover_scopes() {
-    local base=$1
-    if [[ -f $base/active-scope ]]; then
-        venue_stop_verify_scope "$base/active-scope" || fail "cannot verify termination of prior scope ($(venue_scope_state "$base/active-scope")); venue remains unavailable"
-        rm -f -- "$base/active-scope"
+    local base=$1 state
+    if [[ -e $base/active-scope || -L $base/active-scope ]]; then
+        [[ -f $base/active-scope && ! -L $base/active-scope ]] || fail "invalid reservation: $base/active-scope"
+        if ! venue_owner recover "$base/active-scope"; then
+            state=$(venue_scope_state "$base/active-scope" 2>&1 || :)
+            fail "cannot verify termination of prior scope ($state); venue remains unavailable"
+        fi
     fi
 }
 
@@ -637,7 +171,7 @@ prune_runs() {
         (
             cd "$runs"
             if [[ $rc == 0 ]]; then rm -rf -- "$path"; else printf 'failed run retained: %s\n' "$path" >&2; fi
-            python3 -I -c 'import pathlib,shutil; paths=sorted(pathlib.Path.cwd().glob("run.*"),key=lambda p:p.stat().st_mtime_ns,reverse=True); [shutil.rmtree(p) for p in paths[5:]]'
+            python3 -I -c "$transport_source" prune
         )
     fi
 }
@@ -659,7 +193,7 @@ restore_attestation() {
 
 remote_main() {
     local op=$1 localname=$2 gover=$3 nodever=$4 scope_limit=$5; shift 5
-    local home base=/tmp/model-gateway-venue run
+    local home base=/tmp/model-gateway-venue run unit=''
     [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || fail 'expected a remote Linux/amd64 venue'
     [[ $(hostname -s) != "$localname" ]] || fail 'refusing same host name as caller'
     home=$(venue_home) || exit $?
@@ -686,9 +220,12 @@ remote_main() {
                 printf 'venue: unavailable (%s)\n' "$(tr '\n' ' ' < "$base/unavailable")"
             elif flock -ns "$base" true; then
                 if [[ -f $base/active-scope ]]; then
-                    printf 'venue: unavailable (%s)\n' "$(venue_scope_state "$base/active-scope")"
+                    local scope_state
+                    scope_state=$(venue_scope_state "$base/active-scope" 2>&1 || :)
+                    printf 'venue: unavailable (reservation: %s/active-scope; %s)\n' "$base" "$scope_state"
+                    status_rc=97
                 else
-                    printf 'lock: free\n'
+                    printf 'lock: free\nreservation: absent\n'
                 fi
             else
                 printf 'lock: held (%s)\n' "$(<"$base/holder")"
@@ -719,8 +256,17 @@ remote_main() {
         # Inspect and stop any recorded quarantined scope BEFORE checking state
         # and protected ports, so a quarantined listener can be recovered while
         # unknown listeners still fail venue_ports_clear.
+        if [[ $# == 1 ]]; then
+            if [[ ! -f $base/active-scope ]] || { ! grep -Fxq "unit=$1" "$base/active-scope" && ! grep -Fxq "pending=$1" "$base/active-scope"; }; then
+                fail "reservation does not match $1; refusing recovery"
+            fi
+        fi
         venue_recover_scopes "$base"
         venue_state_clear "$home"; venue_ports_clear
+        if [[ -f $base/active-scope ]]; then
+            rm -- "$base/active-scope"
+            printf 'remote: verified and cleared prior reservation\n'
+        fi
         if [[ -e $base/unavailable ]]; then
             rm -f -- "$base/unavailable"
             printf 'recovered unavailable venue state after verifying empty scopes\n'
@@ -729,9 +275,12 @@ remote_main() {
         if [[ -e $base/unavailable ]]; then
             fail "venue marked unavailable ($(tr '\n' ' ' < "$base/unavailable")); run provision to verify and recover"
         fi
-        if [[ -f $base/active-scope ]]; then
-            fail "venue has unverified prior scope ($(venue_scope_state "$base/active-scope")); run provision to verify and recover"
+        if [[ -e $base/active-scope || -L $base/active-scope ]]; then
+            fail "venue has unverified prior reservation $base/active-scope ($(tr '\n' ' ' < "$base/active-scope")); run provision to verify and recover"
         fi
+        case $op in run|check-cancellation|check-owner-deadline)
+            unit="mgw-run-$$-$(date +%s).scope" ;;
+        esac
     fi
     if [[ $op == deprovision ]]; then
         rm -f -- "$marker" "$saved"
@@ -755,26 +304,37 @@ remote_main() {
         venue_state_clear "$home"; venue_ports_clear; venue_attest "$home" provision; return
     fi
     run=$(mktemp -d "$base/runs/run.XXXXXXXX")
-    if [[ $op == run ]]; then
-        local unit rc=0
-        unit="mgw-run-$$-$(date +%s).scope"
+    if [[ -n $unit ]]; then
         {
             printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+            declare -p transport_source
             declare -f venue_refuse venue_home venue_file_kind venue_state_clear venue_ports_clear venue_attest venue_require fail fetch tool_version_ok install_tools
             cat <<'PAYLOAD'
-base=$1 run=$2 gover=$3 nodever=$4; shift 4
+base=$1 run=$2 gover=$3 nodever=$4 op=$5; shift 5
+trap 'exit 70' ERR
 install_tools
 mkdir "$run/tree"
 cd "$run/tree"
 tar -xf - --no-same-owner
-./hack/venue-check
-make -- "$@"
+./hack/venue-check || exit 97
+if [[ $op != run ]]; then
+    exec python3 -I ./hack/conformance-owner.py listen "$run/control.ready"
+fi
+# Do not let Make collapse the conformance runner's typed outcomes into exit 2.
+for arg do if [[ $arg == *=* ]]; then export "${arg?}"; fi; done
+for arg do
+    if [[ $arg == *=* ]]; then continue; fi
+    ./hack/venue-check || exit 97
+    if [[ $arg == conformance ]]; then
+        ./hack/conformance || { code=$?; case $code in 1) exit 81 ;; 2) exit 82 ;; 124) exit 83 ;; *) exit "$code" ;; esac; }
+    else make -- "$arg" || exit 81; fi
+done
+exit 80
 PAYLOAD
         } >| "$run/payload.sh"
-        chmod 700 "$run/payload.sh"
-        venue_run_in_scope "$base" "$unit" "$scope_limit" "$run/conformance.status" /bin/bash "$run/payload.sh" "$base" "$run" "$gover" "$nodever" "$@" || rc=$?
-        prune_runs "$rc" "$run" "$base/runs"
-        return "$rc"
+        printf 'pending=%s\n' "$unit" >| "$base/active-scope"
+        printf 'remote: reserved %s\n' "$unit" >&2
+        exec python3 -I -c "$owner_source" run "$base/active-scope" "$unit" "$scope_limit" "$op" "$run" /bin/bash "$run/payload.sh" "$base" "$run" "$gover" "$nodever" "$op" "$@"
     fi
     # negative-control runs outside the run scope under its own timeout and attestation trap.
     # shellcheck disable=SC2064
@@ -794,7 +354,14 @@ remote_parse_args() {
     has_goal=0
     scope_limit=0
     case $op in
-        provision|deprovision|status) [[ $# == 0 ]] || usage_fail "unexpected arguments for $op" ;;
+        provision)
+            [[ $# == 0 || ( $# == 1 && $1 =~ ^mgw-run-[0-9]+-[0-9]+\.scope$ ) ]] || usage_fail 'provision accepts an optional expected reservation unit' ;;
+        deprovision|status|check-cancellation)
+            [[ $# == 0 ]] || usage_fail "unexpected arguments for $op"
+            scope_limit=15 ;;
+        check-owner-deadline)
+            [[ $# == 0 ]] || usage_fail "unexpected arguments for $op"
+            scope_limit=45 ;;
         negative-control)
             [[ $# -le 2 ]] || usage_fail 'negative-control accepts [fixture-package [sentinel-variable]]'
             [[ $# -lt 1 || $1 =~ ^\./internal/venue/testdata/([a-zA-Z0-9_-]+/)*[a-zA-Z0-9_-]+$ ]] || usage_fail 'expected a fixture under ./internal/venue/testdata/'
@@ -838,6 +405,15 @@ remote_parse_args() {
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
     remote_parse_args "$@"
+    root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
+    if [[ $op == run ]]; then
+        for goal in "${@:2}"; do
+            if [[ $goal != *=* ]]; then
+                awk -v goal="$goal" '$1==".PHONY:" {for(i=2;i<=NF;i++) if($i==goal) found=1} END {exit !found}' "$root/Makefile" || usage_fail "unknown make goal: $goal"
+            fi
+        done
+        if (( has_conformance )); then bash "$root/hack/conformance-selection" "$root/test/conformance/classification.tsv" "${@:2}"; fi
+    fi
     shift || :
     host=${VENUE_HOST:-}
     [[ -n $host ]] || usage_fail 'set VENUE_HOST to the approved SSH destination'
@@ -849,8 +425,11 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
     root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
     gover=go1.27.4
     # Send only the functions and validated arguments; stdin remains the tree archive.
-    program=$(declare -f venue_refuse venue_home venue_file_kind venue_state_clear venue_ports_clear venue_attest venue_require fail usage_fail fetch tool_version_ok install_tools negative_control restore_attestation venue_stop_verify_scope venue_scope_state venue_run_in_scope venue_recover_scopes prune_runs cleanup_neg_control remote_main)
-    program=$'set -euo pipefail\n'"$program"$'\nremote_main "$@"'
+    program=$(declare -f venue_refuse venue_home venue_file_kind venue_state_clear venue_ports_clear venue_attest venue_require fail usage_fail fetch tool_version_ok install_tools negative_control restore_attestation venue_owner venue_scope_state venue_recover_scopes prune_runs cleanup_neg_control remote_main)
+    owner_source=$(<"$root/hack/conformance-owner.py")
+    transport_source=$(<"$root/hack/conformance-transport.py")
+    printf -v owner_assignment 'owner_source=%q\ntransport_source=%q' "$owner_source" "$transport_source"
+    program=$'set -euo pipefail\n'"$owner_assignment"$'\n'"$program"$'\nremote_main "$@"'
     # A single-line encoding survives SSH command relays that split multiline arguments.
     encoded=$(printf '%s' "$program" | base64 | tr -d '\n')
     cmd="env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin GITHUB_ACTIONS=\"\${GITHUB_ACTIONS:-}\" /bin/bash -c \"\$(printf %s $encoded | base64 -d)\" remote"
@@ -858,9 +437,14 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
         [[ $arg =~ ^[a-zA-Z0-9_=.:/-]+$ ]] || usage_fail 'invalid remote argument'
         cmd+=" $arg"
     done
-    if [[ $op == negative-control ]]; then cmd="timeout --kill-after=30s 10m $cmd"; fi
+    case $op in
+        negative-control) cmd="timeout --kill-after=30s 10m $cmd" ;;
+        run|check-cancellation) cmd="timeout --signal=KILL $((scope_limit + 45))s $cmd" ;;
+        check-owner-deadline) cmd="timeout --signal=KILL 10s $cmd" ;;
+        provision|deprovision) cmd="timeout --signal=KILL 600s $cmd" ;;
+    esac
     input=/dev/null
-    if [[ $op == run || $op == negative-control ]]; then
+    if [[ $op == run || $op == check-cancellation || $op == check-owner-deadline || $op == negative-control ]]; then
         input=$(mktemp "${TMPDIR:-/tmp}/venue-tree.XXXXXXXX")
         trap 'rm -f -- "$input"' EXIT
         archive_tree "$root" >| "$input"

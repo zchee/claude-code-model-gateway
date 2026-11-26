@@ -3,7 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 set -euo pipefail
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
-"$root/hack/venue-check"
+trap 'exit 70' ERR
+"$root/hack/venue-check" || exit 97
 [[ $root == "$1" ]] || exit 1
 work=$2 tmp=$3
 plugin=$("$root/hack/pinned-source")/plugins/model-gateway

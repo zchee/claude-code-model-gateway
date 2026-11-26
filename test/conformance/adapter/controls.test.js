@@ -7,7 +7,7 @@ const cp = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
-const { evaluateSuite, key, tsv } = require('./evidence.cjs');
+const { checkPinnedLaunchForms, evaluateSuite, key, tsv } = require('./evidence.cjs');
 
 const root = process.env.ADAPTER_CTRL_ROOT;
 const plugin = process.env.ADAPTER_CTRL_PLUGIN;
@@ -201,6 +201,36 @@ test('control: passing two-launch case fails when only one inventoried launch is
     `expected missing file summary error, got: ${truncated.errors.join('; ')}`);
   assert.ok(truncated.errors.some(e => e.includes('missing test summary: suite')),
     `expected missing suite summary error, got: ${truncated.errors.join('; ')}`);
+});
+
+test('control: withholding one execution of a passing repeated site fails attribution', () => {
+  const row = classes.find(r => r.path === 'test/wiring-mode.test.js' && r.name === 'retired wiring-mode flags fail loudly');
+  const dir = fs.mkdtempSync(path.join(work, 'ctrl-count-'));
+  const log = path.join(dir, 'launches.jsonl');
+  const run = cp.spawnSync(process.execPath, [path.join(__dirname, 'run.cjs'), root, plugin, dir,
+    'identity', 'suite', '', '', '', log, '', `${row.path}:${row.line}`], { env: cleanEnv(), encoding: 'utf8' });
+  assert.equal(run.status, 0, `${run.stdout}\n${run.stderr}`);
+  const launches = ndjson(log);
+  assert.equal(launches.length, 3);
+  const verdict = evaluateSuite({ target: 'identity', build: null, full: false, probes: false, selected: [row],
+    baseline, sites, launches: launches.slice(1), events: ndjson(path.join(dir, 'events.jsonl')),
+    expectedFiles: [row.path], runnerStatus: run.status });
+  assert.equal(verdict.failed, true);
+  assert.equal(verdict.errors.length, 1);
+  assert.match(verdict.errors[0], /expected 3, got 2 distinct PIDs in 2 records/);
+});
+
+test('control: static launch-form check rejects out-of-scope forms in pinned sources', () => {
+  checkPinnedLaunchForms(plugin);
+  const fakePlugin = fs.mkdtempSync(path.join(work, 'ctrl-forms-'));
+  const testDir = path.join(fakePlugin, 'test');
+  fs.mkdirSync(testDir, { recursive: true });
+  fs.writeFileSync(path.join(testDir, 'bad.test.js'),
+    "const { Worker } = require('node:worker_threads');\nrequire('node:child_process').spawn('sh', ['-c', 'echo hi'], { shell: true });\n");
+  assert.throws(
+    () => checkPinnedLaunchForms(fakePlugin),
+    /out-of-scope launch forms in pinned test sources: bad\.test\.js:1: worker_threads; bad\.test\.js:2: shell option/,
+  );
 });
 
 test('control: premature suite summary before remaining events fails', () => {

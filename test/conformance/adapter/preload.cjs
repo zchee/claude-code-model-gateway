@@ -77,7 +77,8 @@ module.exports = function install(config, inherited) {
 
   function resolveRealFile(arg, cwd) {
     if (typeof arg !== 'string' || !arg) return null;
-    const candidate = path.resolve(cwd, arg);
+    // Preserve symlink/.. order; lexical normalization changes kernel lookup.
+    const candidate = path.isAbsolute(arg) ? arg : `${cwd}/${arg}`;
     try {
       if (fs.statSync(candidate).isFile()) return fs.realpathSync.native(candidate);
     } catch { /* Non-existent or unreadable path is not a product entry. */ }
@@ -107,38 +108,17 @@ module.exports = function install(config, inherited) {
     return null;
   }
 
-  function isNodeCommand(cmd, cwd, options) {
-    if (typeof cmd !== 'string' || !cmd) return false;
-    if (cmd === process.execPath) return true;
-    if (path.basename(cmd) === 'node') return true;
-    if (cmd.includes('/') || cmd.includes(path.sep)) {
-      return resolveRealFile(cmd, cwd) === execReal;
+  function executable(cmd, cwd, options) {
+    if (typeof cmd !== 'string' || !cmd) return null;
+    const search = (options?.env ?? process.env).PATH ?? '/usr/bin:/bin';
+    const candidates = cmd.includes('/') ? [cmd] : search.split(path.delimiter).map(d => `${d || '.'}/${cmd}`);
+    for (const candidate of candidates) {
+      const real = resolveRealFile(candidate, cwd);
+      if (!real) continue;
+      try { fs.accessSync(real, fs.constants.X_OK); return real; }
+      catch (err) { if (err.code !== 'EACCES' && err.code !== 'ENOENT') throw err; }
     }
-    const envPath = options?.env?.PATH ?? process.env.PATH ?? '';
-    for (const dir of envPath.split(path.delimiter)) {
-      if (!dir) continue;
-      if (resolveRealFile(path.join(dir, cmd), cwd) === execReal) return true;
-    }
-    return false;
-  }
-
-  function unwrapEnv(cmd, args) {
-    if (typeof cmd !== 'string' || path.basename(cmd) !== 'env') return null;
-    let i = 0;
-    let modifiedEnv = false;
-    while (i < args.length) {
-      const a = args[i];
-      if (a === '--') { i++; break; }
-      if (a === '-i' || a === '-0' || a === '--ignore-environment') { modifiedEnv = true; i++; continue; }
-      if (a === '-u' || a === '-C' || a === '--unset' || a === '--chdir') { modifiedEnv = true; i += 2; continue; }
-      if (a.startsWith('--unset=') || a.startsWith('--chdir=')) { modifiedEnv = true; i++; continue; }
-      if (a === '-S' || a === '--split-string') return { splitString: args[i + 1] ?? '' };
-      if (a.startsWith('-')) return { unknownFlag: a, rest: args.slice(i) };
-      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(a)) { modifiedEnv = true; i++; continue; }
-      break;
-    }
-    if (i >= args.length) return null;
-    return { command: args[i], args: args.slice(i + 1), modifiedEnv };
+    return null;
   }
 
   function parseNodeArgs(nodeArgs) {
@@ -184,13 +164,17 @@ module.exports = function install(config, inherited) {
     return { nodeOptions, scriptIndex, evalCode, printCode };
   }
 
-  function isAllowedOptionsForProduct(prod, nodeOptions) {
-    if (nodeOptions.length === 0) return true;
-    // The pinned suite uses one --require/-r preload before bin/model-gateway.js.
-    if (prod.isCli && nodeOptions.length === 1 && (nodeOptions[0].flag === '--require' || nodeOptions[0].flag === '-r')) {
-      return true;
-    }
-    return false;
+  function isAllowedOptionsForProduct(prod, nodeOptions, cwd) {
+    if (!nodeOptions.length) return true;
+    const [opt] = nodeOptions;
+    if (!prod.isCli || nodeOptions.length !== 1 || opt.flag !== '--require') return false;
+    const fixture = resolveRealFile(opt.value, cwd);
+    if (!fixture || fixture !== `${fs.realpathSync.native(cwd)}/delay-proxy-startup.cjs`) return false;
+    const modulePath = JSON.stringify(path.join(plugin, 'lib/process-supervision.js'));
+    const body = fs.readFileSync(fixture, 'utf8');
+    return body.includes(modulePath) && require('node:crypto').createHash('sha256')
+      .update(body.replace(modulePath, 'PINNED_MODULE')).digest('hex') ===
+      'e77c87c51bba3a2a66d6df55d2e2fd64e90b6a85ad437b64d560bbfa518eb25b';
   }
 
   function productInvocationFromScript(prod, tailArgs) {
@@ -216,62 +200,34 @@ module.exports = function install(config, inherited) {
     return null;
   }
 
-  function mentionsProductInShell(text) {
-    return text.includes(cli) || text.includes(hookRegistry) || text.includes(hookEnsure) ||
-      (text.includes('request-worker.js') && text.includes('runWorker')) ||
-      text.includes('/model-gateway/model-gateway.js') || text.includes('/model-gateway/update.js') ||
-      text.includes('worker-birth.cjs');
-  }
-
   function inspectInvocation(command, args, options) {
+    if (options?.shell) return null;
     const cwd = options?.cwd ?? process.cwd();
     const argList = Array.isArray(args) ? args : [];
-    if (options?.shell) {
-      const combined = [command, ...argList].filter(Boolean).join(' ');
-      if (mentionsProductInShell(combined)) {
-        return { unsupported: true, kind: 'cli', reason: 'unsupported product invocation via shell' };
-      }
-      return null;
-    }
-
-    // Direct execution of a product script (shebang) without an explicit Node command.
-    const directProd = classifyProductScript(resolveRealFile(command, cwd), command);
+    const program = executable(command, cwd, options);
+    const directProd = classifyProductScript(program, program);
     if (directProd) {
       const info = productInvocationFromScript(directProd, argList);
       return { unsupported: true, kind: info.kind, reason: `unsupported direct product execution (${info.kind})` };
     }
 
-    let effCmd = command;
+    let effCmd = program;
     let effArgs = argList;
-    let envModified = false;
-    const unwrapped = unwrapEnv(command, argList);
-    if (unwrapped) {
-      if (unwrapped.splitString !== undefined || unwrapped.unknownFlag !== undefined) {
-        const joined = [unwrapped.splitString ?? '', ...(unwrapped.rest ?? [])].join(' ');
-        if (mentionsProductInShell(joined) || argList.some(a => classifyProductScript(resolveRealFile(a, cwd), a))) {
-          return { unsupported: true, kind: 'cli', reason: 'unsupported env wrapper around product invocation' };
-        }
-        return null;
-      }
-      effCmd = unwrapped.command;
-      effArgs = unwrapped.args;
-      envModified = unwrapped.modifiedEnv;
+    if (program === '/usr/bin/env') {
+      const index = argList[0] === '--' ? 1 : 0;
+      if (!argList[index] || argList[index].startsWith('-') || argList[index].includes('=')) return null;
+      effCmd = executable(argList[index], cwd, options);
+      effArgs = argList.slice(index + 1);
     }
-
-    if (!isNodeCommand(effCmd, cwd, options)) {
-      return null;
-    }
+    if (effCmd !== execReal) return null;
 
     const parsed = parseNodeArgs(effArgs);
     if (parsed.evalCode !== null) {
       if (parsed.evalCode === workerEvalExact) {
-        if (envModified || parsed.nodeOptions.length > 0) {
+        if (parsed.nodeOptions.length > 0) {
           return { unsupported: true, kind: 'worker', reason: `unsupported Node options before worker eval: ${parsed.nodeOptions.map(o => o.flag).join(' ')}` };
         }
         return { kind: 'worker', binaryArgs: ['serve-worker'], isCli: false, isBirthObserver: false };
-      }
-      if (parsed.evalCode.includes('request-worker.js') && parsed.evalCode.includes('runWorker')) {
-        return { unsupported: true, kind: 'worker', reason: 'unsupported inline worker eval invocation' };
       }
       return null;
     }
@@ -285,27 +241,10 @@ module.exports = function install(config, inherited) {
       const prod = classifyProductScript(resolveRealFile(scriptArg, cwd), scriptArg);
       if (prod) {
         const info = productInvocationFromScript(prod, effArgs.slice(parsed.scriptIndex + 1));
-        if (envModified) {
-          return { unsupported: true, kind: info.kind, reason: `unsupported env wrapper with flags/assignments before product entry (${info.kind})` };
-        }
-        if (!isAllowedOptionsForProduct(prod, parsed.nodeOptions)) {
+        if (!isAllowedOptionsForProduct(prod, parsed.nodeOptions, cwd)) {
           return { unsupported: true, kind: info.kind, reason: `unsupported Node options before product entry (${info.kind}): ${parsed.nodeOptions.map(o => o.flag).join(' ')}` };
         }
         return info;
-      }
-    }
-
-    // Defense-in-depth: an unrecognized leading Node flag that takes a separate argument
-    // can shift scriptIndex past the real script. Never silently fall back to Node.
-    if (parsed.nodeOptions.length > 0) {
-      for (const a of effArgs) {
-        if (typeof a !== 'string' || a.startsWith('-')) continue;
-        const prod = classifyProductScript(resolveRealFile(a, cwd), a);
-        if (prod) {
-          const idx = effArgs.indexOf(a);
-          const info = productInvocationFromScript(prod, effArgs.slice(idx + 1));
-          return { unsupported: true, kind: info.kind, reason: `unsupported Node option layout before product entry (${info.kind})` };
-        }
       }
     }
 
@@ -453,14 +392,4 @@ module.exports = function install(config, inherited) {
     }
     return originalFork.apply(this, arguments);
   };
-
-  for (const method of ['exec', 'execSync']) {
-    const original = cp[method];
-    cp[method] = function (cmdStr) {
-      if (!inAdapter && typeof cmdStr === 'string' && mentionsProductInShell(cmdStr)) {
-        failClosed(`unsupported product invocation via child_process.${method}`, 'cli', owner());
-      }
-      return original.apply(this, arguments);
-    };
-  }
 };
