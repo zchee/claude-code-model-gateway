@@ -17,6 +17,8 @@ package catalog_test
 import (
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
+	"errors"
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -24,6 +26,7 @@ import (
 	gocmp "github.com/google/go-cmp/cmp"
 
 	"github.com/zchee/claude-code-model-gateway/internal/catalog"
+	"github.com/zchee/claude-code-model-gateway/internal/config"
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
 	"github.com/zchee/claude-code-model-gateway/internal/policy"
 	"github.com/zchee/claude-code-model-gateway/internal/proxymodels"
@@ -59,10 +62,11 @@ func TestMissingVersionWritesString(t *testing.T) {
 func TestPrepare(t *testing.T) {
 	const unmeasured = "grok-composer-unmeasured"
 	tests := map[string]struct {
-		ids     []string
-		windows policy.Windows
-		want    []catalog.Model
-		wantErr string
+		ids       []string
+		windows   policy.Windows
+		want      []catalog.Model
+		wantErr   string
+		labelBase string
 	}{
 		"error: unmeasured listing and saved direct maximum": {
 			ids: []string{"claude-" + unmeasured}, windows: policy.Windows{"grok": {CompactAt: 120000}},
@@ -70,7 +74,7 @@ func TestPrepare(t *testing.T) {
 		},
 		"error: invalid label before an earlier model's window note": {
 			ids: []string{"claude-" + unmeasured, "claude-gpt-1--fast"}, windows: policy.Windows{"grok": {CompactAt: 120000}},
-			wantErr: "Cannot read properties of undefined (reading 'toUpperCase')",
+			wantErr: `cannot label Codex model "gpt-1--fast": empty suffix word`, labelBase: "gpt-1--fast",
 		},
 		"success: unmeasured listing without a direct maximum": {
 			ids:  []string{"claude-" + unmeasured},
@@ -98,6 +102,12 @@ func TestPrepare(t *testing.T) {
 				if prepared != nil || err == nil || err.Error() != tc.wantErr {
 					t.Fatalf("Prepare returned buildable=%t, error=%v; want no prepared inputs and %q", prepared != nil, err, tc.wantErr)
 				}
+				if tc.labelBase != "" {
+					labelErr, ok := errors.AsType[*catalog.LabelError](err)
+					if !ok || labelErr.Base != tc.labelBase {
+						t.Fatalf("error = %T %v; want LabelError for %q", err, err, tc.labelBase)
+					}
+				}
 				return
 			}
 			if err != nil {
@@ -119,6 +129,10 @@ func TestParseIDs(t *testing.T) {
 		"success: isolated escaped surrogates are not replacement characters": {
 			`[{"id":"claude-grok-\ud800"},{"id":"claude-grok-�"},{"id":"claude-grok-\udfff"},{"id":"claude-grok-😀"}]`,
 			[]string{"claude-grok-�", "claude-grok-😀"},
+		},
+		"success: ill-formed UTF-8 is not a replacement character": {
+			"[{\"id\":\"claude-grok-\xff\"},{\"id\":\"claude-grok-�\"}]",
+			[]string{"claude-grok-�"},
 		},
 		"success: last exact id field wins; non-string ids are ignored": {
 			`[null,12,{"id":true},{"ID":"claude-grok-ignored"},{"id":"claude-grok-ignored","id":"claude-grok-kept"},{"id":"claude-grok-ignored","id":"\ud800"}]`,
@@ -171,6 +185,175 @@ func TestSlugCasingAndCollisionOrder(t *testing.T) {
 			}
 			if diff := gocmp.Diff(tc.want, got); diff != "" {
 				t.Errorf("slugs (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestBuildInvalidLabel(t *testing.T) {
+	const invalid = "claude-codex-gpt-1--fast"
+	tests := map[string]struct{ ids []string }{
+		"error: invalid legacy label without a policy": {[]string{invalid}},
+		"error: discard earlier valid rows too":        {[]string{"claude-grok-4.5", invalid}},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			got := catalog.Build(t.Context(), tc.ids, catalog.Inputs{})
+			if diff := gocmp.Diff(catalog.Catalog{}, got); diff != "" {
+				t.Errorf("catalog (-want +got):\n%s", diff)
+			}
+			if data, err := jsonx.EncodeState(got); err == nil {
+				t.Errorf("invalid catalog serialized: %s", data)
+			}
+		})
+	}
+}
+
+func TestPreparedReadinessSnapshot(t *testing.T) {
+	tests := map[string]struct {
+		ids  []string
+		want map[string]catalog.Readiness
+	}{
+		"success: supplied readings are owned and fallback is probed on each build": {
+			ids: []string{"claude-cursor-agent", "claude-gpt-1", "claude-kimi-k3", "claude-grok-4.5"},
+			want: map[string]catalog.Readiness{
+				"cursor": {Ready: true, State: "ready", Message: "cursor observed"},
+				"codex":  {Ready: true, State: "ready", Message: "codex observed"},
+				"kimi":   {State: "proxy-down", Message: "proxy-down"},
+				"grok":   {State: "auth-missing", Message: "not signed in"},
+			},
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			probe := new(observations)
+			inputs := catalog.Inputs{
+				Providers:    map[string]catalog.Readiness{"cursor": {Ready: true, State: "ready", Message: "cursor observed"}},
+				Codex:        new(catalog.Readiness{Ready: true, State: "ready", Message: "codex observed"}),
+				SharedChecks: new(catalog.Checks{ProxyBinary: true}),
+				Fallback:     probe,
+			}
+			routes := proxymodels.NewTable([]proxymodels.Route{{ID: "cursor-agent", Provider: "cursor"}, {ID: "kimi-k3", Provider: "kimi"}})
+			prepared, err := catalog.Prepare(tc.ids, inputs, policy.ResolverInputs{Routes: routes}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			delete(inputs.Providers, "cursor")
+			*inputs.Codex = catalog.Readiness{}
+			*inputs.SharedChecks = catalog.Checks{}
+			first := prepared.Build(t.Context())
+			if diff := gocmp.Diff(tc.want, first.Providers); diff != "" {
+				t.Fatalf("provider snapshot (-want +got):\n%s", diff)
+			}
+			delete(first.Providers, "cursor")
+			first.Models[0].ID = "changed"
+			*first.CodexReadiness = catalog.Readiness{}
+			second := prepared.Build(t.Context())
+			if diff := gocmp.Diff(tc.want, second.Providers); diff != "" {
+				t.Errorf("second provider snapshot (-want +got):\n%s", diff)
+			}
+			if second.Models[0].ID != tc.ids[0] {
+				t.Errorf("second model ID = %q, want %q", second.Models[0].ID, tc.ids[0])
+			}
+			checkCodexMirror(t, second)
+			if diff := gocmp.Diff([]string{"grok", "grok"}, probe.probes); diff != "" {
+				t.Errorf("probes (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestPrepareWindowSnapshot(t *testing.T) {
+	tests := map[string]struct {
+		ids  []string
+		want []int
+	}{
+		"success: lookup cannot change a later model's cap or note": {
+			ids: []string{"claude-grok-4.5", "claude-grok-4.7"}, want: []int{300000, 300000},
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			windows := policy.Windows{"grok": {Value: config.ContextWindow{Tokens: 300000}, CompactAt: 120000}}
+			var calls int
+			lookup := func(string) (string, bool) {
+				calls++
+				windows["grok"] = policy.Setting{Value: config.ContextWindow{Tokens: 200000}, CompactAt: 195000}
+				return "", false
+			}
+			prepared, err := catalog.Prepare(tc.ids, catalog.Inputs{}, policy.ResolverInputs{Windows: windows}, lookup)
+			if err != nil {
+				t.Fatal(err)
+			}
+			models := prepared.Build(t.Context()).Models
+			if calls != len(tc.ids) || len(models) != len(tc.ids) {
+				t.Fatalf("lookup calls = %d, models = %d; want %d each", calls, len(models), len(tc.ids))
+			}
+			for i, row := range models {
+				wantNote := fmt.Sprintf("requested compact-at 120000; backend window 500000 (%s); effective maximum 120000 (compact-at); compacts past 120000", tc.ids[i][len("claude-"):])
+				if row.ContextWindow != tc.want[i] || row.ContextWindowNote != wantNote {
+					t.Errorf("%s: window %d, note %q; want window %d, note %q", row.ID, row.ContextWindow, row.ContextWindowNote, tc.want[i], wantNote)
+				}
+			}
+		})
+	}
+}
+
+func TestProviderPropertyNames(t *testing.T) {
+	tests := map[string]struct{ provider string }{
+		"success: checks is an ordinary provider":      {"checks"},
+		"success: constructor is an ordinary provider": {"constructor"},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			// JavaScript property-name collisions select the flat checks or an inherited constructor instead.
+			probe := new(observations)
+			got := catalog.Build(t.Context(), []string{"claude-example"}, catalog.Inputs{
+				SharedChecks: &catalog.Checks{}, Fallback: probe,
+				Policy: func(string) catalog.Policy {
+					return catalog.Policy{Provider: tc.provider, BackendID: "example", Transport: "proxy"}
+				},
+			})
+			want := map[string]catalog.Readiness{tc.provider: {State: "binary-missing", Message: "binary-missing"}}
+			if diff := gocmp.Diff(want, got.Providers); diff != "" {
+				t.Errorf("providers (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestCodexLabelUnicode(t *testing.T) {
+	tests := map[string]struct{ suffix, want string }{
+		"success: initial outside BMP is unchanged": {"𐐨-fast", "GPT-1 𐐨 Fast"},
+		"success: LF prevents suffix capture":       {"before\n-after", "GPT-1 before\n after"},
+		"success: CR prevents suffix capture":       {"before\r-after", "GPT-1 before\r after"},
+		"success: LS prevents suffix capture":       {"before -after", "GPT-1 before  after"},
+		"success: PS prevents suffix capture":       {"before -after", "GPT-1 before  after"},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			models := catalog.Build(t.Context(), []string{"claude-codex-gpt-1-" + tc.suffix}, catalog.Inputs{}).Models
+			if len(models) != 1 || models[0].Label != tc.want {
+				t.Errorf("models = %+v; want one with label %q", models, tc.want)
+			}
+		})
+	}
+}
+
+func TestShortSlugs(t *testing.T) {
+	tests := map[string]struct{ provider, base, want string }{
+		"success: empty normalized slug becomes x": {"é", "!", "x"},
+		"success: one character stays one":         {"1", "1/", "1"},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			models := catalog.Build(t.Context(), []string{"claude-example"}, catalog.Inputs{
+				Policy: func(string) catalog.Policy {
+					return catalog.Policy{Provider: tc.provider, BackendID: tc.base, Transport: "proxy"}
+				},
+			}).Models
+			if len(models) != 1 || models[0].Slug != tc.want {
+				t.Errorf("models = %+v; want one with slug %q", models, tc.want)
 			}
 		})
 	}

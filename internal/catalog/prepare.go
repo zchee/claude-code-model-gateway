@@ -16,74 +16,54 @@ package catalog
 
 import (
 	"context"
-	"regexp"
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/zchee/claude-code-model-gateway/internal/config"
 	"github.com/zchee/claude-code-model-gateway/internal/policy"
 )
 
-// Prepared binds the discovered IDs to their validated policy observations.
+// Prepared holds a snapshot of validated models and supplied readiness observations.
 type Prepared struct {
-	ids    []string
+	models []Model
 	inputs Inputs
 }
 
 // Prepare resolves model policy and validates labels and window notes before a refresh can build a catalog.
-// It replaces inputs.Policy with resolved observations and returns no prepared catalog on failure.
+// It ignores inputs.Policy and returns no prepared catalog on failure.
 func Prepare(ids []string, inputs Inputs, modelInputs policy.ResolverInputs, lookup config.LookupEnv) (*Prepared, error) {
+	inputs.Policy = nil
+	inputs.Providers = maps.Clone(inputs.Providers)
+	if inputs.Codex != nil {
+		inputs.Codex = new(*inputs.Codex)
+	}
+	if inputs.SharedChecks != nil {
+		inputs.SharedChecks = new(*inputs.SharedChecks)
+	}
+	modelInputs.Windows = maps.Clone(modelInputs.Windows)
 	resolver := policy.NewResolver(modelInputs)
-	pattern := regexp.MustCompile(codexLabelPattern)
-	policies := make(map[string]Policy, len(ids))
-	retained := make([]string, 0, len(ids))
-	for _, id := range ids {
-		if !candidate(id) {
-			continue
-		}
-		if _, known := policies[id]; known {
-			retained = append(retained, id)
-			continue
-		}
-		p := Policy{ClientID: resolver.ClientID(id)}
-		m := resolver.Resolve(id)
-		routing := m
+	observe := func(id string) Policy {
+		p := Policy{ClientID: resolver.ClientID(id), Window: int(resolver.AdvertisedWindow(id))}
 		// Route membership resolves the bare spelling; the client ID and window resolve the original.
-		if bare, ok := strings.CutSuffix(id, longWindow); ok {
-			routing = resolver.Resolve(bare)
-		}
-		if routing != nil {
+		if routing := resolver.Resolve(strings.TrimSuffix(id, longWindow)); routing != nil {
 			p.BackendID, p.Provider, p.Transport = routing.BackendID, routing.Backend, routing.Transport
 		}
-		provider, base := route(id, p)
-		if provider == "" {
-			continue
-		}
-		if provider == "codex" {
-			if _, err := modelLabel(pattern, provider, base); err != nil {
-				return nil, err
-			}
-		}
-		retained = append(retained, id)
-		policies[id] = p
+		return p
 	}
-	// The source resolves all labels before formatting the first window note.
-	windows := modelInputs.Windows
-	for _, id := range retained {
-		p := policies[id]
-		p.Window = int(resolver.AdvertisedWindow(id))
-		if p.Window != 0 {
-			provider, _ := route(id, p)
-			note, err := policy.CheckedWindowNote(provider, windows.Cap(provider), windows[provider].CompactAt, resolver.Resolve(id), lookup)
-			if err != nil {
-				return nil, err
-			}
-			p.WindowNote = note
-		}
-		policies[id] = p
+	note := func(id, provider string) (string, error) {
+		windows := modelInputs.Windows
+		return policy.CheckedWindowNote(provider, windows.Cap(provider), windows[provider].CompactAt, resolver.Resolve(id), lookup)
 	}
-	inputs.Policy = func(id string) Policy { return policies[id] }
-	return &Prepared{ids: retained, inputs: inputs}, nil
+	models, err := prepareModels(ids, observe, note)
+	if err != nil {
+		return nil, err
+	}
+	return &Prepared{models: models, inputs: inputs}, nil
 }
 
-// Build constructs the catalog from the observations validated by Prepare.
-func (p *Prepared) Build(ctx context.Context) Catalog { return Build(ctx, p.ids, p.inputs) }
+// Build constructs a fresh catalog from the validated observations, probing fallback readiness again on each call.
+// Concurrent builds require a concurrency-safe injected fallback.
+func (p *Prepared) Build(ctx context.Context) Catalog {
+	return build(ctx, p.inputs, slices.Clone(p.models))
+}

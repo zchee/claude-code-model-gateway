@@ -138,17 +138,24 @@ func ParseIDs(rows jsontext.Value) ([]string, error) {
 	return ids, nil
 }
 
-// Build constructs a catalog in discovery order from already validated policy observations.
-// Use Prepare for a catalog refresh, where resolving window notes can fail.
+// Build constructs a catalog in discovery order from supplied policy observations.
+// On label validation failure it returns the zero Catalog, which cannot be serialized.
+// Use Prepare if the caller needs the validation error or must resolve window notes.
 func Build(ctx context.Context, ids []string, inputs Inputs) Catalog {
-	catalog := Catalog{
-		SchemaVersion: 4,
-		Source:        "model-gateway",
-		UpdatedAt:     isoTimestamp(inputs.UpdatedAt),
-		WrittenBy:     cmp.Or(inputs.Version, "0.0.0-dev"),
-		Providers:     make(map[string]Readiness),
-		Models:        make([]Model, 0, len(ids)),
+	models, err := prepareModels(ids, inputs.Policy, nil)
+	if err != nil {
+		return Catalog{}
 	}
+	return build(ctx, inputs, models)
+}
+
+func prepareModels(ids []string, observe func(string) Policy, note func(id, provider string) (string, error)) ([]Model, error) {
+	models := make([]Model, 0, len(ids))
+	type pendingNote struct {
+		id    string
+		index int
+	}
+	var pendingNotes []pendingNote
 	used := make(map[string]struct{}, len(ids))
 	pattern := regexp.MustCompile(codexLabelPattern)
 	lower := cases.Lower(language.Und)
@@ -157,8 +164,8 @@ func Build(ctx context.Context, ids []string, inputs Inputs) Catalog {
 			continue
 		}
 		var p Policy
-		if inputs.Policy != nil {
-			p = inputs.Policy(id)
+		if observe != nil {
+			p = observe(id)
 		}
 		provider, base := route(id, p)
 		if provider == "" {
@@ -166,15 +173,39 @@ func Build(ctx context.Context, ids []string, inputs Inputs) Catalog {
 		}
 		label, err := modelLabel(pattern, provider, base)
 		if err != nil {
-			panic(err) // An unchecked observation bypassed the refresh preparation boundary.
+			return nil, err
 		}
 		model := Model{Slug: slugFor(lower, provider, base, used), ID: cmp.Or(p.ClientID, id), Label: label, Provider: provider}
 		if p.Window != 0 {
 			model.ContextWindow, model.ContextWindowNote = p.Window, p.WindowNote
+			if note != nil {
+				pendingNotes = append(pendingNotes, pendingNote{id, len(models)})
+			}
 		}
-		catalog.Models = append(catalog.Models, model)
+		models = append(models, model)
 	}
-	for _, model := range catalog.Models {
+	// All labels must be valid before formatting the first window note.
+	for _, pending := range pendingNotes {
+		m := &models[pending.index]
+		text, err := note(pending.id, m.Provider)
+		if err != nil {
+			return nil, err
+		}
+		m.ContextWindowNote = text
+	}
+	return models, nil
+}
+
+func build(ctx context.Context, inputs Inputs, models []Model) Catalog {
+	catalog := Catalog{
+		SchemaVersion: 4,
+		Source:        "model-gateway",
+		UpdatedAt:     isoTimestamp(inputs.UpdatedAt),
+		WrittenBy:     cmp.Or(inputs.Version, "0.0.0-dev"),
+		Providers:     make(map[string]Readiness),
+		Models:        models,
+	}
+	for _, model := range models {
 		if _, exists := catalog.Providers[model.Provider]; !exists {
 			catalog.Providers[model.Provider] = readinessFor(ctx, model.Provider, inputs)
 		}
@@ -210,6 +241,16 @@ func route(id string, p Policy) (provider, base string) {
 	return "", ""
 }
 
+// LabelError identifies a Codex model whose label suffix has an empty word.
+type LabelError struct {
+	Base string
+}
+
+// Error describes why the model cannot be labeled.
+func (e *LabelError) Error() string {
+	return fmt.Sprintf("cannot label Codex model %q: empty suffix word", e.Base)
+}
+
 func modelLabel(pattern *regexp.Regexp, provider, base string) (string, error) {
 	switch provider {
 	case "grok":
@@ -232,7 +273,7 @@ func modelLabel(pattern *regexp.Regexp, provider, base string) (string, error) {
 		out.WriteString(label)
 		for word := range strings.SplitSeq(parts[2], "-") {
 			if word == "" {
-				return "", errors.New("Cannot read properties of undefined (reading 'toUpperCase')") //nolint:staticcheck // Preserve the source refresh diagnostic.
+				return "", &LabelError{Base: base}
 			}
 			out.WriteByte(' ')
 			_, size := utf8.DecodeRuneInString(word)
@@ -339,8 +380,11 @@ func readinessFor(ctx context.Context, provider string, inputs Inputs) Readiness
 	return Readiness{State: "unavailable", Message: provider + " readiness is unavailable."}
 }
 
-// MarshalJSON writes the catalog in source order, including the dynamic provider keys.
+// MarshalJSON writes the catalog in source order and rejects the zero-schema result of a failed build.
 func (c Catalog) MarshalJSON() ([]byte, error) {
+	if c.SchemaVersion == 0 {
+		return nil, errors.New("cannot serialize a catalog without a schema version")
+	}
 	member := func(name string, value jsonx.WireValue) jsonx.Member {
 		return jsonx.Member{Name: utf16.Encode([]rune(name)), Value: value}
 	}
