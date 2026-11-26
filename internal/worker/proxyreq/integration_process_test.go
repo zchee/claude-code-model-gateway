@@ -48,7 +48,6 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/policy"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/proxyreq"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/route"
-	"github.com/zchee/claude-code-model-gateway/internal/worker/sentry"
 )
 
 type startup struct {
@@ -82,7 +81,7 @@ func TestGatewayFixtureHelper(t *testing.T) {
 			}
 			_, raw, _ := config.CompactTrigger.Read(os.LookupEnv)
 			trigger := windows["codex"].CompactAt
-			h, err := proxyreq.New(proxyreq.Options{StartupDir: dir, DispatchPath: "routes.json", Now: time.Now, Lookup: os.LookupEnv, Windows: windows, Sentry: new(sentry.State)})
+			h, err := proxyreq.New(proxyreq.Options{StartupDir: dir, DispatchPath: "routes.json", Now: time.Now, Lookup: os.LookupEnv, Windows: windows})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -329,7 +328,7 @@ func TestLMTierHTTP(t *testing.T) {
 
 func TestKeepAliveRefusals(t *testing.T) {
 	env := gatewaytest.NewEnv(t.TempDir(), nil, nil, nil)
-	h := newHandler(t, env["HOME"], nil, new(sentry.State))
+	h := newHandler(t, env["HOME"], nil)
 	base := env.StartUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, err := io.ReadAll(r.Body)
 		if err != nil {

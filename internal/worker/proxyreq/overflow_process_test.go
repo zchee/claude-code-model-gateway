@@ -30,10 +30,17 @@ import (
 	gocmp "github.com/google/go-cmp/cmp"
 
 	"github.com/zchee/claude-code-model-gateway/internal/gatewaytest"
+	"github.com/zchee/claude-code-model-gateway/internal/worker/route"
 )
 
 // Request preparation owns the refusal; the running worker must not forward or reroute it.
 func TestToolSchemaEngineQuirkHTTPRefusal(t *testing.T) {
+	t.Run("prepare", func(t *testing.T) {
+		out, w := prepare(t, newHandler(t, t.TempDir(), nil), route.Snapshot{}, "/v1/messages", propertyQuirk, nil)
+		if diff := gocmp.Diff(propertyRefusal, w.Body.String()); diff != "" || w.Code != http.StatusBadRequest || out.LocalStatus != w.Code || len(out.Body) != 0 || w.Header().Get("Content-Type") != "application/json" {
+			t.Errorf("local status %d, HTTP %d %v, forwardable body %q, refusal (-want +got): %s", out.LocalStatus, w.Code, w.Header(), out.Body, diff)
+		}
+	})
 	env := gatewaytest.NewEnv(t.TempDir(), nil, nil, nil)
 	var contacts atomic.Int32
 	upstream := env.StartUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

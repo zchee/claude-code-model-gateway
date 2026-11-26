@@ -31,6 +31,7 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/policy"
 	"github.com/zchee/claude-code-model-gateway/internal/proxymodels"
 	"github.com/zchee/claude-code-model-gateway/internal/venue"
+	"github.com/zchee/claude-code-model-gateway/internal/worker/outcome"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/proxyreq"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/route"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/sentry"
@@ -41,9 +42,9 @@ func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m)
 }
 
-func newHandler(t *testing.T, dir string, env map[string]string, state *sentry.State) *proxyreq.Handler {
+func newHandler(t *testing.T, dir string, env map[string]string) *proxyreq.Handler {
 	t.Helper()
-	h, err := proxyreq.New(proxyreq.Options{StartupDir: dir, DispatchPath: "routes.json", Now: func() time.Time { return time.UnixMilli(1234) }, Lookup: func(k string) (string, bool) { v, ok := env[k]; return v, ok }, Sentry: state})
+	h, err := proxyreq.New(proxyreq.Options{StartupDir: dir, DispatchPath: "routes.json", Now: func() time.Time { return time.UnixMilli(1234) }, Lookup: func(k string) (string, bool) { v, ok := env[k]; return v, ok }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,12 +61,16 @@ func prepare(t testing.TB, h *proxyreq.Handler, s route.Snapshot, path, raw stri
 	}
 	original := []byte(raw)
 	w := httptest.NewRecorder()
+	w.Code = 0 // Distinguish an untouched writer from an explicit 200.
 	out, err := h.Prepare(w, r, s, d, original)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(original, []byte(raw)) {
 		t.Fatal("original request bytes were modified")
+	}
+	if out.LocalStatus == 0 && string(out.Original) != raw {
+		t.Fatalf("original bytes in result = %q, want %q", out.Original, raw)
 	}
 	return out, w
 }
@@ -108,9 +113,19 @@ func TestPrepare(t *testing.T) {
 			if tc.keep {
 				env["CODEX_GATEWAY_KEEP_PLAN_TOOLS"] = "1"
 			}
-			out, w := prepare(t, newHandler(t, t.TempDir(), env, new(sentry.State)), s, tc.path, tc.raw, nil)
+			out, w := prepare(t, newHandler(t, t.TempDir(), env), s, tc.path, tc.raw, nil)
 			if diff := gocmp.Diff(tc.wantBody, string(out.Body)); diff != "" {
 				t.Error(diff)
+			}
+			selected, effective, backend, via := "claude-gpt-5.6-sol[1m]", "gpt-5.6-sol", "codex", "direct"
+			if strings.Contains(tc.raw, `"claude-lmstudio/tiny"`) {
+				selected, effective, backend = "claude-lmstudio/tiny", "lmstudio/tiny", "lmstudio"
+			} else if tc.reason == "thread_unsupported" {
+				selected, effective, via = "claude-codex-auto", "", "dispatch"
+			}
+			wantRoute := outcome.Route{SelectedModel: selected, EffectiveModel: effective, Backend: backend, Via: via}
+			if diff := gocmp.Diff(wantRoute, out.Route); diff != "" {
+				t.Errorf("route (-want +got): %s", diff)
 			}
 			if tc.reason != "" {
 				if out.LocalStatus != 400 || out.Reason != tc.reason || w.Code != 400 || w.Header().Get("Content-Type") != "application/json" {
@@ -119,13 +134,13 @@ func TestPrepare(t *testing.T) {
 				if diff := gocmp.Diff(tc.refusal, w.Body.String()); diff != "" {
 					t.Error(diff)
 				}
-			} else {
-				selected, effective, provider := "claude-gpt-5.6-sol[1m]", "gpt-5.6-sol", "codex"
-				if strings.Contains(tc.raw, `"claude-lmstudio/tiny"`) {
-					selected, effective, provider = "claude-lmstudio/tiny", "lmstudio/tiny", "lmstudio"
+				if out.Audit != nil {
+					t.Errorf("local refusal produced a route log entry: %+v", out.Audit)
 				}
-				if out.LocalStatus != 0 || out.Via != "direct" || out.SelectedModel != selected || out.EffectiveModel != effective || out.Provider != provider {
-					t.Errorf("unexpected direct route: %+v", out)
+			} else {
+				wantAudit := &outcome.Audit{Backend: backend, Model: new(effective)}
+				if diff := gocmp.Diff(wantAudit, out.Audit); diff != "" || out.LocalStatus != 0 {
+					t.Errorf("direct route: local status %d, audit (-want +got): %s", out.LocalStatus, diff)
 				}
 			}
 		})
@@ -136,8 +151,8 @@ func TestDispatchLifetime(t *testing.T) {
 	const marker = "[sidequest-route model=gpt-5.6-sol effort=high ticket=SQ-123]"
 	const auto = "claude-codex-auto"
 	dir := t.TempDir()
-	h := newHandler(t, dir, nil, new(sentry.State))
-	turn := func(content string, headers http.Header, userID, via string) {
+	h := newHandler(t, dir, nil)
+	turn := func(content string, headers http.Header, userID, via string) *outcome.Audit {
 		t.Helper()
 		metadata := ""
 		if userID != "" {
@@ -153,14 +168,19 @@ func TestDispatchLifetime(t *testing.T) {
 			if diff := gocmp.Diff(refusal, w.Body.String()); diff != "" || w.Header().Get("Content-Type") != "application/json" {
 				t.Errorf("unbound refusal Content-Type=%q, body (-want +got): %s", w.Header().Get("Content-Type"), diff)
 			}
-			return
+			want := outcome.Route{SelectedModel: auto, Backend: "codex", Via: "dispatch"}
+			if diff := gocmp.Diff(want, out.Route); diff != "" {
+				t.Errorf("unbound route (-want +got): %s", diff)
+			}
+			return out.Audit
 		}
 		want := fmt.Sprintf(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":%s}],"output_config":{"effort":"high","other":1}%s}`, content, metadata)
 		if diff := gocmp.Diff(want, string(out.Body)); diff != "" {
 			t.Error(diff)
 		}
-		if out.Via != via || out.SelectedModel != auto || out.EffectiveModel != "gpt-5.6-sol" || out.Provider != "codex" || out.Effort == nil || *out.Effort != "high" || out.LocalStatus != 0 {
-			t.Errorf("route = %+v", out)
+		wantRoute := outcome.Route{SelectedModel: auto, EffectiveModel: "gpt-5.6-sol", Backend: "codex", Effort: "high", Via: via}
+		if diff := gocmp.Diff(wantRoute, out.Route); diff != "" || out.LocalStatus != 0 {
+			t.Errorf("local status %d, route (-want +got): %s", out.LocalStatus, diff)
 		}
 		wantTicket := new("SQ-123")
 		if via == "dispatch-inherited" {
@@ -169,28 +189,43 @@ func TestDispatchLifetime(t *testing.T) {
 		if diff := gocmp.Diff(wantTicket, out.Ticket); diff != "" {
 			t.Errorf("%s usage ticket (-want +got): %s", via, diff)
 		}
+		return out.Audit
+	}
+	checkAudit := func(got *outcome.Audit, want outcome.Audit) {
+		t.Helper()
+		if diff := gocmp.Diff(&want, got); diff != "" {
+			t.Errorf("%s audit (-want +got): %s", want.Via, diff)
+		}
 	}
 	parent := http.Header{"X-Claude-Code-Session-Id": {"s"}, "X-Claude-Code-Agent-Id": {"parent"}}
 	child := http.Header{"X-Claude-Code-Session-Id": {"s"}, "X-Claude-Code-Agent-Id": {"child"}, "X-Claude-Code-Parent-Agent-Id": {"parent"}}
 	const follow = `"follow up"`
 	briefing := fmt.Sprintf("%q", marker)
-	turn(briefing, parent, "", "dispatch")
+	accepted := outcome.Audit{Backend: "codex", Model: new("gpt-5.6-sol"), Via: "dispatch", Effort: "high", SessionID: "s", AgentID: "parent", SessionSource: "header", MarkersLength: new(1)}
+	checkAudit(turn(briefing, parent, "", "dispatch"), accepted)
 	cache := filepath.Join(dir, "routes.json")
 	if err := os.Remove(cache); err != nil {
 		t.Fatalf("cache not written under startup directory: %v", err)
 	}
-	turn(follow, parent, "", "dispatch-cached")
-	turn(fmt.Sprintf("%q", marker+marker), parent, "", "")
-	turn(follow, child, "", "dispatch-inherited")
+	cached := accepted
+	cached.Via, cached.MarkersLength = "dispatch-cached", new(0)
+	checkAudit(turn(follow, parent, "", "dispatch-cached"), cached)
+	unbound := outcome.Audit{Backend: "codex", Model: new(auto), Via: "dispatch-unbound", SessionID: "s", AgentID: "parent", SessionSource: "header", MarkersLength: new(2)}
+	checkAudit(turn(fmt.Sprintf("%q", marker+marker), parent, "", ""), unbound)
+	inherited := cached
+	inherited.Via, inherited.AgentID, inherited.ParentAgentID, inherited.InheritedFromAgentID = "dispatch-inherited", "child", "parent", "parent"
+	checkAudit(turn(follow, child, "", "dispatch-inherited"), inherited)
 	child.Del("X-Claude-Code-Parent-Agent-Id")
 	turn(follow, child, "", "dispatch-cached")
 	turn(follow, http.Header{"X-Claude-Code-Session-Id": {"s"}, "X-Claude-Code-Agent-Id": {"sibling"}}, "", "")
-	h = newHandler(t, dir, nil, new(sentry.State))
+	h = newHandler(t, dir, nil)
 	turn(follow, child, "", "dispatch-cached")
 
 	child.Del("X-Claude-Code-Session-Id")
-	turn(follow, child, `{"session_id":"s"}`, "dispatch-cached")
-	turn(follow, child, "user_session_old_session_s", "dispatch-cached")
+	metadata := cached
+	metadata.AgentID, metadata.SessionSource = "child", "metadata"
+	checkAudit(turn(follow, child, `{"session_id":"s"}`, "dispatch-cached"), metadata)
+	checkAudit(turn(follow, child, "user_session_old_session_s", "dispatch-cached"), metadata)
 	turn(follow, child, `{"session_id":"other"}`, "")
 	turn(follow, parent, `{"session_id":"other"}`, "dispatch-cached")
 	child.Set("X-Claude-Code-Session-Id", "unsafe id")
@@ -199,8 +234,10 @@ func TestDispatchLifetime(t *testing.T) {
 	turn(follow, child, `{"session_id":"unsafe id"}`, "")
 
 	parentOnly := http.Header{"X-Claude-Code-Session-Id": {"s"}, "X-Claude-Code-Parent-Agent-Id": {"parent"}}
-	turn(briefing, parentOnly, "", "dispatch")
-	turn(follow, parentOnly, "", "")
+	accepted.AgentID, accepted.ParentAgentID = "", "parent"
+	checkAudit(turn(briefing, parentOnly, "", "dispatch"), accepted)
+	unbound.AgentID, unbound.ParentAgentID, unbound.MarkersLength = "", "parent", new(0)
+	checkAudit(turn(follow, parentOnly, "", ""), unbound)
 	parentOnly.Del("X-Claude-Code-Parent-Agent-Id")
 	turn(follow, parentOnly, "", "")
 	const echo = `{"type":"tool_result","content":"[sidequest-route model=gpt-5.6-terra]"}`
@@ -224,12 +261,6 @@ func TestModelKeys(t *testing.T) {
 	}
 }
 
-type overflowFunc func(http.ResponseWriter, *http.Request, []byte, proxyreq.Result, sentry.Crossing)
-
-func (f overflowFunc) WriteSentryOverflow(w http.ResponseWriter, r *http.Request, original []byte, result proxyreq.Result, crossing sentry.Crossing) {
-	f(w, r, original, result, crossing)
-}
-
 func TestPrepareArmedSentry(t *testing.T) {
 	const session = `["s",null]`
 	const model = "claude-gpt-6.1-sol[1m]"
@@ -238,13 +269,12 @@ func TestPrepareArmedSentry(t *testing.T) {
 	const summary = `"stream":true,"system":"You are a helpful AI assistant tasked with summarizing conversations.",` + history
 	target := sentry.Target{Key: base, Policy: &policy.Sentry{BackendWindow: 920012, CompactTrigger: 242000, Source: "compact-at"}, Headroom: 40000}
 	tests := map[string]struct {
-		path, fields     string
-		disabled, refuse bool
+		path, fields, phase, sessionKey string
 	}{
-		"error: continuation reports original bytes": {"/v1/messages?beta=true", history, false, true},
-		"success: count tokens bypasses crossing":    {"/v1/messages/count_tokens?beta=true", history, false, false},
-		"success: compaction bypasses crossing":      {"/v1/messages", summary, false, false},
-		"success: disabled sentry bypasses crossing": {"/v1/messages", history, true, false},
+		"success: continuation preserves the crossing for admission":       {"/v1/messages?beta=true", history, "continuation", session},
+		"success: count tokens is prepared without consuming the crossing": {"/v1/messages/count_tokens?beta=true", history, "continuation", session},
+		"success: compaction retains its original classification":          {"/v1/messages", summary, "compaction", session},
+		"success: disabled sentry has no session key":                      {"/v1/messages", history, "continuation", ""},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -253,52 +283,30 @@ func TestPrepareArmedSentry(t *testing.T) {
 			state.ObserveJSON(session, target, nil, []byte(`{"type":"message","stop_reason":"end_turn","usage":{"input_tokens":250000}}`))
 			windows := policy.Windows{"codex": {CompactAt: 242000}}
 			env := map[string]string{"CODEX_GATEWAY_COMPACT_TRIGGER": "320000"}
-			if tc.disabled {
+			if tc.sessionKey == "" {
 				env["CODEX_GATEWAY_SENTRY"] = "0"
 			}
-			r := httptest.NewRequestWithContext(t.Context(), http.MethodPost, tc.path, nil)
-			r.Header.Set("X-Claude-Code-Session-Id", "s")
-			w := httptest.NewRecorder()
-			calls := 0
-			reply := overflowFunc(func(rw http.ResponseWriter, req *http.Request, original []byte, res proxyreq.Result, crossing sentry.Crossing) {
-				calls++
-				if rw != w || req != r || string(original) != raw {
-					t.Errorf("overflow writer did not receive the original request, writer and bytes: %q", original)
-				}
-				if diff := gocmp.Diff((sentry.Crossing{Usage: 250000, Trigger: 242000}), crossing); diff != "" {
-					t.Error(diff)
-				}
-				if res.SelectedModel != model || res.EffectiveModel != base || res.Provider != "codex" || res.Via != "direct" || res.SessionKey != session {
-					t.Errorf("incorrect overflow route: %+v", res)
-				}
-				if diff := gocmp.Diff(target, res.Target); diff != "" {
-					t.Error(diff)
-				}
-				rw.WriteHeader(http.StatusRequestEntityTooLarge)
-			})
-			h, err := proxyreq.New(proxyreq.Options{StartupDir: t.TempDir(), DispatchPath: "routes.json", Now: time.Now, Lookup: func(k string) (string, bool) { v, ok := env[k]; return v, ok }, Sentry: state, Windows: windows, Reply: reply})
+			h, err := proxyreq.New(proxyreq.Options{StartupDir: t.TempDir(), DispatchPath: "routes.json", Now: time.Now, Lookup: func(k string) (string, bool) { v, ok := env[k]; return v, ok }, Windows: windows})
 			if err != nil {
 				t.Fatal(err)
 			}
-			s := route.Snapshot{}
-			original := []byte(raw)
-			out, err := h.Prepare(w, r, s, s.Classify(r.Method, r.RequestURI, original), original)
-			if err != nil {
-				t.Fatal(err)
+			out, w := prepare(t, h, route.Snapshot{}, tc.path, raw, http.Header{"X-Claude-Code-Session-Id": {"s"}})
+			want := fmt.Sprintf(`{"model":%q,%s}`, base, tc.fields)
+			if diff := gocmp.Diff(want, string(out.Body)); diff != "" || out.LocalStatus != 0 || w.Code != 0 || w.Body.Len() != 0 {
+				t.Fatalf("local status %d, HTTP %d %q, prepared body (-want +got): %s", out.LocalStatus, w.Code, w.Body, diff)
 			}
-			if tc.refuse {
-				if calls != 1 || w.Code != 413 || out.LocalStatus != 413 || len(out.Body) != 0 {
-					t.Errorf("overflow writer calls=%d, HTTP %d, result=%+v", calls, w.Code, out)
-				}
-			} else {
-				want := fmt.Sprintf(`{"model":%q,%s}`, base, tc.fields)
-				if diff := gocmp.Diff(want, string(out.Body)); diff != "" || calls != 0 || out.LocalStatus != 0 {
-					t.Errorf("expected forward, writer calls=%d, status=%d, body diff=%s", calls, out.LocalStatus, diff)
-				}
+			if out.SessionKey != tc.sessionKey || sentry.RequestPhase(out.Original) != tc.phase {
+				t.Fatalf("session key %q, original phase %q", out.SessionKey, sentry.RequestPhase(out.Original))
 			}
-			if !tc.disabled {
+			if tc.sessionKey != "" {
 				if diff := gocmp.Diff(target, out.Target); diff != "" {
-					t.Error(diff)
+					t.Fatal(diff)
+				}
+			}
+			if tc.path == "/v1/messages?beta=true" {
+				crossing, ok := state.Check(out.SessionKey, out.Target, out.Original)
+				if diff := gocmp.Diff(sentry.Crossing{Usage: 250000, Trigger: 242000}, crossing); !ok || diff != "" {
+					t.Errorf("expected an unconsumed crossing after preparation, got %t: %s", ok, diff)
 				}
 			}
 		})
@@ -330,7 +338,7 @@ func TestSentrySessionIdentity(t *testing.T) {
 			if tc.agent != nil {
 				headers.Set("X-Claude-Code-Agent-Id", *tc.agent)
 			}
-			got, _ := prepare(t, newHandler(t, t.TempDir(), env, new(sentry.State)), route.Snapshot{}, "/v1/messages", `{"model":"claude-gpt-5.6-sol"}`, headers)
+			got, _ := prepare(t, newHandler(t, t.TempDir(), env), route.Snapshot{}, "/v1/messages", `{"model":"claude-gpt-5.6-sol"}`, headers)
 			if diff := gocmp.Diff(tc.want, got.SessionKey); diff != "" {
 				t.Error(diff)
 			}
