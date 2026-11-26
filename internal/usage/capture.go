@@ -15,6 +15,8 @@
 package usage
 
 import (
+	"context"
+	"net"
 	"net/http"
 
 	"github.com/zchee/claude-code-model-gateway/internal/config"
@@ -25,7 +27,14 @@ import (
 type Emitter struct{}
 
 // NewEmitter resolves log settings and shares one builder across captures.
-func NewEmitter(lookup config.LookupEnv, builder *Builder) *Emitter { return &Emitter{} }
+func NewEmitter(lookup config.LookupEnv, builder *Builder) *Emitter {
+	return newEmitter(lookup, builder, nil)
+}
+
+// A nil dial function uses the standard network dialer.
+func newEmitter(lookup config.LookupEnv, builder *Builder, dialContext func(context.Context, string, string) (net.Conn, error)) *Emitter {
+	return &Emitter{}
+}
 
 // Enabled reports whether records have a local export destination.
 func (e *Emitter) Enabled() bool { return false }

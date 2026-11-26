@@ -16,7 +16,9 @@
 package telemetry
 
 import (
+	"context"
 	"io"
+	"net"
 	"net/http"
 	"time"
 
@@ -36,7 +38,12 @@ type Options struct {
 type Recorder struct{}
 
 // NewRecorder creates a recorder from the worker's isolated configuration.
-func NewRecorder(options Options) *Recorder { return &Recorder{} }
+func NewRecorder(options Options) *Recorder { return newRecorder(options, nil) }
+
+// A nil dial function uses the standard network dialer.
+func newRecorder(options Options, dialContext func(context.Context, string, string) (net.Conn, error)) *Recorder {
+	return &Recorder{}
+}
 
 // LogEntry holds only the allowed route and dispatch metadata for the local audit file.
 type LogEntry struct {
@@ -52,7 +59,7 @@ func (r *Recorder) LogRoute(request *http.Request, entry LogEntry) {}
 // Enabled reports whether a local route span destination is configured.
 func (r *Recorder) Enabled() bool { return false }
 
-// Span represents one client request, or one independently reported retry outcome.
+// Span represents one client request, finished once at terminal completion even across internal retries.
 type Span struct{}
 
 // Start records the start instant and incoming trace and session identity.

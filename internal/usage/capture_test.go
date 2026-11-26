@@ -173,7 +173,7 @@ func TestCaptureStream(t *testing.T) {
 		blocks                bool
 		want                  map[string]any
 	}{
-		"success: Anthropic cumulative deltas":    {"anthropic", `{"id":"msg-1","model":"claude-opus-4-8","usage":{"input_tokens":3,"cache_read_input_tokens":7,"cache_creation_input_tokens":0,"output_tokens":0}}`, `{"output_tokens":9,"thinking_tokens":2}`, false, map[string]any{"request_id": "msg-1", "response_mode": "sse", "input_tokens": 3, "output_tokens": 9, "thinking_tokens": 2, "response_body_bytes": 100}},
+		"success: Anthropic cumulative deltas":    {"anthropic", `{"id":"msg-1","model":"claude-opus-4-8","usage":{"input_tokens":3,"cache_read_input_tokens":7,"cache_creation_input_tokens":0,"output_tokens":0}}`, `{"output_tokens":9,"thinking_tokens":2}`, false, map[string]any{"request_id": "msg-1", "model": "claude-opus-4-8", "response_mode": "sse", "input_tokens": 3, "output_tokens": 9, "thinking_tokens": 2, "response_body_bytes": 100}},
 		"success: Codex multi-block final counts": {"codex", `{"id":"msg-blocks","model":"gpt-5.6-terra","usage":{"input_tokens":0,"output_tokens":0}}`, `{"input_tokens":64,"output_tokens":27,"cache_read_input_tokens":120000,"cache_creation_input_tokens":40}`, true, map[string]any{"input_tokens": 64, "output_tokens": 27, "cache_read_tokens": 120000, "cache_creation_tokens": 40, "context_tokens": 120104, "request_sequence": nil}},
 	}
 	for name, tt := range tests {
@@ -265,15 +265,17 @@ func TestBoundedCapture(t *testing.T) {
 }
 
 func TestCaptureRetrySnapshot(t *testing.T) {
-	c := NewCapture(NewBuilder(options(t)), Request{}, 0, nil)
+	c := NewCapture(NewBuilder(options(t)), Request{Backend: "anthropic", EffectiveModel: "claude-route-model"}, 0, nil)
 	c.SetResponse(200, nil)
-	c.ObserveEvent(wire(t, `{"type":"message_start","message":{"id":"old","usage":{"input_tokens":12}}}`))
+	c.ObserveEvent(wire(t, `{"type":"message_start","message":{"id":"old","model":"claude-old-response-model","usage":{"input_tokens":12}}}`))
 	checkJSON(t, 12, c.Snapshot()["input_tokens"])
 	c.ResetUsage()
 	checkJSON(t, nil, c.Snapshot()["input_tokens"])
+	// A retry without a model must fall back to the route, not reuse the old model.
 	c.ObserveJSON([]byte(`{"id":"new","usage":{"output_tokens":3}}`))
 	_, flat := captureLog(t, c.Finish())
 	checkJSON(t, "new", flat["request_id"])
+	checkJSON(t, "claude-route-model", flat["model"])
 	checkJSON(t, "json", flat["response_mode"])
 	if _, ok := flat["input_tokens"]; ok {
 		t.Error("old usage survived retry")
