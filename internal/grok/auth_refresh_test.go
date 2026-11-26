@@ -601,6 +601,359 @@ func TestRefreshLastWaiterLeavingDuringExchange(t *testing.T) {
 	}
 }
 
+// flightStage is the state of the shared refresh when a late caller arrives.
+type flightStage int
+
+const (
+	// noFlight: no refresh is in flight.
+	noFlight flightStage = iota
+	// discovering: a refresh is waiting for its discovery reply and has sent no exchange.
+	discovering
+	// exchangeHeadersHeld: the exchange reached the issuer and its reply headers are held.
+	exchangeHeadersHeld
+	// exchangeBodyHeld: the exchange reached the issuer and its reply body is held.
+	exchangeBodyHeld
+)
+
+// TestAccessTokenJoinsCommittedExchange verifies that AccessToken joins an exchange already sent to
+// the issuer even when the stored key is still fresh. An explicit Refresh starts with a fresh key,
+// its exchange reaches the issuer, which supersedes the stored refresh token on receipt, and its
+// only waiter leaves while the reply is held. A late AccessToken must not return the stored key,
+// whose refresh token the issuer no longer honours: it waits for that exchange and returns the key
+// it produced, and exactly one exchange runs. Without a refresh in flight, or with one still waiting
+// for discovery, a fresh stored key is returned at once and no exchange is sent; a caller whose
+// context has ended gets its context's error at once even while an exchange is in flight.
+func TestAccessTokenJoinsCommittedExchange(t *testing.T) {
+	tests := map[string]struct {
+		stage flightStage
+		// ended ends the late caller's context before it calls.
+		ended bool
+	}{
+		"success: AccessToken with a fresh stored key joins an exchange whose reply headers are held after its waiter left": {
+			stage: exchangeHeadersHeld,
+		},
+		"success: AccessToken with a fresh stored key joins an exchange whose reply body is held after its waiter left": {
+			stage: exchangeBodyHeld,
+		},
+		"success: AccessToken with a fresh stored key and no refresh in flight returns it at once without a request": {
+			stage: noFlight,
+		},
+		"success: AccessToken with a fresh stored key returns it at once while the shared refresh is still discovering": {
+			stage: discovering,
+		},
+		"error: AccessToken with an ended context returns its context's error at once while an exchange is in flight": {
+			stage: exchangeHeadersHeld,
+			ended: true,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Cleanup(func() { goleak.VerifyNone(t) })
+			synctest.Test(t, func(t *testing.T) {
+				file := filepath.Join(t.TempDir(), "auth.json")
+				content := freshAuthJSON()
+				writeFixtureFile(t, file, content)
+
+				issuer := newRotatingIssuer("fixture-refresh-token")
+				gate := make(chan struct{})
+				release := sync.OnceFunc(func() { close(gate) })
+				defer release()
+
+				var requests, discoveries, cancelled atomic.Int32
+				tr := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					requests.Add(1)
+					if req.URL.Path == "/.well-known/openid-configuration" {
+						discoveries.Add(1)
+						if tt.stage == discovering {
+							select {
+							case <-gate:
+							case <-req.Context().Done():
+								cancelled.Add(1)
+								return nil, req.Context().Err()
+							}
+						}
+						return discoveryResponse(req), nil
+					}
+					status, body := issuer.exchange(req)
+					if tt.stage == exchangeBodyHeld {
+						resp := jsonHTTPResponse(req, status, "")
+						resp.Body = &gatedBody{ctx: req.Context(), gate: gate, content: strings.NewReader(body), cancelled: &cancelled}
+						return resp, nil
+					}
+					if tt.stage == exchangeHeadersHeld {
+						select {
+						case <-gate:
+						case <-req.Context().Done():
+							cancelled.Add(1)
+							return nil, req.Context().Err()
+						}
+					}
+					return jsonHTTPResponse(req, status, body), nil
+				})
+				store := mustNewAuthStore(t, grok.AuthOptions{File: file, Transport: tr, Now: func() time.Time { return refreshFixtureNow }})
+
+				committed := tt.stage == exchangeHeadersHeld || tt.stage == exchangeBodyHeld
+				var (
+					refreshing <-chan tokenResult
+					leave      context.CancelFunc
+				)
+				if tt.stage != noFlight {
+					var refreshCtx context.Context
+					refreshCtx, leave = context.WithCancel(t.Context())
+					defer leave()
+					refreshing = startTokenCall(store, refreshCtx, refreshEntryPoints["Refresh"])
+					synctest.Wait()
+					accepted, refused := issuer.counts()
+					switch {
+					case committed && (accepted != 1 || refused != 0):
+						release()
+						t.Fatalf("issuer accepted %d and refused %d exchanges of the explicit Refresh, want 1 accepted and its reply held", accepted, refused)
+					case !committed && (discoveries.Load() != 1 || accepted+refused != 0):
+						release()
+						t.Fatalf("explicit Refresh made %d discoveries and %d exchanges, want 1 discovery held and no exchange", discoveries.Load(), accepted+refused)
+					}
+				}
+				if committed {
+					// The only waiter of the committed exchange leaves; the exchange keeps running.
+					leave()
+					synctest.Wait()
+					if res := receiveNow(t, "explicit Refresh", refreshing, release); !errors.Is(res.err, context.Canceled) {
+						t.Errorf("explicit Refresh that left got %v, want %v", res.err, context.Canceled)
+					}
+				}
+
+				lateCtx := t.Context()
+				if tt.ended {
+					var end context.CancelFunc
+					lateCtx, end = context.WithCancel(t.Context())
+					end()
+				}
+				start := time.Now()
+				late := startTokenCall(store, lateCtx, refreshEntryPoints["AccessToken"])
+				synctest.Wait()
+
+				var res tokenResult
+				switch {
+				case committed && !tt.ended:
+					select {
+					case res = <-late:
+						if res.err != nil {
+							assertNoSecrets(t, "late AccessToken error", res.err.Error(), refreshSecrets...)
+						}
+						t.Errorf("late AccessToken answered while the committed exchange's reply was held (err=%v, returned the stored key=%v); it must wait for that exchange", res.err, res.token == "fixture-fresh-token")
+						release()
+					default:
+						release()
+						synctest.Wait()
+						res = receiveNow(t, "late AccessToken after the exchange reply arrived", late, release)
+					}
+				default:
+					select {
+					case res = <-late:
+					default:
+						t.Error("late AccessToken was still waiting, with no virtual time passed; it must answer at once")
+						release()
+						res = <-late
+					}
+				}
+				if elapsed := time.Since(start); elapsed != 0 {
+					t.Errorf("late AccessToken answered after %v of virtual time, want no virtual time", elapsed)
+				}
+				if res.err != nil {
+					assertNoSecrets(t, "late AccessToken error", res.err.Error(), refreshSecrets...)
+				}
+
+				switch {
+				case tt.ended:
+					if !errors.Is(res.err, context.Canceled) {
+						t.Errorf("late AccessToken error = %v, want its context's error %v", res.err, context.Canceled)
+					}
+					if res.token != "" {
+						t.Errorf("late AccessToken with an ended context returned a token (len=%d)", len(res.token))
+					}
+				case committed:
+					if res.err != nil {
+						t.Errorf("late AccessToken error = %v, want the key of the committed exchange", res.err)
+					} else if res.token != "fixture-rotated-key-1" {
+						t.Errorf("late AccessToken did not return the key of the committed exchange (stored key=%v, len=%d)", res.token == "fixture-fresh-token", len(res.token))
+					}
+				default:
+					if res.err != nil {
+						t.Errorf("late AccessToken error = %v, want the fresh stored key", res.err)
+					} else if res.token != "fixture-fresh-token" {
+						t.Errorf("late AccessToken did not return the fresh stored key (len=%d)", len(res.token))
+					}
+				}
+				if tt.stage == noFlight {
+					if got := requests.Load(); got != 0 {
+						t.Errorf("issuer requests = %d, want 0 for a fresh stored key with no refresh in flight", got)
+					}
+					assertFileUnchanged(t, file, content)
+					return
+				}
+				if tt.stage == discovering {
+					if accepted, refused := issuer.counts(); accepted+refused != 0 {
+						t.Errorf("exchanges while the shared refresh was discovering: accepted=%d refused=%d, want none", accepted, refused)
+					}
+					leave()
+					synctest.Wait()
+					if res := receiveNow(t, "explicit Refresh", refreshing, release); !errors.Is(res.err, context.Canceled) {
+						t.Errorf("explicit Refresh that left got %v, want %v", res.err, context.Canceled)
+					}
+					assertFileUnchanged(t, file, content)
+					return
+				}
+
+				// The committed exchange finishes whoever waits for it.
+				release()
+				synctest.Wait()
+				if accepted, refused := issuer.counts(); accepted != 1 || refused != 0 {
+					t.Errorf("issuer accepted %d and refused %d exchanges, want exactly 1 accepted", accepted, refused)
+				}
+				if got := cancelled.Load(); got != 0 {
+					t.Errorf("the committed exchange saw its context end %d times, want 0", got)
+				}
+				if key, refreshToken := storedCredential(t, file); key != "fixture-rotated-key-1" || refreshToken != "fixture-rotated-refresh-1" {
+					t.Errorf("auth file does not hold the credential of the committed exchange (key len=%d, refresh token len=%d)", len(key), len(refreshToken))
+				}
+			})
+		})
+	}
+}
+
+// endAtDoneCtx is a caller context that ends at the first evaluation of its Done method, after
+// onDone has run there. Its error stays nil until then. A waiter evaluates Done when it starts to
+// wait for the shared refresh, so onDone can let the refresh finish first: the waiter then finds its
+// context ended and the refresh's result ready at the same time.
+type endAtDoneCtx struct {
+	context.Context
+	once   sync.Once
+	onDone func()
+	cancel context.CancelFunc
+	fired  atomic.Bool
+}
+
+func (c *endAtDoneCtx) Done() <-chan struct{} {
+	c.once.Do(func() {
+		c.fired.Store(true)
+		c.onDone()
+		c.cancel()
+	})
+	return c.Context.Done()
+}
+
+// TestRefreshWaiterEndedBeforeResult verifies that a waiter whose context has ended by the time it
+// consumes a finished refresh gets its context's error and not the refresh's key. A witness caller
+// starts the refresh and an exchange is held; the waiter joins it. When the waiter starts to wait,
+// its context lets the exchange reply, waits until the witness has its key (so the refresh's result
+// is set), and only then ends. Both the result and the end of the context are then ready at once,
+// and which one a wait picks first is not fixed, so the scenario is repeated in many rounds and
+// every round must answer the context's error.
+func TestRefreshWaiterEndedBeforeResult(t *testing.T) {
+	const rounds = 64
+
+	tests := map[string]struct {
+		call tokenCall
+	}{
+		"error: AccessToken waiter whose context ended before it consumed the result gets its context's error": {
+			call: refreshEntryPoints["AccessToken"],
+		},
+		"error: Refresh waiter whose context ended before it consumed the result gets its context's error": {
+			call: refreshEntryPoints["Refresh"],
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Cleanup(func() { goleak.VerifyNone(t) })
+			// A real-time escape, created outside the bubble: if the waiter evaluated its Done while
+			// the refresh could not finish (for example under the store's lock), the wait in onDone
+			// gives up instead of hanging.
+			escape := make(chan struct{})
+			timer := time.AfterFunc(time.Minute, func() { close(escape) })
+			defer timer.Stop()
+
+			synctest.Test(t, func(t *testing.T) {
+				dir := t.TempDir()
+				var tookResult, exercised int
+				for round := range rounds {
+					file := filepath.Join(dir, fmt.Sprintf("auth-%d.json", round))
+					writeFixtureFile(t, file, expiredAuthJSON())
+
+					gate := make(chan struct{})
+					release := sync.OnceFunc(func() { close(gate) })
+					var exchanges atomic.Int32
+					tr := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+						if req.URL.Path == "/.well-known/openid-configuration" {
+							return discoveryResponse(req), nil
+						}
+						exchanges.Add(1)
+						select {
+						case <-gate:
+						case <-req.Context().Done():
+							return nil, req.Context().Err()
+						}
+						return jsonHTTPResponse(req, http.StatusOK, `{"access_token":"fixture-exchanged-key","expires_in":3600}`), nil
+					})
+					store := mustNewAuthStore(t, grok.AuthOptions{File: file, Transport: tr, Now: func() time.Time { return refreshFixtureNow }})
+
+					returned := make(chan struct{})
+					var witness tokenResult
+					go func() {
+						defer close(returned)
+						witness.token, witness.err = store.AccessToken(t.Context())
+					}()
+					synctest.Wait()
+
+					inner, cancel := context.WithCancel(t.Context())
+					var witnessFirst atomic.Bool
+					ctx := &endAtDoneCtx{Context: inner, cancel: cancel, onDone: func() {
+						release()
+						select {
+						case <-returned:
+							witnessFirst.Store(true)
+						case <-escape:
+							t.Errorf("round %d: the waiter's Done was evaluated while the shared refresh could not finish", round)
+						}
+					}}
+					waiter := startTokenCall(store, ctx, tt.call)
+					res := awaitTokenCall(t, fmt.Sprintf("round %d waiter", round), waiter, time.Minute, release)
+					release()
+					<-returned
+					cancel()
+
+					if ctx.fired.Load() && witnessFirst.Load() {
+						exercised++
+					}
+					switch {
+					case errors.Is(res.err, context.Canceled) && res.token == "":
+					case res.err == nil && res.token == "fixture-exchanged-key":
+						tookResult++
+					default:
+						if res.err != nil {
+							assertNoSecrets(t, "waiter error", res.err.Error(), refreshSecrets...)
+						}
+						t.Errorf("round %d: waiter got err=%v and a token of len %d, want its context's error %v", round, res.err, len(res.token), context.Canceled)
+					}
+					if witness.err != nil || witness.token != "fixture-exchanged-key" {
+						t.Errorf("round %d: witness got err=%v and a token of len %d, want the exchanged key", round, witness.err, len(witness.token))
+					}
+					if got := exchanges.Load(); got != 1 {
+						t.Errorf("round %d: exchanges = %d, want 1 shared by the witness and the waiter", round, got)
+					}
+				}
+				if tookResult != 0 {
+					t.Errorf("in %d of %d rounds the waiter whose context had ended took the refresh's key instead of its context's error", tookResult, rounds)
+				}
+				if exercised != rounds {
+					t.Errorf("only %d of %d rounds reached the wait with the result ready and the context ended", exercised, rounds)
+				}
+			})
+		})
+	}
+}
+
 // TestRefreshWaiterLeavingKeepsOthers verifies that a waiter leaving the shared refresh while
 // another remains fails nobody: the exchange keeps its live context, the remaining caller gets the
 // exchanged key and exactly one exchange runs.
@@ -871,13 +1224,17 @@ func TestRefreshStalledIssuerDeadline(t *testing.T) {
 // TestExplicitRefreshAfterFlightWithoutExchange verifies that an explicit Refresh that arrives while
 // a shared refresh is running, which then finds the stored key fresh and exchanges nothing, runs one
 // exchange of its own afterwards and never returns a key no exchange produced. Its exchange presents
-// the refresh token the file holds by then; the issuer honours no other.
+// the refresh token the file holds by then; the issuer honours no other. The AccessToken caller that
+// started the shared refresh gets exactly the key stored by the other client, and it gets it while
+// every exchange the issuer has seen is still held, so that key came from the file and not from an
+// exchange the explicit Refresh could share.
 //
 // The AccessToken caller finds the stored key expired. At the first clock read, which follows the
 // caller's own read of the file, another client of the issuer rotates the refresh token and stores a
 // fresh key with it. Every later clock read waits at a barrier, which holds the shared refresh open
 // at its expiry check. Before the barrier is lifted, the test checks that Refresh is still waiting
-// and that no exchange has run, so Refresh demonstrably arrived while the shared refresh was open.
+// and that no request at all has reached the issuer: Refresh demonstrably joined a refresh in flight
+// rather than starting its own, whose discovery would show.
 func TestExplicitRefreshAfterFlightWithoutExchange(t *testing.T) {
 	t.Cleanup(func() { goleak.VerifyNone(t) })
 	synctest.Test(t, func(t *testing.T) {
@@ -885,18 +1242,31 @@ func TestExplicitRefreshAfterFlightWithoutExchange(t *testing.T) {
 		writeFixtureFile(t, file, expiredAuthJSON())
 		external := fmt.Sprintf(`{"https://auth.x.ai::fixture-client":{"key":"fixture-external-key","refresh_token":"fixture-external-refresh","expires_at":%d,"oidc_client_id":"fixture-client","oidc_issuer":"%s"}}`, refreshFixtureNow.Add(time.Hour).UnixMilli(), refreshFixtureIssuer)
 
+		// Every exchange reply is held until replies is closed; the issuer sees the request on receipt.
+		replies := make(chan struct{})
+		releaseReplies := sync.OnceFunc(func() { close(replies) })
+		defer releaseReplies()
+
 		issuer := newRotatingIssuer("fixture-refresh-token")
+		var requests atomic.Int32
 		tr := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			requests.Add(1)
 			if req.URL.Path == "/.well-known/openid-configuration" {
 				return discoveryResponse(req), nil
 			}
 			status, body := issuer.exchange(req)
+			select {
+			case <-replies:
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			}
 			return jsonHTTPResponse(req, status, body), nil
 		})
 
 		barrier := make(chan struct{})
 		lift := sync.OnceFunc(func() { close(barrier) })
 		defer lift()
+		releaseAll := func() { lift(); releaseReplies() }
 		entered := make(chan struct{})
 		enter := sync.OnceFunc(func() { close(entered) })
 		hookErr := make(chan error, 1)
@@ -921,12 +1291,12 @@ func TestExplicitRefreshAfterFlightWithoutExchange(t *testing.T) {
 		case res := <-access:
 			t.Fatalf("AccessToken finished without a clock read after the stored key changed (err=%v, token len=%d); its shared refresh must check the expiry it re-read", res.err, len(res.token))
 		case <-time.After(time.Minute):
-			lift()
+			releaseAll()
 			t.Fatal("AccessToken never read the clock again after the stored key changed")
 		}
 		select {
 		case err := <-hookErr:
-			lift()
+			releaseAll()
 			t.Fatalf("store the externally rotated key: %v", err)
 		default:
 		}
@@ -938,25 +1308,36 @@ func TestExplicitRefreshAfterFlightWithoutExchange(t *testing.T) {
 		select {
 		case gotRefresh = <-refresh:
 			refreshEnded = true
-			accepted, refused := issuer.counts()
-			t.Errorf("Refresh finished while the shared refresh was held open (exchanges accepted=%d refused=%d); it must wait for the refresh in flight", accepted, refused)
+			t.Errorf("Refresh finished while the shared refresh was held open (issuer requests=%d); it must wait for the refresh in flight", requests.Load())
 		default:
-			if accepted, refused := issuer.counts(); accepted+refused != 0 {
-				t.Errorf("exchanges while the shared refresh was held open: accepted=%d refused=%d, want none (Refresh ran an exchange beside the refresh in flight, or AccessToken read the clock again before starting it)", accepted, refused)
+			if got := requests.Load(); got != 0 {
+				t.Errorf("issuer requests while the shared refresh was held open = %d, want 0 (a discovery means Refresh found no shared refresh open and started its own, or AccessToken read the clock again before starting the shared refresh)", got)
 			}
 		}
 		lift()
+		synctest.Wait()
 
-		gotAccess := awaitTokenCall(t, "AccessToken", access, time.Minute, lift)
-		if !refreshEnded {
-			gotRefresh = awaitTokenCall(t, "Refresh", refresh, time.Minute, lift)
+		// The shared refresh found the stored key fresh: AccessToken has its answer although every
+		// exchange reply is still held.
+		var gotAccess tokenResult
+		select {
+		case gotAccess = <-access:
+		default:
+			accepted, refused := issuer.counts()
+			t.Errorf("AccessToken was still waiting after the barrier lifted, while the issuer had seen %d accepted and %d refused exchanges whose replies are held; it must return the externally stored key without any exchange", accepted, refused)
+			releaseReplies()
+			gotAccess = <-access
 		}
-
 		if gotAccess.err != nil {
 			assertNoSecrets(t, "AccessToken error", gotAccess.err.Error(), refreshSecrets...)
-			t.Errorf("AccessToken error = %v, want a valid key", gotAccess.err)
-		} else if gotAccess.token != "fixture-external-key" && gotAccess.token != "fixture-rotated-key-1" {
-			t.Errorf("AccessToken returned neither the stored fresh key nor the exchanged key (len=%d)", len(gotAccess.token))
+			t.Errorf("AccessToken error = %v, want the externally stored key", gotAccess.err)
+		} else if gotAccess.token != "fixture-external-key" {
+			t.Errorf("AccessToken did not return exactly the externally stored key (exchanged key=%v, len=%d)", strings.HasPrefix(gotAccess.token, "fixture-rotated-key-"), len(gotAccess.token))
+		}
+
+		releaseReplies()
+		if !refreshEnded {
+			gotRefresh = awaitTokenCall(t, "Refresh", refresh, time.Minute, releaseAll)
 		}
 		if gotRefresh.err != nil {
 			assertNoSecrets(t, "Refresh error", gotRefresh.err.Error(), refreshSecrets...)
