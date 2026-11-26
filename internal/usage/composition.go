@@ -19,7 +19,6 @@ import (
 	"math"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"unicode/utf16"
 
@@ -141,14 +140,7 @@ func measureInput(body jsonx.WireValue, bodyBytes int64) (map[string]int64, []se
 		}
 	}
 	// Object.entries visits array-index property names before the other server names.
-	index := func(s string) uint64 {
-		v, e := strconv.ParseUint(s, 10, 32)
-		if e != nil || strconv.FormatUint(v, 10) != s {
-			return math.MaxUint32
-		}
-		return v
-	}
-	slices.SortStableFunc(servers, func(a, b serverMeasure) int { return cmp.Compare(index(a.name), index(b.name)) })
+	slices.SortStableFunc(servers, func(a, b serverMeasure) int { return cmp.Compare(indexOf(a.name), indexOf(b.name)) })
 	return counts, servers
 }
 
@@ -161,7 +153,14 @@ func allocateLargestRemainder(total int64, weights []int64) []int64 {
 	return out
 }
 
+const maxSafeInteger = 1<<53 - 1
+
 func shares(total float64, weights []int64) []float64 {
+	// Unit increments beyond the exact integer range are not meaningful. Cap finite
+	// totals before distribution so an untrusted count cannot overflow an allocation.
+	if !math.IsInf(total, 0) {
+		total = min(total, maxSafeInteger)
+	}
 	total = math.Floor(total)
 	out := make([]float64, len(weights))
 	var sum float64

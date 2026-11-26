@@ -28,6 +28,7 @@ import (
 	"time"
 	"uuid"
 
+	"github.com/zchee/claude-code-model-gateway/internal/config"
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
 )
 
@@ -39,21 +40,23 @@ type Request struct {
 	StatusCode      int
 	ResponseHeaders http.Header
 	Usage           map[string]any
-	TicketRef       string
-	MessageID       string
-	ResponseModel   string
-	RouteModel      string
-	EffectiveModel  string
-	RequestedModel  string
-	SelectedModel   string
-	Backend         string
-	Effort          string
-	Via             string
-	ResponseMode    string
-	ResponseBytes   int64
-	Elapsed         time.Duration
-	Incomplete      bool
-	Overflowed      bool
+	// WireUsage takes precedence over Usage and preserves member order across response observations.
+	WireUsage      jsonx.WireValue
+	TicketRef      string
+	MessageID      string
+	ResponseModel  string
+	RouteModel     string
+	EffectiveModel string
+	RequestedModel string
+	SelectedModel  string
+	Backend        string
+	Effort         string
+	Via            string
+	ResponseMode   string
+	ResponseBytes  int64
+	Elapsed        time.Duration
+	Incomplete     bool
+	Overflowed     bool
 	// Sequence, when provided by response capture, preserves request start order across overlapping responses.
 	Sequence *uint64
 }
@@ -65,6 +68,23 @@ type Record struct {
 	TraceID    string
 	SpanID     string
 	Attributes map[string]any
+	order      []string
+}
+
+type recordField struct {
+	key   string
+	value any
+}
+
+func (r *Record) add(key string, value any) {
+	r.order = append(r.order, key)
+	r.Attributes[key] = value
+}
+
+func (r *Record) take(source map[string]any, keys ...string) {
+	for _, key := range keys {
+		r.add(key, source[key])
+	}
 }
 
 // Builder retains bounded counts-only snapshots across requests.
@@ -86,9 +106,11 @@ type Options struct {
 }
 
 // NewBuilder creates an independent record builder without a network transport.
+// It panics if Options.Now is nil. Project lookup requires a clean absolute ProjectsDir;
+// transcript symlinks leaving that directory are ignored, leaving the project name unset.
 func NewBuilder(options Options) *Builder {
 	if options.Now == nil {
-		options.Now = time.Now
+		panic("usage: missing observation clock")
 	}
 	if options.MaxIdentities <= 0 {
 		options.MaxIdentities = 500
@@ -156,12 +178,17 @@ func (b *Builder) Build(req Request) []Record {
 	defer b.mu.Unlock()
 	b.sequence++
 	now := b.options.Now()
-	a := limitEvidence(req.ResponseHeaders, now)
+	limits := limitEvidence(req.ResponseHeaders, now)
+	a := make(map[string]any)
 	event := "gateway.limit.signal"
 	success := req.StatusCode >= 200 && req.StatusCode < 300
 	var servers []serverMeasure
 	if success {
-		exact := exactUsage(req.Usage)
+		raw := req.WireUsage
+		if raw.Kind == 0 {
+			raw = legacyWire(req.Usage)
+		}
+		exact := exactWireUsage(raw)
 		if req.Incomplete || req.Overflowed || exact["input_tokens"] == nil && exact["output_tokens"] == nil && exact["cache_read_tokens"] == nil && exact["cache_creation_tokens"] == nil {
 			return nil
 		}
@@ -172,15 +199,11 @@ func (b *Builder) Build(req Request) []Record {
 		}
 		servers = attribute(a, counts, measures)
 		event = "gateway.token.usage"
-	} else if len(a) == 0 {
+	} else if len(limits) == 0 {
 		return nil
 	}
 	key := identity{identifierHeader(req.Headers, "x-claude-code-session-id"), identifierHeader(req.Headers, "x-claude-code-agent-id"), identifierHeader(req.Headers, "x-claude-code-parent-agent-id")}
-	a["source"] = "codex_gateway"
-	a["source_schema"] = "gateway-usage-v1"
-	a["source_event_id"] = b.id("gateway-usage-")
-	a["event_name"] = event
-	a["event.name"] = event
+	r := b.record(event, "gateway-usage-", now)
 	rid := cmp.Or(identifierHeader(req.ResponseHeaders, "request-id"), identifierHeader(req.ResponseHeaders, "x-request-id"), identifierHeader(req.ResponseHeaders, "x-codex-request-id"))
 	src := "response_header"
 	if rid == "" {
@@ -191,60 +214,73 @@ func (b *Builder) Build(req Request) []Record {
 		rid = b.id("gateway-request-")
 		src = "generated"
 	}
-	a["request_id"] = nullable(rid)
-	a["request_id_source"] = src
-	a["client_request_id"] = nullable(cmp.Or(identifierHeader(req.Headers, "x-claude-code-request-id"), identifierHeader(req.Headers, "x-request-id")))
-	a["session_id"] = nullable(key.session)
-	a["project_name"] = nullable(b.projectName(key.session))
-	a["agent_id"] = nullable(key.agent)
-	a["parent_agent_id"] = nullable(key.parent)
-	a["agent_role"] = "orchestrator"
+	r.add("request_id", nullable(rid))
+	r.add("request_id_source", src)
+	r.add("client_request_id", nullable(cmp.Or(identifierHeader(req.Headers, "x-claude-code-request-id"), identifierHeader(req.Headers, "x-request-id"))))
+	r.add("session_id", nullable(key.session))
+	r.add("project_name", nullable(b.projectName(key.session)))
+	r.add("agent_id", nullable(key.agent))
+	r.add("parent_agent_id", nullable(key.parent))
+	role := "orchestrator"
 	if key.agent != "" {
-		a["agent_role"] = "executor"
+		role = "executor"
 	}
+	r.add("agent_role", role)
 	route, response := safeID(cmp.Or(req.EffectiveModel, req.RouteModel)), safeID(req.ResponseModel)
 	if req.Backend == "anthropic" {
 		route, response = response, route
 	}
-	a["model"] = nullable(cmp.Or(route, response))
-	a["requested_model"] = nullable(safeID(cmp.Or(req.RequestedModel, req.SelectedModel)))
-	a["backend"] = nullable(safeID(req.Backend))
-	a["via"] = nullable(safeID(req.Via))
-	a["ticket_ref"] = nullable(safeID(req.TicketRef))
-	a["effort"] = nil
+	r.add("model", nullable(cmp.Or(route, response)))
+	r.add("requested_model", nullable(safeID(cmp.Or(req.RequestedModel, req.SelectedModel))))
+	r.add("backend", nullable(safeID(req.Backend)))
+	var effort any
 	switch req.Effort {
 	case "low", "medium", "high", "xhigh", "max":
-		a["effort"] = req.Effort
+		effort = req.Effort
 	}
-	a["status"] = statusClass(req.StatusCode)
-	a["status_code"] = nil
+	r.add("effort", effort)
+	r.add("via", nullable(safeID(req.Via)))
+	r.add("ticket_ref", nullable(safeID(req.TicketRef)))
+	r.add("status", statusClass(req.StatusCode))
+	var code, mode, estimator, cache, sequence any
 	if req.StatusCode != 0 {
-		a["status_code"] = req.StatusCode
+		code = req.StatusCode
 	}
+	r.add("status_code", code)
+	if req.ResponseMode == "json" || req.ResponseMode == "sse" {
+		mode = req.ResponseMode
+	}
+	r.add("response_mode", mode)
+	if success {
+		estimator = "utf8_bytes_div_4_normalized"
+		cache = "prefix_order_estimate"
+	}
+	r.add("token_estimator", estimator)
+	r.add("cache_attribution", cache)
 	seq := b.sequence
 	if req.Sequence != nil {
 		seq = *req.Sequence
 	}
-	a["request_sequence"] = nil
-	if seq < 1<<53 {
-		a["request_sequence"] = seq
+	if seq <= maxSafeInteger {
+		sequence = seq
 	}
-	a["response_mode"] = nil
-	switch req.ResponseMode {
-	case "json", "sse":
-		a["response_mode"] = req.ResponseMode
+	r.add("request_sequence", sequence)
+	r.add("duration_ms", float64(req.Elapsed)/float64(time.Millisecond))
+	r.add("response_body_bytes", req.ResponseBytes)
+	for _, limit := range limits {
+		r.add(limit.key, limit.value)
 	}
-	a["response_body_bytes"] = req.ResponseBytes
-	a["duration_ms"] = float64(req.Elapsed) / float64(time.Millisecond)
-	a["token_estimator"] = nil
-	a["cache_attribution"] = nil
 	if success {
-		a["token_estimator"] = "utf8_bytes_div_4_normalized"
-		a["cache_attribution"] = "prefix_order_estimate"
+		r.take(a, "request_body_bytes", "input_system_bytes", "input_tools_bytes", "input_native_tools_bytes", "input_mcp_tools_bytes", "input_messages_bytes", "input_first_message_bytes", "input_history_bytes", "input_tool_results_bytes")
+		r.take(a, "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "thinking_tokens", "server_tool_use_count", "web_search_requests", "web_fetch_requests", "code_execution_requests", "tool_search_requests")
+		r.take(a, "context_tokens", "input_tools_tokens", "input_native_tools_tokens", "input_mcp_tools_tokens")
+		for _, s := range servers {
+			r.add("input_mcp_tools_"+s.name+"_tokens", s.tokens)
+		}
+		r.take(a, "input_system_tokens", "input_first_message_tokens", "input_history_tokens", "input_tool_results_tokens", "cache_read_tools_tokens", "cache_read_system_tokens", "cache_read_first_message_tokens", "cache_read_history_tokens", "fresh_tools_tokens", "fresh_system_tokens", "fresh_first_message_tokens", "fresh_history_tokens")
 	}
-	r := Record{EventName: event, ObservedAt: now, Attributes: a}
 	tp, _ := header(req.Headers, "traceparent")
-	if m := tracePattern.FindStringSubmatch(strings.TrimSpace(tp)); m != nil && m[1] != "ff" && strings.Trim(m[2], "0") != "" && strings.Trim(m[3], "0") != "" {
+	if m := tracePattern.FindStringSubmatch(config.JSTrim(tp)); m != nil && m[1] != "ff" && strings.Trim(m[2], "0") != "" && strings.Trim(m[3], "0") != "" {
 		var span [8]byte
 		reader := b.options.Random
 		if reader == nil {
@@ -264,19 +300,26 @@ func (b *Builder) Build(req Request) []Record {
 			continue
 		}
 		foot := b.derived(r, "gateway.mcp.footprint", "gateway-mcp-footprint-")
-		foot.Attributes["mcp_server"] = s.name
-		foot.Attributes["input_mcp_tools_tokens"] = s.tokens
+		foot.add("mcp_server", s.name)
+		foot.add("input_mcp_tools_tokens", s.tokens)
 		records = append(records, foot)
 	}
 	return append(records, b.toolRecords(r, key, req.Body)...)
 }
 
+func (b *Builder) record(event, prefix string, now time.Time) Record {
+	r := Record{EventName: event, ObservedAt: now, Attributes: make(map[string]any)}
+	r.add("source", "codex_gateway")
+	r.add("source_event_id", b.id(prefix))
+	r.add("source_schema", "gateway-usage-v1")
+	r.add("event.name", event)
+	r.add("event_name", event)
+	return r
+}
+
 func (b *Builder) derived(primary Record, event, prefix string) Record {
-	a := map[string]any{"event.name": event, "event_name": event, "source_event_id": b.id(prefix)}
-	for _, k := range []string{"source", "source_schema", "request_id", "client_request_id", "session_id", "project_name", "agent_id", "parent_agent_id", "agent_role", "model", "requested_model", "backend", "effort", "via", "ticket_ref", "request_sequence"} {
-		a[k] = primary.Attributes[k]
-	}
-	primary.EventName = event
-	primary.Attributes = a
-	return primary
+	r := b.record(event, prefix, primary.ObservedAt)
+	r.TraceID, r.SpanID = primary.TraceID, primary.SpanID
+	r.take(primary.Attributes, "request_id", "client_request_id", "session_id", "project_name", "agent_id", "parent_agent_id", "agent_role", "model", "requested_model", "backend", "effort", "via", "ticket_ref", "request_sequence")
+	return r
 }

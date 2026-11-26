@@ -127,14 +127,19 @@ func (b *Builder) toolRecords(r Record, key identity, body jsonx.WireValue) []Re
 		return nil
 	}
 	now := r.ObservedAt
+	expired := func(e *list.Element) bool {
+		elapsed := now.UnixMilli() - e.Value.(cacheEntry[identity, snapshot]).at.UnixMilli()
+		return float64(elapsed) >= float64(b.options.SnapshotTTL)/float64(time.Millisecond)
+	}
 	cache := &b.snapshots
-	for front := cache.order.Front(); front != nil; front = cache.order.Front() {
-		if now.Sub(front.Value.(cacheEntry[identity, snapshot]).at) < b.options.SnapshotTTL {
-			break
-		}
+	prev := cache.byKey[key]
+	if prev != nil && expired(prev) {
+		cache.pop(prev)
+		prev = nil
+	}
+	for front := cache.order.Front(); front != nil && expired(front); front = cache.order.Front() {
 		cache.pop(front)
 	}
-	prev := cache.byKey[key]
 	cur := snapshot{messageBlocks(body), math.Floor(total)}
 	cache.put(key, cur, now, b.options.MaxIdentities)
 	if prev == nil {
@@ -171,11 +176,11 @@ func (b *Builder) toolRecords(r Record, key identity, body jsonx.WireValue) []Re
 			continue
 		}
 		rec := b.derived(r, "gateway.tool_result.usage", "gateway-tool-result-")
-		rec.Attributes["tool_use_id"] = v.toolID
-		rec.Attributes["tool_name"] = nullable(v.toolName)
-		rec.Attributes["tool_result_tokens"] = allocations[i]
-		rec.Attributes["tool_result_tokens_unit"] = "tokens"
-		rec.Attributes["tool_result_tokens_quality"] = quality
+		rec.add("tool_use_id", v.toolID)
+		rec.add("tool_name", nullable(v.toolName))
+		rec.add("tool_result_tokens", allocations[i])
+		rec.add("tool_result_tokens_unit", "tokens")
+		rec.add("tool_result_tokens_quality", quality)
 		records = append(records, rec)
 	}
 	return records

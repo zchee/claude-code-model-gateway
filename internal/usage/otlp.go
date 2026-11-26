@@ -16,30 +16,40 @@ package usage
 
 import (
 	"encoding/json/jsontext"
-	json "encoding/json/v2"
 	"errors"
 	"maps"
 	"math"
 	"reflect"
 	"slices"
 	"strconv"
+	"unicode/utf16"
 
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
 )
 
-type logAttribute struct {
-	Key   string         `json:"key"`
-	Value map[string]any `json:"value"`
+func wireString(s string) jsonx.WireValue {
+	return jsonx.WireValue{Kind: '"', Text: utf16.Encode([]rune(s))}
 }
 
-func otlpValue(value any) (map[string]any, error) {
+func member(key string, v jsonx.WireValue) jsonx.Member {
+	return jsonx.Member{Name: utf16.Encode([]rune(key)), Value: v}
+}
+func object(m ...jsonx.Member) jsonx.WireValue   { return jsonx.WireValue{Kind: '{', Members: m} }
+func array(v ...jsonx.WireValue) jsonx.WireValue { return jsonx.WireValue{Kind: '[', Elements: v} }
+func stringValue(s string) jsonx.WireValue       { return object(member("stringValue", wireString(s))) }
+
+func otlpValue(value any) (jsonx.WireValue, error) {
 	v := reflect.ValueOf(value)
 	var n float64
 	switch v.Kind() {
 	case reflect.Bool:
-		return map[string]any{"boolValue": v.Bool()}, nil
+		kind := jsontext.Kind('f')
+		if v.Bool() {
+			kind = 't'
+		}
+		return object(member("boolValue", jsonx.WireValue{Kind: kind})), nil
 	case reflect.String:
-		return map[string]any{"stringValue": v.String()}, nil
+		return stringValue(v.String()), nil
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		n = float64(v.Int())
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
@@ -47,49 +57,58 @@ func otlpValue(value any) (map[string]any, error) {
 	case reflect.Float32, reflect.Float64:
 		n = v.Float()
 	default:
-		return nil, errors.New("usage: unsupported attribute type")
+		return jsonx.WireValue{}, errors.New("usage: unsupported attribute type")
 	}
-	if math.IsInf(n, 0) || math.IsNaN(n) {
-		return map[string]any{"doubleValue": nil}, nil
+	number := jsonx.WireValue{Kind: '0', Number: n}
+	if !math.IsInf(n, 0) && n == math.Trunc(n) {
+		raw, _ := jsonx.EncodeWire(number)
+		return object(member("intValue", wireString(string(raw)))), nil
 	}
-	if n == math.Trunc(n) {
-		raw, e := jsonx.EncodeWire(jsonx.WireValue{Kind: '0', Number: n})
-		if e != nil {
-			return nil, errors.New("usage: cannot encode integer")
-		}
-		return map[string]any{"intValue": string(raw)}, nil
-	}
-	return map[string]any{"doubleValue": n}, nil
+	return object(member("doubleValue", number)), nil
 }
 
 // OTLP encodes this record as an OTLP/HTTP JSON log export payload.
 func (r Record) OTLP() (jsontext.Value, error) {
-	attrs := make([]logAttribute, 0, len(r.Attributes))
-	for _, k := range slices.Sorted(maps.Keys(r.Attributes)) {
-		if r.Attributes[k] == nil {
+	order := r.order
+	if len(order) == 0 { // Records created from a bare map have no source insertion order.
+		order = slices.Sorted(maps.Keys(r.Attributes))
+	}
+	attrs := make([]jsonx.WireValue, 0, len(order))
+	for _, key := range order {
+		val := r.Attributes[key]
+		if val == nil {
 			continue
 		}
-		v, e := otlpValue(r.Attributes[k])
-		if e != nil {
-			return nil, e
+		v, err := otlpValue(val)
+		if err != nil {
+			return nil, err
 		}
-		attrs = append(attrs, logAttribute{k, v})
+		attrs = append(attrs, object(member("key", wireString(key)), member("value", v)))
 	}
 	stamp := "0"
 	if ms := r.ObservedAt.UnixMilli(); ms != 0 {
 		stamp = strconv.FormatInt(ms, 10) + "000000"
 	}
-	log := map[string]any{"timeUnixNano": stamp, "observedTimeUnixNano": stamp, "eventName": r.EventName, "body": map[string]string{"stringValue": r.EventName}, "attributes": attrs}
+	log := object(
+		member("timeUnixNano", wireString(stamp)),
+		member("observedTimeUnixNano", wireString(stamp)),
+		member("eventName", wireString(r.EventName)),
+		member("body", stringValue(r.EventName)),
+		member("attributes", array(attrs...)),
+	)
 	if r.TraceID != "" {
-		log["traceId"] = r.TraceID
+		log.Members = append(log.Members, member("traceId", wireString(r.TraceID)))
 	}
 	if r.SpanID != "" {
-		log["spanId"] = r.SpanID
+		log.Members = append(log.Members, member("spanId", wireString(r.SpanID)))
 	}
-	scope := map[string]any{"scope": map[string]string{"name": "eigenwise.codex-gateway.usage", "version": "1"}, "logRecords": []any{log}}
-	resource := map[string]any{"attributes": []logAttribute{{"service.name", map[string]any{"stringValue": "codex-gateway"}}}}
-	data, e := json.Marshal(map[string]any{"resourceLogs": []any{map[string]any{"resource": resource, "scopeLogs": []any{scope}}}}, json.Deterministic(true))
-	if e != nil {
+	service := object(member("key", wireString("service.name")), member("value", stringValue("codex-gateway")))
+	resource := object(member("attributes", array(service)))
+	scope := object(member("name", wireString("eigenwise.codex-gateway.usage")), member("version", wireString("1")))
+	scopeLogs := array(object(member("scope", scope), member("logRecords", array(log))))
+	payload := object(member("resourceLogs", array(object(member("resource", resource), member("scopeLogs", scopeLogs)))))
+	data, err := jsonx.EncodeWire(payload)
+	if err != nil {
 		return nil, errors.New("usage: cannot encode log record")
 	}
 	return data, nil

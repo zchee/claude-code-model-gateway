@@ -21,14 +21,17 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/zchee/claude-code-model-gateway/internal/atomicfile"
+	"github.com/zchee/claude-code-model-gateway/internal/config"
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
 )
 
@@ -40,10 +43,10 @@ type HighWater struct {
 	maxima    map[string]int64
 }
 
-// NewHighWater creates a tracker for the supplied directory using the supplied clock.
+// NewHighWater creates a tracker for a clean absolute directory. It panics if now is nil.
 func NewHighWater(directory string, now func() time.Time) *HighWater {
 	if now == nil {
-		now = time.Now
+		panic("usage: missing high-water clock")
 	}
 	return &HighWater{directory: directory, now: now, maxima: make(map[string]int64)}
 }
@@ -52,7 +55,7 @@ var sessionPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,255}$`)
 
 // Record persists a new maximum and returns the known value, or nil if unavailable.
 func (h *HighWater) Record(session string, size int64) *int64 {
-	if size < 0 || !sessionPattern.MatchString(session) || !filepath.IsAbs(h.directory) || filepath.Clean(h.directory) != h.directory {
+	if size < 0 || size > maxSafeInteger || !sessionPattern.MatchString(session) || !filepath.IsAbs(h.directory) || filepath.Clean(h.directory) != h.directory {
 		return nil
 	}
 	h.mu.Lock()
@@ -72,10 +75,10 @@ func (h *HighWater) Record(session string, size int64) *int64 {
 		defer func() { _ = dir.Close() }()
 		if !known {
 			if data, e := dir.ReadFile(name); e == nil {
-				var state map[string]any
-				if json.Unmarshal(data, &state, jsontext.AllowDuplicateNames(true)) == nil {
-					if n, ok := numeric(state["value"]); ok && n < 1<<63 {
-						previous = int64(n)
+				if state, err := jsonx.DecodeWire(data); err == nil {
+					v := field(state, "value")
+					if v.Kind == '0' && v.Number >= 0 && v.Number <= maxSafeInteger && v.Number == math.Trunc(v.Number) {
+						previous = int64(v.Number)
 					}
 				}
 			}
@@ -128,7 +131,7 @@ func (b *Builder) projectName(session string) string {
 		if !entry.IsDir() {
 			continue
 		}
-		f, e := root.Open(filepath.Join(entry.Name(), session+".jsonl"))
+		f, e := root.OpenFile(filepath.Join(entry.Name(), session+".jsonl"), readFlags, 0)
 		if e != nil {
 			continue
 		}
@@ -156,7 +159,8 @@ func transcriptCWD(f *os.File) string {
 		return ""
 	}
 	var cwd string
-	if json.Unmarshal(m[1], &cwd) != nil {
+	// Only the captured value must be valid Unicode; unrelated transcript fields need not be decodable.
+	if !utf8.Valid(m[1]) || json.Unmarshal(m[1], &cwd) != nil {
 		return ""
 	}
 	return cwd
@@ -178,7 +182,7 @@ func projectFromCWD(cwd string) string {
 		}
 	}
 	for p := path; ; p = filepath.Dir(p) {
-		marker, err := os.Open(filepath.Join(p, ".git"))
+		marker, err := os.OpenFile(filepath.Join(p, ".git"), readFlags, 0)
 		if err == nil {
 			info, e := marker.Stat()
 			if e == nil {
@@ -193,7 +197,10 @@ func projectFromCWD(cwd string) string {
 				}
 			}
 			_ = marker.Close()
-			break
+			if e != nil || info.IsDir() || info.Mode().IsRegular() || p == filepath.Dir(p) {
+				break
+			}
+			continue
 		}
 		if !errors.Is(err, fs.ErrNotExist) || p == filepath.Dir(p) {
 			break
@@ -204,7 +211,7 @@ func projectFromCWD(cwd string) string {
 }
 
 func worktreeRoot(dir, pointer string) string {
-	rest, ok := strings.CutPrefix(strings.TrimSpace(pointer), "gitdir:")
+	rest, ok := strings.CutPrefix(config.JSTrim(pointer), "gitdir:")
 	if !ok {
 		return ""
 	}
@@ -214,10 +221,21 @@ func worktreeRoot(dir, pointer string) string {
 		}
 		return filepath.Join(base, s)
 	}
-	p := resolve(dir, strings.TrimSpace(rest))
-	data, err := os.ReadFile(filepath.Join(p, "commondir"))
+	p := resolve(dir, config.JSTrim(rest))
+	common, err := os.OpenFile(filepath.Join(p, "commondir"), readFlags, 0)
 	if err == nil {
-		p = resolve(p, strings.TrimSpace(string(data)))
+		defer func() { _ = common.Close() }()
+		info, err := common.Stat()
+		if err != nil {
+			return ""
+		}
+		if info.Mode().IsRegular() {
+			data, err := io.ReadAll(common)
+			if err != nil {
+				return ""
+			}
+			p = resolve(p, config.JSTrim(string(data)))
+		}
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return ""
 	}

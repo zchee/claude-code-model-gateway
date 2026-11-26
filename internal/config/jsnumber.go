@@ -37,6 +37,9 @@ func jsSpace(r rune) bool {
 
 func jsTrim(s string) string { return strings.TrimFunc(s, jsSpace) }
 
+// JSTrim trims the whitespace and line terminators removed by ECMAScript's String.prototype.trim.
+func JSTrim(s string) string { return jsTrim(s) }
+
 // JSNumber implements ECMAScript Number for environment strings and decoded JSON values.
 // A nil value represents JSON null; callers handling a missing value must use NaN instead.
 func JSNumber(value any) float64 {
