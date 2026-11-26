@@ -147,23 +147,26 @@ type wireHead struct {
 
 // rawHeadServer is a loopback HTTP/1.1 server that reads request heads from the connection's bytes, so that framing
 // and trailer fields a parsing server moves out of its header map are seen as they were written. It answers every
-// request with a two-byte body and keeps the connection open.
+// request with a two-byte body and keeps the connection open. A head whose declared length differs from the length of
+// the body the test sends is recorded without a body and its connection is closed at once, instead of waiting for
+// bytes that never come.
 type rawHeadServer struct {
-	addr  string
-	wg    sync.WaitGroup
-	mu    sync.Mutex
-	conns int
-	heads []wireHead
+	addr       string
+	wantLength int
+	wg         sync.WaitGroup
+	mu         sync.Mutex
+	conns      int
+	heads      []wireHead
 }
 
-func startRawHeadServer(t *testing.T) *rawHeadServer {
+func startRawHeadServer(t *testing.T, wantLength int) *rawHeadServer {
 	t.Helper()
 	var cfg net.ListenConfig
 	ln, err := cfg.Listen(t.Context(), "tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &rawHeadServer{addr: ln.Addr().String()}
+	s := &rawHeadServer{addr: ln.Addr().String(), wantLength: wantLength}
 	var open sync.Map
 	s.wg.Go(func() {
 		for {
@@ -220,6 +223,12 @@ func (s *rawHeadServer) serve(conn net.Conn, id int) {
 					return
 				}
 			}
+		}
+		if length != s.wantLength {
+			s.mu.Lock()
+			s.heads = append(s.heads, head)
+			s.mu.Unlock()
+			return
 		}
 		body := make([]byte, length)
 		if _, err := io.ReadFull(br, body); err != nil {
@@ -292,7 +301,7 @@ func TestRequestWireFraming(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			srv := startRawHeadServer(t)
+			srv := startRawHeadServer(t, len(tt.body))
 			client := upstream.NewClient(upstream.Options{})
 			t.Cleanup(func() { _ = client.Close() })
 			for range 2 {
@@ -305,7 +314,7 @@ func TestRequestWireFraming(t *testing.T) {
 					Body:          []byte(tt.body),
 				})
 				if err != nil {
-					t.Fatalf("Do: %v", err)
+					t.Fatalf("Do: %v; request heads on the wire so far: %+v", err, srv.recorded())
 				}
 				// Reading to the end returns the connection to the pool before the next send.
 				_, readErr := io.ReadAll(resp.Body)

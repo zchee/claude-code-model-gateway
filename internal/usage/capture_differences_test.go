@@ -235,25 +235,66 @@ func TestCaptureStreamUncoercibleUsage(t *testing.T) {
 }
 
 // advancingClock returns base on its first reading and moves forward by step on every later
-// reading, so two readings during one record construction give two different instants.
+// reading, so two readings during one record construction give two different instants. Once armed,
+// it also moves forward by step on every read of its random source, whether or not the clock is
+// read, so a single reading taken after an identifier was drawn gives a later instant too.
 type advancingClock struct {
 	mu    sync.Mutex
 	base  time.Time
 	step  time.Duration
 	reads int
+	// armed makes random reads advance the clock; drawn counts the random reads made while armed.
+	armed bool
+	drawn int
 }
 
 func (c *advancingClock) now() time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	at := c.base.Add(time.Duration(c.reads) * c.step)
+	at := c.base.Add(time.Duration(c.reads+c.drawn) * c.step)
 	c.reads++
 	return at
 }
 
+// arm makes every later read of the clock's random source advance the clock.
+func (c *advancingClock) arm() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.armed = true
+}
+
+// randomReads returns the number of random reads made since arm.
+func (c *advancingClock) randomReads() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.drawn
+}
+
+// clockRandom is the builder's identifier source: deterministic bytes, and an advance of its clock
+// on every read once the clock is armed.
+type clockRandom struct {
+	clock *advancingClock
+	next  byte
+}
+
+func (r *clockRandom) Read(p []byte) (int, error) {
+	r.clock.mu.Lock()
+	if r.clock.armed {
+		r.clock.drawn++
+	}
+	r.clock.mu.Unlock()
+	for i := range p {
+		p[i] = r.next
+		r.next++
+	}
+	return len(p), nil
+}
+
 // TestCaptureClockSample checks that the primary record's observedAt and the evaluation of a
-// date-valued Retry-After use one clock sample taken at the start of record construction, with
-// a clock that moves on every reading; records derived from the primary record keep its instant.
+// date-valued Retry-After use one clock sample taken at the start of record construction, before
+// any identifier of the record is drawn: the clock moves on every reading and, from just before
+// Build or Finish, on every read of the identifier source. Records derived from the primary record
+// keep its instant.
 func TestCaptureClockSample(t *testing.T) {
 	base := time.Date(2026, time.July, 19, 20, 0, 0, 0, time.UTC)
 	tests := map[string]struct {
@@ -300,6 +341,7 @@ func TestCaptureClockSample(t *testing.T) {
 			clock := &advancingClock{base: base, step: 7 * time.Second}
 			opts := newTestOptions(t)
 			opts.Now = clock.now
+			opts.Random = &clockRandom{clock: clock}
 			builder := usage.NewBuilder(opts)
 			headers := http.Header{"Retry-After": {tt.retryAfter}}
 			var records []usage.Record
@@ -312,6 +354,7 @@ func TestCaptureClockSample(t *testing.T) {
 				if tt.status == http.StatusOK {
 					req.WireUsage = decodeWire(t, `{"input_tokens":100,"output_tokens":3}`)
 				}
+				clock.arm()
 				records = builder.Build(req)
 			} else {
 				c := usage.NewCapture(builder, usage.Request{Body: decodeWire(t, `{}`)}, 0, nil)
@@ -319,6 +362,7 @@ func TestCaptureClockSample(t *testing.T) {
 				if tt.body != "" {
 					c.ObserveJSON([]byte(tt.body))
 				}
+				clock.arm()
 				if r := c.Finish(); r != nil {
 					records = append(records, *r)
 				}
@@ -326,15 +370,18 @@ func TestCaptureClockSample(t *testing.T) {
 			if len(records) < 1+tt.wantDerived {
 				t.Fatalf("got %d records, want a primary record and at least %d derived", len(records), tt.wantDerived)
 			}
+			if clock.randomReads() == 0 {
+				t.Fatal("test precondition: no identifier was drawn after the clock was armed, so a late clock sample would go unseen")
+			}
 			primary := records[0]
 			if diff := gocmp.Diff(tt.wantEvent, primary.EventName); diff != "" {
 				t.Errorf("EventName (-want +got):\n%s", diff)
 			}
 			if !primary.ObservedAt.Equal(base) {
-				t.Errorf("ObservedAt = %v, want the first clock sample %v", primary.ObservedAt, base)
+				t.Errorf("ObservedAt = %v, want the instant before any identifier was drawn %v", primary.ObservedAt, base)
 			}
 			if diff := gocmp.Diff(any(tt.wantRetry), primary.Attributes["retry_after_ms"]); diff != "" {
-				t.Errorf("retry_after_ms evaluated against the first clock sample (-want +got):\n%s", diff)
+				t.Errorf("retry_after_ms evaluated against the instant before any identifier was drawn (-want +got):\n%s", diff)
 			}
 			for i, r := range records[1:] {
 				if !r.ObservedAt.Equal(primary.ObservedAt) {

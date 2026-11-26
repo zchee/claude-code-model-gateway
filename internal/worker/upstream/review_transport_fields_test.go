@@ -40,7 +40,9 @@ import (
 // dial function and TLS configuration captured from the construction options: replacing the
 // returned transport's DialContext, TLSHandshakeTimeout or TLSClientConfig does not change it, while
 // mutating the configuration object TLSClientConfig points to before first use does, because that
-// object is shared with the dialer and cloned for every dial.
+// object is shared with the dialer and cloned for every dial. The server presents a certificate from an
+// authority the test generates, so no trust store on the host can hold its key: a refused handshake
+// fails certificate verification of exactly that certificate, never anything earlier or later.
 func TestNewTransportCapturesHTTPSDialSettings(t *testing.T) {
 	type setup struct {
 		trusted   *x509.CertPool
@@ -121,7 +123,9 @@ func TestNewTransportCapturesHTTPSDialSettings(t *testing.T) {
 				_, _ = io.WriteString(w, `{"ok":true}`)
 			}))
 			srv.EnableHTTP2 = true
+			cert, roots := newTrustedServerCert(t)
 			srv.TLS = &tls.Config{
+				Certificates: []tls.Certificate{cert},
 				GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
 					offeredMu.Lock()
 					offered = append(offered, slices.Clone(hello.SupportedProtos))
@@ -131,20 +135,16 @@ func TestNewTransportCapturesHTTPSDialSettings(t *testing.T) {
 			}
 			srv.StartTLS()
 			t.Cleanup(srv.Close)
-			s := setup{
-				trusted:   srv.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs,
-				untrusted: x509.NewCertPool(),
-			}
-			if s.trusted == nil {
-				t.Fatal("test precondition: the test server's client has no trust anchors")
-			}
+			s := setup{trusted: roots, untrusted: x509.NewCertPool()}
+			serverAddr := srv.Listener.Addr().String()
 
 			var optionDials, replacedDials atomic.Int32
 			var dialer net.Dialer
 			tr := upstream.NewTransport(upstream.Options{
-				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				// Every dial reaches the test server, whatever host the request names.
+				DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
 					optionDials.Add(1)
-					return dialer.DialContext(ctx, network, addr)
+					return dialer.DialContext(ctx, network, serverAddr)
 				},
 				TLSConfig: tt.options(s),
 			})
@@ -153,7 +153,7 @@ func TestNewTransportCapturesHTTPSDialSettings(t *testing.T) {
 				tt.change(t, tr, s, &replacedDials)
 			}
 
-			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/v1/models", http.NoBody)
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://"+tlsDialName+"/v1/models", http.NoBody)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -173,6 +173,14 @@ func TestNewTransportCapturesHTTPSDialSettings(t *testing.T) {
 				t.Errorf("RoundTrip: %v", err)
 			case !tt.wantErr && resp.ProtoMajor != 1:
 				t.Errorf("response protocol HTTP/%d.%d, want HTTP/1.1", resp.ProtoMajor, resp.ProtoMinor)
+			case tt.wantErr:
+				verifyErr, ok := errors.AsType[*tls.CertificateVerificationError](err)
+				switch {
+				case !ok:
+					t.Errorf("RoundTrip error %v (%T), want a certificate verification failure", err, err)
+				case len(verifyErr.UnverifiedCertificates) == 0 || !verifyErr.UnverifiedCertificates[0].Equal(cert.Leaf):
+					t.Errorf("certificate verification failed on %d other certificate(s), want the test server's own", len(verifyErr.UnverifiedCertificates))
+				}
 			}
 			wantServed := int32(1)
 			if tt.wantErr {

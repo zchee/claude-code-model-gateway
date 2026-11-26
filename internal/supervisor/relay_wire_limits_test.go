@@ -304,19 +304,28 @@ func TestRelayWorkerLegFramingAndClientReuse(t *testing.T) {
 
 // TestHeadFieldCountBoundary checks that a request head of exactly 2,000 field lines, Host included, is relayed with
 // every field, and that one more field line is refused with 431 before the worker is contacted, rather than relayed
-// with the excess fields silently dropped. Repeated lines of one name count one by one.
+// with the excess fields silently dropped. Repeated lines of one name count one by one. The compact heads stay under
+// the source's 16 KiB head limit at both counts, so their 431 is a refusal of the count, not of the size.
 func TestHeadFieldCountBoundary(t *testing.T) {
-	const limit = 2000
+	const (
+		limit = 2000
+		// sourceHeadLimit is the source server's bound on the bytes of a request head.
+		sourceHeadLimit = 16 << 10
+	)
 	tests := map[string]struct {
 		lines int
 		// repeated writes every filler line under one name; otherwise each line has a name of its own.
 		repeated bool
-		want     int
+		// compact writes every filler line as the shortest repeated field, "X:y".
+		compact bool
+		want    int
 	}{
-		"success: 2,000 distinct field lines":     {lines: limit, want: http.StatusOK},
-		"success: 2,000 lines of a repeated name": {lines: limit, repeated: true, want: http.StatusOK},
-		"error: 2,001 distinct field lines":       {lines: limit + 1, want: http.StatusRequestHeaderFieldsTooLarge},
-		"error: 2,001 lines of a repeated name":   {lines: limit + 1, repeated: true, want: http.StatusRequestHeaderFieldsTooLarge},
+		"success: 2,000 distinct field lines":                    {lines: limit, want: http.StatusOK},
+		"success: 2,000 lines of a repeated name":                {lines: limit, repeated: true, want: http.StatusOK},
+		"error: 2,001 distinct field lines":                      {lines: limit + 1, want: http.StatusRequestHeaderFieldsTooLarge},
+		"error: 2,001 lines of a repeated name":                  {lines: limit + 1, repeated: true, want: http.StatusRequestHeaderFieldsTooLarge},
+		"success: 2,000 compact lines under the head size limit": {lines: limit, compact: true, want: http.StatusOK},
+		"error: 2,001 compact lines under the head size limit":   {lines: limit + 1, compact: true, want: http.StatusRequestHeaderFieldsTooLarge},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -329,13 +338,20 @@ func TestHeadFieldCountBoundary(t *testing.T) {
 			var head strings.Builder
 			fmt.Fprintf(&head, "POST /fields HTTP/1.1\r\nHost: %s\r\nContent-Length: 2\r\n", own)
 			for i := range fillers {
-				if tt.repeated {
+				switch {
+				case tt.compact:
+					head.WriteString("X:y\r\n")
+				case tt.repeated:
 					fmt.Fprintf(&head, "X-Repeat: %04d\r\n", i)
-				} else {
+				default:
 					fmt.Fprintf(&head, "X-Field-%04d: v\r\n", i)
 				}
 			}
-			head.WriteString("\r\n{}")
+			head.WriteString("\r\n")
+			if tt.compact && head.Len() >= sourceHeadLimit {
+				t.Fatalf("test precondition: compact head is %d bytes, want under %d", head.Len(), sourceHeadLimit)
+			}
+			head.WriteString("{}")
 			if _, err := io.WriteString(conn, head.String()); err != nil {
 				t.Fatal(err)
 			}
@@ -355,7 +371,7 @@ func TestHeadFieldCountBoundary(t *testing.T) {
 			}
 			relayed := 0
 			for field, values := range legs[0].fields {
-				if strings.HasPrefix(field, "x-field-") || field == "x-repeat" {
+				if strings.HasPrefix(field, "x-field-") || field == "x-repeat" || field == "x" {
 					relayed += len(values)
 				}
 			}
@@ -364,8 +380,13 @@ func TestHeadFieldCountBoundary(t *testing.T) {
 			}
 			last := fmt.Sprintf("x-field-%04d", fillers-1)
 			want := []string{"v"}
-			if tt.repeated {
+			switch {
+			case tt.compact:
+				last, want = "x", []string{"y"}
+			case tt.repeated:
 				last, want = "x-repeat", []string{fmt.Sprintf("%04d", fillers-1)}
+			}
+			if tt.compact || tt.repeated {
 				if values := legs[0].fields[last]; len(values) > 0 {
 					legs[0].fields[last] = values[len(values)-1:]
 				}

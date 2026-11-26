@@ -125,7 +125,8 @@ func TestProbeDeadlineCoversRedirectChain(t *testing.T) {
 	const window = 65536
 	llamaBody := []byte(`{"default_generation_settings":{"n_ctx":65536}}`)
 	studioBody := studioModelsBody(t, window)
-	port := closedLoopbackPort(t)
+	// The probes reach only the virtual transport, so the port in their URLs is never dialled or bound.
+	const port uint16 = 9
 	llamaURL := "http://127.0.0.1:" + strconv.Itoa(int(port)) + "/props"
 	studioBase := "http://127.0.0.1:" + strconv.Itoa(int(port))
 	studioURL := studioBase + "/api/v1/models"

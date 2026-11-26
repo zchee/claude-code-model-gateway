@@ -23,6 +23,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -221,7 +222,9 @@ func TestRejectionEvidenceNameOrder(t *testing.T) {
 
 // TestTransportFailureWireLength checks on the wire that the small 502 JSON reply to an upstream
 // transport failure carries the content type and bytes of the source's reply, with a
-// Content-Length the HTTP server supplies instead of the chunked framing the source can get.
+// Content-Length the HTTP server supplies instead of the chunked framing the source can get: the
+// handler leaves the length unset and the server derives it from the one complete write. The
+// refused connection is injected, so no released port is dialled again.
 func TestTransportFailureWireLength(t *testing.T) {
 	tests := map[string]struct {
 		connection string
@@ -231,24 +234,25 @@ func TestTransportFailureWireLength(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			closed := httptest.NewServer(http.NotFoundHandler())
-			origin := closed.URL
-			closed.Close()
+			// Nothing dials this origin; it only names the upstream in the reply.
+			const origin = "http://127.0.0.1:9"
+			refusal := &net.OpError{Op: "dial", Net: "tcp", Addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}, Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}
 			type handled struct {
 				refused, err error
 				result       reply.Result
+				// explicitLength reports whether the handler had set Content-Length when Handle returned.
+				explicitLength bool
 			}
 			req := reply.Request{Origin: origin, Body: []byte(`{}`)}
-			send := loopbackSend(t, origin, req.Body)
 			outcome := make(chan handled, 1)
 			front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				var refused error
-				result, err := reply.Handle(r.Context(), w, req, func(ctx context.Context) (*upstream.Response, error) {
-					res, err := send(ctx)
-					refused = err
-					return res, err
+				result, err := reply.Handle(r.Context(), w, req, func(context.Context) (*upstream.Response, error) {
+					refused = refusal
+					return nil, refusal
 				})
-				outcome <- handled{refused: refused, err: err, result: result}
+				_, explicit := w.Header()["Content-Length"]
+				outcome <- handled{refused: refused, err: err, result: result, explicitLength: explicit}
 			}))
 			t.Cleanup(front.Close)
 
@@ -271,11 +275,12 @@ func TestTransportFailureWireLength(t *testing.T) {
 			}
 			h := <-outcome
 			if !errors.Is(h.refused, syscall.ECONNREFUSED) {
-				t.Fatalf("expected a refused loopback connection, got %v (Handle: %v)", h.refused, h.err)
+				t.Fatalf("test precondition: the injected send did not run, got %v (Handle: %v)", h.refused, h.err)
 			}
 			if h.err != nil {
 				t.Fatalf("Handle: %v", h.err)
 			}
+			equal(t, false, h.explicitLength)
 			equal(t, http.StatusBadGateway, h.result.Status)
 			equal(t, "upstream_error", h.result.StatusOverride)
 			want := `{"type":"error","error":{"type":"api_error","message":` + strconv.Quote("model-gateway shim: upstream "+origin+" failed: "+h.refused.Error()) + `}}`

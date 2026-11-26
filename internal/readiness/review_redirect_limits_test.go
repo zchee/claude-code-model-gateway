@@ -23,6 +23,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/zchee/claude-code-model-gateway/internal/readiness"
 )
@@ -48,7 +50,9 @@ func (rt redirectChainTransport) RoundTrip(req *http.Request) (*http.Response, e
 // /v1/models answer reached through a chain of redirects. The check follows 301, 302, 303, 307 and
 // 308 for at most ten requests including the first: nine redirects still reach the 200 answer, while
 // a tenth redirect fails the check without an eleventh request. A 3xx status outside those five is
-// the answer even when it names a Location, which is never requested, and is not a ready proxy.
+// the answer even when it names a Location, which is never requested, and is not a ready proxy. Each
+// case runs in a synctest bubble with the chain served from memory: the check's deadline runs on the
+// bubble clock, and the answer arrives with no bubble time passed, so no deadline decides an outcome.
 func TestProxyCheckRedirectHopLimitAndUnfollowedStatus(t *testing.T) {
 	followed := []int{http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect}
 	tests := map[string]struct {
@@ -90,54 +94,61 @@ func TestProxyCheckRedirectHopLimitAndUnfollowedStatus(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			var mu sync.Mutex
-			var seen []string
-			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				mu.Lock()
-				seen = append(seen, r.URL.Path)
-				mu.Unlock()
-				hop := 0
-				if rest, ok := strings.CutPrefix(r.URL.Path, "/hop/"); ok {
-					n, err := strconv.Atoi(rest)
-					if err != nil {
+			synctest.Test(t, func(t *testing.T) {
+				var mu sync.Mutex
+				var seen []string
+				handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					mu.Lock()
+					seen = append(seen, r.URL.Path)
+					mu.Unlock()
+					hop := 0
+					if rest, ok := strings.CutPrefix(r.URL.Path, "/hop/"); ok {
+						n, err := strconv.Atoi(rest)
+						if err != nil {
+							w.WriteHeader(http.StatusNotFound)
+							return
+						}
+						hop = n
+					} else if r.URL.Path != "/v1/models" {
 						w.WriteHeader(http.StatusNotFound)
 						return
 					}
-					hop = n
-				} else if r.URL.Path != "/v1/models" {
-					w.WriteHeader(http.StatusNotFound)
-					return
+					switch {
+					case hop < tt.redirects:
+						w.Header().Set("Location", "/hop/"+strconv.Itoa(hop+1))
+						w.WriteHeader(followed[hop%len(followed)])
+					case tt.finalStatus != http.StatusOK:
+						w.Header().Set("Location", "/unfollowed")
+						w.WriteHeader(tt.finalStatus)
+					default:
+						w.Header().Set("Content-Type", "application/json")
+						_, _ = io.WriteString(w, `{"data":[]}`)
+					}
+				})
+				binary := fakeProxyBinary(t)
+				start := time.Now()
+				got := readiness.ProbeProxyAndAuth(t.Context(), readiness.ProxyAuthProbe{
+					ProxyBinary:    binary,
+					ProxyModelsURL: "http://127.0.0.1:19993/v1/models",
+					Client:         &http.Client{Transport: redirectChainTransport{handler: handler}},
+				})
+				if elapsed := time.Since(start); elapsed != 0 {
+					t.Errorf("test precondition: the check took %v of bubble time, want none", elapsed)
 				}
-				switch {
-				case hop < tt.redirects:
-					w.Header().Set("Location", "/hop/"+strconv.Itoa(hop+1))
-					w.WriteHeader(followed[hop%len(followed)])
-				case tt.finalStatus != http.StatusOK:
-					w.Header().Set("Location", "/unfollowed")
-					w.WriteHeader(tt.finalStatus)
-				default:
-					w.Header().Set("Content-Type", "application/json")
-					_, _ = io.WriteString(w, `{"data":[]}`)
+				want := readiness.ProxyAuthResult{ProxyBinary: true, ProxyModels: tt.wantModels}
+				if got != want {
+					t.Errorf("ProbeProxyAndAuth = %+v, want %+v", got, want)
+				}
+				mu.Lock()
+				paths := slices.Clone(seen)
+				mu.Unlock()
+				if len(paths) != tt.wantRequests {
+					t.Errorf("requests received = %d (%q), want %d", len(paths), paths, tt.wantRequests)
+				}
+				if slices.Contains(paths, "/unfollowed") {
+					t.Errorf("the check requested the Location of an unfollowed status: %q", paths)
 				}
 			})
-			got := readiness.ProbeProxyAndAuth(t.Context(), readiness.ProxyAuthProbe{
-				ProxyBinary:    fakeProxyBinary(t),
-				ProxyModelsURL: "http://127.0.0.1:19993/v1/models",
-				Client:         &http.Client{Transport: redirectChainTransport{handler: handler}},
-			})
-			want := readiness.ProxyAuthResult{ProxyBinary: true, ProxyModels: tt.wantModels}
-			if got != want {
-				t.Errorf("ProbeProxyAndAuth = %+v, want %+v", got, want)
-			}
-			mu.Lock()
-			paths := slices.Clone(seen)
-			mu.Unlock()
-			if len(paths) != tt.wantRequests {
-				t.Errorf("requests received = %d (%q), want %d", len(paths), paths, tt.wantRequests)
-			}
-			if slices.Contains(paths, "/unfollowed") {
-				t.Errorf("the check requested the Location of an unfollowed status: %q", paths)
-			}
 		})
 	}
 }
