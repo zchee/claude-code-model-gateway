@@ -20,7 +20,8 @@ import (
 )
 
 // ECMA-262, 16th edition, §22.2.2.9, Tables 69–70. Table 71 properties
-// describe strings and are not available with the u flag. Alias spelling is exact.
+// describe strings and are not available with the u flag. In addition to Table
+// 70, ICU 77.1 accepts WSpace as an exact alias for White_Space.
 func validProperty(expr string) bool {
 	name, value, pair := strings.Cut(expr, "=")
 	if !pair {
@@ -47,7 +48,7 @@ func validProperty(expr string) bool {
 		"IDS_Trinary_Operator", "IDST", "ID_Continue", "IDC", "ID_Start", "IDS", "Ideographic", "Ideo", "Join_Control", "Join_C", "Logical_Order_Exception", "LOE",
 		"Lowercase", "Lower", "Math", "Noncharacter_Code_Point", "NChar", "Pattern_Syntax", "Pat_Syn", "Pattern_White_Space", "Pat_WS", "Quotation_Mark", "QMark",
 		"Radical", "Regional_Indicator", "RI", "Sentence_Terminal", "STerm", "Soft_Dotted", "SD", "Terminal_Punctuation", "Term", "Unified_Ideograph", "UIdeo",
-		"Uppercase", "Upper", "Variation_Selector", "VS", "White_Space", "space", "XID_Continue", "XIDC", "XID_Start", "XIDS":
+		"Uppercase", "Upper", "Variation_Selector", "VS", "White_Space", "WSpace", "space", "XID_Continue", "XIDC", "XID_Start", "XIDS":
 		return true
 	}
 	return false

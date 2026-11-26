@@ -97,11 +97,11 @@ func Adapt(tools jsonx.WireValue) (jsonx.WireValue, []Edit, error) {
 		if n := fieldIndex(tool, "name"); n >= 0 && tool.Members[n].Value.Kind == '"' {
 			c.toolName = tool.Members[n].Value.Text
 		}
-		path := utf16.Encode([]rune("/tools/" + strconv.Itoa(i) + "/input_schema"))
+		c.path = utf16.Encode([]rune("/tools/" + strconv.Itoa(i) + "/input_schema"))
 		if v.Kind != '{' {
-			return jsonx.WireValue{}, nil, c.refuse(path, "invalid-schema")
+			return jsonx.WireValue{}, nil, c.refuse("invalid-schema")
 		}
-		if err := c.visit(*v, path); err != nil {
+		if err := c.visit(*v); err != nil {
 			return jsonx.WireValue{}, nil, err
 		}
 		if len(c.edits) != 0 {
@@ -208,23 +208,24 @@ func affected(v jsonx.WireValue, seen map[containerID]bool) bool {
 }
 
 type classification struct {
+	path     []uint16 // Shared traversal buffer; edits and refusals retain a copy.
 	toolName []uint16
 	edits    []Edit
 	patterns map[*jsonx.WireValue][]uint16
 	visiting map[containerID]bool
 }
 
-func (c *classification) refuse(path []uint16, reason string) error {
-	return &CompatibilityError{Pointer: slices.Clone(path), ReasonCode: reason, ToolName: slices.Clone(c.toolName)}
+func (c *classification) refuse(reason string) error {
+	return &CompatibilityError{Pointer: slices.Clone(c.path), ReasonCode: reason, ToolName: slices.Clone(c.toolName)}
 }
 
-func (c *classification) visit(v jsonx.WireValue, path []uint16) error {
+func (c *classification) visit(v jsonx.WireValue) error {
 	switch v.Kind {
 	case 't', 'f':
 		return nil
 	case '{':
 	default:
-		return c.refuse(path, "invalid-schema-container")
+		return c.refuse("invalid-schema-container")
 	}
 	id := identity(v)
 	if c.visiting[id] {
@@ -232,34 +233,35 @@ func (c *classification) visit(v jsonx.WireValue, path []uint16) error {
 	}
 	c.visiting[id] = true
 	defer delete(c.visiting, id)
+	base := len(c.path)
 	for i := range v.Members {
 		m := &v.Members[i]
 		k := string(utf16.Decode(m.Name))
 		child := &m.Value
-		p := pointer(path, m.Name)
+		c.path = pointer(c.path[:base], m.Name)
 		switch k {
 		case "$schema":
 			const dialect = "https://json-schema.org/draft/2020-12/schema"
 			s := string(utf16.Decode(child.Text))
 			if child.Kind != '"' || s != dialect && s != dialect+"#" {
-				return c.refuse(p, "unsupported-dialect")
+				return c.refuse("unsupported-dialect")
 			}
 		case "$vocabulary":
-			return c.refuse(p, "custom-vocabulary")
+			return c.refuse("custom-vocabulary")
 		case "$id", "$ref", "$dynamicRef", "$recursiveRef", "$anchor", "$dynamicAnchor", "$recursiveAnchor":
-			return c.refuse(p, "reference-or-anchor-keyword")
+			return c.refuse("reference-or-anchor-keyword")
 		case "$defs", "definitions", "not", "if", "then", "else", "oneOf", "contains", "contentSchema":
-			return c.refuse(p, "forbidden-schema-applicator")
+			return c.refuse("forbidden-schema-applicator")
 		case "pattern":
 			if child.Kind != '"' || !containsPotentialProperty(child.Text) {
 				continue
 			}
 			spans, why := scanPattern(child.Text)
 			if why != "" {
-				return c.refuse(p, why)
+				return c.refuse(why)
 			}
 			if !validUnicodePattern(child.Text) {
-				return c.refuse(p, invalidRegex)
+				return c.refuse(invalidRegex)
 			}
 			var replacement []uint16
 			cursor := 0
@@ -269,42 +271,50 @@ func (c *classification) visit(v jsonx.WireValue, path []uint16) error {
 			}
 			replacement = append(replacement, child.Text[cursor:]...)
 			c.patterns[child] = replacement
-			c.edits = append(c.edits, Edit{Pointer: slices.Clone(p), Replacement: replacement})
+			c.edits = append(c.edits, Edit{Pointer: slices.Clone(c.path), Replacement: replacement})
 		case "patternProperties", "properties", "dependentSchemas":
 			if child.Kind != '{' {
 				if affected(*child, make(map[containerID]bool)) {
-					return c.refuse(p, "invalid-schema-container")
+					return c.refuse("invalid-schema-container")
 				}
 				continue
 			}
+			prefix := len(c.path)
 			for _, entry := range child.Members {
+				c.path = c.path[:prefix]
 				if k == "patternProperties" && containsPotentialProperty(entry.Name) {
-					return c.refuse(p, "affected-pattern-properties-key")
+					return c.refuse("affected-pattern-properties-key")
 				}
-				if err := c.visit(entry.Value, pointer(p, entry.Name)); err != nil {
+				c.path = pointer(c.path, entry.Name)
+				if err := c.visit(entry.Value); err != nil {
 					return err
 				}
 			}
 		case "additionalProperties", "items", "propertyNames", "unevaluatedProperties", "unevaluatedItems":
-			if err := c.visit(*child, p); err != nil {
+			if err := c.visit(*child); err != nil {
 				return err
 			}
 		case "prefixItems", "allOf", "anyOf":
 			if child.Kind != '[' {
 				if affected(*child, make(map[containerID]bool)) {
-					return c.refuse(p, "invalid-schema-container")
+					return c.refuse("invalid-schema-container")
 				}
 				continue
 			}
+			prefix := len(c.path)
 			for j, entry := range child.Elements {
-				if err := c.visit(entry, pointer(p, utf16.Encode([]rune(strconv.Itoa(j))))); err != nil {
+				c.path = append(c.path[:prefix], '/')
+				for _, d := range strconv.Itoa(j) {
+					c.path = append(c.path, uint16(d))
+				}
+				if err := c.visit(entry); err != nil {
 					return err
 				}
 			}
 		case "$comment", "title", "deprecated", "readOnly", "writeOnly", "format", "contentEncoding", "contentMediaType", "multipleOf", "maximum", "exclusiveMaximum", "minimum", "exclusiveMinimum", "maxLength", "minLength", "maxItems", "minItems", "uniqueItems", "maxContains", "minContains", "maxProperties", "minProperties", "required", "dependentRequired", "type":
 		default:
 			if !dataKeyword(k) && affected(*child, make(map[containerID]bool)) {
-				return c.refuse(p, "unknown-schema-container")
+				return c.refuse("unknown-schema-container")
 			}
 		}
 	}

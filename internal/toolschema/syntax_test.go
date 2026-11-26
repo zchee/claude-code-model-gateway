@@ -15,11 +15,45 @@
 package toolschema
 
 import (
+	"errors"
+	"strings"
 	"testing"
+	"unicode"
 	"unicode/utf16"
 
 	gocmp "github.com/google/go-cmp/cmp"
 )
+
+func TestIdentifierTableVersion(t *testing.T) {
+	// Recompute identifierChar's ID_Start and ID_Continue differences against
+	// the pinned Node UCD before accepting a new Go Unicode version.
+	if diff := gocmp.Diff("17.0.0", unicode.Version); diff != "" {
+		t.Fatalf("identifier delta needs updating (-expected Unicode version +got):\n%s", diff)
+	}
+}
+
+func TestEmptyToolName(t *testing.T) {
+	tools := toolsWithPattern(t, `\p{L}`)
+	member(t, tools.Elements[0], "name").Text = []uint16{}
+	_, _, err := Adapt(tools)
+	refusal, ok := errors.AsType[*CompatibilityError](err)
+	if !ok {
+		t.Fatalf("want compatibility refusal; got %v", err)
+	}
+	if diff := gocmp.Diff("Codex schema compatibility refused  at /tools/0/input_schema/pattern (property-outside-negated-character-class)", refusal.Error()); diff != "" {
+		t.Error(diff)
+	}
+}
+
+func TestWhitespacePropertyRewrite(t *testing.T) {
+	out, _, err := Adapt(toolsWithPattern(t, `[^\p{WSpace}x]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := gocmp.Diff("[^x]", string(utf16.Decode(member(t, *schemaOf(t, out), "pattern").Text))); diff != "" {
+		t.Error(diff)
+	}
+}
 
 func TestUnicodeGrammar(t *testing.T) {
 	const u = `\u`
@@ -27,6 +61,13 @@ func TestUnicodeGrammar(t *testing.T) {
 		valid    bool
 		patterns []string
 	}{
+		"success: maximum capture count":                {true, []string{strings.Repeat("()", 32767)}},
+		"error: capture register exhaustion":            {false, []string{strings.Repeat("()", 32768)}},
+		"success: raw and escaped identifier":           {true, []string{`(?<π>x)\k<` + u + `03c0>`, `(?<` + u + `03c0>x)\k<π>`}},
+		"error: nonjoiner cannot start an identifier":   {false, []string{"(?<" + string(rune(0x200c)) + ">x)", `(?<` + u + `200c>x)`}},
+		"success: class backspace equals eight":         {true, []string{`[\b-\x08]`, `[\x08-\b]`}},
+		"error: range ends before backspace":            {false, []string{`[\b-\x07]`, `[\x09-\b]`}},
+		"error: loose whitespace property spelling":     {false, []string{`\p{wspace}`, `\p{W_Space}`}},
 		"success: alternatives and atoms":               {true, []string{"", `|a||`, `(?:.|()|/|\/)`, "[\n]\r", `[[]`, `[]`, `[^]`}},
 		"success: assertions":                           {true, []string{`^\b(?=a)(?!b)(?<=c)(?<!d)\B$`, `(?=a|)`}},
 		"success: quantifiers":                          {true, []string{`a?b+?c*?d??`, `a{0002}b{2,}c{0,0}?`, `a{2147483648,2147483647}`}},
