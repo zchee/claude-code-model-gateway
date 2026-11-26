@@ -16,6 +16,7 @@ package catalog
 
 import (
 	"context"
+	"slices"
 
 	"github.com/zchee/claude-code-model-gateway/internal/config"
 	"github.com/zchee/claude-code-model-gateway/internal/localprov"
@@ -39,22 +40,64 @@ type LiveReadinessOptions struct {
 // LiveReadinessSource resolves provider readiness for one catalog build using immutable local-engine
 // snapshots, live proxy provider checks, and a read-only Grok readiness callback.
 // It satisfies ReadinessSource.
-type LiveReadinessSource struct{}
+type LiveReadinessSource struct {
+	opts LiveReadinessOptions
+}
 
 // NewLiveReadinessSource constructs a per-build ReadinessSource, copying LlamaState and StudioState.
 func NewLiveReadinessSource(opts LiveReadinessOptions) *LiveReadinessSource {
-	_ = opts
-	return &LiveReadinessSource{}
+	if opts.LlamaState != nil {
+		opts.LlamaState = new(*opts.LlamaState)
+	}
+	if opts.StudioState != nil {
+		studio := *opts.StudioState
+		studio.Models = slices.Clone(studio.Models)
+		if studio.Invalid != nil {
+			studio.Invalid = new(*studio.Invalid)
+		}
+		opts.StudioState = &studio
+	}
+	return &LiveReadinessSource{opts: opts}
 }
 
 // Probe returns the provider's live readiness summary without reading ambient environment or files.
+// The catalog calls it for a proxy provider only after the shared checks passed, so only the
+// provider's own sign-in or server state is decided here.
 func (s *LiveReadinessSource) Probe(ctx context.Context, provider string) Readiness {
-	_, _ = ctx, provider
-	return Readiness{}
+	switch provider {
+	case "grok":
+		if s.opts.ReadGrok == nil {
+			return Readiness{State: "unavailable", Message: provider + " readiness is unavailable."}
+		}
+		return s.opts.ReadGrok(ctx)
+	case "codex":
+		return Readiness{State: "unavailable", Message: provider + " readiness is unavailable."}
+	}
+	passed := readiness.SharedChecks{ProxyBinary: true, ProxyModels: true, ShimRunning: true, ServingVersionMatches: true}
+	return readiness.ProxyProviderReadiness(provider, passed, func(provider string) string {
+		return readiness.ProviderAuthState(ctx, provider, readiness.ProviderAuthOptions{
+			Lookup:      s.opts.Lookup,
+			ConfigDir:   s.opts.ConfigDir,
+			ProxyBinary: s.opts.ProxyBinary,
+			RunStatus:   s.opts.RunStatus,
+			LlamaState:  s.opts.LlamaState,
+			StudioState: s.opts.StudioState,
+		})
+	}, s.messageOptions())
 }
 
 // SharedFailureMessage describes a failed shared proxy check using the configured installation paths.
 func (s *LiveReadinessSource) SharedFailureMessage(state string) string {
-	_ = state
-	return ""
+	return readiness.SharedFailureMessage(state, s.messageOptions())
+}
+
+func (s *LiveReadinessSource) messageOptions() readiness.ProviderMessageOptions {
+	return readiness.ProviderMessageOptions{
+		Lookup:      s.opts.Lookup,
+		ConfigDir:   s.opts.ConfigDir,
+		ProxyBinary: s.opts.ProxyBinary,
+		CommandPath: s.opts.CommandPath,
+		LlamaState:  s.opts.LlamaState,
+		StudioState: s.opts.StudioState,
+	}
 }
