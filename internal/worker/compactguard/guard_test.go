@@ -89,14 +89,45 @@ type countedBody struct {
 func (b *countedBody) Close() error { b.closes.Add(1); return b.ReadCloser.Close() }
 
 type headRecorder struct {
-	*httptest.ResponseRecorder
+	rec   *httptest.ResponseRecorder
 	heads []int
 }
 
+var (
+	_ http.ResponseWriter = (*headRecorder)(nil)
+	_ http.Flusher        = (*headRecorder)(nil)
+	_ io.StringWriter     = (*headRecorder)(nil)
+)
+
+func (r *headRecorder) Header() http.Header { return r.rec.Header() }
+
 func (r *headRecorder) WriteHeader(code int) {
 	r.heads = append(r.heads, code)
-	r.ResponseRecorder.WriteHeader(code)
+	r.rec.WriteHeader(code)
 }
+
+func (r *headRecorder) Write(b []byte) (int, error) {
+	if len(r.heads) == 0 {
+		r.heads = append(r.heads, http.StatusOK)
+	}
+	return r.rec.Write(b)
+}
+
+func (r *headRecorder) WriteString(s string) (int, error) {
+	if len(r.heads) == 0 {
+		r.heads = append(r.heads, http.StatusOK)
+	}
+	return r.rec.WriteString(s)
+}
+
+func (r *headRecorder) Flush() {
+	if len(r.heads) == 0 {
+		r.heads = append(r.heads, http.StatusOK)
+	}
+	r.rec.Flush()
+}
+
+func (r *headRecorder) bodyString() string { return r.rec.Body.String() }
 
 func TestGuardSettledVerdict(t *testing.T) {
 	tests := map[string]struct {
@@ -111,7 +142,7 @@ func TestGuardSettledVerdict(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			req := guardRequest()
-			w := &headRecorder{ResponseRecorder: httptest.NewRecorder()}
+			w := &headRecorder{rec: httptest.NewRecorder()}
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			cap := usage.NewCapture(usage.NewBuilder(usage.Options{Now: time.Now}), usage.Request{Backend: "codex"}, 0, nil)
@@ -170,8 +201,8 @@ func TestGuardSettledVerdict(t *testing.T) {
 			if diff := gocmp.Diff(heads, w.heads); diff != "" {
 				t.Error(diff)
 			}
-			if w.Body.Len() != 0 {
-				t.Errorf("guard wrote a second response: %q", w.Body.String())
+			if body := w.bodyString(); body != "" {
+				t.Errorf("guard wrote a second response: %q", body)
 			}
 		})
 	}

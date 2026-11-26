@@ -152,32 +152,50 @@ func checkLive(t *testing.T, provider string, enabled bool) {
 }
 
 type syncRecorder struct {
-	*httptest.ResponseRecorder
-	mu sync.Mutex
+	rec *httptest.ResponseRecorder
+	mu  sync.Mutex
+}
+
+var (
+	_ http.ResponseWriter = (*syncRecorder)(nil)
+	_ http.Flusher        = (*syncRecorder)(nil)
+	_ io.StringWriter     = (*syncRecorder)(nil)
+)
+
+func (r *syncRecorder) Header() http.Header {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.rec.Header()
 }
 
 func (r *syncRecorder) WriteHeader(code int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.ResponseRecorder.WriteHeader(code)
+	r.rec.WriteHeader(code)
 }
 
 func (r *syncRecorder) Write(b []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.ResponseRecorder.Write(b)
+	return r.rec.Write(b)
+}
+
+func (r *syncRecorder) WriteString(s string) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.rec.WriteString(s)
 }
 
 func (r *syncRecorder) Flush() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.ResponseRecorder.Flush()
+	r.rec.Flush()
 }
 
 func (r *syncRecorder) bodyString() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.Body.String()
+	return r.rec.Body.String()
 }
 
 func TestGuardClientDisconnectStopsRetry(t *testing.T) {
@@ -239,7 +257,7 @@ func TestGuardClientDisconnectStopsRetry(t *testing.T) {
 		},
 	}
 	bindLoopback(t, service, srv.URL, &req, nil)
-	w := &syncRecorder{ResponseRecorder: httptest.NewRecorder()}
+	w := &syncRecorder{rec: httptest.NewRecorder()}
 	type serveResult struct {
 		res outcome.Result
 		err error
@@ -252,10 +270,17 @@ func TestGuardClientDisconnectStopsRetry(t *testing.T) {
 	}()
 	defer func() {
 		if !joined {
+			disconnect()
 			proceed()
 			release()
 			stop()
-			<-done
+			timer := time.NewTimer(time.Second)
+			defer timer.Stop()
+			select {
+			case <-done:
+			case <-timer.C:
+				t.Error("Serve did not exit during cleanup")
+			}
 		}
 	}()
 	select {

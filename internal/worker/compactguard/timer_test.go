@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"slices"
 	"strings"
@@ -44,6 +45,63 @@ func TestGuardRequiresServiceContext(t *testing.T) {
 	r.ServiceContext = nil
 	if _, err := r.Serve(t.Context(), httptest.NewRecorder(), req); err == nil {
 		t.Error("missing service context accepted")
+	}
+}
+
+func TestGuardClientAlreadyDone(t *testing.T) {
+	tests := map[string]struct {
+		makeCtx func(context.Context) (context.Context, context.CancelFunc)
+	}{
+		"success: canceled client context skips first attempt": {
+			makeCtx: func(parent context.Context) (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(parent)
+				cancel()
+				return ctx, cancel
+			},
+		},
+		"success: expired client deadline skips first attempt": {
+			makeCtx: func(parent context.Context) (context.Context, context.CancelFunc) {
+				return context.WithDeadline(parent, time.Now().Add(-time.Second))
+			},
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			client, cancel := tt.makeCtx(t.Context())
+			defer cancel()
+			if client.Err() == nil {
+				t.Fatal("client context was not already done")
+			}
+			req := guardRequest()
+			var calls int
+			req.Next = func(context.Context, bool) (*upstream.Response, outcome.Result, error) {
+				calls++
+				return sseResponse(io.NopCloser(strings.NewReader(completeStream("unexpected")))), outcome.Result{Contacted: true}, nil
+			}
+			w := &headRecorder{rec: httptest.NewRecorder()}
+			got, err := guardRunner(t.Context(), 1).Serve(client, w, req)
+			if err != nil {
+				t.Fatalf("Serve error = %v, want nil", err)
+			}
+			if calls != 0 {
+				t.Errorf("Next called %d times, want 0", calls)
+			}
+			if got.Contacted {
+				t.Errorf("Serve set Contacted = true, want false")
+			}
+			if got.Cancelled {
+				t.Errorf("Serve set Cancelled = true, want false")
+			}
+			if got.Status != 0 {
+				t.Errorf("Serve Status = %d, want 0", got.Status)
+			}
+			if len(w.heads) != 0 || len(w.Header()) != 0 {
+				t.Errorf("wrote headers with already-done client: heads=%v header=%v", w.heads, w.Header())
+			}
+			if body := w.bodyString(); body != "" {
+				t.Errorf("wrote body with already-done client: %q", body)
+			}
+		})
 	}
 }
 
@@ -87,9 +145,15 @@ func TestGuardPeekLifetime(t *testing.T) {
 		go func() { _, err := guardRunner(service, 1).Serve(client, w, req); done <- err }()
 		defer func() {
 			if !joined {
+				disconnect()
 				stop()
 				_ = wr.Close()
-				<-done
+				synctest.Wait()
+				select {
+				case <-done:
+				default:
+					t.Error("Serve did not exit during cleanup")
+				}
 			}
 		}()
 		synctest.Wait()
@@ -207,23 +271,47 @@ func TestGuardRetryDelaySynctest(t *testing.T) {
 }
 
 type heartbeatRecorder struct {
-	*httptest.ResponseRecorder
+	rec     *httptest.ResponseRecorder
 	mu      sync.Mutex
 	start   time.Time
 	flushed []time.Duration
 }
 
+var (
+	_ http.ResponseWriter = (*heartbeatRecorder)(nil)
+	_ http.Flusher        = (*heartbeatRecorder)(nil)
+	_ io.StringWriter     = (*heartbeatRecorder)(nil)
+)
+
+func (r *heartbeatRecorder) Header() http.Header {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.rec.Header()
+}
+
+func (r *heartbeatRecorder) WriteHeader(code int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rec.WriteHeader(code)
+}
+
 func (r *heartbeatRecorder) Write(b []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.ResponseRecorder.Write(b)
+	return r.rec.Write(b)
+}
+
+func (r *heartbeatRecorder) WriteString(s string) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.rec.WriteString(s)
 }
 
 func (r *heartbeatRecorder) Flush() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.ResponseRecorder.Flush()
-	for n := bytes.Count(r.Body.Bytes(), []byte(": ping\n\n")); len(r.flushed) < n; {
+	r.rec.Flush()
+	for n := bytes.Count(r.rec.Body.Bytes(), []byte(": ping\n\n")); len(r.flushed) < n; {
 		r.flushed = append(r.flushed, time.Since(r.start))
 	}
 }
@@ -237,7 +325,7 @@ func (r *heartbeatRecorder) snapshotFlushed() []time.Duration {
 func (r *heartbeatRecorder) bodyString() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.Body.String()
+	return r.rec.Body.String()
 }
 
 func TestGuardHeartbeatSynctest(t *testing.T) {
@@ -246,7 +334,7 @@ func TestGuardHeartbeatSynctest(t *testing.T) {
 		r.Settings.RetryDelayMillis = 250
 		req := guardRequest()
 		req.Stream.HeartbeatInterval = 20 * time.Second
-		w := &heartbeatRecorder{ResponseRecorder: httptest.NewRecorder(), start: time.Now()}
+		w := &heartbeatRecorder{rec: httptest.NewRecorder(), start: time.Now()}
 		var wg sync.WaitGroup
 		var readers []*io.PipeReader
 		var heads []bool
@@ -278,10 +366,10 @@ func TestGuardHeartbeatSynctest(t *testing.T) {
 		if diff := gocmp.Diff([]bool{false, true}, heads); diff != "" {
 			t.Error(diff)
 		}
-		if diff := gocmp.Diff([]time.Duration{20 * time.Second, 50 * time.Second, 75250 * time.Millisecond, 105250 * time.Millisecond}, w.flushed); diff != "" {
+		if diff := gocmp.Diff([]time.Duration{20 * time.Second, 50 * time.Second, 75250 * time.Millisecond, 105250 * time.Millisecond}, w.snapshotFlushed()); diff != "" {
 			t.Error(diff)
 		}
-		if diff := gocmp.Diff(strings.Repeat(": ping\n\n", 4)+advertisedStart+frameTextDelta("still alive")+frameMessageStop, w.Body.String()); diff != "" {
+		if diff := gocmp.Diff(strings.Repeat(": ping\n\n", 4)+advertisedStart+frameTextDelta("still alive")+frameMessageStop, w.bodyString()); diff != "" {
 			t.Error(diff)
 		}
 	})
@@ -297,7 +385,7 @@ func TestGuardHeartbeatStopsOnClientDisconnect(t *testing.T) {
 		r.Settings.RetryDelayMillis = 250
 		req := guardRequest()
 		req.Stream.HeartbeatInterval = 20 * time.Second
-		w := &heartbeatRecorder{ResponseRecorder: httptest.NewRecorder(), start: time.Now()}
+		w := &heartbeatRecorder{rec: httptest.NewRecorder(), start: time.Now()}
 		rd, wr := io.Pipe()
 		defer func() { _ = wr.Close() }()
 		body := &countedBody{ReadCloser: rd}
@@ -324,9 +412,15 @@ func TestGuardHeartbeatStopsOnClientDisconnect(t *testing.T) {
 		}()
 		defer func() {
 			if !joined {
+				disconnect()
 				stop()
 				_ = wr.Close()
-				<-done
+				synctest.Wait()
+				select {
+				case <-done:
+				default:
+					t.Error("Serve did not exit during cleanup")
+				}
 			}
 		}()
 		time.Sleep(25 * time.Second)

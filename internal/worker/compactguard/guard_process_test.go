@@ -164,7 +164,7 @@ func TestGuardRetryAndDelivery(t *testing.T) {
 			service, stop := context.WithTimeout(t.Context(), 5*time.Second)
 			defer stop()
 			var heads []bool
-			w := &headRecorder{ResponseRecorder: httptest.NewRecorder()}
+			w := &headRecorder{rec: httptest.NewRecorder()}
 			bindLoopback(t, service, server.URL, &req, func(head bool) {
 				if head != (len(w.heads) > 0) {
 					t.Errorf("head=%v at Next, writes=%v", head, w.heads)
@@ -198,7 +198,7 @@ func TestGuardRetryAndDelivery(t *testing.T) {
 			if w.Header().Get("X-First-Attempt") != "0" || w.Header().Get("Content-Length") != "" {
 				t.Errorf("unexpected relay headers: %v", w.Header())
 			}
-			if diff := gocmp.Diff(tt.body, w.Body.String()); diff != "" {
+			if diff := gocmp.Diff(tt.body, w.bodyString()); diff != "" {
 				t.Error(diff)
 			}
 			wantDiag := &outcome.Compaction{Outcome: tt.label, TerminalCode: tt.terminal, ErrorCode: tt.code, UpstreamStatus: new(200), InputTokens: tt.input, OutputTokens: tt.output, CacheReadTokens: tt.cache}
@@ -261,7 +261,7 @@ func TestGuardLMStudioPeek(t *testing.T) {
 			req := guardRequest()
 			req.ProxyProvider = tt.provider
 			req.Stream.Provider = tt.provider
-			w := &headRecorder{ResponseRecorder: httptest.NewRecorder()}
+			w := &headRecorder{rec: httptest.NewRecorder()}
 			var heads []bool
 			bindLoopback(t, service, srv.URL, &req, func(head bool) {
 				if head != (len(w.heads) > 0) {
@@ -315,7 +315,7 @@ func TestGuardLMStudioPeek(t *testing.T) {
 			if peeks != tt.peeks || overflows != tt.overflows || int(count.Load()) != len(tt.attempts) {
 				t.Errorf("peeks=%d overflows=%d attempts=%d", peeks, overflows, count.Load())
 			}
-			if diff := gocmp.Diff(tt.body, w.Body.String()); diff != "" {
+			if diff := gocmp.Diff(tt.body, w.bodyString()); diff != "" {
 				t.Error(diff)
 			}
 		})
