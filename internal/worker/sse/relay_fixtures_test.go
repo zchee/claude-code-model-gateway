@@ -123,13 +123,18 @@ func sseResponse(body io.ReadCloser, header http.Header) *upstream.Response {
 	return &upstream.Response{StatusCode: http.StatusOK, Header: h.Clone(), RelayHeader: h.Clone(), Body: body}
 }
 
-// assertNothingWritten fails when the recorder saw a status line, a body write attempt, or a flush.
+// assertNothingWritten fails when the recorder saw a status line, a body write attempt, or a flush,
+// or when its header map holds a field: every caller expects the relay never to have reached the
+// point of copying a head.
 func assertNothingWritten(t *testing.T, rec *streamingRecorder) {
 	t.Helper()
 	status, wroteHeader, _, _, flushes := rec.snapshot()
 	if attempts := rec.attemptedSnapshot(); wroteHeader || len(attempts) != 0 || flushes != 0 {
 		t.Errorf("client output after it left or before the relay could commit: wroteHeader=%t status=%d flushes=%d attempted writes=%q",
 			wroteHeader, status, flushes, attempts)
+	}
+	if got := rec.Header(); len(got) != 0 {
+		t.Errorf("client header fields = %v, want none", got)
 	}
 }
 

@@ -17,7 +17,6 @@ package sse_test
 import (
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/sse"
@@ -27,16 +26,14 @@ func TestEventObserverLongFrameInSmallChunks(t *testing.T) {
 	tests := map[string]struct {
 		frameBytes int
 		chunkBytes int
-		budget     time.Duration
 	}{
 		// Work per Write that grows with the pending frame makes this input quadratic: about 3.7
 		// million one-byte writes over an average of 1.75 MiB pending text is several TiB of copying,
-		// more than a minute at any memory bandwidth, while work proportional to the chunk finishes
-		// in a few seconds even under the race detector.
-		"success: a frame just under the default budget fed one byte at a time is observed in linear time": {
+		// so such an observer shows up as this test running into the test binary's timeout. The test
+		// sets no time limit of its own: a paused or starved process must not fail a correct observer.
+		"success: a frame just under the default budget fed one byte at a time is observed whole": {
 			frameBytes: sse.DefaultMaxObserveBytes - 512<<10,
 			chunkBytes: 1,
-			budget:     20 * time.Second,
 		},
 	}
 
@@ -54,24 +51,10 @@ func TestEventObserverLongFrameInSmallChunks(t *testing.T) {
 				events = append(events, mustEncodeWire(t, event))
 			}, func() { overflows++ })
 
-			start := time.Now()
-			writes := 0
 			for off := 0; off < len(frame); off += tt.chunkBytes {
 				o.Write(frame[off:min(off+tt.chunkBytes, len(frame))])
-				writes++
-				if writes%65536 == 0 {
-					if elapsed := time.Since(start); elapsed > tt.budget {
-						t.Fatalf("observer spent %v on %d of %d bytes (%d writes of %d bytes); the cost of a write grows with the pending frame",
-							elapsed, off, len(frame), writes, tt.chunkBytes)
-					}
-				}
 			}
 			o.End()
-			elapsed := time.Since(start)
-			t.Logf("observed a %d-byte frame in %d writes of %d bytes in %v", len(frame), writes, tt.chunkBytes, elapsed)
-			if elapsed > tt.budget {
-				t.Errorf("observer spent %v, want at most %v", elapsed, tt.budget)
-			}
 
 			if overflows != 0 {
 				t.Errorf("onOverflow calls = %d, want 0 for a frame under the budget", overflows)

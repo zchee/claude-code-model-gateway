@@ -29,11 +29,10 @@ import (
 func TestPassthroughEmptyCompressedBody(t *testing.T) {
 	// An empty gzip, deflate or br body is a decode failure, not a clean end: the source's Node
 	// streams zlib.createGunzip, createInflate and createBrotliDecompress all emit the error
-	// "unexpected end of file" when they are ended with no input, measured with the venue's pinned
-	// Node v24.11.1 and recorded in
-	// .omc/handoffs/2026-11-26-session3/evidence/node-probes/zlib-empty-input.txt. The source then
-	// marks the capture's overflow once and reports no event. An empty body holds no pending text for
-	// a clean end to flush, so the overflow mark is the only observable difference from a clean end.
+	// "unexpected end of file" when they are ended with no input, as measured with the pinned Node
+	// v24.11.1. The source then marks the capture's overflow once and reports no event. An empty
+	// body holds no pending text for a clean end to flush, so the overflow mark is the only
+	// observable difference from a clean end.
 	tests := map[string]struct {
 		encoding      string
 		wantOverflows int

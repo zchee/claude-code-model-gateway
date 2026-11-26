@@ -17,9 +17,11 @@ package sse_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/zchee/claude-code-model-gateway/internal/worker/outcome"
@@ -85,46 +87,52 @@ func TestRelayEndedServiceContextOnEntry(t *testing.T) {
 		}
 		for name, tt := range tests {
 			t.Run(name, func(t *testing.T) {
-				// The whole stream is readable at once, so a relay that reads before it looks at the
-				// context can deliver or decide on data after shutdown. Repeat to catch either order.
-				const rounds = 50
-				var bad int
-				var firstBad string
-				for round := range rounds {
-					ctx, cancel := context.WithCancel(t.Context())
-					cancel()
-					var clientDone chan struct{}
-					if tt.clientGone {
-						clientDone = make(chan struct{})
-						close(clientDone)
-					}
-					src := newEOFChunkBody([]byte(ordinary))
-					rec := newStreamingRecorder()
+				// The bubble's fake clock keeps the LM Studio first-event wait from being a real
+				// deadline: a relay that waits on it instead of seeing the ended context still returns.
+				synctest.Test(t, func(t *testing.T) {
+					// The whole stream is readable at once, so a relay that reads before it looks at
+					// the context can deliver or decide on data after shutdown. Repeat to catch either
+					// order. No read may be requested at all.
+					const rounds = 50
+					var bad int
+					var firstBad string
+					for round := range rounds {
+						ctx, cancel := context.WithCancel(t.Context())
+						cancel()
+						var clientDone chan struct{}
+						if tt.clientGone {
+							clientDone = make(chan struct{})
+							close(clientDone)
+						}
+						src := newEOFChunkBody([]byte(ordinary))
+						rec := newStreamingRecorder()
 
-					res, err := relay(ctx, rec, sseResponse(src, nil), clientDone)
-					if got := src.closes.Load(); got != 1 {
-						t.Fatalf("round %d of %d: owned resp.Body close count = %d, want 1", round, rounds, got)
+						res, err := relay(ctx, rec, sseResponse(src, nil), clientDone)
+						if got := src.closes.Load(); got != 1 {
+							t.Fatalf("round %d of %d: owned resp.Body close count = %d, want 1", round, rounds, got)
+						}
+						if res.Cancelled {
+							t.Fatalf("round %d of %d: outcome.Cancelled = true, want false", round, rounds)
+						}
+						status, wroteHeader, body, _, flushes := rec.snapshot()
+						wantErr := !tt.clientGone
+						errOK := err == nil
+						if wantErr {
+							errOK = errors.Is(err, context.Canceled) && !errors.Is(err, http.ErrAbortHandler)
+						}
+						reads := src.reads.Load()
+						if errOK && reads == 0 && !wroteHeader && rec.attemptCount() == 0 && flushes == 0 {
+							continue
+						}
+						bad++
+						if firstBad == "" {
+							firstBad = fmt.Sprintf("%s upstream reads=%d", formatRelayOutcome(round, res, err, wroteHeader, status, body), reads)
+						}
 					}
-					if res.Cancelled {
-						t.Fatalf("round %d of %d: outcome.Cancelled = true, want false", round, rounds)
+					if bad != 0 {
+						t.Errorf("%d of %d rounds read the body, committed output or returned the wrong error after shutdown; first: %s", bad, rounds, firstBad)
 					}
-					status, wroteHeader, body, _, flushes := rec.snapshot()
-					wantErr := !tt.clientGone
-					errOK := err == nil
-					if wantErr {
-						errOK = errors.Is(err, context.Canceled) && !errors.Is(err, http.ErrAbortHandler)
-					}
-					if errOK && !wroteHeader && rec.attemptCount() == 0 && flushes == 0 {
-						continue
-					}
-					bad++
-					if firstBad == "" {
-						firstBad = formatRelayOutcome(round, res, err, wroteHeader, status, body)
-					}
-				}
-				if bad != 0 {
-					t.Errorf("%d of %d rounds committed output or returned the wrong error after shutdown; first: %s", bad, rounds, firstBad)
-				}
+				})
 			})
 		}
 	}
@@ -159,6 +167,7 @@ func TestRelayEndedServiceContextBetweenReads(t *testing.T) {
 			relay := relays[tt.relay]
 			// The service context ends while the first chunk is written; the next chunk and the clean
 			// end are already readable, so a relay that requests another read can still deliver them.
+			// The read count also catches a read whose result is dropped instead of delivered.
 			const rounds = 2000
 			var bad int
 			var firstBad string
@@ -176,13 +185,14 @@ func TestRelayEndedServiceContextBetweenReads(t *testing.T) {
 				status, wroteHeader, body, _, _ := rec.snapshot()
 				attempts := rec.attemptedSnapshot()
 				delivered := strings.Contains(strings.Join(attempts, ""), tt.secondMark)
-				if !delivered && len(attempts) == 1 && errors.Is(err, http.ErrAbortHandler) && errors.Is(err, context.Canceled) &&
+				reads := src.reads.Load()
+				if !delivered && reads == 1 && len(attempts) == 1 && errors.Is(err, http.ErrAbortHandler) && errors.Is(err, context.Canceled) &&
 					res.Status == http.StatusOK && res.StatusOverride == "upstream_aborted" && !res.Cancelled {
 					continue
 				}
 				bad++
 				if firstBad == "" {
-					firstBad = formatRelayOutcome(round, res, err, wroteHeader, status, body)
+					firstBad = fmt.Sprintf("%s upstream reads=%d (want 1)", formatRelayOutcome(round, res, err, wroteHeader, status, body), reads)
 				}
 			}
 			if bad != 0 {

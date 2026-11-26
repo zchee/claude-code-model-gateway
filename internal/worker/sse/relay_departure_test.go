@@ -145,9 +145,16 @@ func TestPassthroughFinishesObservationAfterLastChunk(t *testing.T) {
 }
 
 func TestPassthroughAbandonsObservationOfDiscardedChunk(t *testing.T) {
-	t.Run("success: a chunk that arrives after the client left is discarded and its frame is not observed", func(t *testing.T) {
+	t.Run("success: a chunk that arrives after the client left is discarded and the frame left pending by the observed chunks is not reported", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
-			trailing := "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":6}}"
+			// The observed chunk ends with a complete, valid frame that lacks only its blank-line
+			// terminator, so only the observer's end-of-stream flush could report it. The discarded
+			// chunk would terminate that frame and add another one. Abandoning reports neither; a relay
+			// that finishes the observation instead reports the pending frame, and one that observes
+			// the discarded chunk reports both.
+			pending := "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":6}}"
+			observed := departureStartFrame + pending
+			discardedChunk := "\n\n" + departureStopFrame
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			src := newHeldBody()
@@ -172,7 +179,7 @@ func TestPassthroughAbandonsObservationOfDiscardedChunk(t *testing.T) {
 				}
 			}()
 
-			src.release(departureStartFrame, nil)
+			src.release(observed, nil)
 			synctest.Wait()
 			attemptsBefore := rec.attemptCount()
 			if attemptsBefore != 1 {
@@ -181,7 +188,7 @@ func TestPassthroughAbandonsObservationOfDiscardedChunk(t *testing.T) {
 
 			close(clientDone)
 			synctest.Wait()
-			src.release(trailing, io.EOF)
+			src.release(discardedChunk, io.EOF)
 			synctest.Wait()
 
 			var out handlerOutcome
@@ -202,7 +209,7 @@ func TestPassthroughAbandonsObservationOfDiscardedChunk(t *testing.T) {
 			}
 			events, _, _, overflows := usage.snapshot(t)
 			if diff := gocmp.Diff([]string{departureStartEvent}, events); diff != "" {
-				t.Errorf("observed events (-want +got):\n%s", diff)
+				t.Errorf("observed events: the pending frame of the observed chunk must not be flushed and the discarded chunk must not be observed (-want +got):\n%s", diff)
 			}
 			if overflows != 0 {
 				t.Errorf("MarkOverflow calls = %d, want 0 (abandoning is not a decode failure)", overflows)
@@ -295,9 +302,23 @@ func TestRelayWritesNothingToDepartedClient(t *testing.T) {
 					}
 				}()
 
-				// Two default heartbeat intervals pass without upstream data.
+				// Two default heartbeat intervals pass without upstream data. The relay must still be
+				// waiting for the end of the service, with the body neither read nor closed: the
+				// provider is held by back-pressure, not drained or dropped.
 				time.Sleep(2*sse.DefaultHeartbeatInterval + time.Second)
 				synctest.Wait()
+				select {
+				case out := <-done:
+					joined = true
+					t.Fatalf("RelayPassthrough returned before the service context ended: result=%+v err=%v body closes=%d", out.res, out.err, out.bodyCloses)
+				default:
+				}
+				if got := src.reads.Load(); got != 0 {
+					t.Errorf("upstream body reads before shutdown = %d, want 0 for a client gone on entry", got)
+				}
+				if got := src.closes.Load(); got != 0 {
+					t.Errorf("upstream body closes before shutdown = %d, want 0 while the relay waits", got)
+				}
 				assertNothingWritten(t, rec)
 
 				cancel()
@@ -495,9 +516,6 @@ func TestRelayWritesNothingToDepartedClient(t *testing.T) {
 			// relay had not touched the client's header before the peek, so any header field, status,
 			// body byte or flush on the real writer came from the responder.
 			assertNothingWritten(t, rec)
-			if got := rec.Header(); len(got) != 0 {
-				t.Errorf("client header fields after the client left = %v, want none", got)
-			}
 		})
 	})
 
