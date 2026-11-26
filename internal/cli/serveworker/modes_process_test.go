@@ -19,12 +19,15 @@ package serveworker_test
 import (
 	"bufio"
 	"bytes"
+	"context"
 	json "encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -43,14 +46,14 @@ func TestGatewayFixtureHelper(t *testing.T) {
 	gatewaytest.DispatchHelper(t, map[string]gatewaytest.HelperFunc{"worker": func(t testing.TB, args []string) {
 		mode := args[0]
 		// DispatchHelper has consumed its private directory at fd 3. Shift the inherited pipe ends into the worker's slots.
-		if mode == "supervised" || mode == "missing" {
+		if mode == "supervised" || mode == "missing" || mode == "no-generation" || mode == "stdin-live" {
 			if err := unix.Dup2(4, 3); err != nil {
 				t.Fatal(err)
 			}
 			if err := unix.Close(4); err != nil {
 				t.Fatal(err)
 			}
-			if mode == "supervised" {
+			if mode == "supervised" || mode == "no-generation" {
 				if err := unix.Dup2(5, 4); err != nil {
 					t.Fatal(err)
 				}
@@ -60,15 +63,16 @@ func TestGatewayFixtureHelper(t *testing.T) {
 			}
 		}
 		lookup := os.LookupEnv
-		if mode == "unguarded" {
+		if mode == "unguarded" || mode == "node-fixture" {
 			lookup = func(key string) (string, bool) {
-				if key == "MODEL_GATEWAY_TEST_SANDBOX" || key == "NODE_TEST_CONTEXT" {
+				if key == "MODEL_GATEWAY_TEST_SANDBOX" || (key == "NODE_TEST_CONTEXT" && mode == "unguarded") {
 					return "", false
 				}
 				return os.LookupEnv(key)
 			}
 		}
-		if err := serveworker.Run(t.Context(), lookup, os.Stdout, os.Stderr); err != nil {
+		opts := serveworker.Options{Lookup: lookup, Home: os.UserHomeDir, Cwd: os.Getwd, Version: "fixture-build", Stdout: os.Stdout, Stderr: os.Stderr}
+		if err := serveworker.Run(t.Context(), opts); err != nil {
 			t.Fatal(err)
 		}
 		_, _ = fmt.Fprintln(os.Stdout, "worker returned cleanly")
@@ -86,8 +90,25 @@ func pipe(t *testing.T) (*os.File, *os.File) {
 }
 
 func TestWorkerModes(t *testing.T) {
-	const token = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	tests := map[string]struct{ mode string }{"success: standalone ignores closed stdin": {"standalone"}, "success: supervised reports port then follows parent EOF": {"supervised"}, "success: fixture EOF stops standalone worker": {"fixture"}, "success: outside fixture guard the channel closes unread": {"unguarded"}, "error: missing liveness descriptor": {"missing"}, "error: malformed descriptor setting": {"malformed"}}
+	const fixtureToken = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	tests := map[string]struct{ mode, wantError string }{
+		"success: standalone ignores closed stdin":                 {"standalone", ""},
+		"success: supervised reports port then follows parent EOF": {"supervised", ""},
+		"success: fixture EOF stops standalone worker":             {"fixture", ""},
+		"success: NODE_TEST_CONTEXT alone enables fixture EOF":     {"node-fixture", ""},
+		"success: outside fixture guard the channel closes unread": {"unguarded", ""},
+		"success: missing token created for drain":                 {"new-token", ""},
+		"success: configured socket serves health":                 {"socket", ""},
+		"success: occupied socket path does not prevent TCP":       {"plain-file", ""},
+		"success: configured port needs no report pipe":            {"fixed-port", ""},
+		"error: missing liveness descriptor":                       {"missing", "descriptor"},
+		"error: missing report descriptor":                         {"no-report", "descriptor"},
+		"error: malformed descriptor setting":                      {"malformed", "descriptor"},
+		"error: stdin is not the report descriptor":                {"stdin-report", "descriptor"},
+		"error: stdin is not the liveness descriptor":              {"stdin-live", "descriptor"},
+		"error: supervised generation missing":                     {"no-generation", "generation"},
+		"error: malformed token file":                              {"bad-token", "token"},
+	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			// The nested test name alone can exceed the Unix socket pathname limit.
@@ -105,8 +126,36 @@ func TestWorkerModes(t *testing.T) {
 			if err := os.MkdirAll(state, 0o700); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(filepath.Join(state, "control-token"), []byte(token+"\n"), 0o600); err != nil {
-				t.Fatal(err)
+			token := fixtureToken
+			tokenPath := filepath.Join(state, "control-token")
+			if tt.mode == "bad-token" {
+				token = "not-hex"
+			}
+			if tt.mode != "new-token" {
+				if err := os.WriteFile(tokenPath, []byte(token+"\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			socketPath := filepath.Join(home, "configured.sock")
+			env["CODEX_GATEWAY_SOCKET_PATH"] = socketPath
+			if tt.mode == "plain-file" {
+				if err := os.WriteFile(socketPath, []byte("untouched"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tt.mode == "fixed-port" {
+				ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp4", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				port := ln.Addr().(*net.TCPAddr).Port
+				if err := ln.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if port == 80 || port == 18764 || port == 18765 {
+					t.Fatal("ephemeral range includes protected port")
+				}
+				env["CODEX_GATEWAY_WORKER_PORT"] = strconv.Itoa(port)
 			}
 			cmd, err := env.HelperCommand(t, "worker", tt.mode)
 			if err != nil {
@@ -115,17 +164,34 @@ func TestWorkerModes(t *testing.T) {
 			reportR, reportW := pipe(t)
 			liveR, liveW := pipe(t)
 			switch tt.mode {
-			case "supervised", "missing":
+			case "supervised", "missing", "no-generation", "stdin-live":
 				env["MODEL_GATEWAY_CONTROL_FDS"] = "3,4"
-				env["MODEL_GATEWAY_WORKER_GENERATION"] = "fixture-gen"
+				if tt.mode != "no-generation" {
+					env["MODEL_GATEWAY_WORKER_GENERATION"] = "fixture-gen"
+				}
 				cmd.ExtraFiles = []*os.File{reportW}
-				if tt.mode == "supervised" {
+				if tt.mode == "supervised" || tt.mode == "no-generation" {
 					cmd.ExtraFiles = append(cmd.ExtraFiles, liveR)
 				}
-			case "fixture", "unguarded":
+				if tt.mode == "stdin-live" {
+					env["MODEL_GATEWAY_CONTROL_FDS"] = "3,0"
+				}
+			case "no-report", "stdin-report":
+				// DispatchHelper closes fd 3; the inherited liveness reader stays at fd 4.
+				cmd.ExtraFiles = []*os.File{liveR}
+				env["MODEL_GATEWAY_CONTROL_FDS"] = "3,4"
+				env["MODEL_GATEWAY_WORKER_GENERATION"] = "fixture-gen"
+				if tt.mode == "stdin-report" {
+					env["MODEL_GATEWAY_CONTROL_FDS"] = "0,4"
+				}
+			case "fixture", "unguarded", "node-fixture":
+				if tt.mode == "node-fixture" {
+					env["NODE_TEST_CONTEXT"] = "child-v8"
+				}
 				env["NODE_CHANNEL_FD"] = "4"
 				cmd.ExtraFiles = []*os.File{liveR}
 			case "malformed":
+				env["MODEL_GATEWAY_WORKER_GENERATION"] = "fixture-gen"
 				env["MODEL_GATEWAY_CONTROL_FDS"] = "not-a-descriptor"
 			}
 			var diagnostics bytes.Buffer
@@ -135,7 +201,8 @@ func TestWorkerModes(t *testing.T) {
 			done := make(chan struct{})
 			var runErr error
 			go func() { defer close(done); runErr = env.RunFixtureWithin(cmd, 10*time.Second); _ = w.Close() }()
-			defer func() { _ = stdout.Close(); _ = liveW.Close(); <-done }()
+			// HelperCommand uses t.Context(), which is canceled before cleanups run.
+			t.Cleanup(func() { _ = stdout.Close(); _ = liveW.Close(); <-done })
 			scanner := bufio.NewScanner(stdout)
 			pattern := regexp.MustCompile(`^model-gateway shim listening on 127\.0\.0\.1:([0-9]+)(?:\s|$)`)
 			port := ""
@@ -151,14 +218,16 @@ func TestWorkerModes(t *testing.T) {
 			if err := scanner.Err(); err != nil {
 				t.Fatalf("read startup output: %v", err)
 			}
-			if tt.mode == "missing" || tt.mode == "malformed" {
+			if tt.wantError != "" {
 				if port != "" {
-					t.Fatalf("served despite invalid descriptors: %s", port)
+					t.Fatalf("served despite invalid startup configuration: %s", port)
 				}
 				<-done
 				text := strings.ToLower(strings.Join(output, "\n") + diagnostics.String())
-				if runErr == nil || (!strings.Contains(text, "descriptor") && !strings.Contains(text, "control_fds") && !strings.Contains(text, "bad file")) {
-					t.Fatalf("want descriptor-specific startup failure, got %v: %s", runErr, text)
+				specific := strings.Contains(text, tt.wantError) || (tt.wantError == "descriptor" && (strings.Contains(text, "control_fds") || strings.Contains(text, "bad file")))
+				exit, ok := errors.AsType[*exec.ExitError](runErr)
+				if !ok || exit.ExitCode() != 1 || !specific {
+					t.Fatalf("want %s startup failure (exit 1), got %v: %s", tt.wantError, runErr, text)
 				}
 				return
 			}
@@ -169,6 +238,26 @@ func TestWorkerModes(t *testing.T) {
 			n, err := strconv.Atoi(port)
 			if err != nil || n <= 0 || n > 65535 {
 				t.Fatalf("invalid listening port %q", port)
+			}
+			if tt.mode == "fixed-port" && port != env["CODEX_GATEWAY_WORKER_PORT"] {
+				t.Fatalf("worker ignored configured port: got %s want %s", port, env["CODEX_GATEWAY_WORKER_PORT"])
+			}
+			if tt.mode == "new-token" {
+				info, err := os.Stat(tokenPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if info.Mode() != 0o600 {
+					t.Fatalf("generated token mode %v, want 0600", info.Mode())
+				}
+				data, err := os.ReadFile(tokenPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !regexp.MustCompile(`^[0-9a-f]{64}\n$`).Match(data) {
+					t.Fatal("generated token has wrong format")
+				}
+				token = strings.TrimSuffix(string(data), "\n")
 			}
 			addr := "http://127.0.0.1:" + port
 			if tt.mode == "supervised" {
@@ -208,19 +297,30 @@ func TestWorkerModes(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			resp, err := client.Do(req)
+			healthClient := client
+			if tt.mode == "socket" {
+				healthClient = &http.Client{Timeout: 3 * time.Second, Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+					return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+				}}}
+				defer healthClient.CloseIdleConnections()
+			}
+			resp, err := healthClient.Do(req)
 			if err != nil {
 				t.Fatal(err)
 			}
 			var health struct {
-				OK bool `json:"ok"`
+				OK      bool   `json:"ok"`
+				Version string `json:"version"`
 			}
 			err = json.UnmarshalRead(resp.Body, &health)
 			_ = resp.Body.Close()
 			if err != nil || resp.StatusCode != 200 || !health.OK {
 				t.Fatalf("health status=%d ok=%t err=%v", resp.StatusCode, health.OK, err)
 			}
-			if tt.mode == "supervised" || tt.mode == "fixture" {
+			if health.Version != "fixture-build" {
+				t.Fatalf("health version %q, want fixture-build", health.Version)
+			}
+			if tt.mode == "supervised" || tt.mode == "fixture" || tt.mode == "node-fixture" {
 				if err := liveW.Close(); err != nil {
 					t.Fatal(err)
 				}
@@ -231,6 +331,21 @@ func TestWorkerModes(t *testing.T) {
 				}
 				drain.Header.Set("Content-Type", "application/json")
 				drain.Header.Set("X-Model-Gateway-Control-Token", token)
+				if tt.mode == "socket" {
+					unixDrain := drain.Clone(t.Context())
+					unixDrain.Body, err = drain.GetBody()
+					if err != nil {
+						t.Fatal(err)
+					}
+					denied, err := healthClient.Do(unixDrain)
+					if err != nil {
+						t.Fatal(err)
+					}
+					_ = denied.Body.Close()
+					if denied.StatusCode != http.StatusForbidden {
+						t.Fatalf("Unix drain status %d, want 403", denied.StatusCode)
+					}
+				}
 				resp, err := client.Do(drain)
 				if err != nil {
 					t.Fatal(err)
@@ -251,6 +366,15 @@ func TestWorkerModes(t *testing.T) {
 				t.Fatalf("read shutdown output: %v", err)
 			}
 			<-done
+			if tt.mode == "plain-file" {
+				got, err := os.ReadFile(socketPath)
+				if err != nil || string(got) != "untouched" {
+					t.Fatalf("worker replaced the occupied socket path: %q, %v", got, err)
+				}
+				if !strings.Contains(diagnostics.String(), socketPath) {
+					t.Errorf("no bind diagnostic for occupied socket path: %s", &diagnostics)
+				}
+			}
 			if runErr != nil || !returned {
 				t.Fatalf("clean return=%t, child status=%v: %s", returned, runErr, &diagnostics)
 			}

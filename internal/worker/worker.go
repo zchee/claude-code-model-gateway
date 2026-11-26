@@ -17,6 +17,7 @@ package worker
 
 import (
 	"errors"
+	"io"
 	"net"
 	"net/http"
 
@@ -25,7 +26,10 @@ import (
 )
 
 // Forward handles a classified request using the same catalog generation and the original body bytes.
-type Forward func(http.ResponseWriter, *http.Request, route.Snapshot, route.Decision, []byte)
+type Forward func(http.ResponseWriter, *http.Request, route.Snapshot, route.Decision, []byte) ForwardResult
+
+// ForwardResult distinguishes requests handed upstream from branch-local refusals.
+type ForwardResult struct{ Forwarded bool }
 
 // Options supplies the worker's startup settings and its three upstream handlers.
 type Options struct {
@@ -34,6 +38,9 @@ type Options struct {
 	Routes                 *route.Store
 	Anthropic, Proxy, Grok Forward
 	BeginDrain             func()
+	Diagnostics            io.Writer
+	// StartRequest may attach request-scoped state before the first body read.
+	StartRequest func(*http.Request) *http.Request
 }
 
 // NewHandler constructs the handler shared by the TCP and Unix listeners.

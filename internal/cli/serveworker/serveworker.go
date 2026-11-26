@@ -23,7 +23,15 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/config"
 )
 
+// Options supplies startup dependencies without requiring process-global lookups.
+type Options struct {
+	Lookup         config.LookupEnv
+	Home, Cwd      func() (string, error)
+	Version        string
+	Stdout, Stderr io.Writer
+}
+
 // Run serves until drain, parent disconnect, or cancellation, returning a startup or serving error.
-func Run(ctx context.Context, lookup config.LookupEnv, stdout, stderr io.Writer) error {
+func Run(ctx context.Context, options Options) error {
 	return errors.New("not implemented")
 }
