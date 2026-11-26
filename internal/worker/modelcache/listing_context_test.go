@@ -20,12 +20,13 @@ import (
 	json "encoding/json/v2"
 	"maps"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	gocmp "github.com/google/go-cmp/cmp"
@@ -50,7 +51,12 @@ var (
 	}
 )
 
-func newProxyListingServer(t *testing.T, rows []idDisplay) *httptest.Server {
+const (
+	listingProxyURL   = "http://127.0.0.1:19991"
+	listingGatewayURL = "http://127.0.0.1:19999"
+)
+
+func proxyListingHandler(t *testing.T, rows []idDisplay) http.HandlerFunc {
 	t.Helper()
 	payload, err := json.Marshal(struct {
 		Data []idDisplay `json:"data"`
@@ -58,16 +64,15 @@ func newProxyListingServer(t *testing.T, rows []idDisplay) *httptest.Server {
 	if err != nil {
 		t.Fatalf("marshal proxy listing fixture: %v", err)
 	}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/models" {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.String() != listingProxyURL+"/v1/models" {
+			t.Errorf("unexpected listing fixture request: %s %s", r.Method, r.URL.Redacted())
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(payload)
-	}))
-	t.Cleanup(srv.Close)
-	return srv
+	}
 }
 
 func defaultGatewayWindows() policy.Windows {
@@ -226,16 +231,16 @@ func TestPublishedListingWindows(t *testing.T) {
 
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			proxySrv := newProxyListingServer(t, tt.proxyRows)
+			client := &http.Client{Transport: handlerTransport{handler: proxyListingHandler(t, tt.proxyRows)}}
 			_, lookup, resolver := newTestPaths(t, nil)
 			routes := &route.Store{}
 			cache, err := modelcache.New(modelcache.Options{
 				Lookup:         lookup,
 				Paths:          resolver,
 				Windows:        defaultGatewayWindows(),
-				ProxyBaseURL:   proxySrv.URL,
-				DefaultBaseURL: "http://127.0.0.1:19999",
-				Client:         newTestClient(t),
+				ProxyBaseURL:   listingProxyURL,
+				DefaultBaseURL: listingGatewayURL,
+				Client:         client,
 				Routes:         routes,
 				Sentry:         &sentry.State{},
 			})
@@ -282,9 +287,157 @@ func TestPublishedListingWindows(t *testing.T) {
 	}
 }
 
-func TestDiscoveryCacheRespellsProxyFable(t *testing.T) {
-	const defaultURL = "http://127.0.0.1:19999"
+func checkListingDiscovery(t *testing.T, home, stage string, wantFetchedAt int64, want []idDisplay) []idDisplay {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(home, ".claude", "cache", "gateway-models.json"))
+	if err != nil {
+		t.Fatalf("%s: read discovery cache: %v", stage, err)
+	}
+	var keys map[string]jsontext.Value
+	if err := json.Unmarshal(raw, &keys); err != nil {
+		t.Fatalf("%s: unmarshal discovery cache keys: %v", stage, err)
+	}
+	if diff := gocmp.Diff([]string{"baseUrl", "fetchedAt", "models"}, slices.Sorted(maps.Keys(keys))); diff != "" {
+		t.Errorf("%s: discovery cache keys mismatch (-want +got):\n%s", stage, diff)
+	}
+	var doc struct {
+		BaseURL   string      `json:"baseUrl"`
+		FetchedAt int64       `json:"fetchedAt"`
+		Models    []idDisplay `json:"models"`
+	}
+	if err := json.Unmarshal(raw, &doc, json.RejectUnknownMembers(true)); err != nil {
+		t.Fatalf("%s: unmarshal discovery cache: %v", stage, err)
+	}
+	if doc.BaseURL != listingGatewayURL || doc.FetchedAt != wantFetchedAt {
+		t.Errorf("%s: discovery header = (%q, %d), want (%q, %d)", stage, doc.BaseURL, doc.FetchedAt, listingGatewayURL, wantFetchedAt)
+	}
+	if diff := gocmp.Diff(want, doc.Models); diff != "" {
+		t.Errorf("%s: discovery cache models mismatch (-want +got):\n%s", stage, diff)
+	}
+	return doc.Models
+}
 
+func TestDiscoveryCacheDuringRefresh(t *testing.T) {
+	tests := map[string]struct {
+		initial, replacement         []idDisplay
+		wantInitial, wantReplacement []idDisplay
+	}{
+		"success: removed collision changes discovery only after publication": {
+			initial: []idDisplay{
+				{ID: "vertex/anthropic/claude-fable-5-2", DisplayName: "vertex/anthropic/claude-fable-5-2 (vertex)"},
+				{ID: "vertex/anthropic/fable-5-2", DisplayName: "vertex/anthropic/fable-5-2 (vertex)"},
+			},
+			replacement: []idDisplay{
+				{ID: "vertex/anthropic/claude-fable-5-2", DisplayName: "vertex/anthropic/claude-fable-5-2 (vertex)"},
+				{ID: "local/gguf", DisplayName: "local/gguf (local)"},
+			},
+			wantInitial: slices.Concat(defaultGrokDiscoveryRows, []idDisplay{
+				{ID: "claude-vertex/anthropic/claude-fable-5-2[1m]", DisplayName: "vertex/anthropic/claude-fable-5-2 (Vertex AI)"},
+				{ID: "claude-vertex/anthropic/fable-5-2", DisplayName: "vertex/anthropic/fable-5-2 (Vertex AI)"},
+			}),
+			wantReplacement: slices.Concat(defaultGrokDiscoveryRows, []idDisplay{
+				{ID: "claude-vertex/anthropic/fable-5-2[1m]", DisplayName: "vertex/anthropic/claude-fable-5-2 (Vertex AI)"},
+				{ID: "claude-local/gguf", DisplayName: "local/gguf (Local GGUF)"},
+			}),
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				initial := proxyListingHandler(t, tt.initial)
+				replacement := proxyListingHandler(t, tt.replacement)
+				var replacing bool
+				paused, release := make(chan struct{}), make(chan struct{})
+				signalPause := sync.OnceFunc(func() { close(paused) })
+				resume := sync.OnceFunc(func() { close(release) })
+				handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if !replacing {
+						initial(w, r)
+						return
+					}
+					if r.Method != http.MethodGet || r.URL.String() != "http://127.0.0.1:19992/props" {
+						replacement(w, r)
+						return
+					}
+					// This probe requires a row from the new listing, but precedes its publication.
+					signalPause()
+					select {
+					case <-release:
+					case <-r.Context().Done():
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"default_generation_settings":{"n_ctx":65536}}`))
+				})
+				home, lookup, resolver := newTestPaths(t, map[string]string{"CCP_LLAMA_PORT": "19992"})
+				nowMs := int64(1700000000000)
+				routes := &route.Store{}
+				cache, err := modelcache.New(modelcache.Options{
+					Lookup:           lookup,
+					Paths:            resolver,
+					Windows:          defaultGatewayWindows(),
+					ProxyBaseURL:     listingProxyURL,
+					DefaultBaseURL:   listingGatewayURL,
+					Client:           &http.Client{Transport: handlerTransport{handler: handler}},
+					Clock:            func() time.Time { return time.UnixMilli(nowMs) },
+					Routes:           routes,
+					Sentry:           &sentry.State{},
+					EffectiveBaseURL: baseURLFunc(listingGatewayURL),
+				})
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				if err := cache.Refresh(t.Context()); err != nil {
+					t.Fatalf("initial Refresh: %v", err)
+				}
+				checkListingDiscovery(t, home, "after initial Refresh", 1700000000000, tt.wantInitial)
+				snap, ok := routes.Load()
+				if !ok {
+					t.Fatal("no published catalog after initial Refresh")
+				}
+				_, raw := snap.Catalog()
+				var published []idDisplay
+				if err := json.Unmarshal(raw, &published); err != nil {
+					t.Fatalf("decode initial catalog: %v", err)
+				}
+				if diff := gocmp.Diff(tt.wantInitial, published); diff != "" {
+					t.Fatalf("published collision rows mismatch (-want +got):\n%s", diff)
+				}
+
+				replacing = true
+				nowMs = 1700000005000
+				done := make(chan struct{})
+				var refreshErr error
+				go func() {
+					defer close(done)
+					refreshErr = cache.Refresh(t.Context())
+				}()
+				defer func() {
+					resume()
+					<-done
+				}()
+				select {
+				case <-paused:
+				case <-done:
+					t.Fatalf("replacement Refresh returned before the local probe: %v", refreshErr)
+				}
+				forced, err := cache.SyncDiscoveryCache(true)
+				if err != nil || forced.State != "wrote" {
+					t.Fatalf("forced discovery sync during local probe = %+v, %v; want wrote", forced, err)
+				}
+				checkListingDiscovery(t, home, "during local probe", 1700000005000, tt.wantInitial)
+				resume()
+				<-done
+				if refreshErr != nil {
+					t.Fatalf("replacement Refresh: %v", refreshErr)
+				}
+				checkListingDiscovery(t, home, "after replacement Refresh", 1700000005000, tt.wantReplacement)
+			})
+		})
+	}
+}
+
+func TestDiscoveryCacheRespellsProxyFable(t *testing.T) {
 	tests := map[string]struct {
 		proxyRows           []idDisplay
 		wantPublished       []modelRow
@@ -336,7 +489,7 @@ func TestDiscoveryCacheRespellsProxyFable(t *testing.T) {
 
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			proxySrv := newProxyListingServer(t, tt.proxyRows)
+			client := &http.Client{Transport: handlerTransport{handler: proxyListingHandler(t, tt.proxyRows)}}
 			home, lookup, resolver := newTestPaths(t, nil)
 			routes := &route.Store{}
 			nowMs := int64(1700000000000)
@@ -345,13 +498,13 @@ func TestDiscoveryCacheRespellsProxyFable(t *testing.T) {
 				Lookup:           lookup,
 				Paths:            resolver,
 				Windows:          defaultGatewayWindows(),
-				ProxyBaseURL:     proxySrv.URL,
-				DefaultBaseURL:   defaultURL,
-				Client:           newTestClient(t),
+				ProxyBaseURL:     listingProxyURL,
+				DefaultBaseURL:   listingGatewayURL,
+				Client:           client,
 				Clock:            func() time.Time { return time.UnixMilli(nowMs) },
 				Routes:           routes,
 				Sentry:           &sentry.State{},
-				EffectiveBaseURL: baseURLFunc(defaultURL),
+				EffectiveBaseURL: baseURLFunc(listingGatewayURL),
 			})
 			if err != nil {
 				t.Fatalf("New: %v", err)
@@ -359,6 +512,8 @@ func TestDiscoveryCacheRespellsProxyFable(t *testing.T) {
 			if err := cache.Refresh(t.Context()); err != nil {
 				t.Fatalf("Refresh: %v", err)
 			}
+
+			persistedInitial := checkListingDiscovery(t, home, "after Refresh", 1700000000000, tt.wantDiscovery)
 
 			snap, ok := routes.Load()
 			if !ok {
@@ -382,39 +537,6 @@ func TestDiscoveryCacheRespellsProxyFable(t *testing.T) {
 				t.Errorf("GET /v1/models rows mismatch (-want +got):\n%s", diff)
 			}
 
-			cachePath := filepath.Join(home, ".claude", "cache", "gateway-models.json")
-			readDiscovery := func(stage string, wantFetchedAt int64) []idDisplay {
-				t.Helper()
-				raw, err := os.ReadFile(cachePath)
-				if err != nil {
-					t.Fatalf("%s: read discovery cache: %v", stage, err)
-				}
-				var keys map[string]jsontext.Value
-				if err := json.Unmarshal(raw, &keys); err != nil {
-					t.Fatalf("%s: unmarshal discovery cache keys: %v", stage, err)
-				}
-				if diff := gocmp.Diff([]string{"baseUrl", "fetchedAt", "models"}, slices.Sorted(maps.Keys(keys))); diff != "" {
-					t.Errorf("%s: discovery cache keys mismatch (-want +got):\n%s", stage, diff)
-				}
-				var doc struct {
-					BaseURL   string      `json:"baseUrl"`
-					FetchedAt int64       `json:"fetchedAt"`
-					Models    []idDisplay `json:"models"`
-				}
-				if err := json.Unmarshal(raw, &doc); err != nil {
-					t.Fatalf("%s: unmarshal discovery cache: %v", stage, err)
-				}
-				if doc.BaseURL != defaultURL || doc.FetchedAt != wantFetchedAt {
-					t.Errorf("%s: discovery header = (%q, %d), want (%q, %d)", stage, doc.BaseURL, doc.FetchedAt, defaultURL, wantFetchedAt)
-				}
-				if diff := gocmp.Diff(tt.wantDiscovery, doc.Models); diff != "" {
-					t.Errorf("%s: discovery cache models mismatch (-want +got):\n%s", stage, diff)
-				}
-				return doc.Models
-			}
-
-			persistedInitial := readDiscovery("after Refresh", 1700000000000)
-
 			nowMs = 1700000005000
 			forced, err := cache.SyncDiscoveryCache(true)
 			if err != nil {
@@ -423,7 +545,7 @@ func TestDiscoveryCacheRespellsProxyFable(t *testing.T) {
 			if forced.State != "wrote" {
 				t.Errorf("SyncDiscoveryCache(true) state = %q, want %q", forced.State, "wrote")
 			}
-			persistedForced := readDiscovery("after SyncDiscoveryCache(true)", 1700000005000)
+			persistedForced := checkListingDiscovery(t, home, "after SyncDiscoveryCache(true)", 1700000005000, tt.wantDiscovery)
 
 			if tt.forbidReservedFable {
 				for _, row := range publishedRows {
