@@ -69,13 +69,16 @@ func TestDecodeWireMalformedMemberName(t *testing.T) {
 			if err == nil {
 				t.Fatal("accepted object with malformed member name")
 			}
+			synErr, gotSyntactic := errors.AsType[*jsontext.SyntacticError](err)
+			if gotSyntactic && synErr == nil {
+				t.Fatal("matched nil *jsontext.SyntacticError")
+			}
+			if diff := gocmp.Diff(tt.wantSyntactic, gotSyntactic); diff != "" {
+				t.Errorf("SyntacticError (-want +got) for err=%v:\n%s", err, diff)
+			}
 			_, gotDepth := errors.AsType[*jsonx.WireDepthError](err)
 			if diff := gocmp.Diff(tt.wantDepth, gotDepth); diff != "" {
 				t.Errorf("WireDepthError (-want +got) for err=%v:\n%s", err, diff)
-			}
-			synErr, gotSyntactic := errors.AsType[*jsontext.SyntacticError](err)
-			if diff := gocmp.Diff(tt.wantSyntactic, gotSyntactic); diff != "" {
-				t.Errorf("SyntacticError (-want +got) for err=%v:\n%s", err, diff)
 			}
 			if diff := gocmp.Diff(tt.wantNonStringName, errors.Is(err, jsontext.ErrNonStringName)); diff != "" {
 				t.Errorf("errors.Is(err, ErrNonStringName) (-want +got) for err=%v:\n%s", err, diff)

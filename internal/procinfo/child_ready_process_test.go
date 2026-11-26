@@ -46,7 +46,12 @@ func TestChildWithoutReadyEcho(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+			// The re-executed test binary runs TestMain's venue check before this test: three
+			// sequential system queries on Linux (account lookup plus two port listener checks;
+			// macOS runs two, caching one listener snapshot for both ports), each bounded by a
+			// 10s timeout and 1s wait delay, followed by startChild's 5s readiness deadline and
+			// 7s for process start and teardown (3*11s + 5s + 7s = 45s).
+			ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
 			defer cancel()
 			cmd := exec.CommandContext(ctx, binary, "-test.run=^TestChildWithoutReadyEcho$")
 			cmd.Env = []string{"LC_ALL=C", "PATH=/usr/bin:/bin", fixture + "=" + name}
