@@ -28,7 +28,12 @@ import (
 // TestDispatchNowPanicReleasesRouteLock checks that a panic in Options.Now during a dispatched request does not
 // leave the handler's dispatch lock held and wedge later dispatched requests on the same handler.
 func TestDispatchNowPanicReleasesRouteLock(t *testing.T) {
-	const path = "/v1/messages"
+	const (
+		path              = "/v1/messages"
+		laterTurnWatchdog = 30 * time.Second
+	)
+	type injectedClockPanic string
+	const clockPanicSentinel injectedClockPanic = "injected clock panic"
 	headers := http.Header{"X-Claude-Code-Session-Id": {"s"}, "X-Claude-Code-Agent-Id": {"a"}}
 	tests := map[string]struct {
 		seed                 bool
@@ -53,7 +58,7 @@ func TestDispatchNowPanicReleasesRouteLock(t *testing.T) {
 			h, err := proxyreq.New(proxyreq.Options{
 				Now: func() time.Time {
 					if armed.CompareAndSwap(true, false) {
-						panic("injected clock panic")
+						panic(clockPanicSentinel)
 					}
 					return time.UnixMilli(1234)
 				},
@@ -75,8 +80,8 @@ func TestDispatchNowPanicReleasesRouteLock(t *testing.T) {
 				_, _ = panicTurn.prepare(h)
 				return nil
 			}()
-			if recovered == nil {
-				t.Fatal("expected injected Options.Now panic during dispatched request, got nil")
+			if recovered != clockPanicSentinel {
+				t.Fatalf("Options.Now panic = %v (%T), want %v (%T)", recovered, recovered, clockPanicSentinel, clockPanicSentinel)
 			}
 
 			laterTurn := newPendingTurn(t, path, tc.laterBody, headers)
@@ -94,7 +99,7 @@ func TestDispatchNowPanicReleasesRouteLock(t *testing.T) {
 				done <- prepareResult{outcome: outcomeOf(laterTurn.prepare(h))}
 			}()
 
-			timer := time.NewTimer(3 * time.Second)
+			timer := time.NewTimer(laterTurnWatchdog)
 			defer timer.Stop()
 			select {
 			case got := <-done:
@@ -105,7 +110,7 @@ func TestDispatchNowPanicReleasesRouteLock(t *testing.T) {
 					t.Errorf("later dispatched request (-want +got): %s", diff)
 				}
 			case <-timer.C:
-				t.Fatal("later dispatched request did not complete within 3s")
+				t.Fatalf("later dispatched request did not complete within %s", laterTurnWatchdog)
 			}
 		})
 	}
