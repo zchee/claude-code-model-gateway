@@ -16,6 +16,7 @@ package wiring_test
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -205,4 +206,50 @@ func migrateRegisteredHooks(t *testing.T) {
 	equal(t, []map[string]any{object(t, encoded(t, want))}, shape.Hooks.UserPromptSubmit[0].Hooks)
 	absent(t, f.user)
 	equal(t, original, text(t, unregistered))
+}
+
+func TestWiringUnregisteredProjectHookUntouched(t *testing.T) {
+	tests := map[string]struct {
+		url string
+	}{
+		"success: unregistered default-wired projects stay untouched while registered project migrates": {url: direct},
+		"success: unregistered legacy-wired projects stay untouched while registered project migrates":  {url: compat},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			f := sandbox(t)
+			regProject := t.TempDir()
+			regLocal := filepath.Join(regProject, ".claude", "settings.local.json")
+			regOriginal, regWant := firstHookSettings(t, f)
+			put(t, regLocal, regOriginal)
+			put(t, f.registry, encoded(t, map[string]any{"projects": []string{regProject}}))
+
+			unregisteredContent := strings.Replace(regOriginal, direct, tt.url, 1)
+			otherLocal := filepath.Join(t.TempDir(), ".claude", "settings.local.json")
+			unregisteredFiles := []string{f.local, f.shared, otherLocal}
+			beforeInfo := make([]os.FileInfo, len(unregisteredFiles))
+			for i, file := range unregisteredFiles {
+				put(t, file, unregisteredContent)
+				info, err := os.Stat(file)
+				check(t, err)
+				beforeInfo[i] = info
+			}
+
+			check(t, f.MigrateReadinessHooks())
+
+			// The registered project in the same run must be migrated so the test cannot pass by doing nothing.
+			migrated := text(t, regLocal)
+			equal(t, regWant, migrated)
+			equal(t, true, f.ReadinessHookPresent([]byte(migrated)))
+
+			for i, file := range unregisteredFiles {
+				equal(t, unregisteredContent, text(t, file))
+				afterInfo, err := os.Stat(file)
+				check(t, err)
+				equal(t, true, os.SameFile(beforeInfo[i], afterInfo))
+				equal(t, false, f.ReadinessHookPresent([]byte(text(t, file))))
+			}
+			absent(t, f.user)
+		})
+	}
 }

@@ -312,3 +312,60 @@ func TestLatchWithoutExpiry(t *testing.T) {
 		check(t, &s, "armed", m, first, sentry.Crossing{Usage: 110, Trigger: 100})
 	})
 }
+
+func TestSentryStateRetention(t *testing.T) {
+	const (
+		idlePeriod    = 30 * 24 * time.Hour
+		otherSessions = 2000
+	)
+	tests := map[string]struct {
+		mode string
+	}{
+		"success: armed session retained after idle period and session churn":       {mode: "armed"},
+		"success: fired latch retained after idle period and session churn":         {mode: "fired"},
+		"success: below-trigger usage retained after idle period and session churn": {mode: "below"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var s sentry.State
+				m := model()
+				key := sentry.SessionKey(true, "session-retained-"+tt.mode, nil)
+				switch tt.mode {
+				case "armed":
+					observe(&s, key, m, 105, false)
+				case "fired":
+					observe(&s, key, m, 108, false)
+					check(t, &s, key, m, first, sentry.Crossing{Usage: 108, Trigger: 100})
+				case "below":
+					observe(&s, key, m, 85, false)
+				}
+
+				time.Sleep(idlePeriod)
+				for i := range otherSessions {
+					other := sentry.SessionKey(true, fmt.Sprintf("other-session-%d", i), nil)
+					observe(&s, other, m, 101, false)
+					check(t, &s, other, m, first, sentry.Crossing{Usage: 101, Trigger: 100})
+				}
+				time.Sleep(idlePeriod)
+
+				switch tt.mode {
+				case "armed":
+					check(t, &s, key, m, first, sentry.Crossing{Usage: 105, Trigger: 100})
+				case "fired":
+					// If the fired entry had been evicted, observing usage above the trigger
+					// would arm a fresh entry and cause Check to refuse again.
+					observe(&s, key, m, 109, false)
+					check(t, &s, key, m, first, sentry.Crossing{})
+					if got := s.Overflow(key, m, false); got != 109 {
+						t.Errorf("Overflow(%q) = %v, want 109", key, got)
+					}
+				case "below":
+					if got := s.Overflow(key, m, false); got != 85 {
+						t.Errorf("Overflow(%q) = %v, want 85", key, got)
+					}
+				}
+			})
+		})
+	}
+}
