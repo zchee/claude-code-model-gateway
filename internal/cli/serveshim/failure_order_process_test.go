@@ -28,10 +28,12 @@ import (
 	"maps"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -47,17 +49,20 @@ const (
 	orderControlKey = "FAILURE_ORDER_CONTROL"
 	// orderMisreportKey, when set, makes the child report a port other than its configured one as soon as it starts.
 	orderMisreportKey = "FAILURE_ORDER_MISREPORT"
-	// orderLingerKey, when set, keeps the child running after its supervisor disconnected it, until the supervisor
-	// signals it. The supervisor waits a few seconds for a disconnected worker to exit before it signals, so that its
-	// stop stays in progress for that long.
+	// orderLingerKey, when set, keeps the child running after its supervisor disconnected it, until the test releases
+	// it or the supervisor kills it. The child ignores SIGTERM, so the supervisor's stop stays in progress for both of
+	// its exit waits, and the child answers "alive" on the control socket while it still runs.
 	orderLingerKey = "FAILURE_ORDER_LINGER"
 	// stopGuard bounds the wait for a supervisor's stop, which includes the wait for a lingering worker.
 	stopGuard = 20 * time.Second
+	// reportTimeoutText is the supervisor's diagnostic for a worker that did not report its listener in time.
+	reportTimeoutText = "model-gateway: shim worker did not report its listener port within 5000ms"
 )
 
 // orderChild is the worker the supervisor under test starts through the launcher script. It never reports the port it
 // was configured with: it reports another one when orderMisreportKey is set, and nothing otherwise. It says "parent
-// gone" on the control socket when its supervisor disconnects it.
+// gone" on the control socket when its supervisor disconnects it. On the control socket it answers "alive?" with
+// "alive" and exits on "release" or when the test closes the socket.
 func orderChild(ctx context.Context, control string) error {
 	generation := os.Getenv("MODEL_GATEWAY_WORKER_GENERATION")
 	if generation == "" || os.Getenv("MODEL_GATEWAY_CONTROL_FDS") != "3,4" {
@@ -94,6 +99,9 @@ func orderChild(ctx context.Context, control string) error {
 		}
 	}
 	_, linger := os.LookupEnv(orderLingerKey)
+	if linger {
+		signal.Ignore(syscall.SIGTERM)
+	}
 	go func() {
 		_, _ = io.Copy(io.Discard, live)
 		send("parent gone")
@@ -101,8 +109,16 @@ func orderChild(ctx context.Context, control string) error {
 			os.Exit(0)
 		}
 	}()
-	// The test ends a lingering child by closing its control socket, if the supervisor has not signalled it already.
-	_, _ = io.Copy(io.Discard, conn)
+	commands := bufio.NewScanner(conn)
+	for commands.Scan() {
+		switch commands.Text() {
+		case "alive?":
+			send("alive")
+		case "release":
+			os.Exit(0)
+		}
+	}
+	// The test closed its control socket.
 	os.Exit(0)
 	return nil
 }
@@ -278,30 +294,13 @@ func (s *orderedShim) awaitStop(t *testing.T) {
 	}
 }
 
-// diagnosticLines splits what the supervisor printed on stderr into lines and checks that each one is complete and
-// carries the "model-gateway: " prefix exactly once, at its start.
-func diagnosticLines(t *testing.T, stderr string) []string {
-	t.Helper()
-	if stderr == "" {
-		return nil
-	}
-	if !strings.HasSuffix(stderr, "\n") {
-		t.Errorf("stderr does not end with a complete line: %q", stderr)
-	}
-	lines := strings.Split(strings.TrimSuffix(stderr, "\n"), "\n")
-	for _, line := range lines {
-		if !strings.HasPrefix(line, "model-gateway: ") || strings.Count(line, "model-gateway:") != 1 {
-			t.Errorf("stderr line %q does not carry the \"model-gateway: \" prefix exactly once, at its start", line)
-		}
-	}
-	return lines
-}
-
 // TestReportTimeoutAgainstStop checks how a worker that never reports its listener and a stop request decide the
 // supervisor's outcome. A stop that comes first ends the supervisor with status 0 and nothing on stderr. A report
 // deadline that passes first stops it with the timeout, which Run returns and does not print itself. When the stop
-// request arrives at the deadline, either may win, but the timeout is seen at most once: returned by Run, or printed
-// once as a warning while Run returns nil.
+// request arrives at the deadline, either may win, and only these outcomes are accepted: the stop came first (status
+// 0, nothing on stderr); the timeout came first (Run returns exactly the timeout, nothing on stderr); or the timeout
+// was decided but the stop won the selection of the reason to stop (status 0, the timeout printed once as a warning,
+// and nothing else). Any other error or line fails the case.
 //
 // Which side wins at the deadline is decided by the scheduler. These requests straddle the deadline so that both
 // orders occur; a timeout that is decided and then neither returned nor printed cannot be told apart from a stop
@@ -336,8 +335,8 @@ func TestReportTimeoutAgainstStop(t *testing.T) {
 			s := startOrderedShim(t, nil)
 			s.awaitReady(t)
 			s.awaitStop(t)
-			if s.result == nil {
-				t.Error("supervisor stopped with exit status 0; want the report timeout")
+			if s.result == nil || s.result.Error() != reportTimeoutText {
+				t.Errorf("supervisor stopped with %v; want exactly the report timeout %q", s.result, reportTimeoutText)
 			}
 			// The error Run returns is printed by its caller; a copy here would print it twice.
 			if diff := gocmp.Diff("", s.stderr.String()); diff != "" {
@@ -361,12 +360,16 @@ func TestReportTimeoutAgainstStop(t *testing.T) {
 				at.Stop()
 			}
 			s.awaitStop(t)
-			lines := diagnosticLines(t, s.stderr.String())
+			stderr := s.stderr.String()
 			switch {
-			case s.result != nil && len(lines) != 0:
-				t.Errorf("Run returned %q and also printed %d line(s); a returned failure is printed by the caller only:\n%s", s.result, len(lines), s.stderr)
-			case s.result == nil && len(lines) > 1:
-				t.Errorf("Run returned nil and printed %d lines; want at most one warning for the timeout:\n%s", len(lines), s.stderr)
+			case s.result == nil && stderr == "":
+				// The stop came first.
+			case s.result != nil && s.result.Error() == reportTimeoutText && stderr == "":
+				// The timeout came first; the caller of Run prints it.
+			case s.result == nil && stderr == reportTimeoutText+"\n":
+				// The timeout was decided, and the stop won the selection; the timeout is printed once as a warning.
+			default:
+				t.Errorf("supervisor stopped with %v and stderr %q; want nil and nothing on stderr, exactly the report timeout %q and nothing on stderr, or nil and that timeout printed once as the only line", s.result, stderr, reportTimeoutText)
 			}
 		}}
 	}
