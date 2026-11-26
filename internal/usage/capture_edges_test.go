@@ -77,6 +77,36 @@ func findEvents(records []usage.Record, name string) []usage.Record {
 	return out
 }
 
+func compareRecords(t *testing.T, label string, want, got usage.Record) {
+	t.Helper()
+	if diff := gocmp.Diff(want.EventName, got.EventName); diff != "" {
+		t.Errorf("%s EventName (-want +got):\n%s", label, diff)
+	}
+	if !want.ObservedAt.Equal(got.ObservedAt) {
+		t.Errorf("%s ObservedAt = %v, want %v", label, got.ObservedAt, want.ObservedAt)
+	}
+	if diff := gocmp.Diff(want.TraceID, got.TraceID); diff != "" {
+		t.Errorf("%s TraceID (-want +got):\n%s", label, diff)
+	}
+	if diff := gocmp.Diff(want.SpanID, got.SpanID); diff != "" {
+		t.Errorf("%s SpanID (-want +got):\n%s", label, diff)
+	}
+	if diff := gocmp.Diff(want.Attributes, got.Attributes); diff != "" {
+		t.Errorf("%s Attributes (-want +got):\n%s", label, diff)
+	}
+	wantOTLP, err := want.OTLP()
+	if err != nil {
+		t.Fatalf("%s want.OTLP(): %v", label, err)
+	}
+	gotOTLP, err := got.OTLP()
+	if err != nil {
+		t.Fatalf("%s got.OTLP(): %v", label, err)
+	}
+	if diff := gocmp.Diff([]byte(wantOTLP), []byte(gotOTLP)); diff != "" {
+		t.Errorf("%s OTLP (-want +got):\n%s", label, diff)
+	}
+}
+
 func TestCaptureFinishCallbackRecovery(t *testing.T) {
 	tests := map[string]struct {
 		status    int
@@ -157,9 +187,7 @@ func TestCaptureFinishCallbackRecovery(t *testing.T) {
 				if diff := gocmp.Diff(tt.wantVal, first.Attributes[tt.wantAttr]); diff != "" {
 					t.Errorf("Attributes[%q] (-want +got):\n%s", tt.wantAttr, diff)
 				}
-				if diff := gocmp.Diff(*first, emitted, gocmp.AllowUnexported(usage.Record{})); diff != "" {
-					t.Errorf("emitted record (-returned +emitted):\n%s", diff)
-				}
+				compareRecords(t, "emitted record", *first, emitted)
 			}
 			if tt.reentrant && nested != nil {
 				t.Errorf("reentrant Finish returned %+v, want nil", nested)
@@ -233,9 +261,7 @@ func TestCaptureFinishConcurrent(t *testing.T) {
 			if len(returned) != 1 {
 				t.Fatalf("non-nil Finish results = %d, want 1", len(returned))
 			}
-			if diff := gocmp.Diff(*returned[0], emitted, gocmp.AllowUnexported(usage.Record{})); diff != "" {
-				t.Errorf("emitted record (-returned +emitted):\n%s", diff)
-			}
+			compareRecords(t, "emitted record", *returned[0], emitted)
 			if again, p := callFinishGuarded(c); p != nil || again != nil {
 				t.Errorf("trailing Finish = (%+v, panic=%v), want (nil, nil)", again, p)
 			}
@@ -413,7 +439,8 @@ func TestStandaloneCaptureDerivesNoFootprints(t *testing.T) {
 				c := usage.NewCapture(usage.NewBuilder(opts), usage.Request{Body: decodeWire(t, body)}, 0, func(r usage.Record) { emitted = append(emitted, r) })
 				c.SetResponse(http.StatusOK, http.Header{"Request-Id": {"provider-capture"}})
 				c.ObserveJSON([]byte(`{"usage":{"input_tokens":100,"output_tokens":5}}`))
-				return c.Finish(), emitted, rng.read
+				record := c.Finish()
+				return record, emitted, rng.read
 			}
 
 			nativeRec, nativeEmitted, nativeRandomBytes := runCapture(nativeOnlyBody)
@@ -442,10 +469,11 @@ func TestStandaloneCaptureDerivesNoFootprints(t *testing.T) {
 func TestCaptureBodyImmutability(t *testing.T) {
 	const requestJSON = `{"system":"short system","tools":[{"name":"Read","description":"native"},{"name":"mcp__alpha__claim","description":"alpha tool"}],"messages":[{"role":"user","content":"first msg"},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"res"}]}]}`
 	tests := map[string]struct {
-		bodyBytes int64
+		bodyBytes     int64
+		wantBodyBytes int64
 	}{
-		"success: explicit body bytes and composition survive body mutation": {bodyBytes: int64(len(requestJSON))},
-		"success: measured compact body size survives body mutation":         {bodyBytes: -1},
+		"success: explicit body bytes and composition survive body mutation": {bodyBytes: 999, wantBodyBytes: 999},
+		"success: measured compact body size survives body mutation":         {bodyBytes: -1, wantBodyBytes: 267},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -493,27 +521,31 @@ func TestCaptureBodyImmutability(t *testing.T) {
 			if refRec == nil || mutRec == nil {
 				t.Fatalf("got records (%+v, %+v), want both non-nil", refRec, mutRec)
 			}
-			for _, attr := range []string{
-				"request_body_bytes",
-				"input_system_bytes",
-				"input_tools_bytes",
-				"input_native_tools_bytes",
-				"input_mcp_tools_bytes",
-				"input_messages_bytes",
-				"input_first_message_bytes",
-				"input_history_bytes",
-				"input_tool_results_bytes",
-				"input_tools_tokens",
-				"input_native_tools_tokens",
-				"input_mcp_tools_tokens",
-				"input_mcp_tools_alpha_tokens",
-				"input_system_tokens",
-				"input_first_message_tokens",
-				"input_history_tokens",
-				"input_tool_results_tokens",
-			} {
-				if diff := gocmp.Diff(refRec.Attributes[attr], mutRec.Attributes[attr]); diff != "" {
-					t.Errorf("Attributes[%q] (-unmutated +mutated):\n%s", attr, diff)
+			wantAttrs := map[string]any{
+				"request_body_bytes":           tt.wantBodyBytes,
+				"input_system_bytes":           int64(14),
+				"input_tools_bytes":            int64(96),
+				"input_native_tools_bytes":     int64(38),
+				"input_mcp_tools_bytes":        int64(55),
+				"input_messages_bytes":         int64(125),
+				"input_first_message_bytes":    int64(37),
+				"input_history_bytes":          int64(85),
+				"input_tool_results_bytes":     int64(57),
+				"input_tools_tokens":           float64(207),
+				"input_native_tools_tokens":    float64(85),
+				"input_mcp_tools_tokens":       float64(122),
+				"input_mcp_tools_alpha_tokens": float64(122),
+				"input_system_tokens":          float64(30),
+				"input_first_message_tokens":   float64(80),
+				"input_history_tokens":         float64(183),
+				"input_tool_results_tokens":    float64(120),
+			}
+			for attr, want := range wantAttrs {
+				if diff := gocmp.Diff(want, refRec.Attributes[attr]); diff != "" {
+					t.Errorf("unmutated Attributes[%q] (-want +got):\n%s", attr, diff)
+				}
+				if diff := gocmp.Diff(want, mutRec.Attributes[attr]); diff != "" {
+					t.Errorf("mutated Attributes[%q] (-want +got):\n%s", attr, diff)
 				}
 			}
 			if _, leaked := mutRec.Attributes["input_mcp_tools_mutated_tokens"]; leaked {
@@ -889,6 +921,214 @@ func TestCaptureJSONPrimitiveCoercionFailure(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestCaptureJSONCoercionKeepsIdentity checks parity with lib/usage-observability.js lines
+// 743-748 and 770-775, where observeIdentity runs before mergeUsage so the first safe response id
+// and model are retained even when numeric conversion fails and drops usage and response mode.
+func TestCaptureJSONCoercionKeepsIdentity(t *testing.T) {
+	const (
+		throwingDoc = `{"id":"msg-kept-first","model":"claude-kept-first","usage":{"input_tokens":15,"extra":{"toString":null}}}`
+		followUpDoc = `{"id":"msg-second","model":"claude-second","usage":{"input_tokens":20,"output_tokens":3}}`
+	)
+	tests := map[string]struct {
+		chunked      bool
+		followUp     string
+		status       int
+		headers      http.Header
+		wantEvent    string
+		wantID       string
+		wantIDSrc    string
+		wantModel    string
+		wantMode     any
+		wantInputTok any
+	}{
+		"success: ObserveJSON keeps id and model on limit signal when usage coercion fails": {
+			status:    http.StatusTooManyRequests,
+			headers:   http.Header{"Retry-After": {"2"}},
+			wantEvent: "gateway.limit.signal",
+			wantID:    "msg-kept-first",
+			wantIDSrc: "message_id",
+			wantModel: "claude-kept-first",
+			wantMode:  nil,
+		},
+		"success: ObserveChunk keeps id and model on limit signal when usage coercion fails": {
+			chunked:   true,
+			status:    http.StatusTooManyRequests,
+			headers:   http.Header{"Retry-After": {"2"}},
+			wantEvent: "gateway.limit.signal",
+			wantID:    "msg-kept-first",
+			wantIDSrc: "message_id",
+			wantModel: "claude-kept-first",
+			wantMode:  nil,
+		},
+		"success: ObserveJSON keeps first id and model across a subsequent valid JSON document": {
+			followUp:     followUpDoc,
+			status:       http.StatusOK,
+			wantEvent:    "gateway.token.usage",
+			wantID:       "msg-kept-first",
+			wantIDSrc:    "message_id",
+			wantModel:    "claude-kept-first",
+			wantMode:     "json",
+			wantInputTok: float64(20),
+		},
+		"success: ObserveJSON keeps first id and model when followed by an SSE event": {
+			status:       http.StatusOK,
+			wantEvent:    "gateway.token.usage",
+			wantID:       "msg-kept-first",
+			wantIDSrc:    "message_id",
+			wantModel:    "claude-kept-first",
+			wantMode:     "sse",
+			wantInputTok: float64(9),
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			c := usage.NewCapture(usage.NewBuilder(newTestOptions(t)), usage.Request{Body: decodeWire(t, `{}`), Backend: "anthropic"}, 0, nil)
+			c.SetResponse(tt.status, tt.headers.Clone())
+			if tt.chunked {
+				mid := len(throwingDoc) / 2
+				c.ObserveChunk([]byte(throwingDoc[:mid]))
+				c.ObserveChunk([]byte(throwingDoc[mid:]))
+			} else {
+				c.ObserveJSON([]byte(throwingDoc))
+				if diff := gocmp.Diff(any(nil), c.Snapshot()["input_tokens"]); diff != "" {
+					t.Errorf("Snapshot input_tokens after throwing JSON (-want +got):\n%s", diff)
+				}
+			}
+			if tt.followUp != "" {
+				c.ObserveJSON([]byte(tt.followUp))
+			} else if tt.wantMode == "sse" {
+				c.ObserveEvent(decodeWire(t, `{"type":"message_start","message":{"id":"msg-sse","model":"claude-sse","usage":{"input_tokens":9,"output_tokens":1}}}`))
+			}
+
+			rec := c.Finish()
+			if rec == nil {
+				t.Fatalf("Finish returned nil, want %q", tt.wantEvent)
+			}
+			for attr, want := range map[string]any{
+				"event_name":        tt.wantEvent,
+				"request_id":        tt.wantID,
+				"request_id_source": tt.wantIDSrc,
+				"model":             tt.wantModel,
+				"response_mode":     tt.wantMode,
+			} {
+				if diff := gocmp.Diff(want, rec.Attributes[attr]); diff != "" {
+					t.Errorf("Attributes[%q] (-want +got):\n%s", attr, diff)
+				}
+			}
+			if tt.wantInputTok != nil {
+				if diff := gocmp.Diff(tt.wantInputTok, rec.Attributes["input_tokens"]); diff != "" {
+					t.Errorf("Attributes[input_tokens] (-want +got):\n%s", diff)
+				}
+			}
+		})
+	}
+}
+
+// TestCaptureJSONCoercionBoundaries verifies the exact coercion edges of numericTree in
+// lib/usage-observability.js lines 535-558: array element stringification, the depth-6 traversal
+// ceiling, a usage root carrying its own toString member, __proto__ properties evaluated before
+// merge skipping, and valueOf alone without own toString.
+func TestCaptureJSONCoercionBoundaries(t *testing.T) {
+	tests := map[string]struct {
+		doc      string
+		wantDrop bool
+	}{
+		"error: array element object with own toString drops JSON observation": {
+			doc:      `{"usage":{"input_tokens":15,"extra":[{"toString":null}]}}`,
+			wantDrop: true,
+		},
+		"error: nested array element object with own toString drops JSON observation": {
+			doc:      `{"usage":{"input_tokens":15,"extra":[1,[2,{"toString":"bad"}]]}}`,
+			wantDrop: true,
+		},
+		"success: array containing ordinary object with nested toString merges": {
+			doc:      `{"usage":{"input_tokens":15,"extra":[{"nested":{"toString":null}}]}}`,
+			wantDrop: false,
+		},
+		"error: object with own toString at depth-6 entry drops JSON observation": {
+			doc:      `{"usage":{"input_tokens":15,"d1":{"d2":{"d3":{"d4":{"d5":{"d6":{"d7":{"toString":null}}}}}}}}}`,
+			wantDrop: true,
+		},
+		"success: object with own toString past depth-6 boundary merges": {
+			doc:      `{"usage":{"input_tokens":15,"d1":{"d2":{"d3":{"d4":{"d5":{"d6":{"d7":{"d8":{"toString":null}}}}}}}}}}`,
+			wantDrop: false,
+		},
+		"success: usage root with own null toString merges without drop": {
+			doc:      `{"usage":{"input_tokens":15,"toString":null}}`,
+			wantDrop: false,
+		},
+		"success: usage root with own string toString merges without drop": {
+			doc:      `{"usage":{"input_tokens":15,"toString":"bad"}}`,
+			wantDrop: false,
+		},
+		"error: __proto__ object with own toString drops JSON observation": {
+			doc:      `{"usage":{"input_tokens":15,"__proto__":{"toString":null}}}`,
+			wantDrop: true,
+		},
+		"error: nested object under __proto__ with own toString drops JSON observation": {
+			doc:      `{"usage":{"input_tokens":15,"__proto__":{"nested":{"toString":null}}}}`,
+			wantDrop: true,
+		},
+		"success: __proto__ without toString merges without drop": {
+			doc:      `{"usage":{"input_tokens":15,"__proto__":{}}}`,
+			wantDrop: false,
+		},
+		"success: sibling object with null valueOf alone merges without drop": {
+			doc:      `{"usage":{"input_tokens":15,"extra":{"valueOf":null}}}`,
+			wantDrop: false,
+		},
+		"success: sibling object with string valueOf alone merges without drop": {
+			doc:      `{"usage":{"input_tokens":15,"extra":{"valueOf":"1"}}}`,
+			wantDrop: false,
+		},
+	}
+	for name, tt := range tests {
+		for _, chunked := range []bool{false, true} {
+			mode := "ObserveJSON"
+			if chunked {
+				mode = "ObserveChunk"
+			}
+			t.Run(name+"/"+mode, func(t *testing.T) {
+				c := usage.NewCapture(usage.NewBuilder(newTestOptions(t)), usage.Request{Body: decodeWire(t, `{}`)}, 0, nil)
+				c.SetResponse(http.StatusOK, nil)
+				if chunked {
+					mid := len(tt.doc) / 2
+					c.ObserveChunk([]byte(tt.doc[:mid]))
+					c.ObserveChunk([]byte(tt.doc[mid:]))
+				} else {
+					c.ObserveJSON([]byte(tt.doc))
+					var wantSnap any = float64(15)
+					if tt.wantDrop {
+						wantSnap = nil
+					}
+					if diff := gocmp.Diff(wantSnap, c.Snapshot()["input_tokens"]); diff != "" {
+						t.Errorf("Snapshot input_tokens (-want +got):\n%s", diff)
+					}
+				}
+				rec := c.Finish()
+				if tt.wantDrop {
+					if rec != nil {
+						t.Errorf("Finish returned %+v, want nil", rec)
+					}
+					return
+				}
+				if rec == nil {
+					t.Fatal("Finish returned nil, want gateway.token.usage record")
+				}
+				if diff := gocmp.Diff("gateway.token.usage", rec.EventName); diff != "" {
+					t.Errorf("EventName (-want +got):\n%s", diff)
+				}
+				if diff := gocmp.Diff(any(float64(15)), rec.Attributes["input_tokens"]); diff != "" {
+					t.Errorf("input_tokens (-want +got):\n%s", diff)
+				}
+				if diff := gocmp.Diff(any("json"), rec.Attributes["response_mode"]); diff != "" {
+					t.Errorf("response_mode (-want +got):\n%s", diff)
+				}
+			})
+		}
 	}
 }
 

@@ -15,7 +15,6 @@
 package sentry_test
 
 import (
-	"bytes"
 	"encoding/json/jsontext"
 	"testing"
 	"unicode/utf16"
@@ -33,79 +32,83 @@ func TestRawMergeUsagePassthrough(t *testing.T) {
 		invalidPrev  = "  {not valid json\t\n"
 	)
 	tests := map[string]struct {
-		previous jsontext.Value
-		event    jsontext.Value
-		want     jsontext.Value
+		previous string
+		event    string
+		want     string
 	}{
 		"success: content delta preserves unusual whitespace verbatim": {
-			previous: jsontext.Value(spacedPrev),
-			event:    jsontext.Value(`{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}`),
-			want:     jsontext.Value(spacedPrev),
+			previous: spacedPrev,
+			event:    `{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}`,
+			want:     spacedPrev,
 		},
 		"success: content delta preserves invalid previous spelling verbatim": {
-			previous: jsontext.Value(invalidPrev),
-			event:    jsontext.Value(`{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}`),
-			want:     jsontext.Value(invalidPrev),
+			previous: invalidPrev,
+			event:    `{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}`,
+			want:     invalidPrev,
 		},
 		"success: ping preserves unnormalized previous bytes verbatim": {
-			previous: jsontext.Value(unsortedPrev),
-			event:    jsontext.Value(`{"type":"ping"}`),
-			want:     jsontext.Value(unsortedPrev),
+			previous: unsortedPrev,
+			event:    `{"type":"ping"}`,
+			want:     unsortedPrev,
 		},
 		"success: message delta without usage preserves unusual whitespace verbatim": {
-			previous: jsontext.Value(spacedPrev),
-			event:    jsontext.Value(`{"type":"message_delta"}`),
-			want:     jsontext.Value(spacedPrev),
+			previous: spacedPrev,
+			event:    `{"type":"message_delta"}`,
+			want:     spacedPrev,
 		},
 		"success: message delta with scalar usage preserves invalid previous spelling verbatim": {
-			previous: jsontext.Value(invalidPrev),
-			event:    jsontext.Value(`{"type":"message_delta","usage":13}`),
-			want:     jsontext.Value(invalidPrev),
+			previous: invalidPrev,
+			event:    `{"type":"message_delta","usage":13}`,
+			want:     invalidPrev,
 		},
 		"success: message delta with null usage preserves unusual whitespace verbatim": {
-			previous: jsontext.Value(spacedPrev),
-			event:    jsontext.Value(`{"type":"message_delta","usage":null}`),
-			want:     jsontext.Value(spacedPrev),
+			previous: spacedPrev,
+			event:    `{"type":"message_delta","usage":null}`,
+			want:     spacedPrev,
 		},
 		"success: message start without nested usage ignores outer usage and preserves invalid spelling": {
-			previous: jsontext.Value(invalidPrev),
-			event:    jsontext.Value(`{"type":"message_start","usage":{"input_tokens":5},"message":{}}`),
-			want:     jsontext.Value(invalidPrev),
+			previous: invalidPrev,
+			event:    `{"type":"message_start","usage":{"input_tokens":5},"message":{}}`,
+			want:     invalidPrev,
 		},
 		"success: malformed event preserves invalid previous spelling verbatim": {
-			previous: jsontext.Value(invalidPrev),
-			event:    jsontext.Value(`{"type":"message_delta"`),
-			want:     jsontext.Value(invalidPrev),
+			previous: invalidPrev,
+			event:    `{"type":"message_delta"`,
+			want:     invalidPrev,
 		},
 		"success: null event preserves unusual whitespace verbatim": {
-			previous: jsontext.Value(spacedPrev),
-			event:    jsontext.Value(`null`),
-			want:     jsontext.Value(spacedPrev),
+			previous: spacedPrev,
+			event:    `null`,
+			want:     spacedPrev,
 		},
-		"success: usable delta normalizes top level once onto spaced previous": {
-			previous: jsontext.Value(spacedPrev),
-			event:    jsontext.Value(`{"type":"message_delta","usage":{"output_tokens":9,"0":1}}`),
-			want:     jsontext.Value(`{"0":1,"input_tokens":3,"output_tokens":9}`),
+		"success: usable delta normalizes top level onto spaced previous": {
+			previous: spacedPrev,
+			event:    `{"type":"message_delta","usage":{"output_tokens":9,"0":1}}`,
+			want:     `{"0":1,"input_tokens":3,"output_tokens":9}`,
 		},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			got := sentry.MergeUsage(tt.previous, tt.event)
-			if !bytes.Equal(got, tt.want) {
-				t.Errorf("MergeUsage bytes mismatch:\nwant: %q\ngot:  %q", string(tt.want), string(got))
+			prev := jsontext.Value(tt.previous)
+			event := jsontext.Value(tt.event)
+			got := sentry.MergeUsage(prev, event)
+			if diff := gocmp.Diff([]byte(tt.want), []byte(got)); diff != "" {
+				t.Errorf("MergeUsage bytes (-want +got):\n%s", diff)
 			}
 		})
 	}
 }
 
 func TestWireMergeUsagePassthrough(t *testing.T) {
-	unnormalized := jsonx.WireValue{
-		Kind: '{',
-		Members: []jsonx.Member{
-			{Name: utf16.Encode([]rune("z")), Value: jsonx.WireValue{Kind: '0', Number: 1}},
-			{Name: utf16.Encode([]rune("0")), Value: jsonx.WireValue{Kind: '0', Number: 2}},
-			{Name: utf16.Encode([]rune("z")), Value: jsonx.WireValue{Kind: '0', Number: 3}},
-		},
+	newUnnormalized := func() jsonx.WireValue {
+		return jsonx.WireValue{
+			Kind: '{',
+			Members: []jsonx.Member{
+				{Name: utf16.Encode([]rune("z")), Value: jsonx.WireValue{Kind: '0', Number: 1}},
+				{Name: utf16.Encode([]rune("0")), Value: jsonx.WireValue{Kind: '0', Number: 2}},
+				{Name: utf16.Encode([]rune("z")), Value: jsonx.WireValue{Kind: '0', Number: 3}},
+			},
+		}
 	}
 	tests := map[string]struct {
 		event string
@@ -117,13 +120,18 @@ func TestWireMergeUsagePassthrough(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
+			prev := newUnnormalized()
+			want := newUnnormalized()
 			ev, err := jsonx.DecodeWire([]byte(tt.event))
 			if err != nil {
 				t.Fatalf("DecodeWire(%q): %v", tt.event, err)
 			}
-			got := sentry.MergeWireUsage(unnormalized, ev)
-			if diff := gocmp.Diff(unnormalized, got); diff != "" {
+			got := sentry.MergeWireUsage(prev, ev)
+			if diff := gocmp.Diff(want, got); diff != "" {
 				t.Errorf("MergeWireUsage modified previous (-want +got):\n%s", diff)
+			}
+			if diff := gocmp.Diff(want, prev); diff != "" {
+				t.Errorf("MergeWireUsage mutated caller previous (-want +got):\n%s", diff)
 			}
 		})
 	}
