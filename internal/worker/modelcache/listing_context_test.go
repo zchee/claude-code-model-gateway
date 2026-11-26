@@ -328,8 +328,8 @@ func (f listingRoundTrip) RoundTrip(r *http.Request) (*http.Response, error) { r
 type witnessedBody struct {
 	body      io.ReadCloser
 	remaining int64
-	eof       *atomic.Bool
-	closed    *atomic.Bool
+	eof       atomic.Bool
+	completed *atomic.Bool
 }
 
 func (w *witnessedBody) Read(p []byte) (int, error) {
@@ -343,7 +343,9 @@ func (w *witnessedBody) Read(p []byte) (int, error) {
 
 func (w *witnessedBody) Close() error {
 	err := w.body.Close()
-	w.closed.Store(true)
+	if err == nil && w.eof.Load() {
+		w.completed.Store(true)
+	}
 	return err
 }
 
@@ -376,9 +378,9 @@ func TestDiscoveryCacheDuringRefresh(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				initial := proxyListingHandler(t, tt.initial)
 				replacement := proxyListingHandler(t, tt.replacement)
-				var replacing, listingEOF, listingClosed atomic.Bool
+				var replacing, listingCompleted atomic.Bool
 				paused, release := make(chan bool, 1), make(chan struct{})
-				signalPause := sync.OnceFunc(func() { paused <- listingEOF.Load() && listingClosed.Load() })
+				signalPause := sync.OnceFunc(func() { paused <- listingCompleted.Load() })
 				resume := sync.OnceFunc(func() { close(release) })
 				transport := listingRoundTrip(func(r *http.Request) (*http.Response, error) {
 					if !replacing.Load() {
@@ -393,7 +395,7 @@ func TestDiscoveryCacheDuringRefresh(t *testing.T) {
 						remaining := int64(rec.Body.Len())
 						resp := rec.Result()
 						resp.Request = r
-						resp.Body = &witnessedBody{body: resp.Body, remaining: remaining, eof: &listingEOF, closed: &listingClosed}
+						resp.Body = &witnessedBody{body: resp.Body, remaining: remaining, completed: &listingCompleted}
 						return resp, nil
 					}
 					if r.Method != http.MethodGet || r.URL.String() != "http://127.0.0.1:19992/props" {
@@ -415,14 +417,34 @@ func TestDiscoveryCacheDuringRefresh(t *testing.T) {
 				home, lookup, resolver := newTestPaths(t, map[string]string{"CCP_LLAMA_PORT": "19992"})
 				nowMs := int64(1700000000000)
 				routes := &route.Store{}
+				checkSnapshot := func(stage, surface string, snapshot route.Snapshot, wantRows []idDisplay, wantBackend string) {
+					t.Helper()
+					source, raw := snapshot.Catalog()
+					if source != "proxy" {
+						t.Errorf("%s: %s catalog source = %q, want proxy", stage, surface, source)
+					}
+					var published []idDisplay
+					if err := json.Unmarshal(raw, &published); err != nil {
+						t.Errorf("%s: decode %s catalog: %v", stage, surface, err)
+						return
+					}
+					if diff := gocmp.Diff(wantRows, published); diff != "" {
+						t.Errorf("%s: %s catalog mismatch (-want +got):\n%s", stage, surface, diff)
+					}
+					owner, ok := snapshot.ProxyID("claude-vertex/anthropic/fable-5-2[1m]")
+					if !ok || owner.ID != wantBackend || owner.Provider != "vertex" {
+						t.Errorf("%s: %s alias route = %+v, %t; want vertex backend %q", stage, surface, owner, ok, wantBackend)
+					}
+				}
 				publisher := &observingRoutes{
 					store:  routes,
 					mu:     new(sync.Mutex),
 					events: new([]pubEvent),
-					onPublish: func(route.Snapshot) {
+					onPublish: func(snapshot route.Snapshot) {
 						if !replacing.Load() {
 							return
 						}
+						checkSnapshot("before route publication", "forwarded snapshot", snapshot, tt.wantReplacement, "vertex/anthropic/claude-fable-5-2")
 						raw, err := os.ReadFile(filepath.Join(home, ".claude", "cache", "gateway-models.json"))
 						var doc struct {
 							BaseURL   string      `json:"baseUrl"`
@@ -454,25 +476,6 @@ func TestDiscoveryCacheDuringRefresh(t *testing.T) {
 				})
 				if err != nil {
 					t.Fatalf("New: %v", err)
-				}
-				checkSnapshot := func(stage, surface string, snapshot route.Snapshot, wantRows []idDisplay, wantBackend string) {
-					t.Helper()
-					source, raw := snapshot.Catalog()
-					if source != "proxy" {
-						t.Errorf("%s: %s catalog source = %q, want proxy", stage, surface, source)
-					}
-					var published []idDisplay
-					if err := json.Unmarshal(raw, &published); err != nil {
-						t.Errorf("%s: decode %s catalog: %v", stage, surface, err)
-						return
-					}
-					if diff := gocmp.Diff(wantRows, published); diff != "" {
-						t.Errorf("%s: %s catalog mismatch (-want +got):\n%s", stage, surface, diff)
-					}
-					owner, ok := snapshot.ProxyID("claude-vertex/anthropic/fable-5-2[1m]")
-					if !ok || owner.ID != wantBackend || owner.Provider != "vertex" {
-						t.Errorf("%s: %s alias route = %+v, %t; want vertex backend %q", stage, surface, owner, ok, wantBackend)
-					}
 				}
 				if err := cache.Refresh(t.Context()); err != nil {
 					t.Fatalf("initial Refresh: %v", err)

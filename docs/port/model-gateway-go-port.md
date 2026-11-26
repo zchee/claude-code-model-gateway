@@ -1457,7 +1457,7 @@ The phase table separates frozen tests from implementation and binary proof; ver
 producer-identified conformance export for each cumulative gate.
 
 After the discovery-cache review: recorded when a removed alias collision changes the persisted picker ID. While the
-replacement is pending, a forced write keeps the old spelling; after a successful refresh, the discovery file contains
+replacement is pending, a forced write keeps the old spelling; after a successful wired refresh, the discovery file contains
 the replacement spelling with the display name unchanged. The two frozen replacement tests cover that transition and
 the unchanged steady-state display name.
 
