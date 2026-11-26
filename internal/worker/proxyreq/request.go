@@ -65,6 +65,7 @@ type Result struct {
 }
 
 // Handler owns one worker's dispatch cache and shared request settings.
+// A Handler must not be copied after New.
 type Handler struct {
 	// routesMu makes each request's dispatch decision (its explicit binding, or its own lookup, parent lookup
 	// and inherited write) one step, so concurrent turns of a session end as some serial order would leave them.
@@ -177,21 +178,7 @@ func (h *Handler) Prepare(w http.ResponseWriter, r *http.Request, snapshot route
 		id = requestIdentity(r.Header, payload)
 		var marked *dispatch.Route
 		marked, markers = dispatch.FromWireMessages(memberValue(payload, "messages"))
-		h.routesMu.Lock()
-		switch {
-		case markers == 1 && marked != nil:
-			chosen = &dispatch.CachedRoute{Route: *marked}
-			h.routes.Set(id.key, *chosen)
-			via = "dispatch"
-		case markers == 0:
-			if chosen = h.routes.Get(id.key); chosen != nil {
-				via = "dispatch-cached"
-			} else if chosen = h.routes.Get(id.parentKey); chosen != nil {
-				h.routes.Set(id.key, *chosen)
-				inheritedID, via = id.parentAgentID, "dispatch-inherited"
-			}
-		}
-		h.routesMu.Unlock()
+		chosen, via, inheritedID = h.decideDispatch(id, marked, markers)
 		if chosen == nil {
 			res.Route.Via = "dispatch"
 			res.Audit = id.audit(outcome.Audit{Backend: provider, Model: new(advertised), Via: "dispatch-unbound", MarkersLength: new(markers)})
@@ -239,6 +226,31 @@ func (h *Handler) Prepare(w http.ResponseWriter, r *http.Request, snapshot route
 	res.SessionKey = sentry.SessionKey(h.sentryEnabled, headerValue(r.Header, sessionHeader), optionalHeader(r.Header, agentHeader))
 	res.Target = h.target(snapshot.Resolver(), model)
 	return res, nil
+}
+
+// decideDispatch binds or looks up a session route, returning the chosen route, its via label and any
+// inherited parent agent ID. A request with more than one marker does not depend on the cache and takes no lock.
+func (h *Handler) decideDispatch(id identity, marked *dispatch.Route, markers int) (*dispatch.CachedRoute, string, string) {
+	if markers > 1 {
+		return nil, "", ""
+	}
+	h.routesMu.Lock()
+	defer h.routesMu.Unlock()
+	switch {
+	case markers == 1 && marked != nil:
+		chosen := &dispatch.CachedRoute{Route: *marked}
+		h.routes.Set(id.key, *chosen)
+		return chosen, "dispatch", ""
+	case markers == 0:
+		if chosen := h.routes.Get(id.key); chosen != nil {
+			return chosen, "dispatch-cached", ""
+		}
+		if chosen := h.routes.Get(id.parentKey); chosen != nil {
+			h.routes.Set(id.key, *chosen)
+			return chosen, "dispatch-inherited", id.parentAgentID
+		}
+	}
+	return nil, "", ""
 }
 
 // target resolves the sentry policy of the effective model with the backend's saved window settings.
