@@ -189,6 +189,8 @@ func wireCoercionValue(value jsonx.WireValue) any {
 		}
 	}
 	// Objects and arrays with multiple entries do not produce a numeric value.
+	// Values whose coercion throws a JavaScript TypeError (such as an object
+	// with a null toString or an array containing it) leave the hold active.
 	return math.NaN()
 }
 

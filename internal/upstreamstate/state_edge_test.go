@@ -108,6 +108,17 @@ func TestStateDecisionMembers(t *testing.T) {
 			unavailableJSON: `null`,
 			block:           &upstreamstate.Blocked{State: "upstream-blocked"},
 		},
+		// The source throws a TypeError when either value cannot be coerced to a primitive.
+		"success: object with null toString keeps the hold active": {
+			blockJSON:       `{"state":"upstream-blocked","expiresAtMs":{"toString":null}}`,
+			unavailableJSON: `null`,
+			block:           &upstreamstate.Blocked{State: "upstream-blocked"},
+		},
+		"success: array with noncoercible object keeps the hold active": {
+			blockJSON:       `{"state":"upstream-blocked","expiresAtMs":[{"toString":null}]}`,
+			unavailableJSON: `null`,
+			block:           &upstreamstate.Blocked{State: "upstream-blocked"},
+		},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
