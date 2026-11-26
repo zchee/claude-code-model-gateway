@@ -67,6 +67,12 @@ func openDirCreate(path string, perm fs.FileMode, afterOpen func(string)) (*Dir,
 // rules as [OpenDirCreate], and returns the final directory as a readable file.
 // The caller owns the file and must close it. Use this for directory-relative
 // system calls not offered by [Dir]; otherwise prefer [OpenDirCreate].
+//
+// File.Name returns the original spelling of path for diagnostics; after a rename
+// it may no longer name the held directory. Enumerate with File.Readdirnames and
+// use descriptor-relative calls for metadata: DirEntry.Info from File.ReadDir
+// may call Lstat by path. Keep the file open and alive until the last use of its
+// raw descriptor (for example, call runtime.KeepAlive afterward).
 func OpenDirectoryFile(path string, perm fs.FileMode) (*os.File, error) {
 	return openDirectoryFile(path, perm, nil)
 }

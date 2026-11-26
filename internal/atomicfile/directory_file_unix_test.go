@@ -104,6 +104,25 @@ func TestOpenDirectoryFileErrorsCloseDescriptors(t *testing.T) {
 			}
 		})
 	}
+	t.Run("panic: after opening final component", func(t *testing.T) {
+		const sentinel = "final directory opened"
+		defer func() {
+			if got := recover(); got != sentinel {
+				t.Errorf("hook panic: got %v, want %v", got, sentinel)
+			}
+		}()
+		f, err := openDirectoryFile("parent/final", 0o700, func(component string) {
+			if component == "final" {
+				panic(sentinel)
+			}
+		})
+		if f != nil {
+			_ = f.Close()
+		}
+		if err != nil {
+			t.Error(err)
+		}
+	})
 	// Check only this walk's directories: other process descriptors may change independently.
 	fdDir := "/dev/fd"
 	if runtime.GOOS == "linux" {
@@ -113,7 +132,7 @@ func TestOpenDirectoryFileErrorsCloseDescriptors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{".", "parent", "parent/readonly"} {
+	for _, path := range []string{".", "parent", "parent/readonly", "parent/final"} {
 		var want unix.Stat_t
 		if err := unix.Stat(path, &want); err != nil {
 			t.Fatal(err)
