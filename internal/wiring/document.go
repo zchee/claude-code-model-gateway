@@ -16,12 +16,14 @@ package wiring
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io/fs"
 	"math"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"unicode/utf16"
@@ -106,8 +108,45 @@ func readSettingsForWrite(file string) (document, error) {
 // is not created as an empty object.
 var errUnchanged = errors.New("settings unchanged")
 
+// missingDocument is what the settings replacement hands an edit in place of a file that does not exist.
+const missingDocument = "{}"
+
+// settingsMissing reports whether file has no directory entry. An existing file holding exactly the empty
+// object reaches an edit with the same bytes as a missing one, so the bytes alone cannot tell the two apart.
+// The parent is handed to the kernel in the spelling the settings replacement resolves, and the name is looked
+// up in that opened directory without following a link: a link, even a dangling one, is an existing entry.
+func settingsMissing(file string) (bool, error) {
+	parent, name := filepath.Split(file)
+	dir, err := atomicfile.OpenDir(cmp.Or(parent, "."))
+	if errors.Is(err, fs.ErrNotExist) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = dir.Close() }()
+	_, err = dir.ReadFile(name)
+	if err == nil {
+		return false, nil
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		return true, nil
+	}
+	if _, ok := errors.AsType[*atomicfile.NonRegularError](err); ok {
+		return false, nil
+	}
+	return false, err
+}
+
 // replace runs change on the current bytes of file inside the configured settings replacement. change may run
 // more than once when another writer modifies the file concurrently. It reports whether the file was written.
+//
+// An existing file is edited in place and keeps every byte the edits do not name, the bytes after the closing
+// brace included. A file this write creates has no authored bytes: it is written as the source writes settings,
+// JSON.stringify(settings, null, 2) followed by one newline (lib/settings-wiring.js:107-112). Whether the file
+// is being created is decided here, inside the replacement, and not by an earlier look at the path: the
+// replacement publishes the result only if its own re-read still finds the state it handed to this edit, so a
+// file that appears or disappears meanwhile sends the edit round again with the new state.
 func (s Store) replace(file string, change func(*document) error) (bool, error) {
 	replace := s.Replace
 	if replace == nil {
@@ -127,7 +166,17 @@ func (s Store) replace(file string, change func(*document) error) (bool, error) 
 		if bytes.Equal(doc.data, old) {
 			return nil, errUnchanged
 		}
-		return doc.data, nil
+		if string(old) != missingDocument {
+			return doc.data, nil
+		}
+		missing, err := settingsMissing(file)
+		if err != nil {
+			return nil, err
+		}
+		if !missing {
+			return doc.data, nil
+		}
+		return jsonx.EncodeState(doc.root)
 	})
 	if errors.Is(err, errUnchanged) {
 		return false, nil
