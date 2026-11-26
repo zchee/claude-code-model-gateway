@@ -267,6 +267,7 @@ func TestForegroundSupervisor(t *testing.T) {
 			if diff := gocmp.Diff(map[string]any{"supervisorPid": float64(guardian), "supervisorVersion": fixtureVersion, "proxyRecovery": true, "workerField": "preserved"}, health); diff != "" {
 				t.Fatalf("health (-want +got): %s", diff)
 			}
+			checkHostAsSent(t, port)
 			for {
 				// Read both entries without ReadRecord: its mirror repair would mask a missing write.
 				mirror, mirrorErr := os.ReadFile(filepath.Join(state, "shim.pid"))
@@ -321,6 +322,63 @@ func TestForegroundSupervisor(t *testing.T) {
 				t.Fatalf("worker did not see liveness EOF: %q, %v", eof, err)
 			}
 			checkLifecycle(t, state, guardian, int(child), tc.event)
+		})
+	}
+}
+
+// checkHostAsSent writes raw HTTP/1.1 to the supervisor's public port. net/http drops the Host header of an
+// absolute-form request before any handler runs, so only a listener path that keeps the header as sent refuses these.
+// The fixture worker answers 404 off /healthz and 200 on it, so a request that slips past the gate is visible.
+func checkHostAsSent(t *testing.T, port int) {
+	t.Helper()
+	public := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	type result struct {
+		Status    int
+		EmptyBody bool
+	}
+	refused := result{Status: http.StatusForbidden, EmptyBody: true}
+	tests := map[string]struct {
+		target string
+		header []string
+		want   result
+	}{
+		"error: absolute-form relay path with foreign Host": {"http://" + public + "/sample", []string{"Host: outside.invalid"}, refused},
+		"error: absolute-form health with foreign Host":     {"http://" + public + "/healthz", []string{"Host: outside.invalid"}, refused},
+		"error: Origin lines in mixed case on health":       {"/healthz", []string{"Host: " + public, "oRiGiN: ", "ORIGIN: null"}, refused},
+		"success: origin-form health with own Host":         {"/healthz", []string{"Host: " + public}, result{Status: http.StatusOK}},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			var dialer net.Dialer
+			conn, err := dialer.DialContext(t.Context(), "tcp4", public)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = conn.Close() }()
+			if err := conn.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			var head strings.Builder
+			fmt.Fprintf(&head, "GET %s HTTP/1.1\r\n", tc.target)
+			for _, line := range tc.header {
+				head.WriteString(line + "\r\n")
+			}
+			head.WriteString("Connection: close\r\n\r\n")
+			if _, err := io.WriteString(conn, head.String()); err != nil {
+				t.Fatal(err)
+			}
+			resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+			if err != nil {
+				t.Fatalf("read response to %q: %v", head.String(), err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			b, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if diff := gocmp.Diff(tc.want, result{Status: resp.StatusCode, EmptyBody: len(b) == 0}); diff != "" {
+				t.Errorf("request %q (-want +got):\n%s", head.String(), diff)
+			}
 		})
 	}
 }
