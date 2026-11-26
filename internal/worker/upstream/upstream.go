@@ -24,10 +24,13 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // ErrTimeout reports that an upstream connection exceeded its one-hour socket-inactivity deadline.
@@ -105,6 +108,17 @@ type Send func(context.Context) (*Response, error)
 // errClientClosed reports a request made on, or ended by, a closed Client.
 var errClientClosed = errors.New("upstream client closed")
 
+// errResponseFailed replaces an error from the response side of an exchange. net/http quotes the
+// upstream's bytes in some of those errors (a malformed status line, header line or framing
+// value), and the error reaches the client in a gateway error body.
+var errResponseFailed = errors.New("upstream response failed")
+
+// idlePoolTimeout is how long an unused pooled connection waits for its next request. It is shorter
+// than socketInactivity so that net/http evicts an idle connection under its own pool lock before
+// the inactivity deadline closes it, which could otherwise happen while a request carrying a body,
+// which net/http never retries, is taking the connection.
+const idlePoolTimeout = 55 * time.Minute
+
 // Client executes pooled HTTP/1.1 requests (up to 64 connections per host, 1-hour socket-inactivity
 // timeout) to upstream providers without environment proxy lookup, automatic decompression,
 // redirect following, or automatic replay of requests carrying a body.
@@ -137,13 +151,15 @@ func newTransport(opts Options, lifetime context.Context) *http.Transport {
 	protocols := new(http.Protocols)
 	protocols.SetHTTP1(true)
 	// Start from a zero Transport: no environment proxy, and no timer other than the socket
-	// inactivity deadline (the source sets no connect, handshake or idle-pool timeout).
+	// inactivity deadline and the idle-pool timeout below it (the source sets no separate connect
+	// or handshake timeout).
 	return &http.Transport{
 		DialContext:         inactivityDialer(opts.DialContext, lifetime),
 		TLSClientConfig:     tlsConfig,
 		DisableCompression:  true,
 		MaxConnsPerHost:     64,
 		MaxIdleConnsPerHost: 64,
+		IdleConnTimeout:     idlePoolTimeout,
 		Protocols:           protocols,
 	}
 }
@@ -160,7 +176,9 @@ func NewClient(opts Options) *Client {
 
 // Do sends req over the upstream transport and returns the upstream response.
 // ctx bounds the whole exchange, including reads of the returned Body; Close on the Client ends it
-// too. The caller owns the returned Body and must close it.
+// too. The caller owns the returned Body and must close it. A failure after the connection was
+// obtained is reported as one fixed error unless it is ErrTimeout, the context's cancellation or
+// deadline, or the client's closing, so no upstream bytes reach the error text.
 func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 	if c == nil || c.transport == nil {
 		return nil, errors.New("upstream client not constructed by NewClient")
@@ -179,10 +197,22 @@ func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 		stop()
 		cancel(nil)
 	}
-	resp, err := c.transport.RoundTrip(outbound.WithContext(reqCtx)) //nolint:bodyclose // The body is handed to the caller inside Response, which owns closing it.
+	// connected tells a failure of the attempt's connection setup (dial, TLS) from one after a
+	// connection was obtained; net/http starts a new attempt with GetConn when it retries.
+	var connected atomic.Bool
+	traced := httptrace.WithClientTrace(reqCtx, &httptrace.ClientTrace{
+		GetConn: func(string) { connected.Store(false) },
+		GotConn: func(httptrace.GotConnInfo) { connected.Store(true) },
+	})
+	resp, err := c.transport.RoundTrip(outbound.WithContext(traced)) //nolint:bodyclose // The body is handed to the caller inside Response, which owns closing it.
 	if err != nil {
 		release()
-		return nil, err
+		if c.lifetime.Err() != nil {
+			// Closing the client also closes its connections, and the transport can report the
+			// broken connection before it sees the cancelled request.
+			return nil, errClientClosed
+		}
+		return nil, exchangeError(err, connected.Load())
 	}
 
 	relay := ResponseHeaders(resp.Header)
@@ -207,6 +237,21 @@ func (c *Client) Close() error {
 	c.cancel()
 	c.transport.CloseIdleConnections()
 	return nil
+}
+
+// exchangeError keeps the identity of an error that cannot carry upstream bytes: a failure before
+// the attempt had a connection (dial, TLS handshake), the inactivity timeout, the request
+// context's cancellation or deadline, and the client's own closing. Every other error is replaced
+// by errResponseFailed, without inspecting its text.
+func exchangeError(err error, connected bool) error {
+	if !connected ||
+		errors.Is(err, ErrTimeout) ||
+		errors.Is(err, errClientClosed) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return errResponseFailed
 }
 
 // responseBody owns a live upstream response body and the request context bound to it.
@@ -253,8 +298,9 @@ func buildRequest(req Request) (*http.Request, error) {
 			return nil, err
 		}
 		header = make(http.Header, len(req.GrokHeaders))
-		for name, values := range req.GrokHeaders {
-			for _, value := range values {
+		// Sorted, so that names differing only in case merge in the same order every time.
+		for _, name := range slices.Sorted(maps.Keys(req.GrokHeaders)) {
+			for _, value := range req.GrokHeaders[name] {
 				header.Add(name, value)
 			}
 		}
