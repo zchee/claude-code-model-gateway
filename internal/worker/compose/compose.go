@@ -83,8 +83,8 @@ type Options struct {
 	// Windows holds per-backend context window caps and compaction thresholds.
 	Windows policy.Windows
 
-	// SentryEnabled controls request-side context-sentry refusals and upstream overflow
-	// normalization and learning. SentryEnvTrigger overrides derived triggers when positive.
+	// SentryEnabled controls request-side refusals and overflow learning, not error normalization.
+	// SentryEnvTrigger overrides derived triggers when positive.
 	SentryEnabled    bool
 	SentryEnvTrigger float64
 
@@ -121,20 +121,17 @@ type Options struct {
 	BeginDrain func()
 	// Diagnostics receives bounded classifier-refusal logs.
 	Diagnostics io.Writer
-	// NewMessageID optionally supplies message IDs for synthesized empty-completion replies.
-	NewMessageID func() string
 
 	// ReplyRetries and ReplyRetryDelay optionally override buffered reply retry defaults.
 	ReplyRetries    *int
 	ReplyRetryDelay *time.Duration
-	// HeartbeatInterval, FirstEventWait, and MaxObserveBytes optionally override SSE relay defaults.
+	// HeartbeatInterval optionally overrides the SSE heartbeat interval.
 	HeartbeatInterval time.Duration
-	FirstEventWait    time.Duration
-	MaxObserveBytes   int
 }
 
 // New validates opts and returns the worker.Options wired to all live branches, telemetry,
-// usage observation, catalog hooks, and readiness reporting.
+// usage observation, catalog hooks, and readiness reporting. New starts no goroutines, timers,
+// or catalog refreshes; the caller owns ModelCache.Start and ServiceContext cancellation.
 //
 // The composed branches enforce the worker lifetime contract: every upstream send and SSE relay
 // runs under ServiceContext, reply and compactguard receive the client request context, relays

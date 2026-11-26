@@ -15,13 +15,65 @@
 package compose_test
 
 import (
+	"context"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/zchee/claude-code-model-gateway/internal/worker/sentry"
 )
+
+type headerBarrier struct {
+	http.ResponseWriter
+	onHeader func()
+}
+
+func (w headerBarrier) WriteHeader(code int) { w.onHeader(); w.ResponseWriter.WriteHeader(code) }
+
+func (w headerBarrier) Write(p []byte) (int, error) { w.onHeader(); return w.ResponseWriter.Write(p) }
+
+func (h *harness) refusedTurn(body string, headers http.Header, backend string) (int, http.Header, []byte) {
+	h.t.Helper()
+	ctx, cancel := context.WithTimeout(h.t.Context(), 5*time.Second)
+	defer cancel()
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header = headers.Clone()
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	atHeader := make(chan struct{})
+	release := make(chan struct{})
+	resume := sync.OnceFunc(func() { close(release) })
+	done := make(chan struct{})
+	w := headerBarrier{rec, sync.OnceFunc(func() {
+		close(atHeader)
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+	})}
+	go func() { defer close(done); h.workerHandler.ServeHTTP(w, req) }()
+	defer func() { resume(); cancel(); waitSignal(h.t, "refusal handler cleanup", done, 6*time.Second) }()
+	waitSignal(h.t, "first refusal write", atHeader, 3*time.Second)
+	served, ok := h.healthz()["served"].(map[string]any)
+	if !ok {
+		h.t.Fatal("/healthz served missing or not an object")
+	}
+	audits := h.readAuditLines()
+	mustDiff(h.t, "served at refusal", float64(2), served[backend])
+	mustDiff(h.t, "audits at refusal", 2, len(audits))
+	mustDiff(h.t, "refused backend", backend, audits[1]["backend"])
+	resume()
+	waitSignal(h.t, "refusal completion", done, 3*time.Second)
+	mustDiff(h.t, "served unchanged after refusal", served, h.healthz()["served"])
+	mustDiff(h.t, "audits unchanged after refusal", audits, h.readAuditLines())
+	assertNoSecrets(h.t, "refusal", rec.Body.Bytes())
+	return rec.Code, rec.Header(), rec.Body.Bytes()
+}
 
 func TestAdmissionAndCounting(t *testing.T) {
 	t.Run("success: proxy accepted counts and logs at admission before upstream replies", func(t *testing.T) {
@@ -29,7 +81,7 @@ func TestAdmissionAndCounting(t *testing.T) {
 		markEntered := sync.OnceFunc(func() { close(entered) })
 		release := make(chan struct{})
 		unblock := sync.OnceFunc(func() { close(release) })
-		t.Cleanup(unblock)
+		defer unblock()
 
 		h := newHarness(t, harnessConfig{
 			proxyHandler: func(w http.ResponseWriter, r *http.Request) {
@@ -44,26 +96,7 @@ func TestAdmissionAndCounting(t *testing.T) {
 			},
 		})
 
-		type result struct {
-			status int
-		}
-		done := make(chan result, 1)
-		go func() {
-			status, _, _ := h.do(http.MethodPost, "/v1/messages", messageRequestJSON("claude-gpt-6.1-sol[1m]", false), http.Header{
-				"X-Claude-Code-Session-Id": {"session-admit-order"},
-			})
-			done <- result{status: status}
-		}()
-		t.Cleanup(func() {
-			unblock()
-			timer := time.NewTimer(3 * time.Second)
-			defer timer.Stop()
-			select {
-			case <-done:
-			case <-timer.C:
-				t.Error("in-flight proxy request did not exit during cleanup")
-			}
-		})
+		finish := h.startPost(messageRequestJSON("claude-gpt-6.1-sol[1m]", false), http.Header{"X-Claude-Code-Session-Id": {"session-admit-order"}}, unblock)
 
 		waitSignal(t, "proxy upstream entry", entered, 3*time.Second)
 
@@ -76,15 +109,7 @@ func TestAdmissionAndCounting(t *testing.T) {
 		mustDiff(t, "audit backend while in flight", any("codex"), midAudit[0]["backend"])
 
 		unblock()
-		var got result
-		timer := time.NewTimer(3 * time.Second)
-		defer timer.Stop()
-		select {
-		case got = <-done:
-		case <-timer.C:
-			t.Fatal("proxy request did not finish after release")
-		}
-		mustDiff(t, "proxy HTTP status", http.StatusOK, got.status)
+		mustDiff(t, "proxy HTTP status", http.StatusOK, finish())
 
 		// Completion must not log a second audit entry or increment served a second time.
 		h.telemetryRec.Wait()
@@ -102,20 +127,22 @@ func TestAdmissionAndCounting(t *testing.T) {
 			env:              map[string]string{"CODEX_GATEWAY_COMPACT_TRIGGER": "100"},
 			proxyHandler: func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "text/event-stream")
-				_, _ = io.WriteString(w, "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":30,\"cache_read_input_tokens\":50,\"cache_creation_input_tokens\":21,\"output_tokens\":2}}\n\n")
+				_, _ = io.WriteString(w, "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"input_tokens\":30,\"cache_read_input_tokens\":50,\"cache_creation_input_tokens\":21}}\n\n")
 				_, _ = io.WriteString(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 			},
 		})
 
-		body := messageRequestJSON("claude-gpt-5.6-sol", true)
-		hdrs := http.Header{"X-Claude-Code-Session-Id": {"sentry-codex-session"}}
+		body := `{"model":"claude-gpt-5.6-sol","max_tokens":1,"messages":[{"role":"user","content":"test"}]}`
+		hdrs := traced(traceOne)
+		hdrs.Set("X-Claude-Code-Session-Id", "sentry-test-session")
 
 		// Turn 1: exceeds trigger (30 + 50 + 21 = 101 > 100) and arms sentry.
 		s1, _, _ := h.do(http.MethodPost, "/v1/messages", body, hdrs)
 		mustDiff(t, "turn 1 status", http.StatusOK, s1)
 
 		// Turn 2: admitted (served.codex -> 2, audit -> 2), then refused locally by reply.WriteSentry with 413.
-		s2, respHdr, respRaw := h.do(http.MethodPost, "/v1/messages", body, hdrs)
+		hdrs.Set("Traceparent", traced(traceTwo).Get("Traceparent"))
+		s2, respHdr, respRaw := h.refusedTurn(body, hdrs, "codex")
 		mustDiff(t, "turn 2 sentry status", http.StatusRequestEntityTooLarge, s2)
 		if got := respHdr.Get("X-Model-Gateway-Upstream-Status"); got != "" {
 			t.Errorf("request-side sentry 413 must not set X-Model-Gateway-Upstream-Status, got %q", got)
@@ -140,7 +167,8 @@ func TestAdmissionAndCounting(t *testing.T) {
 		h.telemetryRec.Wait()
 		spans := decodeOTLPSpans(t, h.traceCollector.snapshot())
 		mustDiff(t, "exported route spans", 2, len(spans))
-		mustDiff(t, "turn 2 span status_code", int64(http.StatusRequestEntityTooLarge), spans[1].Attributes["status_code"])
+		assertSpan(t, spans, traceOne, "ok", http.StatusOK)
+		assertSpan(t, spans, traceTwo, "client_error", http.StatusRequestEntityTooLarge)
 	})
 
 	t.Run("success: grok sentry 413 uses reply writer, counts at admission, logs audit, and skips auth", func(t *testing.T) {
@@ -149,7 +177,7 @@ func TestAdmissionAndCounting(t *testing.T) {
 			env:              map[string]string{"CODEX_GATEWAY_COMPACT_TRIGGER": "100"},
 			grokHandler: func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = io.WriteString(w, `{"id":"resp_fixture","status":"completed","output":[],"usage":{"input_tokens":101,"output_tokens":1}}`)
+				_, _ = io.WriteString(w, `{"id":"resp_fixture","output":[],"usage":{"input_tokens":101}}`)
 			},
 		})
 
@@ -160,7 +188,9 @@ func TestAdmissionAndCounting(t *testing.T) {
 		mustDiff(t, "grok turn 1 status", http.StatusOK, s1)
 		authBefore := h.grokAuthHits.Load()
 
-		s2, respHdr, respRaw := h.do(http.MethodPost, "/v1/messages", body, hdrs)
+		// An early token lookup must refresh, even though inference is refused.
+		writeGrokAuthFile(t, h.dir, h.grokAuthSrv.URL, fixedClock().Add(-time.Hour))
+		s2, respHdr, respRaw := h.refusedTurn(body, hdrs, "grok")
 		mustDiff(t, "grok turn 2 sentry status", http.StatusRequestEntityTooLarge, s2)
 		if got := respHdr.Get("X-Model-Gateway-Upstream-Status"); got != "" {
 			t.Errorf("grok request-side sentry 413 must not set X-Model-Gateway-Upstream-Status, got %q", got)
@@ -192,7 +222,25 @@ func TestAdmissionAndCounting(t *testing.T) {
 		mustDiff(t, "grok audit entries", 2, len(audits))
 	})
 
-	localRefusals := map[string]struct {
+	t.Run("error: sentry refusal creates no request high-water record", func(t *testing.T) {
+		h := newHarness(t, harnessConfig{sentryEnvTrigger: 100, env: map[string]string{"CODEX_GATEWAY_COMPACT_TRIGGER": "100"}})
+		const session = "refused-first-request"
+		const model = "claude-gpt-5.6-sol"
+		snap, _ := h.modelCache.Snapshot()
+		target, err := sentry.ResolveTarget(snap.Resolver(), model, 100, 0, 0)
+		if err != nil {
+			t.Fatalf("sentry target: %v", err)
+		}
+		h.sentryState.Observe(sentry.SessionKey(true, session, nil), target, []byte(`{"type":"message_delta","usage":{"input_tokens":101}}`), true)
+		status, _, _ := h.do(http.MethodPost, "/v1/messages", messageRequestJSON(model, false), http.Header{"X-Claude-Code-Session-Id": {session}})
+		mustDiff(t, "sentry refusal", http.StatusRequestEntityTooLarge, status)
+		mustDiff(t, "provider contacts", int64(0), h.proxyHits.Load())
+		if _, err := os.Stat(h.highWaterPath(session)); !os.IsNotExist(err) {
+			t.Fatal("sentry refusal created high-water state")
+		}
+	})
+
+	tests := map[string]struct {
 		body             string
 		wantOverride     string
 		wantAuditEntries int
@@ -226,9 +274,10 @@ func TestAdmissionAndCounting(t *testing.T) {
 		},
 	}
 
-	for name, tt := range localRefusals {
+	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			h := newHarness(t, harnessConfig{})
+			before := h.healthz()["served"]
 			status, _, _ := h.do(http.MethodPost, "/v1/messages", tt.body, http.Header{
 				"X-Claude-Code-Session-Id": {"local-refusal-session"},
 			})
@@ -240,6 +289,10 @@ func TestAdmissionAndCounting(t *testing.T) {
 
 			health := h.healthz()
 			served, _ := health["served"].(map[string]any)
+			mustDiff(t, "all served counters unchanged", before, served)
+			if _, err := os.Stat(h.highWaterPath("local-refusal-session")); !os.IsNotExist(err) {
+				t.Fatal("unexpected high-water record for local refusal")
+			}
 			mustDiff(t, "served."+tt.servedKey, any(float64(0)), served[tt.servedKey])
 
 			h.telemetryRec.Wait()

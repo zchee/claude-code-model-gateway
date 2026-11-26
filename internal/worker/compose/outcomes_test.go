@@ -26,8 +26,15 @@ import (
 
 func TestTerminalOutcomesAndUsage(t *testing.T) {
 	t.Run("success: buffered proxy reply preserves headers, status, body and emits one span and one usage record", func(t *testing.T) {
+		var preparedSize atomic.Int64
 		h := newHarness(t, harnessConfig{
 			proxyHandler: func(w http.ResponseWriter, r *http.Request) {
+				n, err := io.Copy(io.Discard, r.Body)
+				if err != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				preparedSize.Store(n)
 				w.Header().Set("Content-Type", "application/json")
 				w.Header().Set("X-Custom-Relay", "preserved-value")
 				w.Header().Set("Request-Id", "req-buffered-1")
@@ -45,7 +52,16 @@ func TestTerminalOutcomesAndUsage(t *testing.T) {
 		mustDiff(t, "buffered Request-Id header", "req-buffered-1", hdr.Get("Request-Id"))
 
 		respObj := decodeJSONObject(t, body)
-		mustDiff(t, "rewritten response model", any("claude-gpt-6.1-sol[1m]"), respObj["model"])
+		wantBody := decodeJSONObject(t, []byte(`{"id":"msg_buf","type":"message","model":"claude-gpt-6.1-sol[1m]","stop_reason":"end_turn","content":[{"type":"text","text":"buffered hello"}],"usage":{"input_tokens":42,"output_tokens":9,"cache_read_input_tokens":10,"cache_creation_input_tokens":3}}`))
+		mustDiff(t, "entire buffered response", wantBody, respObj)
+		if preparedSize.Load() == 0 || preparedSize.Load() == int64(len(reqBody)) {
+			t.Fatal("fixture must distinguish prepared from original bytes")
+		}
+		raw, err := os.ReadFile(h.highWaterPath("session-buffered-1"))
+		if err != nil {
+			t.Fatal("missing accepted high-water record")
+		}
+		mustDiff(t, "prepared bytes at high-water", float64(preparedSize.Load()), decodeJSONObject(t, raw)["value"])
 
 		h.telemetryRec.Wait()
 		h.usageEmitter.Wait()
@@ -94,7 +110,7 @@ func TestTerminalOutcomesAndUsage(t *testing.T) {
 				if n <= 2 {
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(http.StatusForbidden)
-					_, _ = io.WriteString(w, `{"type":"error","error":{"type":"api_error","message":"failed to connect to websocket: HTTP 403 Forbidden"}}`)
+					_, _ = io.WriteString(w, upgradeRejection)
 					return
 				}
 				w.Header().Set("Content-Type", "application/json")
@@ -134,33 +150,32 @@ func TestTerminalOutcomesAndUsage(t *testing.T) {
 			},
 		})
 
-		directBody := messageRequestJSON("claude-gpt-5.6-sol", true)
+		directBody := `{"model":"claude-gpt-5.6-sol","max_tokens":1,"output_config":{"effort":"high"},"messages":[{"role":"user","content":"prompt-secret-must-not-enter-telemetry"}],"tools":[{"name":"PrivateTool","description":"tool-secret-must-not-enter-telemetry"}]}`
 		compactBody := compactRequestJSON("claude-gpt-5.6-sol")
 
-		s1, _, _ := h.do(http.MethodPost, "/v1/messages", directBody, nil)
+		s1, _, _ := h.do(http.MethodPost, "/v1/messages", directBody, traced(traceOne))
 		mustDiff(t, "request 1 status", http.StatusTooManyRequests, s1)
-		s2, _, _ := h.do(http.MethodPost, "/v1/messages", directBody, nil)
+		s2, _, _ := h.do(http.MethodPost, "/v1/messages", directBody, traced(traceTwo))
 		mustDiff(t, "request 2 status", http.StatusOK, s2)
-		s3, _, _ := h.do(http.MethodPost, "/v1/messages", compactBody, nil)
+		s3, _, _ := h.do(http.MethodPost, "/v1/messages", compactBody, traced(traceThree))
 		mustDiff(t, "request 3 status", http.StatusOK, s3)
 
 		h.telemetryRec.Wait()
 		spans := decodeOTLPSpans(t, h.traceCollector.snapshot())
 		mustDiff(t, "three client requests emit three spans", 3, len(spans))
-		mustDiff(t, "failed semantic span status", any("upstream_error"), spans[1].Attributes["status"])
-		mustDiff(t, "failed semantic span status_code", int64(http.StatusOK), spans[1].Attributes["status_code"])
-		mustDiff(t, "retried compaction span status", any("ok"), spans[2].Attributes["status"])
-		mustDiff(t, "retried compaction span status_code", int64(http.StatusOK), spans[2].Attributes["status_code"])
+		assertSpan(t, spans, traceOne, "client_error", http.StatusTooManyRequests)
+		assertSpan(t, spans, traceTwo, "upstream_error", http.StatusOK)
+		assertSpan(t, spans, traceThree, "ok", http.StatusOK)
 		mustDiff(t, "total upstream attempts across 3 requests", int32(4), attempts.Load())
 	})
 
-	grokModes := map[string]struct {
+	tests := map[string]struct {
 		stream bool
 	}{
 		"success: grok buffered finishes one route span and emits zero usage records":  {stream: false},
 		"success: grok streaming finishes one route span and emits zero usage records": {stream: true},
 	}
-	for name, tt := range grokModes {
+	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			h := newHarness(t, harnessConfig{
 				sentryEnvTrigger: 100,
@@ -222,8 +237,11 @@ func TestTerminalOutcomesAndUsage(t *testing.T) {
 		logs := decodeOTLPLogs(t, h.usageCollector.snapshot())
 		mustDiff(t, "lmstudio usage records", 1, len(logs))
 		mustDiff(t, "lmstudio backend", any("lmstudio"), logs[0].Attributes["backend"])
-		mustDiff(t, "lmstudio requested_model", any("claude-lmstudio/ibm/granite-4-micro"), logs[0].Attributes["requested_model"])
-		mustDiff(t, "lmstudio model", any("lmstudio/ibm/granite-4-micro"), logs[0].Attributes["model"])
+		for _, key := range []string{"model", "requested_model"} {
+			if _, exists := logs[0].Attributes[key]; exists {
+				t.Errorf("slash-containing %s must not be exported", key)
+			}
+		}
 		mustDiff(t, "lmstudio corrected exclusive input_tokens", int64(40), logs[0].Attributes["input_tokens"])
 		mustDiff(t, "lmstudio cache_read_tokens", int64(60), logs[0].Attributes["cache_read_tokens"])
 		mustDiff(t, "lmstudio output_tokens", int64(11), logs[0].Attributes["output_tokens"])
@@ -283,6 +301,11 @@ func TestTerminalOutcomesAndUsage(t *testing.T) {
 			proxyHandler: func(w http.ResponseWriter, r *http.Request) {
 				switch mode.Load() {
 				case 0:
+					if providerModel(t, r) != "kimi-k3" {
+						t.Error("non-Kimi request reached rejection fixture")
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
 					w.Header().Set("Content-Type", "application/json")
 					w.Header().Set("Openai-Processing-Ms", "3")
 					w.WriteHeader(http.StatusUnauthorized)
@@ -299,7 +322,12 @@ func TestTerminalOutcomesAndUsage(t *testing.T) {
 		})
 
 		// Non-Codex (Kimi) 401 with OpenAI-style header must pass through unchanged and never touch Codex state.
-		sKimi, _, kimiRaw := h.do(http.MethodPost, "/v1/messages", messageRequestJSON("claude-kimi-k3", false), nil)
+		if h.telemetryRec.Enabled() {
+			t.Fatal("expected tracing disabled before first request")
+		}
+		sKimi, _, kimiRaw := h.do(http.MethodPost, "/v1/messages", `{"model":"claude-kimi-k3","max_tokens":16,"messages":[{"role":"user","content":"hello"}]}`, nil)
+		mustDiff(t, "Kimi proxy contacts", int64(1), h.proxyHits.Load())
+		mustDiff(t, "unintended native contacts", int64(0), h.anthropicHits.Load())
 		mustDiff(t, "kimi 401 status", http.StatusUnauthorized, sKimi)
 		kimiDoc := decodeJSONObject(t, kimiRaw)
 		mustDiff(t, "kimi error body", map[string]any{"type": "authentication_error", "message": "kimi token expired"}, kimiDoc["error"])

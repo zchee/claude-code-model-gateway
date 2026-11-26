@@ -23,6 +23,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/zchee/claude-code-model-gateway/internal/readiness"
@@ -124,9 +125,7 @@ func TestDispatch(t *testing.T) {
 					_, _ = io.WriteString(w, `{"id":"msg_ant","type":"message","model":"claude-sonnet-4-6","stop_reason":"end_turn","content":[{"type":"text","text":"native"}],"usage":{"input_tokens":10,"output_tokens":5}}`)
 				},
 				proxyHandler: func(w http.ResponseWriter, r *http.Request) {
-					raw, _ := io.ReadAll(r.Body)
-					obj := decodeJSONObject(t, raw)
-					model, _ := obj["model"].(string)
+					model := providerModel(t, r)
 					mu.Lock()
 					seenProxyModel = model
 					seenProxyAuth = r.Header.Get("X-Api-Key") + r.Header.Get("Authorization")
@@ -153,9 +152,7 @@ func TestDispatch(t *testing.T) {
 					}
 				},
 				grokHandler: func(w http.ResponseWriter, r *http.Request) {
-					raw, _ := io.ReadAll(r.Body)
-					obj := decodeJSONObject(t, raw)
-					model, _ := obj["model"].(string)
+					model := providerModel(t, r)
 					mu.Lock()
 					seenGrokModel = model
 					seenGrokClientKey = r.Header.Get("X-Api-Key")
@@ -175,7 +172,9 @@ func TestDispatch(t *testing.T) {
 			mu.Lock()
 			defer mu.Unlock()
 			if tt.wantAnthropicHits > 0 {
-				mustDiff(t, "anthropic body preserved byte-for-byte", tt.body, seenAnthropicBody)
+				if tt.body != seenAnthropicBody {
+					t.Fatal("native provider body differs from original request")
+				}
 			}
 			if tt.wantProxyHits > 0 {
 				mustDiff(t, "proxy backend model", tt.wantBackendModel, seenProxyModel)
@@ -194,7 +193,7 @@ func TestDispatch(t *testing.T) {
 				mustDiff(t, "response model", tt.wantResponseModel, got["model"])
 			}
 			if tt.wantResponseContains != "" && !strings.Contains(string(respBody), tt.wantResponseContains) {
-				t.Errorf("response body missing %q: %s", tt.wantResponseContains, string(respBody))
+				t.Errorf("response body missing %q", tt.wantResponseContains)
 			}
 		})
 	}
@@ -207,9 +206,7 @@ func TestDispatchUnlistedModelsReachAnthropicOnly(t *testing.T) {
 
 	h := newHarness(t, harnessConfig{
 		anthropicHandler: func(w http.ResponseWriter, r *http.Request) {
-			raw, _ := io.ReadAll(r.Body)
-			obj := decodeJSONObject(t, raw)
-			model, _ := obj["model"].(string)
+			model := providerModel(t, r)
 			mu.Lock()
 			seenAnthropicModels = append(seenAnthropicModels, model)
 			mu.Unlock()
@@ -217,22 +214,20 @@ func TestDispatchUnlistedModelsReachAnthropicOnly(t *testing.T) {
 			_, _ = io.WriteString(w, `{"id":"msg_ant","type":"message","model":"`+model+`","stop_reason":"end_turn","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`)
 		},
 		proxyHandler: func(w http.ResponseWriter, r *http.Request) {
-			raw, _ := io.ReadAll(r.Body)
-			obj := decodeJSONObject(t, raw)
-			model, _ := obj["model"].(string)
+			model := providerModel(t, r)
 			mu.Lock()
 			seenProxyModels = append(seenProxyModels, model)
 			mu.Unlock()
-			t.Errorf("proxy must not receive Claude or unlisted model %q", model)
+			t.Error("proxy received a Claude or unlisted model")
 			w.WriteHeader(http.StatusInternalServerError)
 		},
 	})
 
 	models := []string{"claude-opus-5-5", "claude-glm-99", "claude-vertex/ai21/jamba-2"}
 	for _, model := range models {
-		status, _, body := h.do(http.MethodPost, "/v1/messages", messageRequestJSON(model, false), nil)
+		status, _, _ := h.do(http.MethodPost, "/v1/messages", `{"model":"`+model+`","max_tokens":16,"messages":[{"role":"user","content":"hello"}]}`, nil)
 		if status != http.StatusOK {
-			t.Fatalf("model %q status=%d body=%s", model, status, string(body))
+			t.Fatalf("model %q status=%d", model, status)
 		}
 	}
 
@@ -257,18 +252,21 @@ func TestWorkerHooksAndHealthz(t *testing.T) {
 			probeOnce := sync.OnceFunc(func() { close(probeDone) })
 
 			h := newHarness(t, harnessConfig{
-				withReadiness: tt.withReadiness,
+				proxyModelsJSON: `{"data":[{"id":"kimi-fixture-discovered","display_name":"kimi-fixture-discovered (kimi)"}]}`,
+				withReadiness:   tt.withReadiness,
 				readinessProbe: func(context.Context) readiness.ProxyAuthResult {
 					defer probeOnce()
 					return readiness.ProxyAuthResult{
 						ProxyBinary: true,
 						ProxyModels: true,
 						CodexAuth:   true,
-						CheckedAt:   fixedTime,
+						CheckedAt:   fixedClock(),
 					}
 				},
 			})
 
+			// The catalog owner, not the composed handler, starts background work.
+			h.modelCache.Start(h.serviceCtx)
 			// GET /v1/models exercises Options.Models and increments served.models.
 			status, hdr, modelsRaw := h.do(http.MethodGet, "/v1/models", "", http.Header{"X-Api-Key": {fixtureAnthropicKey}})
 			mustDiff(t, "GET /v1/models status", http.StatusOK, status)
@@ -280,12 +278,21 @@ func TestWorkerHooksAndHealthz(t *testing.T) {
 			if err := json.Unmarshal(modelsRaw, &listing); err != nil {
 				t.Fatalf("decode /v1/models: %v", err)
 			}
-			if len(listing.Data) == 0 {
-				t.Fatal("GET /v1/models returned empty data; Options.Models not wired to modelcache")
+			found := 0
+			for _, row := range listing.Data {
+				if row["id"] == "claude-kimi-fixture-discovered" {
+					found++
+				}
 			}
+			mustDiff(t, "unique model from fixture listing", 1, found)
 
 			// First /healthz triggers the shared readiness check if bound.
 			health := h.healthz()
+			_, count := h.modelCache.HealthCatalog()
+			if count < 1 {
+				t.Fatal("missing cached rows")
+			}
+			mustDiff(t, "health model count", float64(count), health["models"])
 			mustDiff(t, "/healthz catalog", any("proxy"), health["catalog"])
 			served, _ := health["served"].(map[string]any)
 			mustDiff(t, "/healthz served.models", any(float64(1)), served["models"])
@@ -315,21 +322,27 @@ func TestWorkerHooksAndHealthz(t *testing.T) {
 	}
 
 	t.Run("success: refresh anthropic triggers only for accepted anthropic requests", func(t *testing.T) {
-		h := newHarness(t, harnessConfig{})
-		hdrs := http.Header{"X-Api-Key": {fixtureAnthropicKey}}
+		synctest.Test(t, func(t *testing.T) {
+			h := newHarness(t, harnessConfig{inMemory: true, disableTrace: true, disableUsage: true})
+			synctest.Wait()
+			mustDiff(t, "only explicit one-shot refresh before Start", int64(1), h.proxyCatalogHits.Load())
+			h.modelCache.Start(h.serviceCtx)
+			synctest.Wait()
+			hdrs := http.Header{"X-Api-Key": {fixtureAnthropicKey}}
 
-		status, _, _ := h.do(http.MethodPost, "/v1/messages", messageRequestJSON("claude-gpt-6.1-sol[1m]", false), hdrs)
-		mustDiff(t, "proxy status", http.StatusOK, status)
-		status, _, _ = h.do(http.MethodPost, "/v1/messages", messageRequestJSON("claude-grok-4.7[1m]", false), hdrs)
-		mustDiff(t, "grok status", http.StatusOK, status)
-		status, _, _ = h.do(http.MethodPost, "/v1/messages", `{"model":"\uD800","messages":[]}`, hdrs)
-		mustDiff(t, "classifier refusal status", http.StatusBadRequest, status)
-		h.modelCache.Wait()
-		mustDiff(t, "non-anthropic requests must not trigger anthropic catalog refresh", int64(0), h.anthropicModel.Load())
+			status, _, _ := h.do(http.MethodPost, "/v1/messages", messageRequestJSON("claude-gpt-6.1-sol[1m]", false), hdrs)
+			mustDiff(t, "proxy status", http.StatusOK, status)
+			status, _, _ = h.do(http.MethodPost, "/v1/messages", messageRequestJSON("claude-grok-4.7[1m]", false), hdrs)
+			mustDiff(t, "grok status", http.StatusOK, status)
+			status, _, _ = h.do(http.MethodPost, "/v1/messages", `{"model":"\uD800","messages":[]}`, hdrs)
+			mustDiff(t, "classifier refusal status", http.StatusBadRequest, status)
+			synctest.Wait()
+			mustDiff(t, "non-anthropic requests must not trigger anthropic catalog refresh", int64(0), h.anthropicModel.Load())
 
-		status, _, _ = h.do(http.MethodPost, "/v1/messages", messageRequestJSON("claude-sonnet-4-6", false), hdrs)
-		mustDiff(t, "anthropic status", http.StatusOK, status)
-		h.modelCache.Wait()
-		mustDiff(t, "accepted anthropic request triggered refresh once", int64(1), h.anthropicModel.Load())
+			status, _, _ = h.do(http.MethodPost, "/v1/messages", messageRequestJSON("claude-sonnet-4-6", false), hdrs)
+			mustDiff(t, "anthropic status", http.StatusOK, status)
+			synctest.Wait()
+			mustDiff(t, "accepted anthropic request triggered refresh once", int64(1), h.anthropicModel.Load())
+		})
 	})
 }

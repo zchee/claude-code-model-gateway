@@ -17,6 +17,7 @@ package compose_test
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	json "encoding/json/v2"
 	"errors"
 	"io"
@@ -59,16 +60,15 @@ func TestMain(m *testing.M) {
 }
 
 const (
-	fixtureControlToken = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-	fixtureGrokAccess   = "grok-fixture-access-secret"
-	fixtureGrokRefresh  = "grok-fixture-refresh-secret"
-	fixtureAnthropicKey = "sk-ant-fixture-secret"
-	fixtureCompaction   = "You are a helpful AI assistant tasked with summarizing conversations."
+	fixtureControlToken  = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	fixtureGrokAccess    = "grok-fixture-access-secret"
+	fixtureGrokRefresh   = "grok-fixture-refresh-secret"
+	fixtureAnthropicKey  = "sk-ant-fixture-secret"
+	fixtureRotatedAccess = "rotated-grok-fixture-access"
+	fixtureCompaction    = "You are a helpful AI assistant tasked with summarizing conversations."
 )
 
-var fixedTime = time.UnixMilli(1_700_000_000_000).UTC()
-
-func fixedClock() time.Time { return fixedTime }
+func fixedClock() time.Time { return time.UnixMilli(1_700_000_000_000).UTC() }
 
 func mapLookup(env map[string]string) config.LookupEnv {
 	return func(k string) (string, bool) {
@@ -79,9 +79,9 @@ func mapLookup(env map[string]string) config.LookupEnv {
 
 func assertNoSecrets(t *testing.T, label string, data []byte) {
 	t.Helper()
-	for _, secret := range []string{fixtureGrokAccess, fixtureGrokRefresh, fixtureAnthropicKey, fixtureControlToken} {
+	for _, secret := range []string{fixtureGrokAccess, fixtureRotatedAccess, fixtureGrokRefresh, fixtureAnthropicKey, fixtureControlToken} {
 		if bytes.Contains(data, []byte(secret)) {
-			t.Errorf("%s leaked fixture credential", label)
+			t.Fatalf("%s leaked fixture credential", label)
 		}
 	}
 }
@@ -89,8 +89,21 @@ func assertNoSecrets(t *testing.T, label string, data []byte) {
 func mustDiff(t *testing.T, label string, want, got any) {
 	t.Helper()
 	if diff := gocmp.Diff(want, got); diff != "" {
+		assertNoSecrets(t, label, []byte(diff))
 		t.Fatalf("%s (-want +got):\n%s", label, diff)
 	}
+}
+
+func providerModel(t *testing.T, r *http.Request) string {
+	t.Helper()
+	var doc struct {
+		Model string `json:"model"`
+	}
+	if err := json.UnmarshalRead(r.Body, &doc); err != nil || doc.Model == "" {
+		t.Error("provider received invalid request model")
+		return ""
+	}
+	return doc.Model
 }
 
 func decodeJSONObject(t *testing.T, raw []byte) map[string]any {
@@ -107,13 +120,12 @@ type otlpCollector struct {
 	srv      *httptest.Server
 	mu       sync.Mutex
 	payloads [][]byte
-	ch       chan struct{}
 }
 
-func newOTLPCollector(t *testing.T) *otlpCollector {
+func newOTLPCollector(t *testing.T, newServer func(http.Handler) *httptest.Server) *otlpCollector {
 	t.Helper()
-	c := &otlpCollector{ch: make(chan struct{}, 64)}
-	c.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	c := &otlpCollector{}
+	c.srv = newServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -122,10 +134,6 @@ func newOTLPCollector(t *testing.T) *otlpCollector {
 		c.mu.Lock()
 		c.payloads = append(c.payloads, body)
 		c.mu.Unlock()
-		select {
-		case c.ch <- struct{}{}:
-		default:
-		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	t.Cleanup(c.srv.Close)
@@ -147,6 +155,7 @@ func (c *otlpCollector) snapshot() [][]byte {
 }
 
 type otlpSpan struct {
+	TraceID    string
 	Name       string
 	Attributes map[string]any
 }
@@ -160,6 +169,7 @@ func decodeOTLPSpans(t *testing.T, payloads [][]byte) []otlpSpan {
 			ResourceSpans []struct {
 				ScopeSpans []struct {
 					Spans []struct {
+						TraceID    string          `json:"traceId"`
 						Name       string          `json:"name"`
 						Attributes []otlpAttribute `json:"attributes"`
 					} `json:"spans"`
@@ -172,12 +182,35 @@ func decodeOTLPSpans(t *testing.T, payloads [][]byte) []otlpSpan {
 		for _, rs := range doc.ResourceSpans {
 			for _, ss := range rs.ScopeSpans {
 				for _, s := range ss.Spans {
-					spans = append(spans, otlpSpan{Name: s.Name, Attributes: decodeOTLPAttrs(t, s.Attributes)})
+					spans = append(spans, otlpSpan{TraceID: s.TraceID, Name: s.Name, Attributes: decodeOTLPAttrs(t, s.Attributes)})
 				}
 			}
 		}
 	}
 	return spans
+}
+
+const (
+	traceOne   = "11111111111111111111111111111111"
+	traceTwo   = "22222222222222222222222222222222"
+	traceThree = "33333333333333333333333333333333"
+)
+
+func traced(id string) http.Header {
+	return http.Header{"Traceparent": {"00-" + id + "-00f067aa0ba902b7-01"}}
+}
+
+func assertSpan(t *testing.T, spans []otlpSpan, id, status string, code int64) {
+	t.Helper()
+	n := 0
+	for _, s := range spans {
+		if s.TraceID == id {
+			n++
+			mustDiff(t, "span status", status, s.Attributes["status"])
+			mustDiff(t, "span code", code, s.Attributes["status_code"])
+		}
+	}
+	mustDiff(t, "spans for "+id, 1, n)
 }
 
 type otlpLogRecord struct {
@@ -241,6 +274,9 @@ func decodeOTLPAttrs(t *testing.T, attrs []otlpAttribute) map[string]any {
 			out[a.Key] = *a.Value.DoubleValue
 		case a.Value.BoolValue != nil:
 			out[a.Key] = *a.Value.BoolValue
+		default:
+			// Key presence matters even when the value has an unknown OTLP shape.
+			out[a.Key] = nil
 		}
 	}
 	return out
@@ -289,49 +325,57 @@ type harnessConfig struct {
 	replyRetries      *int
 	replyRetryDelay   *time.Duration
 	heartbeatInterval time.Duration
-	firstEventWait    time.Duration
-	dialContext       func(ctx context.Context, network, addr string) (net.Conn, error)
+	inMemory          bool
+	observeOptions    func(*worker.Options)
 }
 
+type transportFunc func(*http.Request) (*http.Response, error)
+
+func (f transportFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
 type harness struct {
-	t              *testing.T
-	serviceCtx     context.Context
-	cancelService  context.CancelFunc
-	dir            string
-	logPath        string
-	grokAuthPath   string
-	grokCachePath  string
-	anthropicSrv   *httptest.Server
-	proxySrv       *httptest.Server
-	grokSrv        *httptest.Server
-	grokAuthSrv    *httptest.Server
-	traceCollector *otlpCollector
-	usageCollector *otlpCollector
-	gatewaySrv     *httptest.Server
-	anthropicHits  atomic.Int64
-	anthropicModel atomic.Int64
-	proxyHits      atomic.Int64
-	grokHits       atomic.Int64
-	grokAuthHits   atomic.Int64
-	routeStore     *route.Store
-	sentryState    *sentry.State
-	modelCache     *modelcache.Cache
-	upstreamClient *upstream.Client
-	upstreamState  *upstreamstate.Store
-	usageEmitter   *usage.Emitter
-	telemetryRec   *telemetry.Recorder
-	readinessCheck *readiness.SharedCheck
-	workerHandler  http.Handler
+	t                *testing.T
+	serviceCtx       context.Context
+	cancelService    context.CancelFunc
+	dir              string
+	logPath          string
+	grokAuthPath     string
+	grokCachePath    string
+	anthropicSrv     *httptest.Server
+	proxySrv         *httptest.Server
+	grokSrv          *httptest.Server
+	grokAuthSrv      *httptest.Server
+	traceCollector   *otlpCollector
+	usageCollector   *otlpCollector
+	gatewaySrv       *httptest.Server
+	anthropicHits    atomic.Int64
+	anthropicModel   atomic.Int64
+	proxyCatalogHits atomic.Int64
+	proxyHits        atomic.Int64
+	grokHits         atomic.Int64
+	grokAuthHits     atomic.Int64
+	authRequests     atomic.Int64
+	grokDials        atomic.Int64
+	routeStore       *route.Store
+	sentryState      *sentry.State
+	modelCache       *modelcache.Cache
+	upstreamClient   *upstream.Client
+	upstreamState    *upstreamstate.Store
+	usageEmitter     *usage.Emitter
+	telemetryRec     *telemetry.Recorder
+	readinessCheck   *readiness.SharedCheck
+	workerHandler    http.Handler
 }
 
 func defaultProxyListing() string {
 	return `{"data":[` +
-		`{"id":"gpt-6.1-sol","owned_by":"codex"},` +
-		`{"id":"gpt-5.6-sol","owned_by":"codex"},` +
-		`{"id":"gpt-5.6-terra","owned_by":"codex"},` +
-		`{"id":"kimi-k3","owned_by":"kimi"},` +
-		`{"id":"lmstudio/ibm/granite-4-micro","owned_by":"lmstudio"},` +
-		`{"id":"local/gguf","owned_by":"local"}` +
+		`{"id":"claude-opus-5-5","display_name":"claude-opus-5-5 (codex)"},` +
+		`{"id":"gpt-6.1-sol","display_name":"gpt-6.1-sol (codex)"},` +
+		`{"id":"gpt-5.6-sol","display_name":"gpt-5.6-sol (codex)"},` +
+		`{"id":"gpt-5.6-terra","display_name":"gpt-5.6-terra (codex)"},` +
+		`{"id":"kimi-k3","display_name":"kimi-k3 (kimi)"},` +
+		`{"id":"lmstudio/ibm/granite-4-micro","display_name":"lmstudio/ibm/granite-4-micro (lmstudio)"},` +
+		`{"id":"local/gguf","display_name":"local/gguf (local)"}` +
 		`]}`
 }
 
@@ -349,15 +393,41 @@ func newHarness(t *testing.T, cfg harnessConfig) *harness {
 		sentryState:   &sentry.State{},
 	}
 
-	h.traceCollector = newOTLPCollector(t)
-	h.usageCollector = newOTLPCollector(t)
+	newServer := httptest.NewServer
+	dial := (&net.Dialer{}).DialContext
+	if cfg.inMemory {
+		var lnMu sync.RWMutex
+		listeners := map[string]*pipeListener{}
+		dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			lnMu.RLock()
+			ln := listeners[addr]
+			lnMu.RUnlock()
+			if ln == nil {
+				return nil, errors.New("unknown in-memory endpoint")
+			}
+			return ln.DialContext(ctx, network, addr)
+		}
+		newServer = func(handler http.Handler) *httptest.Server {
+			lnMu.Lock()
+			addr := net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 20000 + len(listeners)}
+			ln := &pipeListener{addr: &addr, conns: make(chan net.Conn), done: make(chan struct{})}
+			listeners[addr.String()] = ln
+			lnMu.Unlock()
+			s := &httptest.Server{Listener: ln, Config: &http.Server{Handler: handler}}
+			s.Start()
+			s.Client().Transport.(*http.Transport).DialContext = dial
+			return s
+		}
+	}
+	h.traceCollector = newOTLPCollector(t, newServer)
+	h.usageCollector = newOTLPCollector(t, newServer)
 
 	proxyListing := cfg.proxyModelsJSON
 	if proxyListing == "" {
 		proxyListing = defaultProxyListing()
 	}
 
-	h.anthropicSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h.anthropicSrv = newServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/models") {
 			h.anthropicModel.Add(1)
 			w.Header().Set("Content-Type", "application/json")
@@ -374,8 +444,9 @@ func newHarness(t *testing.T, cfg harnessConfig) *harness {
 	}))
 	t.Cleanup(h.anthropicSrv.Close)
 
-	h.proxySrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h.proxySrv = newServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/v1/models" {
+			h.proxyCatalogHits.Add(1)
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, proxyListing)
 			return
@@ -390,7 +461,7 @@ func newHarness(t *testing.T, cfg harnessConfig) *harness {
 	}))
 	t.Cleanup(h.proxySrv.Close)
 
-	h.grokSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h.grokSrv = newServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h.grokHits.Add(1)
 		if cfg.grokHandler != nil {
 			cfg.grokHandler(w, r)
@@ -401,7 +472,7 @@ func newHarness(t *testing.T, cfg harnessConfig) *harness {
 	}))
 	t.Cleanup(h.grokSrv.Close)
 
-	h.grokAuthSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h.grokAuthSrv = newServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h.grokAuthHits.Add(1)
 		if cfg.grokAuthHandler != nil {
 			cfg.grokAuthHandler(w, r)
@@ -419,7 +490,7 @@ func newHarness(t *testing.T, cfg harnessConfig) *harness {
 
 	expiry := cfg.grokAuthExpiry
 	if expiry.IsZero() {
-		expiry = fixedTime.Add(time.Hour)
+		expiry = fixedClock().Add(time.Hour)
 	}
 	h.grokAuthPath = writeGrokAuthFile(t, dir, h.grokAuthSrv.URL, expiry)
 	if len(cfg.grokCacheIDs) > 0 {
@@ -437,13 +508,16 @@ func newHarness(t *testing.T, cfg harnessConfig) *harness {
 		}
 	}
 
+	localEngine := newServer(http.NotFoundHandler())
+	t.Cleanup(localEngine.Close)
 	env := map[string]string{
+		"CCP_LMSTUDIO_BASE_URL":             localEngine.URL,
 		"CODEX_GATEWAY_TELEMETRY_ENDPOINT":  h.traceCollector.srv.URL + "/v1/traces",
 		"CODEX_GATEWAY_USAGE_ENDPOINT":      h.usageCollector.srv.URL + "/v1/logs",
 		"CLAUDE_CODE_PROPAGATE_TRACEPARENT": "1",
 	}
 	if cfg.disableTrace {
-		env["CODEX_GATEWAY_TELEMETRY_ENDPOINT"] = ""
+		env["CODEX_GATEWAY_TELEMETRY_ENDPOINT"] = "0"
 	}
 	if cfg.disableUsage {
 		env["CODEX_GATEWAY_USAGE_ENDPOINT"] = "0"
@@ -451,7 +525,16 @@ func newHarness(t *testing.T, cfg harnessConfig) *harness {
 	maps.Copy(env, cfg.env)
 	lookup := mapLookup(env)
 
-	upOpts := upstream.Options{DialContext: cfg.dialContext}
+	upOpts := upstream.Options{DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		switch addr {
+		case h.grokSrv.Listener.Addr().String():
+			h.grokDials.Add(1)
+		case h.anthropicSrv.Listener.Addr().String(), h.proxySrv.Listener.Addr().String():
+		default:
+			return nil, errors.New("inference dial outside provider fixtures")
+		}
+		return dial(ctx, network, addr)
+	}}
 	h.upstreamClient = upstream.NewClient(upOpts)
 	t.Cleanup(func() {
 		cancelService()
@@ -470,7 +553,12 @@ func newHarness(t *testing.T, cfg harnessConfig) *harness {
 		}
 	})
 
-	authTr := upstream.NewTransport(upOpts)
+	authTr := upstream.NewTransport(upstream.Options{DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if addr != h.grokAuthSrv.Listener.Addr().String() {
+			return nil, errors.New("auth dial outside issuer fixture")
+		}
+		return dial(ctx, network, addr)
+	}})
 	if authTr == nil {
 		t.Fatal("upstream.NewTransport returned nil (not implemented)")
 	}
@@ -480,7 +568,7 @@ func newHarness(t *testing.T, cfg harnessConfig) *harness {
 		Endpoint:        h.grokSrv.URL + "/v1/responses",
 		AuthFile:        h.grokAuthPath,
 		InferenceClient: h.upstreamClient,
-		AuthTransport:   authTr,
+		AuthTransport:   transportFunc(func(r *http.Request) (*http.Response, error) { h.authRequests.Add(1); return authTr.RoundTrip(r) }),
 		Sentry:          h.sentryState,
 		SentryEnabled:   !cfg.sentryDisabled,
 		Now:             fixedClock,
@@ -572,7 +660,7 @@ func newHarness(t *testing.T, cfg harnessConfig) *harness {
 					ProxyBinary: true,
 					ProxyModels: true,
 					CodexAuth:   true,
-					CheckedAt:   fixedTime,
+					CheckedAt:   fixedClock(),
 				}
 			}
 		}
@@ -609,31 +697,37 @@ func newHarness(t *testing.T, cfg harnessConfig) *harness {
 		ReplyRetries:      cfg.replyRetries,
 		ReplyRetryDelay:   cfg.replyRetryDelay,
 		HeartbeatInterval: cfg.heartbeatInterval,
-		FirstEventWait:    cfg.firstEventWait,
 	})
 	if err != nil {
 		t.Fatalf("compose.New: %v", err)
 	}
 
+	if cfg.observeOptions != nil {
+		cfg.observeOptions(&workerOpts)
+	}
 	wh, err := worker.NewHandler(workerOpts)
 	if err != nil {
 		t.Fatalf("worker.NewHandler: %v", err)
 	}
 	h.workerHandler = wh
-	h.gatewaySrv = httptest.NewServer(wh)
-	t.Cleanup(h.gatewaySrv.Close)
+	h.gatewaySrv = newServer(wh)
+	t.Cleanup(func() { cancelService(); h.gatewaySrv.Close() })
 	return h
 }
 
-func (h *harness) do(method, path, body string, headers http.Header) (int, http.Header, []byte) {
-	h.t.Helper()
-	var rdr io.Reader
-	if body != "" {
-		rdr = strings.NewReader(body)
-	}
-	req, err := http.NewRequestWithContext(h.t.Context(), method, h.gatewaySrv.URL+path, rdr)
+type httpResult struct {
+	status int
+	header http.Header
+	body   []byte
+	err    error
+}
+
+func (h *harness) request(method, path, body string, headers http.Header) httpResult {
+	ctx, cancel := context.WithTimeout(h.t.Context(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, method, h.gatewaySrv.URL+path, strings.NewReader(body))
 	if err != nil {
-		h.t.Fatalf("new request %s %s: %v", method, path, err)
+		return httpResult{err: err}
 	}
 	for k, vals := range headers {
 		for _, v := range vals {
@@ -642,14 +736,44 @@ func (h *harness) do(method, path, body string, headers http.Header) (int, http.
 	}
 	resp, err := h.gatewaySrv.Client().Do(req)
 	if err != nil {
-		h.t.Fatalf("do %s %s: %v", method, path, err)
+		return httpResult{err: err}
 	}
 	defer func() { _ = resp.Body.Close() }()
 	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		h.t.Fatalf("read response %s %s: %v", method, path, err)
+	return httpResult{resp.StatusCode, resp.Header.Clone(), raw, err}
+}
+
+func (h *harness) do(method, path, body string, headers http.Header) (int, http.Header, []byte) {
+	h.t.Helper()
+	r := h.request(method, path, body, headers)
+	if r.err != nil {
+		h.t.Fatalf("%s %s failed: %T", method, path, r.err)
 	}
-	return resp.StatusCode, resp.Header.Clone(), raw
+	assertNoSecrets(h.t, "response body", r.body)
+	return r.status, r.header, r.body
+}
+
+func (h *harness) startPost(body string, headers http.Header, release func()) func() int {
+	var result httpResult
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		result = h.request(http.MethodPost, "/v1/messages", body, headers)
+	}()
+	h.t.Cleanup(func() { release(); waitSignal(h.t, "request cleanup", finished, 6*time.Second) })
+	return func() int {
+		h.t.Helper()
+		waitSignal(h.t, "response", finished, 6*time.Second)
+		if result.err != nil {
+			h.t.Fatalf("POST failed: %T", result.err)
+		}
+		assertNoSecrets(h.t, "response body", result.body)
+		return result.status
+	}
+}
+
+func (h *harness) highWaterPath(session string) string {
+	return filepath.Join(h.dir, "highwater", base64.RawURLEncoding.EncodeToString([]byte(session))+".json")
 }
 
 func (h *harness) healthz() map[string]any {
@@ -684,14 +808,11 @@ func (h *harness) readAuditLines() []map[string]any {
 
 // pipeListener runs an in-memory HTTP server inside a synctest bubble without OS sockets.
 type pipeListener struct {
+	addr   net.Addr
 	mu     sync.Mutex
 	closed bool
 	conns  chan net.Conn
 	done   chan struct{}
-}
-
-func newPipeListener() *pipeListener {
-	return &pipeListener{conns: make(chan net.Conn, 8), done: make(chan struct{})}
 }
 
 func (l *pipeListener) Accept() (net.Conn, error) {
@@ -713,7 +834,7 @@ func (l *pipeListener) Close() error {
 	return nil
 }
 
-func (l *pipeListener) Addr() net.Addr { return pipeAddr{} }
+func (l *pipeListener) Addr() net.Addr { return l.addr }
 
 func (l *pipeListener) DialContext(ctx context.Context, _, _ string) (net.Conn, error) {
 	c1, c2 := net.Pipe()
@@ -730,11 +851,6 @@ func (l *pipeListener) DialContext(ctx context.Context, _, _ string) (net.Conn, 
 		return nil, ctx.Err()
 	}
 }
-
-type pipeAddr struct{}
-
-func (pipeAddr) Network() string { return "pipe" }
-func (pipeAddr) String() string  { return "127.0.0.1:0" }
 
 func waitSignal(t *testing.T, label string, ch <-chan struct{}, timeout time.Duration) {
 	t.Helper()

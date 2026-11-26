@@ -15,11 +15,13 @@
 package compose_test
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -49,7 +51,7 @@ func TestConstructionValidation(t *testing.T) {
 		dir := t.TempDir()
 		lookup := mapLookup(map[string]string{
 			"CODEX_GATEWAY_USAGE_ENDPOINT":     "0",
-			"CODEX_GATEWAY_TELEMETRY_ENDPOINT": "",
+			"CODEX_GATEWAY_TELEMETRY_ENDPOINT": "0",
 		})
 		upClient := upstream.NewClient(upstream.Options{})
 		t.Cleanup(func() { _ = upClient.Close() })
@@ -107,22 +109,37 @@ func TestConstructionValidation(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			opts := baseOptions(t)
+			var drains atomic.Int32
+			var diagnostics strings.Builder
+			opts.BeginDrain = func() { drains.Add(1) }
+			opts.Diagnostics = &diagnostics
 			if tt.mutate != nil {
 				tt.mutate(&opts)
 			}
 			got, err := compose.New(opts)
 			if tt.wantErrName == "" {
 				if err != nil {
+					assertNoSecrets(t, "compose.New error", []byte(err.Error()))
 					t.Fatalf("compose.New unexpected error: %v", err)
 				}
 				if got.Anthropic == nil || got.Proxy == nil || got.Grok == nil || got.BeforeBody == nil || got.LogRoute == nil || got.Models == nil || got.HealthCatalog == nil || got.RefreshAnthropic == nil {
-					t.Fatalf("compose.New returned worker.Options with unset required callbacks: %+v", got)
+					t.Fatal("compose.New returned worker.Options with unset required callbacks")
 				}
+				if got.BeginDrain == nil || got.Diagnostics == nil {
+					t.Fatal("drain or diagnostic hook missing")
+				}
+				got.BeginDrain()
+				mustDiff(t, "bound drain callback", int32(1), drains.Load())
+				if _, err := io.WriteString(got.Diagnostics, "diagnostic"); err != nil {
+					t.Fatal("bound diagnostic writer failed")
+				}
+				mustDiff(t, "bound diagnostic output", "diagnostic", diagnostics.String())
 				return
 			}
 			if err == nil {
 				t.Fatalf("compose.New succeeded with missing %s, want error naming it", tt.wantErrName)
 			}
+			assertNoSecrets(t, "compose.New error", []byte(err.Error()))
 			if !strings.Contains(err.Error(), tt.wantErrName) {
 				t.Errorf("compose.New error = %q, want message naming %q", err.Error(), tt.wantErrName)
 			}
@@ -156,7 +173,7 @@ func TestOrderOfUse(t *testing.T) {
 		markFirst := sync.OnceFunc(func() { close(firstEntered) })
 		releaseFirst := make(chan struct{})
 		unblockFirst := sync.OnceFunc(func() { close(releaseFirst) })
-		t.Cleanup(unblockFirst)
+		defer unblockFirst()
 
 		h := newHarness(t, harnessConfig{
 			proxyHandler: func(w http.ResponseWriter, r *http.Request) {
@@ -179,23 +196,7 @@ func TestOrderOfUse(t *testing.T) {
 			},
 		})
 
-		firstDone := make(chan int, 1)
-		go func() {
-			s, _, _ := h.do(http.MethodPost, "/v1/messages", messageRequestJSON("claude-gpt-6.1-sol[1m]", false), http.Header{
-				"X-Claude-Code-Request-Id": {"req-order-1"},
-			})
-			firstDone <- s
-		}()
-		t.Cleanup(func() {
-			unblockFirst()
-			timer := time.NewTimer(3 * time.Second)
-			defer timer.Stop()
-			select {
-			case <-firstDone:
-			case <-timer.C:
-				t.Error("first overlapping request did not finish during cleanup")
-			}
-		})
+		finish := h.startPost(messageRequestJSON("claude-gpt-6.1-sol[1m]", false), http.Header{"X-Claude-Code-Request-Id": {"req-order-1"}}, unblockFirst)
 
 		waitSignal(t, "first request reaching proxy", firstEntered, 3*time.Second)
 
@@ -206,14 +207,7 @@ func TestOrderOfUse(t *testing.T) {
 		mustDiff(t, "second request status", http.StatusOK, s2)
 
 		unblockFirst()
-		timer := time.NewTimer(3 * time.Second)
-		defer timer.Stop()
-		select {
-		case s1 := <-firstDone:
-			mustDiff(t, "first request status", http.StatusOK, s1)
-		case <-timer.C:
-			t.Fatal("first request did not finish after release")
-		}
+		mustDiff(t, "first request status", http.StatusOK, finish())
 
 		h.usageEmitter.Wait()
 		logs := decodeOTLPLogs(t, h.usageCollector.snapshot())
@@ -232,14 +226,23 @@ func TestOrderOfUse(t *testing.T) {
 	})
 
 	t.Run("success: model cache publishes sentry snapshot before routes on startup and refresh", func(t *testing.T) {
-		var listingGen atomic.Int32
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		native := httptest.NewServer(http.NotFoundHandler())
+		defer native.Close()
+		var sends atomic.Int32
 		proxySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
-			if listingGen.Load() == 0 {
-				_, _ = io.WriteString(w, `{"data":[{"id":"gpt-6.1-sol","owned_by":"codex"}]}`)
+			if r.Method == http.MethodGet && r.URL.Path == "/v1/models" {
+				_, _ = io.WriteString(w, `{"data":[{"id":"kimi-fresh","display_name":"kimi-fresh (kimi)"}]}`)
 				return
 			}
-			_, _ = io.WriteString(w, `{"data":[{"id":"gpt-6.1-sol","owned_by":"codex"},{"id":"kimi-k3","owned_by":"kimi"}]}`)
+			if r.Method != http.MethodPost || r.URL.Path != "/v1/messages" || providerModel(t, r) != "kimi-fresh" {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			sends.Add(1)
+			_, _ = io.WriteString(w, `{"type":"message","model":"kimi-fresh","content":[]}`)
 		}))
 		defer proxySrv.Close()
 
@@ -273,13 +276,13 @@ func TestOrderOfUse(t *testing.T) {
 		dir := t.TempDir()
 		lookup := mapLookup(map[string]string{
 			"CODEX_GATEWAY_USAGE_ENDPOINT":     "0",
-			"CODEX_GATEWAY_TELEMETRY_ENDPOINT": "",
+			"CODEX_GATEWAY_TELEMETRY_ENDPOINT": "0",
 		})
 		mc, err := modelcache.New(modelcache.Options{
 			Lookup:           lookup,
 			Paths:            paths.New(lookup, func() (string, error) { return dir, nil }, func() (string, error) { return dir, nil }),
 			ProxyBaseURL:     proxySrv.URL,
-			AnthropicBaseURL: "http://127.0.0.1:1",
+			AnthropicBaseURL: native.URL,
 			DefaultBaseURL:   "http://127.0.0.1:18764",
 			Shadow:           true,
 			Client:           proxySrv.Client(),
@@ -290,19 +293,9 @@ func TestOrderOfUse(t *testing.T) {
 		if err != nil {
 			t.Fatalf("modelcache.New: %v", err)
 		}
-		defer mc.Wait()
+		defer func() { cancel(); mc.Wait() }()
 
-		listingGen.Store(1)
-		if err := mc.Refresh(t.Context()); err != nil {
-			t.Fatalf("modelcache.Refresh: %v", err)
-		}
-
-		mu.Lock()
-		gotEvents := append([]string(nil), events...)
-		mu.Unlock()
-		mustDiff(t, "publication order across startup and refresh", []string{"sentry", "routes", "sentry", "routes"}, gotEvents)
-
-		// Verify the refreshed snapshot is live in a composed handler wired to the same routeStore and sentryState.
+		// Build the handler against the initial snapshot, before the provider is listed.
 		upClient := upstream.NewClient(upstream.Options{})
 		defer func() { _ = upClient.Close() }()
 		authTr := upstream.NewTransport(upstream.Options{})
@@ -312,7 +305,7 @@ func TestOrderOfUse(t *testing.T) {
 		defer authTr.CloseIdleConnections()
 		gb, err := compose.NewGrokBranch(compose.GrokOptions{
 			Endpoint:        "http://127.0.0.1:1/v1/responses",
-			AuthFile:        writeGrokAuthFile(t, dir, "http://127.0.0.1:1", fixedTime.Add(time.Hour)),
+			AuthFile:        writeGrokAuthFile(t, dir, "http://127.0.0.1:1", fixedClock().Add(time.Hour)),
 			InferenceClient: upClient,
 			AuthTransport:   authTr,
 			Sentry:          sentryState,
@@ -327,11 +320,11 @@ func TestOrderOfUse(t *testing.T) {
 			t.Fatalf("proxyreq.New: %v", err)
 		}
 		workerOpts, err := compose.New(compose.Options{
-			ServiceContext:   t.Context(),
+			ServiceContext:   ctx,
 			Version:          "fixture-build",
 			ControlToken:     fixtureControlToken,
 			Lookup:           lookup,
-			AnthropicBaseURL: "http://127.0.0.1:1",
+			AnthropicBaseURL: native.URL,
 			ProxyBaseURL:     proxySrv.URL,
 			Routes:           routeStore,
 			ModelCache:       mc,
@@ -339,7 +332,7 @@ func TestOrderOfUse(t *testing.T) {
 			Upstream:         upClient,
 			UpstreamState:    &upstreamstate.Store{Dir: filepath.Join(dir, "state"), Now: fixedClock},
 			ProxyReq:         pr,
-			CompactGuard:     &compactguard.Runner{ServiceContext: t.Context()},
+			CompactGuard:     &compactguard.Runner{ServiceContext: ctx},
 			Grok:             gb,
 			Usage:            usage.NewEmitter(lookup, usage.NewBuilder(usage.Options{Now: fixedClock})),
 			Telemetry:        telemetry.NewRecorder(telemetry.Options{Lookup: lookup, Now: fixedClock}),
@@ -352,8 +345,23 @@ func TestOrderOfUse(t *testing.T) {
 		if err != nil {
 			t.Fatalf("worker.NewHandler: %v", err)
 		}
+		post := func() int {
+			rec := httptest.NewRecorder()
+			wh.ServeHTTP(rec, httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/messages", strings.NewReader(messageRequestJSON("claude-kimi-fresh", false))))
+			return rec.Code
+		}
+		mustDiff(t, "unlisted model goes to native fixture", http.StatusNotFound, post())
+		if err := mc.Refresh(ctx); err != nil {
+			t.Fatalf("modelcache.Refresh: %v", err)
+		}
+		mu.Lock()
+		gotEvents := slices.Clone(events)
+		mu.Unlock()
+		mustDiff(t, "publication order across startup and refresh", []string{"sentry", "routes", "sentry", "routes"}, gotEvents)
+		mustDiff(t, "new route on same handler", http.StatusOK, post())
+		mustDiff(t, "fresh model reached proxy", int32(1), sends.Load())
 		rec := httptest.NewRecorder()
-		wh.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/healthz", nil))
+		wh.ServeHTTP(rec, httptest.NewRequestWithContext(ctx, http.MethodGet, "/healthz", nil))
 		mustDiff(t, "composed /healthz status", http.StatusOK, rec.Code)
 		health := decodeJSONObject(t, rec.Body.Bytes())
 		mustDiff(t, "composed /healthz catalog source", any("proxy"), health["catalog"])
@@ -363,17 +371,17 @@ func TestOrderOfUse(t *testing.T) {
 func TestGrokCompositionCallSites(t *testing.T) {
 	t.Run("error: NewGrokBranch rejects nil auth transport and nil inference client", func(t *testing.T) {
 		dir := t.TempDir()
-		authFile := writeGrokAuthFile(t, dir, "http://127.0.0.1:1", fixedTime.Add(time.Hour))
+		authFile := writeGrokAuthFile(t, dir, "http://127.0.0.1:1", fixedClock().Add(time.Hour))
 		upClient := upstream.NewClient(upstream.Options{})
 		defer func() { _ = upClient.Close() }()
 
-		cases := map[string]struct {
+		tests := map[string]struct {
 			nilTransport bool
 		}{
 			"error: nil AuthTransport":   {nilTransport: true},
 			"error: nil InferenceClient": {nilTransport: false},
 		}
-		for name, tt := range cases {
+		for name, tt := range tests {
 			t.Run(name, func(t *testing.T) {
 				opts := compose.GrokOptions{
 					AuthFile: authFile,
@@ -410,19 +418,35 @@ func TestGrokCompositionCallSites(t *testing.T) {
 
 		// Token is already expired so Handle must refresh via the isolated auth transport.
 		h := newHarness(t, harnessConfig{
-			grokAuthExpiry: fixedTime.Add(-time.Minute),
+			grokAuthExpiry: fixedClock().Add(-time.Minute),
 			grokAuthHandler: func(w http.ResponseWriter, r *http.Request) {
-				authHits.Add(1)
-				if r.URL.Path == "/.well-known/openid-configuration" {
+				n := authHits.Add(1)
+				for _, key := range []string{"Authorization", "X-Api-Key", "X-Fixture-Client", "X-Grok-Client-Version", "X-Grok-Model-Override", "X-Grok-Client-Identifier"} {
+					if r.Header.Get(key) != "" {
+						t.Errorf("auth received forbidden header %s", key)
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+				}
+				if n == 1 && r.Method == http.MethodGet && r.URL.RequestURI() == "/.well-known/openid-configuration" {
 					w.Header().Set("Content-Type", "application/json")
 					_, _ = io.WriteString(w, `{"token_endpoint":"`+"http://"+r.Host+`/oauth/token"}`)
 					return
 				}
+				if n != 2 || r.Method != http.MethodPost || r.URL.RequestURI() != "/oauth/token" || !strings.HasPrefix(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") || r.ParseForm() != nil || len(r.PostForm) != 3 || r.PostForm.Get("grant_type") != "refresh_token" || r.PostForm.Get("client_id") != "fixture-client" || r.PostForm.Get("refresh_token") != fixtureGrokRefresh {
+					t.Error("incorrect token exchange method, path, headers or form")
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = io.WriteString(w, `{"access_token":"`+fixtureGrokAccess+`","refresh_token":"`+fixtureGrokRefresh+`","expires_in":3600}`)
+				_, _ = io.WriteString(w, `{"access_token":"`+fixtureRotatedAccess+`","refresh_token":"`+fixtureGrokRefresh+`","expires_in":3600}`)
 			},
 			grokHandler: func(w http.ResponseWriter, r *http.Request) {
-				if r.Header.Get("X-Api-Key") != "" {
+				if r.Header.Get("Authorization") != "Bearer "+fixtureRotatedAccess || r.Method != http.MethodPost || r.URL.RequestURI() != "/v1/responses" {
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				if r.Header.Get("X-Api-Key") != "" || r.Header.Get("X-Fixture-Client") != "" {
 					seenClientHeader.Store(true)
 				}
 				w.Header().Set("Content-Type", "application/json")
@@ -431,13 +455,15 @@ func TestGrokCompositionCallSites(t *testing.T) {
 		})
 
 		status, _, body := h.do(http.MethodPost, "/v1/messages", messageRequestJSON("claude-grok-4.7[1m]", false), http.Header{
-			"X-Api-Key": {fixtureAnthropicKey},
+			"X-Api-Key": {fixtureAnthropicKey}, "X-Fixture-Client": {"only-for-client"},
 		})
 		mustDiff(t, "grok refreshed inference status", http.StatusOK, status)
 		assertNoSecrets(t, "grok response body", body)
-		if authHits.Load() < 2 {
-			t.Errorf("expected OIDC discovery + token refresh via isolated auth transport, got %d hits", authHits.Load())
+		mustDiff(t, "discovery then exchange", int32(2), authHits.Load())
+		if h.authRequests.Load() != 2 || h.grokDials.Load() == 0 {
+			t.Fatal("auth or inference bypassed the dedicated transport")
 		}
+		mustDiff(t, "inference requests", int64(1), h.grokHits.Load())
 		if seenClientHeader.Load() {
 			t.Error("client X-Api-Key leaked to Grok upstream")
 		}
@@ -449,10 +475,9 @@ func TestGrokCompositionCallSites(t *testing.T) {
 		h := newHarness(t, harnessConfig{
 			grokCacheIDs: []string{"grok-private.2"},
 			grokHandler: func(w http.ResponseWriter, r *http.Request) {
-				raw, _ := io.ReadAll(r.Body)
-				obj := decodeJSONObject(t, raw)
+				model := providerModel(t, r)
 				mu.Lock()
-				seenModel, _ = obj["model"].(string)
+				seenModel = model
 				mu.Unlock()
 				w.Header().Set("Content-Type", "application/json")
 				_, _ = io.WriteString(w, `{"id":"resp_priv","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":3,"output_tokens":1}}`)
@@ -475,14 +500,14 @@ func TestGrokCompositionCallSites(t *testing.T) {
 		defer authSrv.Close()
 
 		dir := t.TempDir()
-		validExpired := writeGrokAuthFile(t, dir, authSrv.URL, fixedTime.Add(-time.Hour))
+		validExpired := writeGrokAuthFile(t, dir, authSrv.URL, fixedClock().Add(-time.Hour))
 		invalidPath := filepath.Join(dir, "invalid-auth.json")
 		if err := os.WriteFile(invalidPath, []byte(`{"not-grok":{}}`), 0o600); err != nil {
 			t.Fatalf("write invalid auth: %v", err)
 		}
 		missingPath := filepath.Join(dir, "missing-auth.json")
 
-		cases := map[string]struct {
+		tests := map[string]struct {
 			file      string
 			wantReady bool
 			wantState string
@@ -491,7 +516,7 @@ func TestGrokCompositionCallSites(t *testing.T) {
 			"error: invalid auth file reports auth-invalid without refresh":  {file: invalidPath, wantReady: false, wantState: "auth-invalid"},
 			"error: missing auth file reports auth-missing without refresh":  {file: missingPath, wantReady: false, wantState: "auth-missing"},
 		}
-		for name, tt := range cases {
+		for name, tt := range tests {
 			t.Run(name, func(t *testing.T) {
 				readGrok := compose.NewGrokReadiness(tt.file)
 				if readGrok == nil {
