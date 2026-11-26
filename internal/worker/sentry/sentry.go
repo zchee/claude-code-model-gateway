@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
 	"github.com/zchee/claude-code-model-gateway/internal/policy"
@@ -29,9 +30,10 @@ import (
 
 const defaultHeadroom = 40000
 
-// SessionKey returns the encoded session and optional agent, or empty if gating is disabled or the session is absent.
+// SessionKey encodes the session and optional agent, or disables gating with an empty key
+// if the session is absent, either identifier is invalid UTF-8, or gating is disabled.
 func SessionKey(enabled bool, session string, agent *string) string {
-	if !enabled || session == "" {
+	if !enabled || session == "" || !utf8.ValidString(session) || agent != nil && !utf8.ValidString(*agent) {
 		return ""
 	}
 	id := jsonx.WireValue{Kind: 'n'}
@@ -50,8 +52,16 @@ type Target struct {
 	Headroom int64
 }
 
+func (t Target) validFor(session string) bool {
+	return session != "" && t.Key != "" && utf8.ValidString(session) && utf8.ValidString(t.Key)
+}
+
 // ResolveTarget canonicalizes the model key and derives its trigger from the request's resolver and settings.
+// An invalid UTF-8 model ID yields an inert target rather than selecting a fallback model.
 func ResolveTarget(resolver policy.Resolver, id string, env float64, cap, compactAt int64) (Target, error) {
+	if !utf8.ValidString(id) {
+		return Target{}, nil
+	}
 	model := resolver.Resolve(id)
 	p, err := policy.EffectiveSentry(model, env, cap, compactAt)
 	if err != nil {
@@ -104,27 +114,31 @@ type latch struct {
 
 type modelState struct {
 	policy.Sentry
-	ceiling float64
+	ceiling  float64
+	headroom int64
 }
 
 // State holds session latches and learned model ceilings. Its zero value is safe for concurrent use.
 // Like the original worker, it retains entries until the worker exits, with no expiry or cap.
 // On 64-bit targets each session/model pair uses 48 bytes for its two string headers,
 // usage count and latch, plus the retained string data and map overhead. Sessions share one ceiling per model.
+// Unlike the original worker, State does not resolve live policy in response callbacks.
+// Pass the current target to Check at admission: only a non-compaction admission can replace an
+// existing window. Responses use the installed window and cannot restore their request's older one.
 type State struct {
 	mu       sync.Mutex
 	sessions map[sessionModel]latch
 	models   map[string]*modelState
 }
 
-// model returns the policy snapshot under the caller's lock. Only a backend window change invalidates it.
-func (s *State) model(t Target) *modelState {
+// model returns the shared policy under the caller's lock; only admission may refresh it.
+func (s *State) model(t Target, admission bool) *modelState {
 	m := s.models[t.Key]
-	if m == nil || m.BackendWindow != t.Policy.BackendWindow {
+	if m == nil || admission && m.BackendWindow != t.Policy.BackendWindow {
 		if s.models == nil {
 			s.models = make(map[string]*modelState)
 		}
-		m = &modelState{Sentry: *t.Policy}
+		m = &modelState{Sentry: *t.Policy, headroom: t.Headroom}
 		s.models[t.Key] = m
 	}
 	return m
@@ -142,15 +156,15 @@ type Crossing struct{ Usage, Trigger float64 }
 
 // Check tests the original request for a crossing and latches a refusal until rearmed.
 func (s *State) Check(session string, target Target, request []byte) (Crossing, bool) {
-	if target.Policy == nil || RequestPhase(request) == "compaction" {
+	if !target.validFor(session) || target.Policy == nil || RequestPhase(request) == "compaction" {
 		return Crossing{}, false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	trigger := s.model(target).CompactTrigger
+	trigger := s.model(target, true).CompactTrigger
 	key := sessionModel{session, target.Key}
 	v := s.sessions[key]
-	if session == "" || v.fired || v.usage <= trigger {
+	if v.fired || v.usage <= trigger {
 		return Crossing{}, false
 	}
 	v.fired = true
@@ -160,7 +174,7 @@ func (s *State) Check(session string, target Target, request []byte) (Crossing, 
 
 // Observe records a message_delta usage observation; ordinaryCompleted marks a delivered non-compaction turn.
 func (s *State) Observe(session string, target Target, event jsontext.Value, ordinaryCompleted bool) {
-	if session == "" || target.Policy == nil {
+	if !target.validFor(session) || target.Policy == nil {
 		return
 	}
 	v, err := jsonx.DecodeWire(event)
@@ -186,7 +200,7 @@ func (s *State) observe(session string, target Target, usage jsonx.WireValue, co
 	v := s.sessions[key]
 	v.usage = total
 	if v.fired {
-		trigger := s.model(target).CompactTrigger
+		trigger := s.model(target, false).CompactTrigger
 		low := trigger - min(defaultHeadroom, trigger*0.25)
 		v.fired = !(total < low || completed && total > trigger)
 	}
@@ -195,7 +209,7 @@ func (s *State) observe(session string, target Target, usage jsonx.WireValue, co
 
 // ObserveJSON records a proxy JSON message with the completion rule for its stop reason and original request.
 func (s *State) ObserveJSON(session string, target Target, request, response []byte) {
-	if session == "" || target.Policy == nil {
+	if !target.validFor(session) || target.Policy == nil {
 		return
 	}
 	v, err := jsonx.DecodeWire(response)
@@ -212,17 +226,18 @@ func (s *State) ObserveJSON(session string, target Target, request, response []b
 
 // Overflow latches a genuine refusal and returns the previous usage, optionally learning a derived ceiling.
 func (s *State) Overflow(session string, target Target, learn bool) float64 {
+	if !target.validFor(session) {
+		return 0
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := sessionModel{session, target.Key}
 	v := s.sessions[key]
-	if session != "" {
-		v.fired = true
-		s.store(key, v)
-	}
+	v.fired = true
+	s.store(key, v)
 	if target.Policy != nil {
-		m := s.model(target)
-		headroom := float64(target.Headroom)
+		m := s.model(target, false)
+		headroom := float64(m.headroom)
 		if learn && m.Source == "derived" && v.usage > headroom {
 			if m.ceiling == 0 || v.usage < m.ceiling {
 				m.ceiling = v.usage
@@ -240,10 +255,17 @@ func wireString(s string) jsonx.WireValue {
 func text(v jsonx.WireValue) string { return string(utf16.Decode(v.Text)) }
 
 func member(v jsonx.WireValue, name string) jsonx.WireValue {
+next:
 	for _, m := range v.Members {
-		if string(utf16.Decode(m.Name)) == name {
-			return m.Value
+		if len(m.Name) != len(name) {
+			continue
 		}
+		for i, unit := range m.Name {
+			if unit != uint16(name[i]) {
+				continue next
+			}
+		}
+		return m.Value
 	}
 	return jsonx.WireValue{}
 }
