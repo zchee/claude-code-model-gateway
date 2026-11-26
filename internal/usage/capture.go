@@ -17,40 +17,15 @@ package usage
 import (
 	"bytes"
 	"cmp"
-	"context"
 	"math"
-	"net"
 	"net/http"
 	"slices"
 	"sync"
 	"time"
 	"unicode/utf16"
 
-	"github.com/zchee/claude-code-model-gateway/internal/config"
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
 )
-
-// Emitter sends counts-only records to the configured loopback collector.
-type Emitter struct{}
-
-// NewEmitter resolves log settings and shares one builder across captures.
-func NewEmitter(lookup config.LookupEnv, builder *Builder) *Emitter {
-	return newEmitter(lookup, builder, nil)
-}
-
-// A nil dial function uses the standard network dialer.
-func newEmitter(lookup config.LookupEnv, builder *Builder, dialContext func(context.Context, string, string) (net.Conn, error)) *Emitter {
-	return &Emitter{}
-}
-
-// Enabled reports whether records have a local export destination.
-func (e *Emitter) Enabled() bool { return false }
-
-// Start allocates a request sequence in arrival order, not completion order.
-func (e *Emitter) Start(req Request) *Capture { return &Capture{} }
-
-// Wait waits for scheduled exports after the last request has finished.
-func (e *Emitter) Wait() {}
 
 // defaultMaxResponseBytes bounds a buffered JSON response when the caller supplies no limit.
 const defaultMaxResponseBytes = 4 << 20

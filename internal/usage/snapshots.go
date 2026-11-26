@@ -116,22 +116,36 @@ func messageBlocks(body jsonx.WireValue) []block {
 }
 
 func (b *Builder) toolRecords(r Record, key identity, body jsonx.WireValue) []Record {
+	ttl := float64(b.options.SnapshotTTL) / float64(time.Millisecond)
+	added := advanceTools(&b.snapshots, ttl, b.options.MaxIdentities, key, func() []block { return messageBlocks(body) }, r.Attributes["context_tokens"], r.ObservedAt)
+	return b.toolResultRecords(r, added)
+}
+
+// toolAttribution is one added tool-result block and its share of the context growth.
+type toolAttribution struct {
+	block
+	tokens  float64
+	quality string
+}
+
+// advanceTools replaces the identity's snapshot in cache and attributes the growth in context
+// tokens since the previous snapshot to the tool-result blocks added since then. blocks is
+// called only when the identity and the context count can be tracked.
+func advanceTools(cache *recent[identity, snapshot], ttlMillis float64, limit int, key identity, blocks func() []block, contextTokens any, now time.Time) []toolAttribution {
 	if key.session == "" {
 		return nil
 	}
 	if key.agent != "" {
 		key.parent = ""
 	}
-	total, ok := numeric(r.Attributes["context_tokens"])
+	total, ok := numeric(contextTokens)
 	if !ok {
 		return nil
 	}
-	now := r.ObservedAt
 	expired := func(e *list.Element) bool {
 		elapsed := now.UnixMilli() - e.Value.(cacheEntry[identity, snapshot]).at.UnixMilli()
-		return float64(elapsed) >= float64(b.options.SnapshotTTL)/float64(time.Millisecond)
+		return float64(elapsed) >= ttlMillis
 	}
-	cache := &b.snapshots
 	prev := cache.byKey[key]
 	if prev != nil && expired(prev) {
 		cache.pop(prev)
@@ -143,8 +157,8 @@ func (b *Builder) toolRecords(r Record, key identity, body jsonx.WireValue) []Re
 	for front := cache.order.Front(); front != nil && expired(front); front = cache.order.Front() {
 		cache.pop(front)
 	}
-	cur := snapshot{messageBlocks(body), math.Floor(total)}
-	cache.put(key, cur, now, b.options.MaxIdentities)
+	cur := snapshot{blocks(), math.Floor(total)}
+	cache.put(key, cur, now, limit)
 	if prev == nil {
 		return nil
 	}
@@ -167,23 +181,31 @@ func (b *Builder) toolRecords(r Record, key identity, body jsonx.WireValue) []Re
 		added = append(added, v)
 		weights = append(weights, v.bytes)
 	}
-	var records []Record
 	allocations := shares(delta, weights)
 	quality := "estimate"
 	if len(added) == 1 {
 		allocations[0] = delta
 		quality = "derived_exact"
 	}
+	var attributions []toolAttribution
 	for i, v := range added {
-		if v.toolID == "" {
-			continue
+		if v.toolID != "" {
+			attributions = append(attributions, toolAttribution{v, allocations[i], quality})
 		}
+	}
+	return attributions
+}
+
+// toolResultRecords derives one record per attribution from the primary record. The caller holds b.mu.
+func (b *Builder) toolResultRecords(r Record, attributions []toolAttribution) []Record {
+	var records []Record
+	for _, a := range attributions {
 		rec := b.derived(r, "gateway.tool_result.usage", "gateway-tool-result-")
-		rec.add("tool_use_id", v.toolID)
-		rec.add("tool_name", nullable(v.toolName))
-		rec.add("tool_result_tokens", allocations[i])
+		rec.add("tool_use_id", a.toolID)
+		rec.add("tool_name", nullable(a.toolName))
+		rec.add("tool_result_tokens", a.tokens)
 		rec.add("tool_result_tokens_unit", "tokens")
-		rec.add("tool_result_tokens_quality", quality)
+		rec.add("tool_result_tokens_quality", a.quality)
 		records = append(records, rec)
 	}
 	return records
