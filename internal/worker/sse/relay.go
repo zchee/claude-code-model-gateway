@@ -15,7 +15,6 @@
 package sse
 
 import (
-	"bufio"
 	"compress/gzip"
 	"compress/zlib"
 	"context"
@@ -70,14 +69,38 @@ func copyRelayHeaders(dst http.Header, resp *upstream.Response, dropContentLengt
 }
 
 // relayHeader returns a response header value as the source runtime's parsed header object
-// holds it: repeated fields joined with ", ".
+// holds it. A given RelayHeader is already normalized and is read as it is, every value it holds
+// in order. On the raw Header fallback the source runtime's rule for repeated fields applies:
+// Content-Type keeps its first value and other fields, such as Content-Encoding, are joined
+// with ", ".
 func relayHeader(resp *upstream.Response, name string) string {
-	src := resp.RelayHeader
-	if src == nil {
-		src = resp.Header
+	if resp.RelayHeader != nil {
+		return strings.Join(resp.RelayHeader.Values(name), ", ")
 	}
-	return strings.Join(src.Values(name), ", ")
+	if http.CanonicalHeaderKey(name) == "Content-Type" {
+		return resp.Header.Get(name)
+	}
+	return strings.Join(resp.Header.Values(name), ", ")
 }
+
+// discardWriter stands in for a client that has gone: it accepts a head, body bytes and flushes,
+// and sends nothing anywhere. It holds no reference to the real writer.
+type discardWriter struct {
+	header http.Header
+}
+
+func (d *discardWriter) Header() http.Header {
+	if d.header == nil {
+		d.header = make(http.Header)
+	}
+	return d.header
+}
+
+func (*discardWriter) Write(b []byte) (int, error) { return len(b), nil }
+
+func (*discardWriter) WriteHeader(int) {}
+
+func (*discardWriter) Flush() {}
 
 // heartbeatInterval resolves a configured interval: zero is the default, negative disables.
 func heartbeatInterval(d time.Duration) time.Duration {
@@ -251,8 +274,8 @@ func brokenResult(status int, clientGone bool) (outcome.Result, error) {
 // If the upstream breaks after response headers are committed, RelayProxy returns the terminal
 // outcome facts alongside http.ErrAbortHandler rather than panicking.
 // When the first-event peek finds an engine overflow, OnOverflow is called even if the client is
-// already gone, because the refusal must still reach the sentry; what it writes to w then is the
-// responder's contract.
+// already gone, because the refusal must still reach the sentry; it is then given a writer that
+// discards everything, so no head, body byte or flush reaches w.
 func RelayProxy(ctx context.Context, w http.ResponseWriter, resp *upstream.Response, opts ProxyOptions) (outcome.Result, error) {
 	if resp == nil || resp.Body == nil {
 		return outcome.Result{}, errNilResponse
@@ -274,6 +297,9 @@ func RelayProxy(ctx context.Context, w http.ResponseWriter, resp *upstream.Respo
 		case peeked.overflow != nil:
 			if opts.OnOverflow == nil {
 				return outcome.Result{Status: status}, errNoOverflowResponder
+			}
+			if closed(opts.ClientDone) {
+				return opts.OnOverflow(&discardWriter{}, status, *peeked.overflow)
 			}
 			return opts.OnOverflow(w, status, *peeked.overflow)
 		case peeked.earlyEnd != "":
@@ -510,34 +536,27 @@ func startSideDecoder(encoding string, events *EventObserver, onFailure func()) 
 }
 
 // decodeInto feeds the decompressed stream to events until the compressed stream ends. An empty
-// compressed body decodes to nothing for every encoding, as brotli and the source runtime's
-// decompressors treat it; the gzip and zlib readers would report a missing header instead.
+// compressed body is a decode failure for every encoding, as the source runtime's decompressors
+// report it ("unexpected end of file"), so it marks an overflow like any other failure.
 func decodeInto(encoding string, r io.Reader, events *EventObserver) error {
-	br := bufio.NewReader(r)
-	if _, err := br.Peek(1); err != nil {
-		if errors.Is(err, io.EOF) {
-			return nil
-		}
-		return err
-	}
 	var decoded io.Reader
 	switch encoding {
 	case "gzip":
-		zr, err := gzip.NewReader(br)
+		zr, err := gzip.NewReader(r)
 		if err != nil {
 			return err
 		}
 		defer func() { _ = zr.Close() }()
 		decoded = zr
 	case "deflate":
-		zr, err := zlib.NewReader(br)
+		zr, err := zlib.NewReader(r)
 		if err != nil {
 			return err
 		}
 		defer func() { _ = zr.Close() }()
 		decoded = zr
 	case "br":
-		decoded = brotli.NewReader(br)
+		decoded = brotli.NewReader(r)
 	default:
 		return errUnsupportedEncoding
 	}
