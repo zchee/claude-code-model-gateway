@@ -50,6 +50,9 @@ func TestRateLimitExpiryHeaderForms(t *testing.T) {
 		"success: repeated reset uses default":     {http.Header{reset: {"1790597700", "1790597715"}}, "2026-09-28T10:01:00.000Z", true},
 		"success: reset keys with different cases": {http.Header{reset: {"1790597700"}, "anthropic-ratelimit-unified-reset": {"1790597715"}}, "2026-09-28T10:01:00.000Z", true},
 		"success: unsupported date uses reset":     {http.Header{retry: {"Mon, 28 Sep 2026 10:05:00 XYZ"}, reset: {"1790597700"}}, "2026-09-28T12:15:00.000Z", true},
+		// Bare asctime is local in V8; the gateway cannot assign it a portable instant.
+		"success: asctime falls to reset":   {http.Header{retry: {"Mon Sep 28 10:05:00 2026"}, reset: {"1790597700"}}, "2026-09-28T12:15:00.000Z", true},
+		"success: asctime falls to default": {http.Header{retry: {"Mon Sep 28 10:05:00 2026"}}, "2026-09-28T10:01:00.000Z", true},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -93,6 +96,17 @@ func TestStateDecisionMembers(t *testing.T) {
 		"error: final decision members have the wrong type": {
 			blockJSON:       `{"state":"upstream-blocked","state":true}`,
 			unavailableJSON: `{"state":"upstream-unavailable","observedAtMs":1790589600000,"observedAtMs":"1790589600000"}`,
+		},
+		// JSON.parse produces infinity and the comparison converts singleton arrays
+		// to their element's string (lib/codex-upstream-state.js:14-16,28-31).
+		"success: negative overflow in an array expires": {
+			blockJSON:       `{"state":"upstream-blocked","expiresAtMs":[-1e400]}`,
+			unavailableJSON: `null`,
+		},
+		"success: positive overflow in nested arrays stays active": {
+			blockJSON:       `{"state":"upstream-blocked","expiresAtMs":[[1e400]]}`,
+			unavailableJSON: `null`,
+			block:           &upstreamstate.Blocked{State: "upstream-blocked"},
 		},
 	}
 	for name, tt := range tests {

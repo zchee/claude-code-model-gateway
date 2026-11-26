@@ -28,9 +28,11 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf16"
 
 	"github.com/zchee/claude-code-model-gateway/internal/atomicfile"
 	"github.com/zchee/claude-code-model-gateway/internal/config"
+	"github.com/zchee/claude-code-model-gateway/internal/jsdate"
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
 )
 
@@ -46,6 +48,9 @@ const (
 )
 
 // Store uses a gateway state directory, a clock, and the stable binary path used in guidance.
+// Reads project only metadata representable in the Go records. Wrong-typed metadata
+// does not erase an active hold, but appears as a zero value in readiness output;
+// for example, a string status code is displayed as HTTP 0.
 type Store struct {
 	Dir         string
 	Now         func() time.Time
@@ -112,8 +117,8 @@ func rateLimitExpiry(headers http.Header, now float64) float64 {
 			if seconds := config.JSNumber(retryAfter); !math.IsNaN(seconds) && !math.IsInf(seconds, 0) {
 				return now + max(0, seconds)*1000
 			}
-			if when, ok := retryAfterDate(retryAfter); ok {
-				return float64(when.UnixMilli())
+			if millis, ok := jsdate.Parse(retryAfter); ok {
+				return float64(millis)
 			}
 		}
 	}
@@ -123,22 +128,6 @@ func rateLimitExpiry(headers http.Header, now float64) float64 {
 		return reset * 1000
 	}
 	return now + float64(rateLimitDefault.Milliseconds())
-}
-
-func retryAfterDate(value string) (time.Time, bool) {
-	if date, err := time.Parse("Monday, 02-Jan-06 15:04:05 GMT", value); err == nil {
-		// V8 rolls two-digit years back at 50, rather than Go's 69.
-		if date.Year() >= 2050 {
-			date = date.AddDate(-100, 0, 0)
-		}
-		return date, true
-	}
-	for _, layout := range []string{http.TimeFormat, time.ANSIC, time.RFC3339Nano, "2006-01-02T15:04Z07:00", time.DateOnly, time.RFC1123Z, "Mon, 02 Jan 2006 15:04:05 UTC"} {
-		if date, err := time.Parse(layout, value); err == nil {
-			return date, true
-		}
-	}
-	return time.Time{}, false
 }
 
 func isoTime(ms int64) string {
@@ -159,16 +148,13 @@ func (s Store) ReadBlocked() *Blocked {
 	var expiresAtMs *float64
 	// Missing expiry is indefinite; a present value participates in a JavaScript numeric comparison.
 	if expiry := record["expiresAtMs"]; expiry != nil {
-		if expiry.Kind() == jsontext.KindNumber {
-			ms := config.JSNumber(string(expiry))
-			if float64(now) >= ms {
+		// DecodeWire preserves numeric overflow as infinity, including inside arrays.
+		if value, err := jsonx.DecodeWire(expiry); err == nil {
+			if float64(now) >= config.JSNumber(wireCoercionValue(value)) {
 				return nil
 			}
-			expiresAtMs = new(ms)
-		} else {
-			var value any
-			if err := json.Unmarshal(expiry, &value, jsontext.AllowDuplicateNames(true), jsontext.AllowInvalidUTF8(true)); err == nil && float64(now) >= config.JSNumber(value) {
-				return nil
+			if value.Kind == jsontext.KindNumber {
+				expiresAtMs = new(value.Number)
 			}
 		}
 	}
@@ -180,6 +166,30 @@ func (s Store) ReadBlocked() *Blocked {
 		ExpiresAt:   stateMember[string](record["expiresAt"]),
 		ExpiresAtMs: expiresAtMs,
 	}
+}
+
+func wireCoercionValue(value jsonx.WireValue) any {
+	switch value.Kind {
+	case jsontext.KindNull:
+		return nil
+	case jsontext.KindFalse:
+		return false
+	case jsontext.KindTrue:
+		return true
+	case jsontext.KindNumber:
+		return value.Number
+	case jsontext.KindString:
+		return string(utf16.Decode(value.Text))
+	case jsontext.KindBeginArray:
+		switch len(value.Elements) {
+		case 0:
+			return []any(nil)
+		case 1:
+			return []any{wireCoercionValue(value.Elements[0])}
+		}
+	}
+	// Objects and arrays with multiple entries do not produce a numeric value.
+	return math.NaN()
 }
 
 // ClearBlocked removes the recorded rejection if present.

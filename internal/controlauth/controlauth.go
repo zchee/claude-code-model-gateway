@@ -132,7 +132,9 @@ func hasOrigin(headers http.Header) bool {
 
 // Authenticated reports whether a lifecycle request is authorized for the listener.
 // In addition to the header requirements of [LocalRequestAllowed], req.Header
-// must retain the exact Content-Type value, without media type normalization.
+// must come from an HTTP parser: field names must be ASCII and repeated values
+// must be in received order so the first Content-Type can be selected. Retain
+// its exact value, without media type normalization.
 // ports must contain the listener's actual local port, not a port provided by
 // the request. The caller must load a valid, non-empty token before serving.
 func Authenticated(req *http.Request, token string, ports []int, compatibilityListener bool) bool {
