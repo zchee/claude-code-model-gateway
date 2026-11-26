@@ -60,16 +60,20 @@ func RunProcess(argv []string, stdin io.Reader, stdout, stderr io.Writer, p Proc
 }
 
 func run(argv []string, stdin io.Reader, stdout, stderr io.Writer, lookup func(string) (string, bool), home func() (string, error), commands []sourceCommand) int {
-	environ := func() []string {
-		var entries []string
-		for _, variable := range config.Variables() {
-			if value, ok := lookup(variable.Name); ok {
-				entries = append(entries, variable.Name+"="+value)
+	p := Process{Lookup: lookup, Home: home}
+	// Without a lookup there are no registered variables to list; a nil Environ supplies the empty list.
+	if lookup != nil {
+		p.Environ = func() []string {
+			var entries []string
+			for _, variable := range config.Variables() {
+				if value, ok := lookup(variable.Name); ok {
+					entries = append(entries, variable.Name+"="+value)
+				}
 			}
+			return entries
 		}
-		return entries
 	}
-	return runProcess(argv, stdin, stdout, stderr, Process{Lookup: lookup, Environ: environ, Home: home}, commands)
+	return runProcess(argv, stdin, stdout, stderr, p, commands)
 }
 
 var (
@@ -320,10 +324,13 @@ func reportFatal(stderr io.Writer, err error) error {
 	if err == nil {
 		return nil
 	}
+	const prefix = installedName + ": "
 	line := strings.ReplaceAll(strings.TrimRight(err.Error(), "\n"), "\n", "; ")
-	if !strings.HasPrefix(line, installedName+": ") {
-		line = installedName + ": " + line
+	// An error that wraps or joins causes repeats the prefix of every cause that carries one; the line keeps one.
+	line = strings.ReplaceAll(strings.ReplaceAll(line, ": "+prefix, ": "), "; "+prefix, "; ")
+	for strings.HasPrefix(line, prefix) {
+		line = line[len(prefix):]
 	}
-	_, _ = fmt.Fprintln(stderr, line)
+	_, _ = fmt.Fprintln(stderr, prefix+line)
 	return errReported
 }

@@ -16,6 +16,7 @@ package supervisor
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -83,7 +84,8 @@ type server struct {
 
 // Serve dispatches requests received on the bound public listener until cancellation or listener failure.
 // The handler receives each request with Host set to the Host header exactly as the client sent it.
-// It returns nil after cancellation, once in-flight requests have finished or the shutdown grace has passed.
+// After cancellation it returns once in-flight requests have finished or the shutdown grace has passed, with nil
+// unless the listener had already failed on its own: a listener failure is returned even when cancellation races it.
 func Serve(ctx context.Context, listener net.Listener, handler http.Handler) error {
 	s := &server{handler: handler, base: context.WithoutCancel(ctx), conns: make(map[*conn]struct{})}
 	accepted := make(chan error, 1)
@@ -93,7 +95,7 @@ func Serve(ctx context.Context, listener net.Listener, handler http.Handler) err
 	case err = <-accepted:
 	case <-ctx.Done():
 		_ = listener.Close()
-		<-accepted
+		err = <-accepted
 	}
 	if ctx.Err() == nil {
 		s.closeAll()
@@ -101,7 +103,11 @@ func Serve(ctx context.Context, listener net.Listener, handler http.Handler) err
 		return err
 	}
 	s.shutdown()
-	return nil
+	if errors.Is(err, net.ErrClosed) {
+		// The listener was closed because of the cancellation, here or by the caller; that is not a failure.
+		return nil
+	}
+	return err
 }
 
 func (s *server) accept(ctx context.Context, listener net.Listener) error {
@@ -116,8 +122,9 @@ func (s *server) accept(ctx context.Context, listener net.Listener) error {
 			timer := time.NewTimer(delay)
 			select {
 			case <-ctx.Done():
+				// The pause ended by cancellation, not by a listener failure.
 				timer.Stop()
-				return err
+				return nil
 			case <-timer.C:
 			}
 			continue
@@ -680,8 +687,10 @@ func (b *requestBody) read(p []byte) (int, error) {
 	return n, err
 }
 
-// readTrailer reads the trailer section under the same byte budget and time limit as a request head. A section the
-// stream cut off, even inside a line, is an early end of the body rather than a malformed trailer.
+// readTrailer reads the trailer section under the same byte budget and time limit as a request head. A section is
+// complete only at its empty line, so it is read to that line before any field line is judged: a section the stream
+// cut off, even after a complete malformed line or inside a line, is an early end of the body rather than a malformed
+// trailer. Only a complete section with a malformed field line is refused.
 func (b *requestBody) readTrailer() error {
 	b.c.budget.remain, b.c.budget.ended = maxHeadBytes, false
 	_ = b.c.rwc.SetReadDeadline(time.Now().Add(headTimeout))
@@ -689,14 +698,24 @@ func (b *requestBody) readTrailer() error {
 		b.c.budget.remain = -1
 		_ = b.c.rwc.SetReadDeadline(time.Time{})
 	}()
-	trailer, err := textproto.NewReader(b.c.br).ReadMIMEHeader()
-	if err != nil {
-		if errors.Is(err, io.EOF) || b.c.budget.ended {
-			return io.ErrUnexpectedEOF
+	lines := textproto.NewReader(b.c.br)
+	var section []byte
+	for {
+		// A line the stream cut off is returned without an error, and the next read reports the end.
+		line, err := lines.ReadLineBytes()
+		if err != nil {
+			if errors.Is(err, io.EOF) || b.c.budget.ended {
+				return io.ErrUnexpectedEOF
+			}
+			return err
 		}
-		return err
+		section = append(append(section, line...), '\r', '\n')
+		if len(line) == 0 {
+			break
+		}
 	}
-	if fieldsStatus(http.Header(trailer)) != 0 {
+	trailer, err := textproto.NewReader(bufio.NewReader(bytes.NewReader(section))).ReadMIMEHeader()
+	if err != nil || fieldsStatus(http.Header(trailer)) != 0 {
 		return errMalformedTrailer
 	}
 	return io.EOF

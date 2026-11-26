@@ -141,6 +141,7 @@ func Run(ctx context.Context, opts Options) error {
 
 	var stopErr error
 	signalName := ""
+	listenerDone := false
 	for waiting := true; waiting; {
 		select {
 		case <-ctx.Done():
@@ -152,20 +153,22 @@ func Run(ctx context.Context, opts Options) error {
 				signalName, waiting = "fixture-shutdown", false
 			}
 		case err := <-served:
-			served <- err
-			stopErr, waiting = fmt.Errorf("model-gateway: the public listener stopped: %w", err), false
+			listenerDone = true
+			stopErr, waiting = listenerStopped(err), false
 		case err := <-s.fatal:
 			stopErr, waiting = err, false
 		}
 	}
 	s.stop(signalName)
 	stopServe()
-	if err := <-served; err != nil && stopErr == nil {
-		stopErr = err
+	// A failure that was not the reason to stop is not returned; it is printed once so that it is not lost. The
+	// chosen stop path alone decides the exit status and the records.
+	if !listenerDone {
+		if err := <-served; err != nil {
+			s.warnFatal(listenerStopped(err))
+		}
 	}
 	s.wait()
-	// A failure still pending here was not the reason to stop, so Run does not return it; it is printed once so that
-	// it is not lost. The chosen stop path alone decides the exit status and the records.
 	select {
 	case err := <-s.fatal:
 		s.warnFatal(err)
@@ -180,6 +183,10 @@ func Run(ctx context.Context, opts Options) error {
 
 func samePortError(port int) error {
 	return fmt.Errorf("model-gateway: CODEX_GATEWAY_WORKER_PORT %d is the public port; the worker needs a port of its own", port)
+}
+
+func listenerStopped(err error) error {
+	return fmt.Errorf("model-gateway: the public listener stopped: %w", err)
 }
 
 func writerOr(w io.Writer) io.Writer {
