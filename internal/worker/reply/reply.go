@@ -17,10 +17,11 @@ package reply
 
 import (
 	"context"
-	"errors"
 	"net/http"
+	"strings"
 	"time"
 
+	"github.com/zchee/claude-code-model-gateway/internal/proxymodels"
 	"github.com/zchee/claude-code-model-gateway/internal/upstreamstate"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/outcome"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/sentry"
@@ -68,19 +69,90 @@ type Result struct {
 // Otherwise it returns an untouched open response for the stream relay, or an error wrapping
 // http.ErrAbortHandler when the client connection must abort.
 func Handle(ctx context.Context, w http.ResponseWriter, req Request, forward upstream.Send) (Result, error) {
-	return Result{}, errors.New("not implemented")
+	retries, delay := defaultRetries, defaultRetryDelay
+	if req.Retries != nil {
+		retries = max(0, *req.Retries)
+	}
+	if req.RetryDelay != nil {
+		delay = max(0, *req.RetryDelay)
+	}
+	if req.Usage == nil {
+		req.Usage = noUsage{}
+	}
+	var facts outcome.Result
+	for attempt := 0; ; attempt++ {
+		if ctx.Err() != nil {
+			return Result{Result: facts}, nil
+		}
+		res, err := forward(context.WithoutCancel(ctx))
+		facts.Contacted = true
+		if err != nil {
+			if res != nil && res.Body != nil {
+				_ = res.Body.Close()
+			}
+			return transportFailure(w, req, err, facts)
+		}
+		t := &turn{w: w, req: req, res: res, result: facts}
+		out, retry, err := t.respond(attempt, retries)
+		if !retry {
+			return out, err
+		}
+		if delay > 0 && !wait(ctx, delay) {
+			return Result{Result: facts}, nil
+		}
+	}
+}
+
+const (
+	defaultRetries    = 2
+	defaultRetryDelay = 250 * time.Millisecond
+)
+
+// wait sleeps for d unless the client context ends first, and reports whether the sleep completed.
+func wait(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 // WriteSentry reports a local refusal using the original request bytes and the provider's display label.
 func WriteSentry(w http.ResponseWriter, original []byte, provider string, cross sentry.Crossing) (outcome.Result, error) {
-	return outcome.Result{}, errors.New("not implemented")
+	o := overflowDetails(original, "gateway_sentry", cross.Usage, "previous_turn_usage", cross.Trigger)
+	body, err := overflowBody("Prompt is too long for the "+proxymodels.ProviderLabel(provider)+" context window; compact and retry."+comparison(cross.Usage, cross.Trigger), o)
+	if err != nil {
+		return outcome.Result{}, err
+	}
+	writeOverflow(w, body, nil)
+	return outcome.Result{Route: outcome.Route{Overflow: o}, Status: http.StatusRequestEntityTooLarge}, nil
 }
 
 // WriteEngineOverflow normalizes an upstream refusal using the prepared request and source HTTP status.
 // It always returns Contacted true because the refusal came from the upstream.
 func WriteEngineOverflow(w http.ResponseWriter, req Request, status int, counts sentry.Counts) (outcome.Result, error) {
-	return outcome.Result{}, errors.New("not implemented")
+	o, err := engineOverflow(w, req, status, counts)
+	if err != nil {
+		return outcome.Result{Contacted: true}, err
+	}
+	return outcome.Result{Route: outcome.Route{Overflow: o}, Status: http.StatusRequestEntityTooLarge, Contacted: true}, nil
 }
 
 // HasOpenAIRejectionEvidence reports whether an eligible HTTP rejection identifies OpenAI.
-func HasOpenAIRejectionEvidence(status int, headers http.Header, body []byte) bool { return false }
+func HasOpenAIRejectionEvidence(status int, headers http.Header, body []byte) bool {
+	switch status {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusTooManyRequests:
+	default:
+		return false
+	}
+	for name := range headers {
+		name = strings.ToLower(name)
+		if strings.HasPrefix(name, "x-openai-") || name == "openai-processing-ms" {
+			return true
+		}
+	}
+	return openAIWord.MatchString(lowerASCII(string(body)))
+}
