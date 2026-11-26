@@ -27,7 +27,10 @@ func TestInstallAfterStateDirectoryMoves(t *testing.T) {
 	base := t.TempDir()
 	state, moved := filepath.Join(base, "state"), filepath.Join(base, "moved")
 	lock := lockFor(state)
-	// Acquisition samples its deadline after preparing the candidate, before renaming it.
+	// The deadline is sampled after the parent is open but before installation. Moving
+	// it here catches installation or release by path, not creation by path followed
+	// by holding the descriptor. Acquire uses a single OpenDirectoryFile call;
+	// atomicfile's TestOpenDirCreateMovedAncestor checks the walk between components.
 	lock.Now = func() time.Time {
 		noError(t, os.Rename(state, moved))
 		noError(t, os.Mkdir(state, 0o700))

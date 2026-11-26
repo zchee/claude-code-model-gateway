@@ -205,7 +205,9 @@ func trimJournal(dir *atomicfile.Dir, data []byte) error {
 // Record appends an allowlisted lifecycle event on a best-effort basis.
 // Trimming rewrites the existing regular file in place. If the journal disappears
 // or becomes a symlink before the rewrite, Record neither recreates it nor follows
-// the link, and skips this event. Trimming and appending are not serialized.
+// the link, and skips this event. An interrupted trim can leave an empty or partial
+// journal. The 200-line bound applies only to sequential writers: trimming and
+// appending are not serialized. No ownership decision depends on the journal.
 func (f Files) Record(event string, fields map[string]any) {
 	if !validStateDir(f.StateDir) {
 		return
