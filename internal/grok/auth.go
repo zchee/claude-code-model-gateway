@@ -40,12 +40,13 @@ var (
 )
 
 // CheckAuth verifies that file contains a parseable Grok CLI auth object with a non-empty
-// access key under an https://auth.x.ai:: entry, without returning any credential.
+// access key under an https://auth.x.ai:: entry, without returning any credential,
+// refreshing tokens, or writing to disk.
 func CheckAuth(file string) error {
 	return errNotImplemented
 }
 
-// Readiness reports Grok CLI authentication readiness using check.
+// Readiness reports Grok CLI authentication readiness using check without refreshing tokens.
 // When check returns nil, Grok is ready; otherwise an error whose message contains "invalid"
 // (ASCII case-insensitive) maps to "auth-invalid" and any other error maps to "auth-missing".
 // A nil check reports "auth-missing" with the unavailable fallback message.
@@ -58,7 +59,8 @@ type AuthOptions struct {
 	// File is the clean, absolute path to the Grok CLI auth.json file.
 	File string
 	// Transport performs OIDC discovery and OAuth token refresh requests.
-	// If nil, http.DefaultTransport is used.
+	// Callers must supply a non-nil Transport isolated from the inference client's lifetime;
+	// nil is rejected with an error and http.DefaultTransport is never used.
 	Transport http.RoundTripper
 	// Now returns the current time for expiry checks and refreshed expiry timestamps.
 	// If nil, time.Now is used.
@@ -74,13 +76,17 @@ type AuthOptions struct {
 type AuthStore struct{}
 
 // NewAuthStore constructs an AuthStore for the configured auth file and transport.
-func NewAuthStore(opts AuthOptions) *AuthStore {
-	return &AuthStore{}
+// It returns an error when opts.Transport is nil.
+func NewAuthStore(opts AuthOptions) (*AuthStore, error) {
+	_ = opts
+	return &AuthStore{}, nil
 }
 
 // AccessToken returns a valid Grok access token, refreshing once across concurrent callers
 // when the stored token is expired, unparseable, or within the refresh skew window.
-// In shadow mode it never refreshes or writes the auth file.
+// In shadow mode it uses a stored token until its real expiry (even inside the refresh skew
+// window), refuses expired or unverifiable tokens with ErrAuthCannotRefresh, and never
+// refreshes or writes the auth file.
 func (s *AuthStore) AccessToken(ctx context.Context) (string, error) {
 	return "", errNotImplemented
 }

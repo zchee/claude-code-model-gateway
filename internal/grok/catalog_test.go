@@ -34,6 +34,37 @@ func writeFixtureFile(t *testing.T, path, content string) {
 	}
 }
 
+func isASCIIUnsignedDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := range len(s) {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func versionMeetsGrokMinimum(v string) bool {
+	parts := strings.Split(v, ".")
+	if len(parts) < 3 {
+		return false
+	}
+	var nums [3]int
+	for i := range 3 {
+		if !isASCIIUnsignedDigits(parts[i]) {
+			return false
+		}
+		n, err := strconv.Atoi(parts[i])
+		if err != nil {
+			return false
+		}
+		nums[i] = n
+	}
+	return nums[0] > 1 || (nums[0] == 1 && (nums[1] > 0 || (nums[1] == 0 && nums[2] >= 13)))
+}
+
 func TestVersionAndHeaders(t *testing.T) {
 	tests := map[string]struct {
 		versionFile string
@@ -54,7 +85,7 @@ func TestVersionAndHeaders(t *testing.T) {
 				"X-Grok-Model-Override":    {"grok-4.5"},
 			},
 		},
-		"success: empty version falls back to VersionFallback": {
+		"success: omitted empty version uses VersionFallback": {
 			token: "fixture-token",
 			model: "grok-4.7",
 			wantHeaders: http.Header{
@@ -132,21 +163,33 @@ func TestReadVersion(t *testing.T) {
 }
 
 func TestVersionFallbackMinimum(t *testing.T) {
-	parts := strings.Split(grok.VersionFallback, ".")
-	if len(parts) < 3 {
-		t.Fatalf("VersionFallback = %q, want major.minor.patch", grok.VersionFallback)
+	// Verify the minimum-version predicate itself rejects negative and below-minimum versions.
+	predicateCases := map[string]struct {
+		version string
+		want    bool
+	}{
+		"success: exact minimum 1.0.13":      {version: "1.0.13", want: true},
+		"success: current fallback 1.0.60":   {version: "1.0.60", want: true},
+		"success: higher minor 1.1.0":        {version: "1.1.0", want: true},
+		"success: higher major 2.0.0":        {version: "2.0.0", want: true},
+		"error: below minimum 1.0.12":        {version: "1.0.12", want: false},
+		"error: negative minor 1.-1.0":       {version: "1.-1.0", want: false},
+		"error: negative patch 1.0.-1":       {version: "1.0.-1", want: false},
+		"error: major zero 0.9.99":           {version: "0.9.99", want: false},
+		"error: empty version":               {version: "", want: false},
+		"error: missing patch component 1.0": {version: "1.0", want: false},
 	}
-	var nums [3]int
-	for i := range 3 {
-		n, err := strconv.Atoi(parts[i])
-		if err != nil {
-			t.Fatalf("VersionFallback %q part %d: %v", grok.VersionFallback, i, err)
-		}
-		nums[i] = n
+	for name, tc := range predicateCases {
+		t.Run(name, func(t *testing.T) {
+			if got := versionMeetsGrokMinimum(tc.version); got != tc.want {
+				t.Errorf("versionMeetsGrokMinimum(%q) = %v, want %v", tc.version, got, tc.want)
+			}
+		})
 	}
+
 	// The backend answers a client version older than 1.0.13 with HTTP 426.
-	if nums[0] < 1 || (nums[0] == 1 && nums[1] == 0 && nums[2] < 13) {
-		t.Errorf("VersionFallback = %q, must be at least 1.0.13", grok.VersionFallback)
+	if !versionMeetsGrokMinimum(grok.VersionFallback) {
+		t.Errorf("VersionFallback = %q, must be a valid semver at least 1.0.13", grok.VersionFallback)
 	}
 }
 
@@ -184,13 +227,37 @@ func TestCatalogCache(t *testing.T) {
 			},
 			wantIDs: []string{"grok-4.7", "grok-4.9", "grok-custom"},
 		},
-		"success: accepts models array and data array": {
+		"success: accepts models array shape": {
+			contents: new(`{"models": [{"id": "grok-4.8", "context_window": 300000, "supports_reasoning_effort": true}, {"id": "grok-4.8", "context_window": 999}, {"id": "not-grok"}]}`),
+			wantModels: []grok.Model{
+				{ID: "grok-4.8", Context: 300000, Reasoning: true},
+			},
+			wantIDs: []string{"grok-4.8"},
+		},
+		"success: accepts data array shape": {
 			contents: new(`{"data": [{"id": "grok-4.6", "context_window": "bad"}, {"id": "not-grok"}, {"id": "grok-4.6"}, {"id": "grok-4.5", "supports_reasoning_effort": false}]}`),
 			wantModels: []grok.Model{
 				{ID: "grok-4.6", Context: 500000, Reasoning: true},
 				{ID: "grok-4.5", Context: 500000, Reasoning: false},
 			},
 			wantIDs: []string{"grok-4.6", "grok-4.5"},
+		},
+		"success: preserves positive finite floating-point context and rejects non-positive values": {
+			contents: new(`{
+				"models": [
+					{"id": "grok-frac", "context_window": 123.5, "supports_reasoning_effort": false},
+					{"id": "grok-zero", "context_window": 0},
+					{"id": "grok-neg", "context_window": -42.5},
+					{"id": "grok-large", "context_window": 1e16}
+				]
+			}`),
+			wantModels: []grok.Model{
+				{ID: "grok-frac", Context: 123.5, Reasoning: false},
+				{ID: "grok-zero", Context: 131072, Reasoning: false},
+				{ID: "grok-neg", Context: 131072, Reasoning: false},
+				{ID: "grok-large", Context: 1e16, Reasoning: false},
+			},
+			wantIDs: []string{"grok-frac", "grok-zero", "grok-neg", "grok-large"},
 		},
 		"error: missing cache file returns empty": {
 			contents: nil,

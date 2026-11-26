@@ -15,45 +15,22 @@
 package grok
 
 import (
-	"encoding/json/jsontext"
 	"net/http"
 	"time"
 
+	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
+	"github.com/zchee/claude-code-model-gateway/internal/worker/outcome"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/sentry"
+	"github.com/zchee/claude-code-model-gateway/internal/worker/upstream"
 )
 
-// RouteInfo describes the Grok route metadata reported to telemetry and route logging.
-type RouteInfo struct {
-	SelectedModel  string
-	EffectiveModel string
-	Backend        string
-	Effort         string
-	Fallback       bool
-	Via            string
-}
-
-// OverflowDetails carries structured context-overflow diagnostics attached to synthetic 413 responses.
-type OverflowDetails struct {
-	Phase        string   `json:"phase"`
-	RefusedBy    string   `json:"refused_by"`
-	RequestBytes int      `json:"request_bytes"`
-	Tokens       *float64 `json:"tokens"`
-	TokensFrom   *string  `json:"tokens_from"`
-	LimitTokens  float64  `json:"limit_tokens"`
-}
-
-// Telemetry receives Grok route, overflow, and outcome observations.
-type Telemetry interface {
-	SetRoute(info RouteInfo)
-	SetOverflow(overflow OverflowDetails)
-	Finish(status int, outcome string)
-}
-
-// UsageObserver records upstream response metadata, byte counts, and translated usage for one request.
+// UsageObserver records upstream response metadata, decoded events, byte counts,
+// and translated JSON bodies for one Grok request.
+// The Grok branch observes usage but does not finish or emit a usage record.
 type UsageObserver interface {
 	SetResponse(status int, headers http.Header)
-	NoteResponseBytes(n int)
-	ObserveEvent(event jsontext.Value)
+	ObserveEvent(event jsonx.WireValue)
+	NoteResponseBytes(n int64)
 	ObserveJSON(body []byte)
 }
 
@@ -65,11 +42,11 @@ type BranchOptions struct {
 	VersionFile string
 	// Auth supplies and refreshes Grok CLI access tokens.
 	Auth *AuthStore
-	// Transport executes upstream HTTP requests to Endpoint.
-	// If nil, http.DefaultTransport is used.
-	Transport http.RoundTripper
-	// Sentry holds session latches and learned ceilings. When nil or SentryEnabled is false,
-	// context-sentry checks and usage recording are skipped.
+	// Client executes upstream inference HTTP requests to Endpoint.
+	// Callers must supply a non-nil Client; Handle never falls back to http.DefaultTransport.
+	Client *upstream.Client
+	// Sentry holds session latches and learned ceilings for response-side observation.
+	// When nil or SentryEnabled is false, response-side context-sentry observation is skipped.
 	Sentry        *sentry.State
 	SentryEnabled bool
 	// Now returns the current time for fallback message and tool IDs. If nil, time.Now is used.
@@ -81,10 +58,11 @@ type Branch struct{}
 
 // NewBranch constructs a Grok branch handler.
 func NewBranch(opts BranchOptions) *Branch {
+	_ = opts
 	return &Branch{}
 }
 
-// Request carries one classified Grok inference request into Branch.Handle.
+// Request carries one classified Grok inference request into Branch.Prepare and Branch.Handle.
 type Request struct {
 	// RawBody is the original client request body bytes before any translation.
 	RawBody []byte
@@ -94,14 +72,38 @@ type Request struct {
 	AdvertisedModel string
 	// BackendModel is the resolved Grok upstream model ID (for example "grok-4.7").
 	BackendModel string
+	// SessionKey is the context-sentry session/agent key computed by the worker from the incoming headers.
+	SessionKey string
 	// SentryTarget identifies the model key and effective sentry policy for this request.
 	SentryTarget sentry.Target
-	// Telemetry optionally records route, overflow, and finish status.
-	Telemetry Telemetry
 	// Usage optionally records response metadata, byte counts, and translated usage.
 	Usage UsageObserver
 }
 
-// Handle serves one Grok request, enforcing stateless thread refusal, context-sentry gating,
-// authentication, request and response translation, SSE streaming, and usage observation.
-func (b *Branch) Handle(w http.ResponseWriter, r *http.Request, req Request) {}
+// Prepare validates a Grok request before admission, auth, or upstream contact.
+// On exact path "/v1/messages", an unsupported thread field is answered immediately with HTTP 400
+// and Prepare returns (result, true) with resolved route metadata, Status 400, and StatusOverride
+// "thread_unsupported". Otherwise Prepare writes nothing and returns (result, false) with the
+// resolved route metadata populated.
+func (b *Branch) Prepare(w http.ResponseWriter, r *http.Request, req Request) (outcome.Result, bool) {
+	_, _, _, _ = b, w, r, req
+	return outcome.Result{}, false
+}
+
+// Handle serves one accepted Grok request, performing authentication, request and response
+// translation, SSE streaming, response-side context-sentry observation, and usage observation.
+// Admission and request-side context-sentry checks are performed by the caller before Handle;
+// Handle never runs an admission check and never finishes a usage record.
+//
+// A Grok response that cannot be translated or encoded before headers are committed is answered
+// locally with HTTP 502, error type "api_error", fixed message
+// "model-gateway: Grok response could not be translated.", and StatusOverride "upstream_error".
+//
+// r.Context() carries client liveness; b.Client governs upstream lifetime. outcome.Result.Cancelled
+// is always false here and is decided by the worker root. If the upstream breaks after response
+// headers are committed, Handle returns the terminal outcome facts alongside http.ErrAbortHandler
+// rather than panicking.
+func (b *Branch) Handle(w http.ResponseWriter, r *http.Request, req Request) (outcome.Result, error) {
+	_, _, _, _ = b, w, r, req
+	return outcome.Result{}, errNotImplemented
+}

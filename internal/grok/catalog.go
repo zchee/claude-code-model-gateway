@@ -29,9 +29,10 @@ const (
 )
 
 // Model describes a Grok backend model's context window and reasoning support.
+// Context retains the positive finite floating-point number from the CLI cache without integer narrowing.
 type Model struct {
 	ID        string
-	Context   int
+	Context   float64
 	Reasoning bool
 }
 
@@ -58,7 +59,8 @@ func ReadVersion(file string) string {
 }
 
 // Headers builds the upstream HTTP headers required by the Grok Responses endpoint.
-// An empty version uses VersionFallback.
+// Because Go has no undefined default argument, an empty version uses VersionFallback;
+// callers should pass the version returned by ReadVersion.
 func Headers(token, model, version string) http.Header {
 	return nil
 }

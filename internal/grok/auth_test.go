@@ -15,9 +15,13 @@
 package grok_test
 
 import (
+	"bytes"
+	"context"
 	json "encoding/json/v2"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -35,12 +39,103 @@ import (
 
 	"github.com/zchee/claude-code-model-gateway/internal/catalog"
 	"github.com/zchee/claude-code-model-gateway/internal/grok"
+	"github.com/zchee/claude-code-model-gateway/internal/worker/upstream"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return f(r)
+}
+
+func denyNetworkTransport(t *testing.T) http.RoundTripper {
+	t.Helper()
+	return roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		t.Errorf("unexpected outbound auth HTTP request: %s %s", r.Method, r.URL.Path)
+		return nil, errors.New("network disabled in test")
+	})
+}
+
+func newAuthTransport(t *testing.T, opts upstream.Options) *http.Transport {
+	t.Helper()
+	tr := upstream.NewTransport(opts)
+	if tr == nil {
+		t.Fatal("upstream.NewTransport returned nil")
+	}
+	t.Cleanup(tr.CloseIdleConnections)
+	return tr
+}
+
+func mustNewAuthStore(t *testing.T, opts grok.AuthOptions) *grok.AuthStore {
+	t.Helper()
+	store, err := grok.NewAuthStore(opts)
+	if err != nil {
+		t.Fatalf("NewAuthStore() unexpected error: %v", err)
+	}
+	if store == nil {
+		t.Fatal("NewAuthStore() returned nil store")
+	}
+	return store
+}
+
+func assertNoSecrets(t *testing.T, label, text string, secrets ...string) {
+	t.Helper()
+	for i, secret := range secrets {
+		if secret != "" && strings.Contains(text, secret) {
+			t.Errorf("%s leaked fixture secret #%d", label, i+1)
+		}
+	}
+}
+
+func freezeAuthFixture(t *testing.T, dir, file string) os.FileInfo {
+	t.Helper()
+	if err := os.Chmod(file, 0o400); err != nil {
+		t.Fatalf("chmod fixture file read-only: %v", err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("chmod fixture dir read-only: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(dir, 0o700)
+		_ = os.Chmod(file, 0o600)
+	})
+	info, err := os.Stat(file)
+	if err != nil {
+		t.Fatalf("stat frozen auth fixture: %v", err)
+	}
+	return info
+}
+
+func assertAuthFixtureUntouched(t *testing.T, dir, file string, before os.FileInfo, wantContent string) {
+	t.Helper()
+	after, err := os.Stat(file)
+	if err != nil {
+		t.Fatalf("stat auth fixture after call: %v", err)
+	}
+	if !os.SameFile(before, after) {
+		t.Error("auth fixture file identity changed (file was replaced)")
+	}
+	if !before.ModTime().Equal(after.ModTime()) {
+		t.Errorf("auth fixture mtime changed from %v to %v", before.ModTime(), after.ModTime())
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read auth fixture dir: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(file) {
+		names := make([]string, len(entries))
+		for i, e := range entries {
+			names[i] = e.Name()
+		}
+		t.Errorf("auth fixture directory entries = %v, want only [%s]", names, filepath.Base(file))
+	}
+	gotBytes, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatalf("read auth fixture after call: %v", err)
+	}
+	if !bytes.Equal(gotBytes, []byte(wantContent)) {
+		t.Errorf("auth fixture bytes changed (got len=%d, want len=%d)", len(gotBytes), len(wantContent))
+	}
 }
 
 func jsonHTTPResponse(req *http.Request, status int, body string) *http.Response {
@@ -53,37 +148,65 @@ func jsonHTTPResponse(req *http.Request, status int, body string) *http.Response
 	}
 }
 
-// redirectTransport forwards every request to srv while recording each original URL and body.
-func redirectTransport(srv *httptest.Server, record func(origURL, method, contentType, body string)) http.RoundTripper {
-	target, err := url.Parse(srv.URL)
-	if err != nil {
-		panic(err)
+type recordedAuthRequest struct {
+	method      string
+	url         string
+	contentType string
+	body        string
+	headers     http.Header
+}
+
+func TestNewAuthStore(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "auth.json")
+
+	tests := map[string]struct {
+		opts    grok.AuthOptions
+		wantErr bool
+	}{
+		"error: nil transport is rejected": {
+			opts: grok.AuthOptions{
+				File:      file,
+				Transport: nil,
+			},
+			wantErr: true,
+		},
+		"error: nil transport is rejected in shadow mode": {
+			opts: grok.AuthOptions{
+				File:      file,
+				Transport: nil,
+				Shadow:    true,
+			},
+			wantErr: true,
+		},
+		"success: explicit non-nil transport is accepted": {
+			opts: grok.AuthOptions{
+				File:      file,
+				Transport: denyNetworkTransport(t),
+			},
+			wantErr: false,
+		},
 	}
-	base := srv.Client().Transport
-	return roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		origURL := req.URL.String()
-		var bodyStr string
-		if req.Body != nil {
-			b, err := io.ReadAll(req.Body)
-			_ = req.Body.Close()
-			if err != nil {
-				return nil, err
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			store, err := grok.NewAuthStore(tt.opts)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("NewAuthStore() error = nil, want non-nil error for nil Transport")
+				}
+				if store != nil {
+					t.Error("NewAuthStore() returned non-nil store on error")
+				}
+				return
 			}
-			bodyStr = string(b)
-			req = req.Clone(req.Context())
-			req.Body = io.NopCloser(strings.NewReader(bodyStr))
-			req.ContentLength = int64(len(b))
-		} else {
-			req = req.Clone(req.Context())
-		}
-		if record != nil {
-			record(origURL, req.Method, req.Header.Get("Content-Type"), bodyStr)
-		}
-		req.URL.Scheme = target.Scheme
-		req.URL.Host = target.Host
-		req.Host = target.Host
-		return base.RoundTrip(req)
-	})
+			if err != nil {
+				t.Fatalf("NewAuthStore() unexpected error: %v", err)
+			}
+			if store == nil {
+				t.Fatal("NewAuthStore() returned nil store")
+			}
+		})
+	}
 }
 
 func TestReadiness(t *testing.T) {
@@ -151,10 +274,50 @@ func TestReadiness(t *testing.T) {
 				Message: "Grok CLI auth is present.",
 			},
 		},
+		"success: CheckAuth and Readiness never refresh or write expired auth": {
+			check: func(t *testing.T) func() error {
+				t.Cleanup(func() { goleak.VerifyNone(t) })
+				var hits atomic.Int32
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					hits.Add(1)
+					w.WriteHeader(http.StatusInternalServerError)
+				}))
+				t.Cleanup(srv.Close)
+				t.Cleanup(srv.Client().CloseIdleConnections)
+
+				dir := t.TempDir()
+				file := filepath.Join(dir, "auth.json")
+				content := `{"https://auth.x.ai::fixture-client":{"key":"fixture-expired-key","refresh_token":"fixture-refresh","expires_at":0,"oidc_client_id":"fixture-client","oidc_issuer":"` + srv.URL + `"}}`
+				writeFixtureFile(t, file, content)
+				before := freezeAuthFixture(t, dir, file)
+				return func() error {
+					err := grok.CheckAuth(file)
+					if hits.Load() != 0 {
+						t.Errorf("CheckAuth performed %d network calls, want 0", hits.Load())
+					}
+					assertAuthFixtureUntouched(t, dir, file, before, content)
+					return err
+				}
+			},
+			want: catalog.Readiness{
+				Ready:   true,
+				State:   "ready",
+				Message: "Grok CLI auth is present.",
+			},
+		},
 		"error: CheckAuth rejects missing file": {
 			check: func(t *testing.T) func() error {
 				file := filepath.Join(t.TempDir(), "missing.json")
-				return func() error { return grok.CheckAuth(file) }
+				return func() error {
+					err := grok.CheckAuth(file)
+					if err != nil && !errors.Is(err, grok.ErrAuthMissing) {
+						t.Errorf("CheckAuth(missing) error = %v, want %v", err, grok.ErrAuthMissing)
+					}
+					if err != nil && err.Error() != grok.ErrAuthMissing.Error() {
+						t.Errorf("CheckAuth(missing) error message = %q, want exact %q", err.Error(), grok.ErrAuthMissing.Error())
+					}
+					return err
+				}
 			},
 			want: catalog.Readiness{
 				Ready:   false,
@@ -162,11 +325,20 @@ func TestReadiness(t *testing.T) {
 				Message: "Grok CLI auth is missing. Run `grok` and log in again.",
 			},
 		},
-		"error: CheckAuth rejects empty key": {
+		"error: CheckAuth rejects empty key without leaking sibling secrets": {
 			check: func(t *testing.T) func() error {
 				file := filepath.Join(t.TempDir(), "auth.json")
-				writeFixtureFile(t, file, `{"https://auth.x.ai::fixture-client":{"key":""}}`)
-				return func() error { return grok.CheckAuth(file) }
+				writeFixtureFile(t, file, `{"https://auth.x.ai::fixture-client":{"key":"","refresh_token":"fixture-secret-refresh-checkauth"}}`)
+				return func() error {
+					err := grok.CheckAuth(file)
+					if err != nil {
+						assertNoSecrets(t, "CheckAuth error", err.Error(), "fixture-secret-refresh-checkauth")
+						if !errors.Is(err, grok.ErrAuthInvalid) || err.Error() != grok.ErrAuthInvalid.Error() {
+							t.Errorf("CheckAuth(empty key) error = %v, want exact %v", err, grok.ErrAuthInvalid)
+						}
+					}
+					return err
+				}
 			},
 			want: catalog.Readiness{
 				Ready:   false,
@@ -194,16 +366,20 @@ func TestRefreshAuth(t *testing.T) {
 		missingFile         bool
 		shadow              bool
 		discoveryStatus     int
-		discoveryBody       string
+		useDiscoveredServer bool
 		tokenStatus         int
 		tokenBody           string
+		expectedRefresh     string
 		wantToken           string
 		wantErr             error
-		wantTokenURL        string
+		wantDiscoveryURL    string
+		wantTokenURL        string // empty means tokenSrv.URL + "/discovered/oauth/token"
 		wantRefreshRotated  string
 		wantExpiresAt       int64
+		wantPreserveOther   bool
 		wantZeroNetworkCall bool
 		wantFileUnchanged   bool
+		secrets             []string
 	}{
 		"success: refreshes expired fixture auth": {
 			authJSON: `{
@@ -215,14 +391,17 @@ func TestRefreshAuth(t *testing.T) {
 				},
 				"unrelated": {"keep": true}
 			}`,
-			discoveryStatus:    http.StatusOK,
-			discoveryBody:      `{"token_endpoint":"https://auth.x.ai/oauth/token"}`,
-			tokenStatus:        http.StatusOK,
-			tokenBody:          `{"access_token":"fixture-fresh-token","expires_in":3600}`,
-			wantToken:          "fixture-fresh-token",
-			wantTokenURL:       "https://auth.x.ai/oauth/token",
-			wantRefreshRotated: "fixture-refresh-token",
-			wantExpiresAt:      now.UnixMilli() + 3600*1000,
+			discoveryStatus:     http.StatusOK,
+			useDiscoveredServer: true,
+			tokenStatus:         http.StatusOK,
+			tokenBody:           `{"access_token":"fixture-fresh-token","expires_in":3600}`,
+			expectedRefresh:     "fixture-refresh-token",
+			wantToken:           "fixture-fresh-token",
+			wantDiscoveryURL:    "https://auth.x.ai/.well-known/openid-configuration",
+			wantRefreshRotated:  "fixture-refresh-token",
+			wantExpiresAt:       now.UnixMilli() + 3600*1000,
+			wantPreserveOther:   true,
+			secrets:             []string{"fixture-expired-token", "fixture-refresh-token", "fixture-fresh-token"},
 		},
 		"success: rotates refresh token and falls back when discovery fails": {
 			authJSON: `{
@@ -234,19 +413,22 @@ func TestRefreshAuth(t *testing.T) {
 					"oidc_issuer": "https://issuer.example.test/"
 				}
 			}`,
-			discoveryStatus:    http.StatusInternalServerError,
-			discoveryBody:      `{"error":"discovery unavailable"}`,
-			tokenStatus:        http.StatusOK,
-			tokenBody:          `{"access_token":"fixture-rotated-token","refresh_token":"fixture-new-refresh","expires_in":1200}`,
-			wantToken:          "fixture-rotated-token",
-			wantTokenURL:       "https://issuer.example.test/oauth/token",
-			wantRefreshRotated: "fixture-new-refresh",
-			wantExpiresAt:      now.UnixMilli() + 1200*1000,
+			discoveryStatus:     http.StatusInternalServerError,
+			useDiscoveredServer: false,
+			tokenStatus:         http.StatusOK,
+			tokenBody:           `{"access_token":"fixture-rotated-token","refresh_token":"fixture-new-refresh","expires_in":1200}`,
+			expectedRefresh:     "fixture-old-refresh",
+			wantToken:           "fixture-rotated-token",
+			wantDiscoveryURL:    "https://issuer.example.test/.well-known/openid-configuration",
+			wantTokenURL:        "https://issuer.example.test/oauth/token",
+			wantRefreshRotated:  "fixture-new-refresh",
+			wantExpiresAt:       now.UnixMilli() + 1200*1000,
+			secrets:             []string{"fixture-expired-token", "fixture-old-refresh", "fixture-rotated-token", "fixture-new-refresh"},
 		},
 		"error: missing refresh token cannot refresh": {
 			authJSON: `{
 				"https://auth.x.ai::fixture-client": {
-					"key": "fixture-expired-token",
+					"key": "fixture-expired-token-noref",
 					"expires_at": 0,
 					"oidc_client_id": "fixture-client"
 				}
@@ -254,52 +436,58 @@ func TestRefreshAuth(t *testing.T) {
 			wantErr:             grok.ErrAuthCannotRefresh,
 			wantZeroNetworkCall: true,
 			wantFileUnchanged:   true,
+			secrets:             []string{"fixture-expired-token-noref"},
 		},
 		"error: missing client id cannot refresh": {
 			authJSON: `{
 				"https://auth.x.ai::fixture-client": {
-					"key": "fixture-expired-token",
-					"refresh_token": "fixture-refresh-token",
+					"key": "fixture-expired-token-noclient",
+					"refresh_token": "fixture-refresh-token-noclient",
 					"expires_at": 0
 				}
 			}`,
 			wantErr:             grok.ErrAuthCannotRefresh,
 			wantZeroNetworkCall: true,
 			wantFileUnchanged:   true,
+			secrets:             []string{"fixture-expired-token-noclient", "fixture-refresh-token-noclient"},
 		},
 		"error: non-2xx token response fails without modifying file": {
 			authJSON: `{
 				"https://auth.x.ai::fixture-client": {
-					"key": "fixture-expired-token",
+					"key": "fixture-expired-token-502",
 					"refresh_token": "fixture-secret-refresh-sentinel",
 					"expires_at": 0,
 					"oidc_client_id": "fixture-client"
 				}
 			}`,
-			discoveryStatus:   http.StatusOK,
-			discoveryBody:     `{"token_endpoint":"https://auth.x.ai/oauth/token"}`,
-			tokenStatus:       http.StatusBadGateway,
-			tokenBody:         `{"error":"invalid_grant"}`,
-			wantErr:           grok.ErrAuthRefreshFailed,
-			wantTokenURL:      "https://auth.x.ai/oauth/token",
-			wantFileUnchanged: true,
+			discoveryStatus:     http.StatusOK,
+			useDiscoveredServer: true,
+			tokenStatus:         http.StatusBadGateway,
+			tokenBody:           `{"error":"invalid_grant","detail":"fixture-upstream-secret-detail"}`,
+			expectedRefresh:     "fixture-secret-refresh-sentinel",
+			wantErr:             grok.ErrAuthRefreshFailed,
+			wantDiscoveryURL:    "https://auth.x.ai/.well-known/openid-configuration",
+			wantFileUnchanged:   true,
+			secrets:             []string{"fixture-expired-token-502", "fixture-secret-refresh-sentinel", "fixture-upstream-secret-detail"},
 		},
 		"error: missing access token in 200 response fails": {
 			authJSON: `{
 				"https://auth.x.ai::fixture-client": {
-					"key": "fixture-expired-token",
-					"refresh_token": "fixture-refresh-token",
+					"key": "fixture-expired-token-empty",
+					"refresh_token": "fixture-refresh-token-empty",
 					"expires_at": 0,
 					"oidc_client_id": "fixture-client"
 				}
 			}`,
-			discoveryStatus:   http.StatusOK,
-			discoveryBody:     `{"token_endpoint":"https://auth.x.ai/oauth/token"}`,
-			tokenStatus:       http.StatusOK,
-			tokenBody:         `{"access_token":""}`,
-			wantErr:           grok.ErrAuthRefreshFailed,
-			wantTokenURL:      "https://auth.x.ai/oauth/token",
-			wantFileUnchanged: true,
+			discoveryStatus:     http.StatusOK,
+			useDiscoveredServer: true,
+			tokenStatus:         http.StatusOK,
+			tokenBody:           `{"access_token":""}`,
+			expectedRefresh:     "fixture-refresh-token-empty",
+			wantErr:             grok.ErrAuthRefreshFailed,
+			wantDiscoveryURL:    "https://auth.x.ai/.well-known/openid-configuration",
+			wantFileUnchanged:   true,
+			secrets:             []string{"fixture-expired-token-empty", "fixture-refresh-token-empty"},
 		},
 		"error: missing auth file fails": {
 			missingFile:         true,
@@ -307,16 +495,17 @@ func TestRefreshAuth(t *testing.T) {
 			wantZeroNetworkCall: true,
 		},
 		"error: invalid auth file without x.ai entry fails": {
-			authJSON:            `{"other":{"key":"x"}}`,
+			authJSON:            `{"other":{"key":"fixture-unrelated-secret"}}`,
 			wantErr:             grok.ErrAuthInvalid,
 			wantZeroNetworkCall: true,
 			wantFileUnchanged:   true,
+			secrets:             []string{"fixture-unrelated-secret"},
 		},
 		"error: shadow mode disables refresh without network or disk writes": {
 			authJSON: `{
 				"https://auth.x.ai::fixture-client": {
-					"key": "fixture-expired-token",
-					"refresh_token": "fixture-refresh-token",
+					"key": "fixture-expired-token-shadow",
+					"refresh_token": "fixture-refresh-token-shadow",
 					"expires_at": 0,
 					"oidc_client_id": "fixture-client"
 				}
@@ -325,6 +514,7 @@ func TestRefreshAuth(t *testing.T) {
 			wantErr:             grok.ErrAuthCannotRefresh,
 			wantZeroNetworkCall: true,
 			wantFileUnchanged:   true,
+			secrets:             []string{"fixture-expired-token-shadow", "fixture-refresh-token-shadow"},
 		},
 	}
 
@@ -332,45 +522,126 @@ func TestRefreshAuth(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Cleanup(func() { goleak.VerifyNone(t) })
 
-			file := filepath.Join(t.TempDir(), "auth.json")
+			dir := t.TempDir()
+			file := filepath.Join(dir, "auth.json")
+			var beforeInfo os.FileInfo
 			if !tt.missingFile {
 				writeFixtureFile(t, file, tt.authJSON)
+				if tt.wantFileUnchanged {
+					beforeInfo = freezeAuthFixture(t, dir, file)
+				}
 			}
 
+			var tr http.RoundTripper
 			var mu sync.Mutex
-			var seenURLs []string
-			var tokenURL, tokenContentType, tokenBody string
-			var totalCalls atomic.Int32
+			var requests []recordedAuthRequest
+			var expectedTokenURL string
 
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				totalCalls.Add(1)
-				w.Header().Set("Content-Type", "application/json")
-				switch r.URL.Path {
-				case "/.well-known/openid-configuration":
-					w.WriteHeader(tt.discoveryStatus)
-					_, _ = io.WriteString(w, tt.discoveryBody)
-				case "/oauth/token":
+			if tt.wantZeroNetworkCall {
+				tr = denyNetworkTransport(t)
+			} else {
+				recordRequest := func(r *http.Request, body []byte) {
+					scheme := "http"
+					if r.TLS != nil {
+						scheme = "https"
+					}
+					mu.Lock()
+					requests = append(requests, recordedAuthRequest{
+						method:      r.Method,
+						url:         scheme + "://" + r.Host + r.URL.RequestURI(),
+						contentType: r.Header.Get("Content-Type"),
+						body:        string(body),
+						headers:     r.Header.Clone(),
+					})
+					mu.Unlock()
+				}
+
+				handleTokenExchange := func(w http.ResponseWriter, r *http.Request, raw []byte) {
+					w.Header().Set("Content-Type", "application/json")
+					form, parseErr := url.ParseQuery(string(raw))
+					if parseErr != nil ||
+						r.Method != http.MethodPost ||
+						!strings.HasPrefix(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") ||
+						form.Get("grant_type") != "refresh_token" ||
+						form.Get("refresh_token") != tt.expectedRefresh ||
+						form.Get("client_id") != "fixture-client" {
+						w.WriteHeader(http.StatusBadRequest)
+						_, _ = io.WriteString(w, `{"error":"invalid_grant"}`)
+						return
+					}
 					w.WriteHeader(tt.tokenStatus)
 					_, _ = io.WriteString(w, tt.tokenBody)
-				default:
-					w.WriteHeader(http.StatusNotFound)
 				}
-			}))
-			t.Cleanup(srv.Close)
-			t.Cleanup(srv.Client().CloseIdleConnections)
 
-			tr := redirectTransport(srv, func(origURL, method, contentType, body string) {
-				mu.Lock()
-				defer mu.Unlock()
-				seenURLs = append(seenURLs, origURL)
-				if method == http.MethodPost {
-					tokenURL = origURL
-					tokenContentType = contentType
-					tokenBody = body
+				tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					raw, _ := io.ReadAll(r.Body)
+					recordRequest(r, raw)
+					if r.URL.Path != "/discovered/oauth/token" {
+						w.WriteHeader(http.StatusNotFound)
+						return
+					}
+					handleTokenExchange(w, r, raw)
+				}))
+				t.Cleanup(tokenSrv.Close)
+				t.Cleanup(tokenSrv.Client().CloseIdleConnections)
+
+				discoveredEndpoint := tokenSrv.URL + "/discovered/oauth/token"
+				expectedTokenURL = tt.wantTokenURL
+				if expectedTokenURL == "" {
+					expectedTokenURL = discoveredEndpoint
 				}
-			})
 
-			store := grok.NewAuthStore(grok.AuthOptions{
+				discoverySrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					raw, _ := io.ReadAll(r.Body)
+					recordRequest(r, raw)
+					w.Header().Set("Content-Type", "application/json")
+					switch r.URL.Path {
+					case "/.well-known/openid-configuration":
+						w.WriteHeader(tt.discoveryStatus)
+						if tt.useDiscoveredServer {
+							_, _ = fmt.Fprintf(w, `{"token_endpoint":%q}`, discoveredEndpoint)
+						} else {
+							_, _ = io.WriteString(w, `{"error":"discovery unavailable"}`)
+						}
+					case "/oauth/token":
+						if tt.useDiscoveredServer {
+							// Falling back when discovery succeeded must fail.
+							w.WriteHeader(http.StatusNotFound)
+							_, _ = io.WriteString(w, `{"error":"must use discovered token endpoint"}`)
+							return
+						}
+						handleTokenExchange(w, r, raw)
+					default:
+						w.WriteHeader(http.StatusNotFound)
+					}
+				}))
+				t.Cleanup(discoverySrv.Close)
+				t.Cleanup(discoverySrv.Client().CloseIdleConnections)
+
+				tlsCfg := discoverySrv.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+				tlsCfg.ServerName = "127.0.0.1"
+
+				var dialer net.Dialer
+				tokenAddr := tokenSrv.Listener.Addr().String()
+				discoveryAddr := discoverySrv.Listener.Addr().String()
+				dialCtx := func(ctx context.Context, network, addr string) (net.Conn, error) {
+					switch addr {
+					case "auth.x.ai:443", "issuer.example.test:443":
+						return dialer.DialContext(ctx, network, discoveryAddr)
+					case tokenAddr:
+						return dialer.DialContext(ctx, network, tokenAddr)
+					default:
+						t.Errorf("blocked unapproved auth dial to %q", addr)
+						return nil, fmt.Errorf("blocked unapproved dial to %q", addr)
+					}
+				}
+				tr = newAuthTransport(t, upstream.Options{
+					DialContext: dialCtx,
+					TLSConfig:   tlsCfg,
+				})
+			}
+
+			store := mustNewAuthStore(t, grok.AuthOptions{
 				File:      file,
 				Transport: tr,
 				Now:       func() time.Time { return now },
@@ -382,23 +653,21 @@ func TestRefreshAuth(t *testing.T) {
 				if !errors.Is(err, tt.wantErr) {
 					t.Fatalf("Refresh() error = %v, want %v", err, tt.wantErr)
 				}
+				if err.Error() != tt.wantErr.Error() {
+					t.Errorf("Refresh() error text = %q, want exact %q", err.Error(), tt.wantErr.Error())
+				}
 				if gotToken != "" {
-					t.Errorf("Refresh() returned token %q on error", gotToken)
+					t.Errorf("Refresh() returned non-empty token on error (len=%d)", len(gotToken))
 				}
-				if strings.Contains(err.Error(), "fixture-secret-refresh-sentinel") || strings.Contains(err.Error(), "fixture-expired-token") {
-					t.Errorf("Refresh() error leaked credential: %q", err.Error())
-				}
-				if tt.wantZeroNetworkCall && totalCalls.Load() != 0 {
-					t.Errorf("network calls = %d, want 0 (URLs: %v)", totalCalls.Load(), seenURLs)
-				}
+				assertNoSecrets(t, "Refresh() error", err.Error(), tt.secrets...)
 				if tt.wantFileUnchanged {
-					after, readErr := os.ReadFile(file)
-					if readErr != nil {
-						t.Fatalf("read unchanged auth file: %v", readErr)
-					}
-					if diff := gocmp.Diff(tt.authJSON, string(after)); diff != "" {
-						t.Errorf("auth.json changed on failure (-want +got):\n%s", diff)
-					}
+					assertAuthFixtureUntouched(t, dir, file, beforeInfo, tt.authJSON)
+				}
+				if !tt.wantZeroNetworkCall {
+					mu.Lock()
+					gotReqs := append([]recordedAuthRequest(nil), requests...)
+					mu.Unlock()
+					assertOrderedRefreshRequests(t, gotReqs, tt.wantDiscoveryURL, expectedTokenURL, tt.expectedRefresh)
 				}
 				return
 			}
@@ -406,62 +675,120 @@ func TestRefreshAuth(t *testing.T) {
 				t.Fatalf("Refresh() unexpected error: %v", err)
 			}
 
-			if diff := gocmp.Diff(tt.wantToken, gotToken); diff != "" {
-				t.Errorf("Refresh() token (-want +got):\n%s", diff)
+			if gotToken != tt.wantToken {
+				t.Errorf("Refresh() returned unexpected token (got len=%d, want len=%d)", len(gotToken), len(tt.wantToken))
 			}
+
 			mu.Lock()
-			gotTokenURL, gotContentType, gotBody := tokenURL, tokenContentType, tokenBody
+			gotReqs := append([]recordedAuthRequest(nil), requests...)
 			mu.Unlock()
-			if diff := gocmp.Diff(tt.wantTokenURL, gotTokenURL); diff != "" {
-				t.Errorf("token endpoint URL (-want +got):\n%s", diff)
-			}
-			if !strings.HasPrefix(gotContentType, "application/x-www-form-urlencoded") {
-				t.Errorf("token request Content-Type = %q, want application/x-www-form-urlencoded", gotContentType)
-			}
-			if !strings.Contains(gotBody, "grant_type=refresh_token") {
-				t.Errorf("token request body = %q, want grant_type=refresh_token", gotBody)
-			}
-			form, parseErr := url.ParseQuery(gotBody)
-			if parseErr != nil {
-				t.Fatalf("parse form body %q: %v", gotBody, parseErr)
-			}
-			if diff := gocmp.Diff("fixture-client", form.Get("client_id")); diff != "" {
-				t.Errorf("form client_id (-want +got):\n%s", diff)
-			}
+			assertOrderedRefreshRequests(t, gotReqs, tt.wantDiscoveryURL, expectedTokenURL, tt.expectedRefresh)
 
 			persistedBytes, readErr := os.ReadFile(file)
 			if readErr != nil {
 				t.Fatalf("read persisted auth file: %v", readErr)
 			}
 			if !strings.HasSuffix(string(persistedBytes), "\n") {
-				t.Errorf("persisted auth.json must end with newline")
+				t.Error("persisted auth.json must end with newline")
 			}
 			info, statErr := os.Stat(file)
 			if statErr != nil {
 				t.Fatalf("stat persisted auth file: %v", statErr)
 			}
-			if info.Mode().Perm()&0o077 != 0 {
-				t.Errorf("persisted auth.json mode = %04o, want no group/other permissions", info.Mode().Perm())
+			if info.Mode().Perm() != 0o600 {
+				t.Errorf("persisted auth.json mode = %04o, want exact 0600", info.Mode().Perm())
 			}
 
 			var persisted map[string]any
 			if unmarshalErr := json.Unmarshal(persistedBytes, &persisted); unmarshalErr != nil {
 				t.Fatalf("unmarshal persisted auth.json: %v", unmarshalErr)
 			}
+			wantKeys := 1
+			if tt.wantPreserveOther {
+				wantKeys = 2
+				other, ok := persisted["unrelated"].(map[string]any)
+				if !ok {
+					t.Fatal("persisted auth.json lost unrelated entry")
+				}
+				if diff := gocmp.Diff(map[string]any{"keep": true}, other); diff != "" {
+					t.Errorf("persisted unrelated entry (-want +got):\n%s", diff)
+				}
+			}
+			if len(persisted) != wantKeys {
+				t.Errorf("persisted auth.json top-level key count = %d, want %d", len(persisted), wantKeys)
+			}
+
 			entry, ok := persisted["https://auth.x.ai::fixture-client"].(map[string]any)
 			if !ok {
-				t.Fatalf("persisted auth.json missing x.ai entry: %#v", persisted)
+				t.Fatal("persisted auth.json missing x.ai entry")
 			}
-			if diff := gocmp.Diff(tt.wantToken, entry["key"]); diff != "" {
-				t.Errorf("persisted key (-want +got):\n%s", diff)
+			if entry["key"] != tt.wantToken {
+				t.Error("persisted key did not match refreshed access token")
 			}
-			if diff := gocmp.Diff(tt.wantRefreshRotated, entry["refresh_token"]); diff != "" {
-				t.Errorf("persisted refresh_token (-want +got):\n%s", diff)
+			if entry["refresh_token"] != tt.wantRefreshRotated {
+				t.Error("persisted refresh_token did not match expected refresh token")
 			}
 			if diff := gocmp.Diff(float64(tt.wantExpiresAt), entry["expires_at"]); diff != "" {
 				t.Errorf("persisted expires_at (-want +got):\n%s", diff)
 			}
+			if diff := gocmp.Diff("fixture-client", entry["oidc_client_id"]); diff != "" {
+				t.Errorf("persisted oidc_client_id (-want +got):\n%s", diff)
+			}
 		})
+	}
+}
+
+func assertOrderedRefreshRequests(t *testing.T, reqs []recordedAuthRequest, wantDiscoveryURL, wantTokenURL, wantRefreshToken string) {
+	t.Helper()
+	if len(reqs) != 2 {
+		t.Fatalf("recorded auth HTTP requests = %d, want 2 (discovery then exchange)", len(reqs))
+	}
+	disc := reqs[0]
+	if diff := gocmp.Diff(http.MethodGet, disc.method); diff != "" {
+		t.Errorf("discovery request method (-want +got):\n%s", diff)
+	}
+	if diff := gocmp.Diff(wantDiscoveryURL, disc.url); diff != "" {
+		t.Errorf("discovery request URL (-want +got):\n%s", diff)
+	}
+
+	exch := reqs[1]
+	if diff := gocmp.Diff(http.MethodPost, exch.method); diff != "" {
+		t.Errorf("exchange request method (-want +got):\n%s", diff)
+	}
+	if diff := gocmp.Diff(wantTokenURL, exch.url); diff != "" {
+		t.Errorf("exchange request URL (-want +got):\n%s", diff)
+	}
+	if !strings.HasPrefix(exch.contentType, "application/x-www-form-urlencoded") {
+		t.Errorf("exchange Content-Type = %q, want prefix application/x-www-form-urlencoded", exch.contentType)
+	}
+	form, err := url.ParseQuery(exch.body)
+	if err != nil {
+		t.Fatalf("parse exchange form body: %v", err)
+	}
+	wantForm := url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {wantRefreshToken},
+		"client_id":     {"fixture-client"},
+	}
+	if len(form) != len(wantForm) {
+		t.Errorf("exchange form field count = %d, want %d", len(form), len(wantForm))
+	}
+	if diff := gocmp.Diff(wantForm["grant_type"], form["grant_type"]); diff != "" {
+		t.Errorf("exchange form grant_type (-want +got):\n%s", diff)
+	}
+	if diff := gocmp.Diff(wantForm["client_id"], form["client_id"]); diff != "" {
+		t.Errorf("exchange form client_id (-want +got):\n%s", diff)
+	}
+	if !gocmp.Equal(wantForm["refresh_token"], form["refresh_token"]) {
+		t.Error("exchange form refresh_token did not match fixture refresh token")
+	}
+
+	for i, req := range reqs {
+		for _, forbidden := range []string{"Authorization", "X-Grok-Client-Version", "X-Grok-Model-Override", "X-Grok-Client-Identifier"} {
+			if req.headers.Get(forbidden) != "" {
+				t.Errorf("auth request #%d sent forbidden inference header %q", i+1, forbidden)
+			}
+		}
 	}
 }
 
@@ -469,45 +796,69 @@ func TestAccessToken(t *testing.T) {
 	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
 
 	tests := map[string]struct {
-		expiresAt     string
+		expiresAt     *string
 		shadow        bool
 		wantToken     string
 		wantRefreshed bool
 		wantErr       error
 	}{
 		"success: fresh ISO timestamp skips refresh": {
-			expiresAt:     `"2026-11-26T13:00:00Z"`,
+			expiresAt:     new(`"2026-11-26T13:00:00Z"`),
 			wantToken:     "fixture-current-token",
 			wantRefreshed: false,
 		},
 		"success: fresh epoch seconds skips refresh": {
-			expiresAt:     "1795698000", // 2026-11-26T13:00:00Z in seconds (< 1e11)
+			expiresAt:     new("1795698000"), // 2026-11-26T13:00:00Z in seconds (< 1e11)
 			wantToken:     "fixture-current-token",
 			wantRefreshed: false,
 		},
 		"success: fresh epoch milliseconds skips refresh": {
-			expiresAt:     "1795698000000", // 2026-11-26T13:00:00Z in milliseconds (>= 1e11)
+			expiresAt:     new("1795698000000"), // 2026-11-26T13:00:00Z in milliseconds (>= 1e11)
 			wantToken:     "fixture-current-token",
 			wantRefreshed: false,
 		},
 		"success: shadow mode returns valid non-expiring token": {
-			expiresAt:     `"2026-11-26T13:00:00Z"`,
+			expiresAt:     new(`"2026-11-26T13:00:00Z"`),
+			shadow:        true,
+			wantToken:     "fixture-current-token",
+			wantRefreshed: false,
+		},
+		"success: shadow mode uses valid token inside refresh skew window without refreshing": {
+			expiresAt:     new(`"2026-11-26T12:04:00Z"`),
 			shadow:        true,
 			wantToken:     "fixture-current-token",
 			wantRefreshed: false,
 		},
 		"success: token within 5 minute skew triggers refresh": {
-			expiresAt:     `"2026-11-26T12:04:00Z"`,
+			expiresAt:     new(`"2026-11-26T12:04:00Z"`),
 			wantToken:     "fixture-fresh-token",
 			wantRefreshed: true,
 		},
 		"success: unparseable expiry string triggers refresh": {
-			expiresAt:     `"not-a-timestamp"`,
+			expiresAt:     new(`"not-a-timestamp"`),
 			wantToken:     "fixture-fresh-token",
 			wantRefreshed: true,
 		},
-		"error: shadow mode refuses expiring token without network or disk writes": {
-			expiresAt:     `"2026-11-26T12:04:00Z"`,
+		"error: shadow mode refuses token at exact expiry without network or disk writes": {
+			expiresAt:     new(`"2026-11-26T12:00:00Z"`),
+			shadow:        true,
+			wantRefreshed: false,
+			wantErr:       grok.ErrAuthCannotRefresh,
+		},
+		"error: shadow mode refuses expired token without network or disk writes": {
+			expiresAt:     new(`"2026-11-26T11:59:00Z"`),
+			shadow:        true,
+			wantRefreshed: false,
+			wantErr:       grok.ErrAuthCannotRefresh,
+		},
+		"error: shadow mode refuses unverifiable expiry without network or disk writes": {
+			expiresAt:     new(`"not-a-timestamp"`),
+			shadow:        true,
+			wantRefreshed: false,
+			wantErr:       grok.ErrAuthCannotRefresh,
+		},
+		"error: shadow mode refuses missing expiry without network or disk writes": {
+			expiresAt:     nil,
 			shadow:        true,
 			wantRefreshed: false,
 			wantErr:       grok.ErrAuthCannotRefresh,
@@ -518,29 +869,67 @@ func TestAccessToken(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Cleanup(func() { goleak.VerifyNone(t) })
 
+			var tr http.RoundTripper
+			var issuerURL string
 			var hits atomic.Int32
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				hits.Add(1)
-				w.Header().Set("Content-Type", "application/json")
-				switch r.URL.Path {
-				case "/.well-known/openid-configuration":
-					_, _ = io.WriteString(w, `{"token_endpoint":"http://`+r.Host+`/oauth/token"}`)
-				case "/oauth/token":
-					_, _ = io.WriteString(w, `{"access_token":"fixture-fresh-token","expires_in":3600}`)
-				default:
-					w.WriteHeader(http.StatusNotFound)
-				}
-			}))
-			t.Cleanup(srv.Close)
-			t.Cleanup(srv.Client().CloseIdleConnections)
 
-			file := filepath.Join(t.TempDir(), "auth.json")
-			initial := `{"https://auth.x.ai::fixture-client":{"key":"fixture-current-token","refresh_token":"fixture-refresh-token","expires_at":` + tt.expiresAt + `,"oidc_client_id":"fixture-client","oidc_issuer":"` + srv.URL + `"}}`
+			if tt.wantRefreshed {
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					hits.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					switch r.URL.Path {
+					case "/.well-known/openid-configuration":
+						_, _ = fmt.Fprintf(w, `{"token_endpoint":"http://%s/discovered/token"}`, r.Host)
+					case "/discovered/token":
+						raw, _ := io.ReadAll(r.Body)
+						form, err := url.ParseQuery(string(raw))
+						if err != nil || form.Get("grant_type") != "refresh_token" || form.Get("refresh_token") != "fixture-refresh-token" || form.Get("client_id") != "fixture-client" {
+							w.WriteHeader(http.StatusBadRequest)
+							_, _ = io.WriteString(w, `{"error":"invalid_grant"}`)
+							return
+						}
+						_, _ = io.WriteString(w, `{"access_token":"fixture-fresh-token","expires_in":3600}`)
+					default:
+						w.WriteHeader(http.StatusNotFound)
+					}
+				}))
+				t.Cleanup(srv.Close)
+				t.Cleanup(srv.Client().CloseIdleConnections)
+				issuerURL = srv.URL
+
+				var dialer net.Dialer
+				srvAddr := srv.Listener.Addr().String()
+				tr = newAuthTransport(t, upstream.Options{
+					DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+						if addr != srvAddr {
+							t.Errorf("blocked unapproved auth dial to %q", addr)
+							return nil, fmt.Errorf("blocked unapproved dial to %q", addr)
+						}
+						return dialer.DialContext(ctx, network, srvAddr)
+					},
+				})
+			} else {
+				issuerURL = "http://127.0.0.1:1"
+				tr = denyNetworkTransport(t)
+			}
+
+			dir := t.TempDir()
+			file := filepath.Join(dir, "auth.json")
+			var expiresField string
+			if tt.expiresAt != nil {
+				expiresField = `"expires_at":` + *tt.expiresAt + `,`
+			}
+			initial := `{"https://auth.x.ai::fixture-client":{"key":"fixture-current-token","refresh_token":"fixture-refresh-token",` + expiresField + `"oidc_client_id":"fixture-client","oidc_issuer":"` + issuerURL + `"}}`
 			writeFixtureFile(t, file, initial)
 
-			store := grok.NewAuthStore(grok.AuthOptions{
+			var beforeInfo os.FileInfo
+			if !tt.wantRefreshed {
+				beforeInfo = freezeAuthFixture(t, dir, file)
+			}
+
+			store := mustNewAuthStore(t, grok.AuthOptions{
 				File:      file,
-				Transport: srv.Client().Transport,
+				Transport: tr,
 				Now:       func() time.Time { return now },
 				Shadow:    tt.shadow,
 			})
@@ -550,29 +939,28 @@ func TestAccessToken(t *testing.T) {
 				if !errors.Is(err, tt.wantErr) {
 					t.Fatalf("AccessToken() error = %v, want %v", err, tt.wantErr)
 				}
-				if hits.Load() != 0 {
-					t.Errorf("network hits = %d, want 0", hits.Load())
+				if err.Error() != tt.wantErr.Error() {
+					t.Errorf("AccessToken() error text = %q, want exact %q", err.Error(), tt.wantErr.Error())
 				}
-				after, readErr := os.ReadFile(file)
-				if readErr != nil {
-					t.Fatalf("read auth file: %v", readErr)
+				if got != "" {
+					t.Errorf("AccessToken() returned non-empty token on error (len=%d)", len(got))
 				}
-				if diff := gocmp.Diff(initial, string(after)); diff != "" {
-					t.Errorf("auth.json changed in shadow mode (-want +got):\n%s", diff)
-				}
+				assertNoSecrets(t, "AccessToken() error", err.Error(), "fixture-current-token", "fixture-refresh-token", "fixture-fresh-token")
+				assertAuthFixtureUntouched(t, dir, file, beforeInfo, initial)
 				return
 			}
 			if err != nil {
 				t.Fatalf("AccessToken() unexpected error: %v", err)
 			}
-			if diff := gocmp.Diff(tt.wantToken, got); diff != "" {
-				t.Errorf("AccessToken() (-want +got):\n%s", diff)
+			if got != tt.wantToken {
+				t.Errorf("AccessToken() returned unexpected token (got len=%d, want len=%d)", len(got), len(tt.wantToken))
 			}
-			if tt.wantRefreshed && hits.Load() == 0 {
-				t.Errorf("expected refresh HTTP call, got 0")
-			}
-			if !tt.wantRefreshed && hits.Load() != 0 {
-				t.Errorf("expected 0 refresh HTTP calls, got %d", hits.Load())
+			if tt.wantRefreshed {
+				if hits.Load() != 2 {
+					t.Errorf("refresh HTTP calls = %d, want 2 (discovery + exchange)", hits.Load())
+				}
+			} else {
+				assertAuthFixtureUntouched(t, dir, file, beforeInfo, initial)
 			}
 		})
 	}
@@ -591,9 +979,14 @@ func TestAccessTokenSingleFlight(t *testing.T) {
 			switch req.URL.Path {
 			case "/.well-known/openid-configuration":
 				discoveryHits.Add(1)
-				return jsonHTTPResponse(req, http.StatusOK, `{"token_endpoint":"http://auth.fixture.test/oauth/token"}`), nil
-			case "/oauth/token":
+				return jsonHTTPResponse(req, http.StatusOK, `{"token_endpoint":"http://auth.fixture.test/discovered/token"}`), nil
+			case "/discovered/token":
 				tokenHits.Add(1)
+				raw, _ := io.ReadAll(req.Body)
+				form, err := url.ParseQuery(string(raw))
+				if err != nil || form.Get("grant_type") != "refresh_token" || form.Get("refresh_token") != "fixture-refresh-token" || form.Get("client_id") != "fixture-client" {
+					return jsonHTTPResponse(req, http.StatusBadRequest, `{"error":"invalid_grant"}`), nil
+				}
 				select {
 				case <-release:
 				case <-req.Context().Done():
@@ -606,7 +999,7 @@ func TestAccessTokenSingleFlight(t *testing.T) {
 		})
 
 		now := time.UnixMilli(1_700_000_000_000)
-		store := grok.NewAuthStore(grok.AuthOptions{
+		store := mustNewAuthStore(t, grok.AuthOptions{
 			File:      file,
 			Transport: tr,
 			Now:       func() time.Time { return now },
@@ -636,8 +1029,8 @@ func TestAccessTokenSingleFlight(t *testing.T) {
 			if errs[i] != nil {
 				t.Fatalf("caller %d AccessToken() error: %v", i, errs[i])
 			}
-			if diff := gocmp.Diff("fixture-fresh-token", tokens[i]); diff != "" {
-				t.Errorf("caller %d token (-want +got):\n%s", i, diff)
+			if tokens[i] != "fixture-fresh-token" {
+				t.Errorf("caller %d returned unexpected token (got len=%d)", i, len(tokens[i]))
 			}
 		}
 		if got := discoveryHits.Load(); got != 1 {
