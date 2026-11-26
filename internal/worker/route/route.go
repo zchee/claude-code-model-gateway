@@ -122,8 +122,10 @@ type Decision struct{ Branch, Provider, Model string }
 //
 // The order follows lib/request-worker.js:2361-2416 and 2430-2648: the drain endpoint, the health endpoint for any
 // method, the catalog, any HEAD request, then the body of a request whose path starts with /v1/messages. A body
-// that does not parse as exactly one JSON document, including one nested deeper than the wire decoder accepts,
-// takes the source's catch path to Anthropic, as does a body whose top-level value is null.
+// that does not parse as exactly one JSON document takes the source's catch path to Anthropic, as does a body whose
+// top-level value is null. A body nested deeper than 10,000 containers also goes to Anthropic, but that is a
+// recorded difference, not the source's behaviour: the source still parses and routes such a document by its
+// model, while the port refuses it at the wire decoder's depth limit and takes the default branch.
 func (s Snapshot) Classify(method, target string, body []byte) Decision {
 	path, _, _ := strings.Cut(target, "?")
 	switch {
@@ -176,9 +178,12 @@ func requestedModel(body []byte) (string, bool) {
 
 // grokModel maps a picker part to the first snapshot Grok ID with the same dot-flattened spelling, else to
 // grok-<picker> (lib/grok-backend.js:413-423). The source's fallback for an empty cache
-// (lib/request-worker.js:2603) passes the default model objects, whose string form never equals a picker part
-// built from an ID, so an empty list behaves as a list without a match. The source returns the first match only
-// when it is a non-empty string (match || ...), so a matching empty ID also yields grok-<picker>.
+// (lib/request-worker.js:2603) passes the default model objects, and String() of each is "[object Object]". For
+// every picker but one that never matches, so an empty list behaves as a list without a match. The exception is
+// the picker "[object Object]" (model claude-grok-[object Object]): with an empty list the source's find returns
+// the first default object (id grok-4.7) and routes with that object as the model, while the port returns the
+// string grok-[object Object]. The source returns the first match only when it is truthy (match || ...), so a
+// matching empty ID also yields grok-<picker>.
 func (s Snapshot) grokModel(picker string) string {
 	flattened := strings.ReplaceAll(picker, ".", "-")
 	for _, id := range s.grokIDs {
