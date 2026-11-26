@@ -184,8 +184,9 @@ type PeekResult struct {
 
 // PeekFirstEvent inspects body up to its first complete SSE data event or wait deadline.
 // The ctx parameter is the service-owned lifetime context, not the client request context.
-// PeekFirstEvent takes ownership of body on entry. A zero wait uses DefaultFirstEventWait;
-// a negative wait times out immediately.
+// PeekFirstEvent takes ownership of body on entry. The body passed in must allow Close
+// concurrently with Read, and Close must unblock a Read in flight. A zero wait uses
+// DefaultFirstEventWait; a negative wait times out immediately.
 //
 // A clean EOF before a first data event is not an error and returns a non-nil replay Body.
 // An abnormal upstream read error returns a nil Body, a non-empty EarlyEndOverride, and a nil error.
@@ -224,7 +225,8 @@ type ProxyOptions struct {
 // The ctx parameter is the service-owned lifetime context, not the client request context.
 // When opts.ClientDone closes or a write to w fails, RelayProxy stops heartbeats and writes nothing
 // more to w, then drains the finite upstream tail (observing usage and sentry) until EOF or ctx
-// cancellation. It never sets outcome.Result.Cancelled.
+// cancellation. When ctx ends after the client is gone, RelayProxy closes resp.Body and returns a
+// nil error (neither ctx.Err() nor http.ErrAbortHandler). It never sets outcome.Result.Cancelled.
 // It copies relay headers from resp.RelayHeader (or resp.Header if RelayHeader is nil) minus
 // hop-by-hop and Content-Length headers without mutating resp.Header or resp.RelayHeader.
 // It takes ownership of resp.Body and closes it before returning.
@@ -260,9 +262,11 @@ type PassthroughOptions struct {
 // opts.ClientDone closes or a write to w fails, RelayPassthrough stops heartbeats (if enabled) and
 // writes nothing more to w; Anthropic passthrough (ProxyProvider == "") never sends heartbeats, never
 // updates sentry state, and pauses reading resp.Body for back-pressure without eagerly closing the
-// provider until ctx is canceled. RelayPassthrough never sets outcome.Result.Cancelled. If the upstream
-// breaks after response headers are committed, RelayPassthrough returns the terminal outcome facts
-// alongside http.ErrAbortHandler rather than panicking.
+// provider until ctx is canceled. When ctx ends after the client is gone, RelayPassthrough closes
+// resp.Body and returns a nil error (neither ctx.Err() nor http.ErrAbortHandler). RelayPassthrough
+// never sets outcome.Result.Cancelled. If the upstream breaks after response headers are committed,
+// RelayPassthrough returns the terminal outcome facts alongside http.ErrAbortHandler rather than
+// panicking.
 func RelayPassthrough(ctx context.Context, w http.ResponseWriter, resp *upstream.Response, opts PassthroughOptions) (outcome.Result, error) {
 	_ = ctx
 	_ = w

@@ -30,12 +30,12 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/worker/sse"
 )
 
-// trackedChunkBody delivers scripted chunks, optional trailing error, and tracks Close and concurrent reads.
+// trackedChunkBody delivers scripted chunks, optional trailing error, and tracks Close count and concurrent reads.
 type trackedChunkBody struct {
 	mu           sync.Mutex
 	chunks       [][]byte
 	trailingErr  error
-	closed       atomic.Bool
+	closes       atomic.Int32
 	inFlight     atomic.Int32
 	overlapReads atomic.Int32
 }
@@ -48,7 +48,7 @@ func (b *trackedChunkBody) Read(p []byte) (int, error) {
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.closed.Load() {
+	if b.closes.Load() > 0 {
 		return 0, io.ErrClosedPipe
 	}
 	if len(b.chunks) == 0 {
@@ -67,14 +67,14 @@ func (b *trackedChunkBody) Read(p []byte) (int, error) {
 }
 
 func (b *trackedChunkBody) Close() error {
-	b.closed.Store(true)
+	b.closes.Add(1)
 	return nil
 }
 
-// singleReaderPipeBody wraps an io.PipeReader and detects any concurrent Read calls or premature Close.
+// singleReaderPipeBody wraps an io.PipeReader and detects any concurrent Read calls or duplicate/premature Close.
 type singleReaderPipeBody struct {
 	pr           *io.PipeReader
-	closed       atomic.Bool
+	closes       atomic.Int32
 	inFlight     atomic.Int32
 	overlapReads atomic.Int32
 }
@@ -88,7 +88,7 @@ func (b *singleReaderPipeBody) Read(p []byte) (int, error) {
 }
 
 func (b *singleReaderPipeBody) Close() error {
-	b.closed.Store(true)
+	b.closes.Add(1)
 	return b.pr.Close()
 }
 
@@ -101,7 +101,7 @@ type gatedReadBody struct {
 	closeOnce       sync.Once
 	allowReadReturn chan struct{}
 	allowOnce       sync.Once
-	closed          atomic.Bool
+	closes          atomic.Int32
 	readReturned    atomic.Bool
 	inFlight        atomic.Int32
 	overlapReads    atomic.Int32
@@ -128,7 +128,7 @@ func (b *gatedReadBody) Read(_ []byte) (int, error) {
 }
 
 func (b *gatedReadBody) Close() error {
-	b.closed.Store(true)
+	b.closes.Add(1)
 	b.closeOnce.Do(func() { close(b.closeCalled) })
 	return nil
 }
@@ -237,12 +237,17 @@ func TestPeekFirstEvent(t *testing.T) {
 					_ = res.Body.Close()
 					t.Fatalf("PeekResult.Body = non-nil, want nil")
 				}
-				if tt.wantClosedBefore && !src.closed.Load() {
-					t.Errorf("underlying body was not closed when PeekFirstEvent returned nil Body")
+				if tt.wantClosedBefore {
+					if got := src.closes.Load(); got != 1 {
+						t.Errorf("underlying body close count = %d when PeekFirstEvent returned nil Body, want 1", got)
+					}
 				}
 			} else {
 				if res.Body == nil {
 					t.Fatal("PeekResult.Body = nil, want non-nil replay body")
+				}
+				if got := src.closes.Load(); got != 0 {
+					t.Errorf("underlying body close count = %d before replay Body was read or closed, want 0", got)
 				}
 				gotBytes, readErr := io.ReadAll(res.Body)
 				closeErr := res.Body.Close()
@@ -252,8 +257,8 @@ func TestPeekFirstEvent(t *testing.T) {
 				if closeErr != nil {
 					t.Fatalf("Close(replay): %v", closeErr)
 				}
-				if !src.closed.Load() {
-					t.Errorf("closing replay Body did not close underlying body")
+				if got := src.closes.Load(); got != 1 {
+					t.Errorf("underlying body close count after Close(replay) = %d, want 1", got)
 				}
 				if diff := gocmp.Diff(tt.wantReplay, string(gotBytes)); diff != "" {
 					t.Errorf("replayed bytes mismatch (-want +got):\n%s", diff)
@@ -368,35 +373,90 @@ func TestPeekFirstEvent(t *testing.T) {
 				_ = pr.Close()
 				t.Fatalf("unexpected PeekResult on timeout: %+v", out.res)
 			}
-			if src.closed.Load() {
+			if got := src.closes.Load(); got != 0 {
 				_ = out.res.Body.Close()
 				_ = pw.Close()
-				t.Fatal("timeout closed the usable upstream body")
+				t.Fatalf("timeout closed the usable upstream body (closes=%d, want 0)", got)
 			}
 
-			// Deliver the stalled remainder and tail while reading from replay Body concurrently.
+			// Start reading the replay Body first while the source pipe is still silent, wait for
+			// quiescence, and assert no second reader races the in-flight source Read before writing the tail.
+			type readOut struct {
+				data []byte
+				err  error
+			}
+			readCh := make(chan readOut, 1)
+			readJoined := false
+			defer func() {
+				if !readJoined {
+					_ = pw.Close()
+					_ = pr.Close()
+					_ = out.res.Body.Close()
+					<-readCh
+				}
+			}()
+			go func() {
+				data, err := io.ReadAll(out.res.Body)
+				readCh <- readOut{data: data, err: err}
+			}()
+			synctest.Wait()
+
+			if overlaps := src.overlapReads.Load(); overlaps != 0 {
+				t.Fatalf("detected %d overlapping concurrent Read calls while source was silent after timeout", overlaps)
+			}
+			select {
+			case r := <-readCh:
+				readJoined = true
+				t.Fatalf("ReadAll(replay) returned before source EOF: data=%q err=%v", string(r.data), r.err)
+			default:
+			}
+
+			// Now release the stalled remainder and tail to complete the stream.
 			writeErrCh := make(chan error, 1)
+			writeJoined := false
+			defer func() {
+				if !writeJoined {
+					_ = pw.Close()
+					_ = pr.Close()
+					<-writeErrCh
+				}
+			}()
 			go func() {
 				_, err := io.WriteString(pw, ordinary[30:])
 				_ = pw.Close()
 				writeErrCh <- err
 			}()
+			synctest.Wait()
 
-			got, readErr := io.ReadAll(out.res.Body)
-			closeErr := out.res.Body.Close()
-			if writeErr := <-writeErrCh; writeErr != nil {
+			var writeErr error
+			select {
+			case writeErr = <-writeErrCh:
+				writeJoined = true
+			default:
+				t.Fatal("tail writer did not complete while replay reader was active")
+			}
+			if writeErr != nil {
 				t.Fatalf("writing remainder after timeout: %v", writeErr)
 			}
-			if readErr != nil {
-				t.Fatalf("ReadAll(replay): %v", readErr)
+
+			var r readOut
+			select {
+			case r = <-readCh:
+				readJoined = true
+			default:
+				t.Fatal("ReadAll(replay) did not complete after source EOF")
+			}
+			closeErr := out.res.Body.Close()
+			if r.err != nil {
+				t.Fatalf("ReadAll(replay): %v", r.err)
 			}
 			if closeErr != nil {
 				t.Fatalf("Close(replay): %v", closeErr)
 			}
-			if !src.closed.Load() {
-				t.Errorf("closing replay Body did not close underlying body")
+			if got := src.closes.Load(); got != 1 {
+				t.Errorf("underlying body close count after Close(replay) = %d, want 1", got)
 			}
-			if diff := gocmp.Diff(ordinary, string(got)); diff != "" {
+			if diff := gocmp.Diff(ordinary, string(r.data)); diff != "" {
 				t.Errorf("replayed stream after timeout (-want +got):\n%s", diff)
 			}
 			if overlaps := src.overlapReads.Load(); overlaps != 0 {
@@ -423,14 +483,15 @@ func TestPeekFirstEvent(t *testing.T) {
 			closeJoined := true
 			defer func() {
 				src.allowReturn()
-				_ = src.Close()
 				if !peekJoined {
+					_ = src.Close()
 					out := <-done
 					if out.res.Body != nil {
 						_ = out.res.Body.Close()
 					}
 				}
 				if !closeJoined {
+					_ = src.Close()
 					<-closeDone
 				}
 			}()
@@ -476,8 +537,8 @@ func TestPeekFirstEvent(t *testing.T) {
 			if out.err != nil || out.res.Body == nil {
 				t.Fatalf("expected replay body on timeout, got res=%+v err=%v", out.res, out.err)
 			}
-			if src.closed.Load() {
-				t.Fatal("timeout closed the underlying source body")
+			if got := src.closes.Load(); got != 0 {
+				t.Fatalf("timeout closed the underlying source body (closes=%d, want 0)", got)
 			}
 
 			// Start Close on the replay Body while the stalled reader is gated inside Read.
@@ -488,8 +549,8 @@ func TestPeekFirstEvent(t *testing.T) {
 			}()
 			synctest.Wait()
 
-			if !src.closed.Load() {
-				t.Fatal("Close(replay) did not close underlying body")
+			if got := src.closes.Load(); got != 1 {
+				t.Fatalf("underlying body close count during Close(replay) = %d, want 1", got)
 			}
 			select {
 			case err := <-closeDone:
@@ -509,6 +570,9 @@ func TestPeekFirstEvent(t *testing.T) {
 				}
 			default:
 				t.Fatal("Close(replay) did not return after stalled reader exited")
+			}
+			if got := src.closes.Load(); got != 1 {
+				t.Errorf("underlying body close count after Close(replay) = %d, want 1", got)
 			}
 			if !src.readReturned.Load() {
 				t.Errorf("underlying Read did not exit before Close(replay) returned")
@@ -538,8 +602,8 @@ func TestPeekFirstEvent(t *testing.T) {
 			defer func() {
 				cancel()
 				src.allowReturn()
-				_ = src.Close()
 				if !joined {
+					_ = src.Close()
 					out := <-done
 					if out.res.Body != nil {
 						_ = out.res.Body.Close()
@@ -568,8 +632,8 @@ func TestPeekFirstEvent(t *testing.T) {
 			cancel()
 			synctest.Wait()
 
-			if !src.closed.Load() {
-				t.Fatal("cancellation did not close underlying body")
+			if got := src.closes.Load(); got != 1 {
+				t.Fatalf("underlying body close count on cancellation = %d, want 1", got)
 			}
 			select {
 			case out := <-done:
@@ -597,6 +661,9 @@ func TestPeekFirstEvent(t *testing.T) {
 			if out.res.Body != nil {
 				_ = out.res.Body.Close()
 				t.Fatalf("PeekResult.Body = non-nil on cancellation, want nil")
+			}
+			if got := src.closes.Load(); got != 1 {
+				t.Errorf("underlying body close count after cancellation return = %d, want 1", got)
 			}
 			if !src.readReturned.Load() {
 				t.Errorf("underlying Read did not exit before PeekFirstEvent returned")

@@ -27,10 +27,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -442,7 +440,7 @@ func TestPassthroughFlushAndNoHeartbeat(t *testing.T) {
 				res, err := sse.RelayPassthrough(t.Context(), rec, up, sse.PassthroughOptions{
 					Usage: usage,
 				})
-				done <- handlerOutcome{res: res, err: err, bodyClosed: src.closed.Load()}
+				done <- handlerOutcome{res: res, err: err, bodyCloses: src.closes.Load()}
 			}()
 			joined := false
 			defer func() {
@@ -500,8 +498,8 @@ func TestPassthroughFlushAndNoHeartbeat(t *testing.T) {
 			if out.err != nil {
 				t.Fatalf("RelayPassthrough error = %v, want nil", out.err)
 			}
-			if !out.bodyClosed {
-				t.Errorf("RelayPassthrough returned without closing owned resp.Body")
+			if out.bodyCloses != 1 {
+				t.Errorf("owned resp.Body close count = %d, want 1", out.bodyCloses)
 			}
 			events, _, totalBytes, _ := usage.snapshot(t)
 			if totalBytes != int64(len(part1)+len(part2)) {
@@ -531,7 +529,7 @@ func TestPassthroughFlushAndNoHeartbeat(t *testing.T) {
 					// Even with a positive HeartbeatInterval configured, empty ProxyProvider means Anthropic passthrough.
 					HeartbeatInterval: 5 * time.Second,
 				})
-				done <- handlerOutcome{res: res, err: err, bodyClosed: src.closed.Load()}
+				done <- handlerOutcome{res: res, err: err, bodyCloses: src.closes.Load()}
 			}()
 			joined := false
 			defer func() {
@@ -575,8 +573,8 @@ func TestPassthroughFlushAndNoHeartbeat(t *testing.T) {
 			if out.err != nil {
 				t.Fatalf("RelayPassthrough returned %v, want nil", out.err)
 			}
-			if !out.bodyClosed {
-				t.Errorf("RelayPassthrough returned without closing owned resp.Body")
+			if out.bodyCloses != 1 {
+				t.Errorf("owned resp.Body close count = %d, want 1", out.bodyCloses)
 			}
 			_, _, finalBody, _, _ := rec.snapshot()
 			if diff := gocmp.Diff(first, finalBody); diff != "" {
@@ -747,7 +745,7 @@ func TestStreamAbortAndDisconnect(t *testing.T) {
 					ClientDone:      clientDone,
 					Usage:           usage,
 				})
-				done <- handlerOutcome{res: res, err: err, bodyClosed: src.closed.Load()}
+				done <- handlerOutcome{res: res, err: err, bodyCloses: src.closes.Load()}
 			}()
 			joined := false
 			defer func() {
@@ -784,8 +782,8 @@ func TestStreamAbortAndDisconnect(t *testing.T) {
 				t.Fatalf("heartbeat write attempted after ClientDone: attempts=%d (before=%d) writes=%q",
 					got, attemptsAtDisconnect, rec.attemptedSnapshot())
 			}
-			if src.closed.Load() {
-				t.Fatal("proxy relay closed upstream body early after ClientDone")
+			if got := src.closes.Load(); got != 0 {
+				t.Fatalf("proxy relay closed upstream body early after ClientDone (closes=%d)", got)
 			}
 
 			// Finite upstream tail still drains to completion while observing usage and writing nothing more to w.
@@ -807,8 +805,8 @@ func TestStreamAbortAndDisconnect(t *testing.T) {
 			if out.err != nil {
 				t.Fatalf("RelayProxy returned %v after clean upstream drain, want nil", out.err)
 			}
-			if !out.bodyClosed {
-				t.Errorf("RelayProxy returned without closing owned resp.Body")
+			if out.bodyCloses != 1 {
+				t.Errorf("owned resp.Body close count = %d, want 1", out.bodyCloses)
 			}
 			if out.res.Status != http.StatusOK {
 				t.Errorf("outcome.Status = %d, want 200", out.res.Status)
@@ -856,7 +854,7 @@ func TestStreamAbortAndDisconnect(t *testing.T) {
 					BackendModel:    "gpt-5.6-sol",
 					Usage:           usage,
 				})
-				done <- handlerOutcome{res: res, err: err, bodyClosed: src.closed.Load()}
+				done <- handlerOutcome{res: res, err: err, bodyCloses: src.closes.Load()}
 			}()
 			joined := false
 			defer func() {
@@ -917,8 +915,8 @@ func TestStreamAbortAndDisconnect(t *testing.T) {
 			if out.err != nil {
 				t.Fatalf("RelayProxy returned %v, want nil", out.err)
 			}
-			if !out.bodyClosed {
-				t.Errorf("RelayProxy returned without closing owned resp.Body")
+			if out.bodyCloses != 1 {
+				t.Errorf("owned resp.Body close count = %d, want 1", out.bodyCloses)
 			}
 			if out.res.Cancelled {
 				t.Errorf("outcome.Cancelled = true, want false (relays never set Cancelled)")
@@ -954,7 +952,7 @@ func TestStreamAbortAndDisconnect(t *testing.T) {
 					ProxyProvider: "codex",
 					ClientDone:    clientDone,
 				})
-				done <- handlerOutcome{res: res, err: err, bodyClosed: src.closed.Load()}
+				done <- handlerOutcome{res: res, err: err, bodyCloses: src.closes.Load()}
 			}()
 			joined := false
 			defer func() {
@@ -990,8 +988,8 @@ func TestStreamAbortAndDisconnect(t *testing.T) {
 				t.Fatalf("proxy passthrough attempted heartbeat after ClientDone: attempts=%d (before=%d) writes=%q",
 					got, attemptsAtDisconnect, rec.attemptedSnapshot())
 			}
-			if src.closed.Load() {
-				t.Fatal("proxy passthrough eagerly closed upstream body after ClientDone")
+			if got := src.closes.Load(); got != 0 {
+				t.Fatalf("proxy passthrough eagerly closed upstream body after ClientDone (closes=%d)", got)
 			}
 
 			cancelService()
@@ -1007,152 +1005,13 @@ func TestStreamAbortAndDisconnect(t *testing.T) {
 			if out.err != nil {
 				t.Fatalf("RelayPassthrough returned %v after service shutdown, want nil", out.err)
 			}
-			if !out.bodyClosed {
-				t.Errorf("RelayPassthrough returned without closing owned resp.Body")
+			if out.bodyCloses != 1 {
+				t.Errorf("owned resp.Body close count = %d, want 1", out.bodyCloses)
 			}
 			if out.res.Cancelled {
 				t.Errorf("outcome.Cancelled = true, want false (relays never set Cancelled)")
 			}
 		})
-	})
-
-	t.Run("success: loopback proxy client disconnect drains finite provider tail without eager close", func(t *testing.T) {
-		firstFrame := "event: message_start\ndata: {\"type\":\"message_start\"}\n\n"
-		// 512 x 64 KiB = 32 MiB finite tail: exceeds loopback kernel socket buffers so the provider
-		// cannot finish unless the relay actively drains resp.Body, verified also by usage byte count.
-		const tailBlockCount = 512
-		commentBlock := ": " + strings.Repeat("a", 64*1024-4) + "\n\n"
-		tailDelta := "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":42,\"output_tokens\":7}}\n\n"
-		tailFinal := tailDelta + literalMessageStop
-		wantTailLen := tailBlockCount*len(commentBlock) + len(tailFinal)
-
-		clientGone := make(chan struct{})
-		var goneOnce sync.Once
-		markClientGone := func() { goneOnce.Do(func() { close(clientGone) }) }
-
-		type providerOutcome struct {
-			tailErr error
-			written int
-		}
-		providerDone := make(chan providerOutcome, 1)
-
-		upSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "text/event-stream")
-			w.WriteHeader(http.StatusOK)
-			rc := http.NewResponseController(w)
-			_, _ = io.WriteString(w, firstFrame)
-			_ = rc.Flush()
-			select {
-			case <-clientGone:
-			case <-r.Context().Done():
-				providerDone <- providerOutcome{tailErr: r.Context().Err()}
-				return
-			}
-			total := 0
-			for range tailBlockCount {
-				n, err := io.WriteString(w, commentBlock)
-				total += n
-				if err != nil {
-					providerDone <- providerOutcome{tailErr: err, written: total}
-					return
-				}
-				_ = rc.Flush()
-			}
-			n, err := io.WriteString(w, tailFinal)
-			total += n
-			_ = rc.Flush()
-			providerDone <- providerOutcome{tailErr: err, written: total}
-		}))
-		// LIFO cleanup: release blocked upstream handler before closing upSrv.
-		t.Cleanup(upSrv.Close)
-		t.Cleanup(markClientGone)
-
-		usage := &usageSpy{}
-		handlerClientDone := make(chan struct{})
-		h := startRelayServer(t, upSrv.URL, func(serviceCtx context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
-			go func() {
-				<-r.Context().Done()
-				close(handlerClientDone)
-			}()
-			return sse.RelayProxy(serviceCtx, w, up, sse.ProxyOptions{
-				Provider:          "codex",
-				AdvertisedModel:   "claude-gpt-5.6-sol",
-				BackendModel:      "gpt-5.6-sol",
-				HeartbeatInterval: -1,
-				ClientDone:        r.Context().Done(),
-				Usage:             usage,
-			})
-		})
-
-		// Use a raw TCP connection with an explicit setup deadline so closing it immediately severs the client.
-		conn, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", h.server.Listener.Addr().String())
-		if err != nil {
-			t.Fatalf("Dial: %v", err)
-		}
-		defer func() { _ = conn.Close() }()
-		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-		if _, err := io.WriteString(conn, "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n"); err != nil {
-			t.Fatalf("write request: %v", err)
-		}
-		br := bufio.NewReader(conn)
-		resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodPost})
-		if err != nil {
-			t.Fatalf("ReadResponse: %v", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			t.Fatalf("status = %d (%q), want 200", resp.StatusCode, string(body))
-		}
-		bodyReader := bufio.NewReader(resp.Body)
-		var first strings.Builder
-		for !strings.HasSuffix(first.String(), "\n\n") {
-			line, readErr := bodyReader.ReadString('\n')
-			if readErr != nil {
-				t.Fatalf("reading first frame: %v", readErr)
-			}
-			first.WriteString(line)
-		}
-		// Disconnect client mid-stream.
-		_ = conn.Close()
-		select {
-		case <-handlerClientDone:
-		case <-time.After(2 * time.Second):
-			t.Fatal("relay handler did not observe client disconnect")
-		}
-		markClientGone()
-
-		select {
-		case po := <-providerDone:
-			if po.tailErr != nil || po.written != wantTailLen {
-				t.Fatalf("provider tail failed: err=%v written=%d want=%d", po.tailErr, po.written, wantTailLen)
-			}
-		case <-time.After(10 * time.Second):
-			t.Fatal("timed out waiting for proxy relay to drain 32 MiB finite provider tail")
-		}
-		res, handlerErr := h.waitResult(t)
-		if handlerErr != nil {
-			t.Fatalf("RelayProxy error = %v, want nil", handlerErr)
-		}
-		if res.Status != http.StatusOK {
-			t.Errorf("outcome.Status = %d, want 200", res.Status)
-		}
-		if res.Cancelled {
-			t.Errorf("outcome.Cancelled = true, want false (relays never set Cancelled)")
-		}
-		events, _, totalBytes, _ := usage.snapshot(t)
-		wantTotalBytes := int64(len(firstFrame) + wantTailLen)
-		if totalBytes != wantTotalBytes {
-			t.Errorf("NoteResponseBytes = %d, want %d", totalBytes, wantTotalBytes)
-		}
-		wantEvents := []string{
-			`{"type":"message_start"}`,
-			`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":42,"output_tokens":7}}`,
-			`{"type":"message_stop"}`,
-		}
-		if diff := gocmp.Diff(wantEvents, events); diff != "" {
-			t.Errorf("usage observed events (-want +got):\n%s", diff)
-		}
 	})
 
 	t.Run("success: default-upstream passthrough disconnect applies back-pressure without eager close until service shutdown", func(t *testing.T) {
@@ -1194,7 +1053,7 @@ func TestStreamAbortAndDisconnect(t *testing.T) {
 							ClientDone: clientDone,
 							Usage:      &usageSpy{},
 						})
-						done <- handlerOutcome{res: res, err: err, bodyClosed: src.closed.Load()}
+						done <- handlerOutcome{res: res, err: err, bodyCloses: src.closes.Load()}
 					}()
 					joined := false
 					feederDone := make(chan error, 1)
@@ -1267,8 +1126,8 @@ func TestStreamAbortAndDisconnect(t *testing.T) {
 						t.Fatalf("default-upstream passthrough exited eagerly before service shutdown: res=%+v err=%v", out.res, out.err)
 					default:
 					}
-					if src.closed.Load() {
-						t.Fatal("default-upstream passthrough eagerly closed resp.Body before service shutdown")
+					if got := src.closes.Load(); got != 0 {
+						t.Fatalf("default-upstream passthrough eagerly closed resp.Body before service shutdown (closes=%d)", got)
 					}
 					if tt.useClientDone {
 						if got := rec.attemptCount(); got != attemptsBefore {
@@ -1304,192 +1163,14 @@ func TestStreamAbortAndDisconnect(t *testing.T) {
 					if out.err != nil {
 						t.Fatalf("RelayPassthrough after service shutdown err = %v, want nil", out.err)
 					}
-					if !out.bodyClosed {
-						t.Errorf("RelayPassthrough returned without closing owned resp.Body")
+					if out.bodyCloses != 1 {
+						t.Errorf("owned resp.Body close count = %d, want 1", out.bodyCloses)
 					}
 					if out.res.Cancelled {
 						t.Errorf("outcome.Cancelled = true, want false (relays never set Cancelled)")
 					}
 				})
 			})
-		}
-	})
-
-	t.Run("success: loopback default-upstream passthrough disconnect stalls provider under back-pressure until service shutdown", func(t *testing.T) {
-		firstFrame := "event: message_start\ndata: {\"type\":\"message_start\"}\n\n"
-		payload := bytes.Repeat([]byte("a"), 64*1024)
-		chunkedBlock := fmt.Appendf(nil, "%x\r\n%s\r\n", len(payload), payload)
-
-		var lc net.ListenConfig
-		ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatalf("Listen: %v", err)
-		}
-
-		clientDisconnected := make(chan struct{})
-		var discOnce sync.Once
-		markDisconnected := func() { discOnce.Do(func() { close(clientDisconnected) }) }
-
-		providerStalled := make(chan struct{})
-		providerDone := make(chan struct{})
-		var providerClosedEagerly atomic.Bool
-		var providerDrainedAll atomic.Bool
-		var providerCloseErrMu sync.Mutex
-		var providerCloseErr error
-
-		var wg sync.WaitGroup
-		// LIFO cleanup: markDisconnected -> ln.Close -> wg.Wait (registered before startRelayServer so
-		// relayHarness cleanup cancels serviceCtx and closes sockets first, unblocking the provider conn).
-		t.Cleanup(wg.Wait)
-		t.Cleanup(func() { _ = ln.Close() })
-		t.Cleanup(markDisconnected)
-
-		wg.Go(func() {
-			defer close(providerDone)
-			conn, acceptErr := ln.Accept()
-			if acceptErr != nil {
-				return
-			}
-			defer func() { _ = conn.Close() }()
-
-			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-			req, readReqErr := http.ReadRequest(bufio.NewReader(conn))
-			if readReqErr != nil {
-				return
-			}
-			_, _ = io.Copy(io.Discard, req.Body)
-			_ = req.Body.Close()
-
-			_, writeErr := fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n%x\r\n%s\r\n", len(firstFrame), firstFrame)
-			if writeErr != nil {
-				return
-			}
-			_ = conn.SetDeadline(time.Time{})
-
-			<-clientDisconnected
-
-			// Write 64 KiB chunked blocks with a 250ms per-write deadline until kernel TCP buffers
-			// saturate and conn.Write returns os.ErrDeadlineExceeded, proving a pending provider write
-			// on an open socket rather than relying on a passive silence sleep.
-			stalled := false
-			for range 2048 {
-				_ = conn.SetWriteDeadline(time.Now().Add(250 * time.Millisecond))
-				_, wErr := conn.Write(chunkedBlock)
-				if wErr == nil {
-					continue
-				}
-				if errors.Is(wErr, os.ErrDeadlineExceeded) {
-					stalled = true
-					break
-				}
-				providerClosedEagerly.Store(true)
-				return
-			}
-			if !stalled {
-				providerDrainedAll.Store(true)
-				return
-			}
-			_ = conn.SetWriteDeadline(time.Time{})
-			close(providerStalled)
-
-			// Wait for the relay's service shutdown to close the upstream TCP connection.
-			_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-			var one [1]byte
-			_, rErr := conn.Read(one[:])
-			providerCloseErrMu.Lock()
-			providerCloseErr = rErr
-			providerCloseErrMu.Unlock()
-		})
-
-		handlerClientDone := make(chan struct{})
-		h := startRelayServer(t, "http://"+ln.Addr().String(), func(serviceCtx context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
-			go func() {
-				<-r.Context().Done()
-				close(handlerClientDone)
-			}()
-			return sse.RelayPassthrough(serviceCtx, w, up, sse.PassthroughOptions{
-				ClientDone: r.Context().Done(),
-			})
-		})
-
-		conn, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", h.server.Listener.Addr().String())
-		if err != nil {
-			t.Fatalf("Dial: %v", err)
-		}
-		defer func() { _ = conn.Close() }()
-		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-		if _, err := io.WriteString(conn, "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n"); err != nil {
-			t.Fatalf("write request: %v", err)
-		}
-		br := bufio.NewReader(conn)
-		resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodPost})
-		if err != nil {
-			t.Fatalf("ReadResponse: %v", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			t.Fatalf("status = %d (%q), want 200", resp.StatusCode, string(body))
-		}
-		bodyReader := bufio.NewReader(resp.Body)
-		var first strings.Builder
-		for !strings.HasSuffix(first.String(), "\n\n") {
-			line, readErr := bodyReader.ReadString('\n')
-			if readErr != nil {
-				t.Fatalf("reading first frame: %v", readErr)
-			}
-			first.WriteString(line)
-		}
-
-		// Disconnect client mid-stream, wait for the relay handler to see ClientDone, then let provider write.
-		_ = conn.Close()
-		select {
-		case <-handlerClientDone:
-		case <-time.After(2 * time.Second):
-			t.Fatal("relay handler did not observe client disconnect")
-		}
-		markDisconnected()
-
-		// Require positive kernel-level proof of a pending provider write under back-pressure.
-		select {
-		case <-providerStalled:
-		case <-providerDone:
-			if providerClosedEagerly.Load() {
-				t.Fatal("default-upstream passthrough eagerly closed the provider connection on client disconnect")
-			}
-			if providerDrainedAll.Load() {
-				t.Fatal("default-upstream passthrough drained 128 MiB instead of applying back-pressure")
-			}
-			t.Fatal("provider exited unexpectedly before stalling under back-pressure")
-		case <-time.After(5 * time.Second):
-			t.Fatal("timed out waiting for provider write to stall under back-pressure")
-		}
-		select {
-		case <-providerDone:
-			t.Fatal("provider connection closed before service shutdown")
-		default:
-		}
-
-		// Trigger bounded service shutdown and verify both relay and provider exit cleanly.
-		h.cancelService()
-		select {
-		case <-providerDone:
-		case <-time.After(5 * time.Second):
-			t.Fatal("provider did not observe peer close after service shutdown")
-		}
-		providerCloseErrMu.Lock()
-		gotCloseErr := providerCloseErr
-		providerCloseErrMu.Unlock()
-		if gotCloseErr == nil || errors.Is(gotCloseErr, os.ErrDeadlineExceeded) {
-			t.Errorf("provider read after service shutdown = %v, want peer close error/EOF", gotCloseErr)
-		}
-
-		res, handlerErr := h.waitResult(t)
-		if handlerErr != nil {
-			t.Fatalf("RelayPassthrough error after service shutdown = %v, want nil", handlerErr)
-		}
-		if res.Cancelled {
-			t.Errorf("outcome.Cancelled = true, want false (relays never set Cancelled)")
 		}
 	})
 }

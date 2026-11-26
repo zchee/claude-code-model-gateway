@@ -330,7 +330,7 @@ func TestLocalNonStudioNoPeek(t *testing.T) {
 					HeartbeatInterval: -1,
 					OnPeek:            func() { peekCalls.Add(1) },
 				})
-				done <- handlerOutcome{res: res, err: err, bodyClosed: src.closed.Load()}
+				done <- handlerOutcome{res: res, err: err, bodyCloses: src.closes.Load()}
 			}()
 			joined := false
 			defer func() {
@@ -384,8 +384,8 @@ func TestLocalNonStudioNoPeek(t *testing.T) {
 			if out.err != nil {
 				t.Fatalf("RelayProxy returned %v, want nil", out.err)
 			}
-			if !out.bodyClosed {
-				t.Errorf("RelayProxy returned without closing owned resp.Body")
+			if out.bodyCloses != 1 {
+				t.Errorf("owned resp.Body close count = %d, want 1", out.bodyCloses)
 			}
 		})
 	})
@@ -523,7 +523,7 @@ func TestProxyRelayFlushAndHeaders(t *testing.T) {
 					BackendModel:      "gpt-5.6-sol",
 					HeartbeatInterval: -1,
 				})
-				done <- handlerOutcome{res: res, err: err, bodyClosed: src.closed.Load()}
+				done <- handlerOutcome{res: res, err: err, bodyCloses: src.closes.Load()}
 			}()
 			joined := false
 			defer func() {
@@ -581,8 +581,8 @@ func TestProxyRelayFlushAndHeaders(t *testing.T) {
 			if out.err != nil {
 				t.Fatalf("RelayProxy error = %v, want nil", out.err)
 			}
-			if !out.bodyClosed {
-				t.Errorf("RelayProxy returned without closing owned resp.Body")
+			if out.bodyCloses != 1 {
+				t.Errorf("owned resp.Body close count = %d, want 1", out.bodyCloses)
 			}
 			if diff := gocmp.Diff(outcome.Result{Status: http.StatusOK}, out.res); diff != "" {
 				t.Errorf("outcome.Result (-want +got):\n%s", diff)
@@ -1361,6 +1361,9 @@ func TestLMStudioFirstEventPeek(t *testing.T) {
 		var calls int
 		var gotCounts sentry.Counts
 		var gotUpstreamStatus int
+		var bodyAtCallback string
+		var writesAtCallback []string
+		var attemptsAtCallback int
 		res, err := sse.RelayProxy(t.Context(), rec, up, sse.ProxyOptions{
 			Provider:          sse.LMStudioProvider,
 			AdvertisedModel:   "claude-lmstudio/qwen3-coder-30b",
@@ -1372,6 +1375,8 @@ func TestLMStudioFirstEventPeek(t *testing.T) {
 				gotUpstreamStatus = upstreamStatus
 				gotCounts = counts
 				_, _ = testEngineOverflowResponder(w, upstreamStatus, counts)
+				_, _, bodyAtCallback, writesAtCallback, _ = rec.snapshot()
+				attemptsAtCallback = rec.attemptCount()
 				return wantRes, errOverflowWrite
 			},
 		})
@@ -1391,8 +1396,27 @@ func TestLMStudioFirstEventPeek(t *testing.T) {
 		if diff := gocmp.Diff(wantRes, res); diff != "" {
 			t.Errorf("RelayProxy result (-want +got):\n%s", diff)
 		}
-		if !src.closed.Load() {
-			t.Errorf("RelayProxy returned without closing owned resp.Body")
+		if got := src.closes.Load(); got != 1 {
+			t.Errorf("owned resp.Body close count = %d, want 1", got)
+		}
+		status, wroteHeader, gotBody, gotWrites, _ := rec.snapshot()
+		if !wroteHeader || status != http.StatusRequestEntityTooLarge {
+			t.Errorf("recorded response wroteHeader=%t status=%d, want true and %d", wroteHeader, status, http.StatusRequestEntityTooLarge)
+		}
+		if got := rec.Header().Get("Content-Type"); got != "application/json" {
+			t.Errorf("recorded Content-Type = %q, want application/json", got)
+		}
+		if got := rec.Header().Get("X-Model-Gateway-Upstream-Status"); got != "200" {
+			t.Errorf("recorded X-Model-Gateway-Upstream-Status = %q, want 200", got)
+		}
+		if got := rec.attemptCount(); got != attemptsAtCallback || attemptsAtCallback != 1 {
+			t.Errorf("client write attempts = %d (at callback=%d), want 1 with no additional write after 413", got, attemptsAtCallback)
+		}
+		if diff := gocmp.Diff(writesAtCallback, gotWrites); diff != "" {
+			t.Errorf("recorded writes after OnOverflow error (-want +got):\n%s", diff)
+		}
+		if diff := gocmp.Diff(bodyAtCallback, gotBody); diff != "" {
+			t.Errorf("recorded body after OnOverflow error (-want +got):\n%s", diff)
 		}
 	})
 
@@ -1487,7 +1511,7 @@ func TestProxyTimers(t *testing.T) {
 					AdvertisedModel: "claude-gpt-5.6-terra",
 					BackendModel:    "gpt-5.6-terra",
 				})
-				done <- handlerOutcome{res: res, err: err, bodyClosed: src.closed.Load()}
+				done <- handlerOutcome{res: res, err: err, bodyCloses: src.closes.Load()}
 			}()
 			joined := false
 			defer func() {
@@ -1567,8 +1591,8 @@ func TestProxyTimers(t *testing.T) {
 			if out.err != nil {
 				t.Fatalf("RelayProxy returned %v, want nil", out.err)
 			}
-			if !out.bodyClosed {
-				t.Errorf("RelayProxy returned without closing owned resp.Body")
+			if out.bodyCloses != 1 {
+				t.Errorf("owned resp.Body close count = %d, want 1", out.bodyCloses)
 			}
 			if diff := gocmp.Diff(outcome.Result{Status: http.StatusOK}, out.res); diff != "" {
 				t.Errorf("outcome.Result (-want +got):\n%s", diff)
@@ -1599,7 +1623,7 @@ func TestProxyTimers(t *testing.T) {
 					BackendModel:      "gpt-5.6-terra",
 					HeartbeatInterval: -1,
 				})
-				done <- handlerOutcome{res: res, err: err, bodyClosed: src.closed.Load()}
+				done <- handlerOutcome{res: res, err: err, bodyCloses: src.closes.Load()}
 			}()
 			joined := false
 			defer func() {
@@ -1638,8 +1662,8 @@ func TestProxyTimers(t *testing.T) {
 			if out.err != nil {
 				t.Fatalf("RelayProxy returned %v, want nil", out.err)
 			}
-			if !out.bodyClosed {
-				t.Errorf("RelayProxy returned without closing owned resp.Body")
+			if out.bodyCloses != 1 {
+				t.Errorf("owned resp.Body close count = %d, want 1", out.bodyCloses)
 			}
 			if diff := gocmp.Diff(outcome.Result{Status: http.StatusOK}, out.res); diff != "" {
 				t.Errorf("outcome.Result (-want +got):\n%s", diff)
@@ -1666,7 +1690,7 @@ func TestProxyTimers(t *testing.T) {
 					AdvertisedModel: "claude-lmstudio/qwen3-coder-30b",
 					BackendModel:    "lmstudio/qwen3-coder-30b",
 				})
-				done <- handlerOutcome{res: res, err: err, bodyClosed: src.closed.Load()}
+				done <- handlerOutcome{res: res, err: err, bodyCloses: src.closes.Load()}
 			}()
 			joined := false
 			defer func() {
@@ -1730,8 +1754,8 @@ func TestProxyTimers(t *testing.T) {
 			if out.err != nil {
 				t.Fatalf("RelayProxy returned %v, want nil", out.err)
 			}
-			if !out.bodyClosed {
-				t.Errorf("RelayProxy returned without closing owned resp.Body")
+			if out.bodyCloses != 1 {
+				t.Errorf("owned resp.Body close count = %d, want 1", out.bodyCloses)
 			}
 			if diff := gocmp.Diff(outcome.Result{Status: http.StatusOK}, out.res); diff != "" {
 				t.Errorf("outcome.Result (-want +got):\n%s", diff)
@@ -1772,7 +1796,7 @@ func TestProxyTimers(t *testing.T) {
 						return testEngineOverflowResponder(w, upstreamStatus, counts)
 					},
 				})
-				done <- handlerOutcome{res: res, err: err, bodyClosed: src.closed.Load()}
+				done <- handlerOutcome{res: res, err: err, bodyCloses: src.closes.Load()}
 			}()
 			joined := false
 			defer func() {
@@ -1809,8 +1833,8 @@ func TestProxyTimers(t *testing.T) {
 			if out.err != nil {
 				t.Fatalf("RelayProxy returned %v, want nil", out.err)
 			}
-			if !out.bodyClosed {
-				t.Errorf("RelayProxy returned without closing owned resp.Body")
+			if out.bodyCloses != 1 {
+				t.Errorf("owned resp.Body close count = %d, want 1", out.bodyCloses)
 			}
 			status, _, finalBody, _, _ := rec.snapshot()
 			if status != http.StatusOK {

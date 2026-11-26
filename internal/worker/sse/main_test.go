@@ -131,14 +131,14 @@ func (u *usageSpy) snapshot(t *testing.T) (events []string, chunks []byte, total
 	return events, chunks, totalBytes, overflows
 }
 
-// trackedReadCloser records whether the relay that owns an upstream Body closed it before returning.
+// trackedReadCloser counts how many times the relay that owns an upstream Body closed it.
 type trackedReadCloser struct {
 	io.ReadCloser
-	closed atomic.Bool
+	closes atomic.Int32
 }
 
 func (b *trackedReadCloser) Close() error {
-	b.closed.Store(true)
+	b.closes.Add(1)
 	return b.ReadCloser.Close()
 }
 
@@ -244,7 +244,7 @@ func (r *streamingRecorder) snapshot() (status int, wroteHeader bool, body strin
 type handlerOutcome struct {
 	res        outcome.Result
 	err        error
-	bodyClosed bool
+	bodyCloses int32
 }
 
 type relayHarness struct {
@@ -259,8 +259,8 @@ func (h *relayHarness) waitResult(t *testing.T) (outcome.Result, error) {
 	t.Helper()
 	select {
 	case out := <-h.results:
-		if !out.bodyClosed {
-			t.Errorf("relay returned without closing owned resp.Body")
+		if out.bodyCloses != 1 {
+			t.Errorf("owned resp.Body close count = %d, want 1", out.bodyCloses)
 		}
 		return out.res, out.err
 	case <-time.After(5 * time.Second):
@@ -302,13 +302,13 @@ func startRelayServer(t *testing.T, upstreamURL string, relay func(serviceCtx co
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upReq, err := http.NewRequestWithContext(serviceCtx, r.Method, upstreamURL+r.URL.RequestURI(), r.Body)
 		if err != nil {
-			results <- handlerOutcome{err: err, bodyClosed: true}
+			results <- handlerOutcome{err: err, bodyCloses: 1}
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		upResp, err := upClient.Do(upReq) //nolint:bodyclose // Owned by the relay under test; fallback cleanup closes any unclosed body on failure.
 		if err != nil {
-			results <- handlerOutcome{err: err, bodyClosed: true}
+			results <- handlerOutcome{err: err, bodyCloses: 1}
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
@@ -321,13 +321,13 @@ func startRelayServer(t *testing.T, upstreamURL string, relay func(serviceCtx co
 		}
 
 		res, err := relay(serviceCtx, w, r, up)
-		closedByRelay := trackedBody.closed.Load()
-		if !closedByRelay {
+		closes := trackedBody.closes.Load()
+		if closes == 0 {
 			fallbackMu.Lock()
 			fallbackBodies = append(fallbackBodies, upResp.Body)
 			fallbackMu.Unlock()
 		}
-		results <- handlerOutcome{res: res, err: err, bodyClosed: closedByRelay}
+		results <- handlerOutcome{res: res, err: err, bodyCloses: closes}
 		if errors.Is(err, http.ErrAbortHandler) {
 			panic(http.ErrAbortHandler)
 		}
@@ -340,10 +340,11 @@ func startRelayServer(t *testing.T, upstreamURL string, relay func(serviceCtx co
 	client := &http.Client{Transport: clientTransport}
 
 	// LIFO cleanup order: close client idle conns -> cancel serviceCtx (unblocking paused relays)
-	// -> close any body left open by a failing relay -> close relay server -> close upstream idle conns.
+	// -> close relay server (joining active handlers) -> close any body left open by a failing relay
+	// -> close upstream idle conns.
 	t.Cleanup(upTransport.CloseIdleConnections)
-	t.Cleanup(srv.Close)
 	t.Cleanup(closeFallbackBodies)
+	t.Cleanup(srv.Close)
 	t.Cleanup(cancelService)
 	t.Cleanup(clientTransport.CloseIdleConnections)
 
