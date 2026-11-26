@@ -35,18 +35,20 @@ func TestSuccessfulJSON(t *testing.T) {
 	const inclusive = `{"input_tokens":3013,"cache_read_input_tokens":2497,"output_tokens":8}`
 	const exclusive = `{"input_tokens":516,"cache_read_input_tokens":2497,"output_tokens":8}`
 	const raw = `{"type":"message","model":"engine","stop_reason":"tool_use","content":[{"type":"tool_use","name":"ExitPlanMode"}],"usage":` + inclusive + `,"nested":[{"model":"gpt-inner"},{"model":"unrelated"}]}`
+	const alreadyExclusive = `{"type":"message","usage":` + exclusive + `}`
 	const filtered = `{"type":"message","model":"shown","stop_reason":"end_turn","content":[],"usage":` + inclusive + `,"nested":[{"model":"shown"},{"model":"unrelated"}]}`
 	tests := map[string]struct {
 		provider, body, want, observed, override string
 		filter                                   bool
 		usage                                    float64
 	}{
-		"LM Studio corrects before observation and rewrite": {"lmstudio", raw, strings.ReplaceAll(strings.ReplaceAll(raw, `"engine"`, `"shown"`), `"gpt-inner"`, `"shown"`), strings.Replace(raw, inclusive, exclusive, 1), "", false, 3013},
-		"Codex removes only plan tool":                      {"codex", raw, filtered, raw, "", true, 5510},
-		"real tool keeps tool use stop":                     {"codex", `{"type":"message","stop_reason":"tool_use","content":[{"type":"tool_use","name":"EnterPlanMode"},{"type":"tool_use","name":"Bash"}]}`, `{"type":"message","stop_reason":"tool_use","content":[{"type":"tool_use","name":"Bash"}]}`, "", "", true, 0},
-		"error envelope not completed":                      {"codex", `{"type":"message","error":{"message":"failure"}}`, `{"type":"message","error":{"message":"failure"}}`, "", "upstream_error", false, 0},
-		"malformed bytes not committed as success":          {"codex", " \xff {", " \xff {", "", "upstream_error", false, 0},
-		"wire order and duplicate model":                    {"kimi", `{ "z":1e400, "12":"twelve", "2":"two", "model":"ignored", "model":"engine", "s":"\ud800" }`, `{"2":"two","12":"twelve","z":null,"model":"shown","s":"\ud800"}`, "", "upstream_error", false, 0},
+		"success: LM Studio corrects before observation and rewrite": {"lmstudio", raw, strings.ReplaceAll(strings.ReplaceAll(raw, `"engine"`, `"shown"`), `"gpt-inner"`, `"shown"`), strings.Replace(raw, inclusive, exclusive, 1), "", false, 3013},
+		"success: LM Studio preserves already exclusive input":       {"lmstudio", alreadyExclusive, alreadyExclusive, alreadyExclusive, "", false, 3013},
+		"success: Codex removes only plan tool":                      {"codex", raw, filtered, raw, "", true, 5510},
+		"success: real tool keeps tool use stop":                     {"codex", `{"type":"message","stop_reason":"tool_use","content":[{"type":"tool_use","name":"EnterPlanMode"},{"type":"tool_use","name":"Bash"}]}`, `{"type":"message","stop_reason":"tool_use","content":[{"type":"tool_use","name":"Bash"}]}`, "", "", true, 0},
+		"error: error envelope not completed":                        {"codex", `{"type":"message","error":{"message":"failure"}}`, `{"type":"message","error":{"message":"failure"}}`, "", "upstream_error", false, 0},
+		"error: malformed bytes not committed as success":            {"codex", " \xff {", " \xff {", "", "upstream_error", false, 0},
+		"success: wire order and duplicate model":                    {"kimi", `{ "z":1e400, "12":"twelve", "2":"two", "model":"ignored", "model":"engine", "s":"\ud800" }`, `{"2":"two","12":"twelve","z":null,"model":"shown","s":"\ud800"}`, "", "upstream_error", false, 0},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -87,10 +89,10 @@ func TestEmptyCompletion(t *testing.T) {
 		status                int
 		contentType, body     string
 	}{
-		"JSON before legacy normalization": {"codex", `{"stream":"true"}`, input, 200, "application/json", prefix + `"end_turn"` + suffix},
-		"requested SSE":                    {"codex", `{"stream":true}`, input, 200, "text/event-stream", stream},
-		"ordinary 503":                     {"codex", `{}`, `{"message":"upstream overloaded"}`, 503, "application/json", `{"message":"upstream overloaded"}`},
-		"other provider":                   {"kimi", `{}`, `{"message":"Codex completed without producing output"}`, 503, "application/json", `{"message":"Codex completed without producing output"}`},
+		"success: JSON before legacy normalization": {"codex", `{"stream":"true"}`, input, 200, "application/json", prefix + `"end_turn"` + suffix},
+		"success: requested SSE":                    {"codex", `{"stream":true}`, input, 200, "text/event-stream", stream},
+		"error: ordinary 503":                       {"codex", `{}`, `{"message":"upstream overloaded"}`, 503, "application/json", `{"message":"upstream overloaded"}`},
+		"error: other provider":                     {"kimi", `{}`, `{"message":"Codex completed without producing output"}`, 503, "application/json", `{"message":"Codex completed without producing output"}`},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -107,8 +109,14 @@ func TestEmptyCompletion(t *testing.T) {
 func TestRejectionAttribution(t *testing.T) {
 	tests := map[string]struct {
 		provider string
+		status   int
 		want     bool
-	}{"attributed Codex": {"codex", true}, "other provider": {"kimi", false}}
+		expires  *float64
+	}{
+		"error: attributed Codex rate limit":         {"codex", 429, true, new(float64(1001000))},
+		"error: other provider":                      {"kimi", 429, false, nil},
+		"error: ordinary attributed Codex forbidden": {"codex", 403, true, nil},
+	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			store := &upstreamstate.Store{Dir: t.TempDir(), Now: func() time.Time { return time.Unix(1000, 0) }}
@@ -117,12 +125,12 @@ func TestRejectionAttribution(t *testing.T) {
 				w.Header().Set("X-OpenAI-Request-Id", "private-id")
 				w.Header().Add("Retry-After", "1")
 				w.Header().Add("Retry-After", "60")
-				w.WriteHeader(429)
+				w.WriteHeader(tc.status)
 				_, _ = io.WriteString(w, body)
 			}).forward)
-			equal(t, 429, w.Code)
+			equal(t, tc.status, w.Code)
 			equal(t, body, w.Body.String())
-			equal(t, 429, result.CaptureStatus)
+			equal(t, tc.status, result.CaptureStatus)
 			equal(t, []string{"1", "60"}, result.CaptureHeaders.Values("Retry-After"))
 			equal(t, int64(len(body)), result.ResponseBytes)
 			block := store.ReadBlocked()
@@ -130,8 +138,8 @@ func TestRejectionAttribution(t *testing.T) {
 				t.Fatalf("ReadBlocked = %+v, want present=%v", block, tc.want)
 			}
 			if block != nil {
-				equal(t, 429, block.StatusCode)
-				equal(t, new(float64(1001000)), block.ExpiresAtMs)
+				equal(t, tc.status, block.StatusCode)
+				equal(t, tc.expires, block.ExpiresAtMs)
 				if strings.Contains(block.Evidence, "private-id") {
 					t.Error("evidence contains a header value")
 				}
@@ -152,23 +160,64 @@ func (w *countedWriter) WriteHeader(status int) {
 
 func TestCommittedCompaction(t *testing.T) {
 	tests := map[string]struct {
-		status       int
-		body, detail string
-	}{"forbidden before ordinary rejection": {403, `{"error":{"type":"permission_error","message":"WebSocket upgrade was rejected"}}`, "model-gateway: upstream returned 403: WebSocket upgrade was rejected"}, "successful JSON cannot change committed stream": {200, `{}`, "model-gateway: upstream returned 200 with no readable error body"}}
+		status             int
+		body, kind, detail string
+		truncated          bool
+	}{
+		"error: forbidden before ordinary rejection":            {403, `{"error":{"type":"permission_error","message":"WebSocket upgrade was rejected"}}`, "api_error", "model-gateway: upstream returned 403: WebSocket upgrade was rejected", false},
+		"error: successful JSON cannot change committed stream": {200, `{}`, "api_error", "model-gateway: upstream returned 200 with no readable error body", false},
+		"error: overflow latches session and learns ceiling":    {413, `{"error":{"type":"request_too_large","message":"too large"}}`, "api_error", "model-gateway: upstream returned 413: too large", false},
+		"error: attributed unauthorized without detail":         {401, "", "authentication_error", "Codex dispatch refused: ChatGPT sign-in is required. Run `\"/stable gateway\" login`, finish browser OAuth, then run `\"/stable gateway\" setup` and retry. Credentials live in `~/.config/claude-code-proxy/`. Upstream detail: HTTP 401", false},
+		"error: truncated response":                             {500, `{"message":"partial response"}`, "api_error", "model-gateway: upstream returned 500: partial response", true},
+	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			w := &countedWriter{ResponseRecorder: httptest.NewRecorder()}
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(200)
-			r, e := reply.Handle(t.Context(), w, reply.Request{Provider: "codex", AdvertisedModel: "shown", Compaction: true, HeadWritten: true, Body: []byte(`{}`)}, answer(t, tc.status, tc.body).forward)
+			state := new(sentry.State)
+			target := sentry.Target{Key: "model", Policy: &policy.Sentry{BackendWindow: 110, CompactTrigger: 100, Source: "derived"}, Headroom: 10}
+			store := &upstreamstate.Store{Dir: t.TempDir(), Now: func() time.Time { return time.Unix(1000, 0) }}
+			req := reply.Request{Provider: "codex", AdvertisedModel: "shown", Compaction: true, HeadWritten: true, Body: []byte(`{}`), Session: "only", Target: target, SentryEnabled: true, Sentry: state, Upstream: store, CommandPath: "/stable gateway"}
+			state.Observe("only", target, []byte(`{"type":"message_delta","usage":{"input_tokens":80}}`), false)
+			r, e := reply.Handle(t.Context(), w, req, upstream(t, func(w http.ResponseWriter, _ *http.Request) {
+				if tc.status == 401 {
+					w.Header().Set("X-Openai-Request-Id", "req_test")
+				}
+				if tc.truncated {
+					w.Header().Set("Content-Length", strconv.Itoa(len(tc.body)+1))
+				}
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
+			}).forward)
 			if e != nil {
 				t.Fatal(e)
 			}
 			equal(t, []int{200}, w.heads)
-			equal(t, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\""+tc.detail+"\"}}\n\n", w.Body.String())
+			equal(t, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":"+strconv.Quote(tc.kind)+",\"message\":"+strconv.Quote(tc.detail)+"}}\n\n", w.Body.String())
 			equal(t, tc.status, r.Status)
 			equal(t, true, r.Incomplete)
 			equal(t, "upstream_error", r.CompactionOutcome)
+			if tc.truncated && r.StatusOverride != "upstream_error" && r.StatusOverride != "upstream_aborted" {
+				t.Errorf("unexpected truncated response status %q", r.StatusOverride)
+			}
+			if tc.status == 401 {
+				block := store.ReadBlocked()
+				if block == nil {
+					t.Fatal("missing attributed Codex rejection")
+				}
+				equal(t, 401, block.StatusCode)
+				equal(t, (*float64)(nil), block.ExpiresAtMs)
+			}
+			if tc.status == 413 {
+				state.Observe("only", target, []byte(`{"type":"message_delta","usage":{"input_tokens":101}}`), false)
+				_, crossed := state.Check("only", target, req.Body)
+				equal(t, false, crossed)
+				state.Observe("other", target, []byte(`{"type":"message_delta","usage":{"input_tokens":75}}`), false)
+				crossing, crossed := state.Check("other", target, req.Body)
+				equal(t, true, crossed)
+				equal(t, float64(70), crossing.Trigger)
+			}
 		})
 	}
 }
@@ -177,7 +226,13 @@ func TestBufferedReadFailure(t *testing.T) {
 	tests := map[string]struct {
 		status         int
 		enabled, abort bool
-	}{"enabled genuine": {413, true, false}, "other proxy failure": {500, true, false}, "forbidden": {403, true, true}, "sentry off": {413, false, true}, "JSON success": {200, true, true}}
+	}{
+		"error: enabled genuine":     {413, true, false},
+		"error: other proxy failure": {500, true, false},
+		"error: forbidden":           {403, true, true},
+		"error: sentry off":          {413, false, true},
+		"error: JSON success":        {200, true, true},
+	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			w := httptest.NewRecorder()
@@ -209,12 +264,36 @@ func TestBufferedReadFailure(t *testing.T) {
 }
 
 func TestTransportFailure(t *testing.T) {
-	w, r := handle(t, reply.Request{Origin: "https://proxy.invalid", Compaction: true}, func(context.Context) (*http.Response, error) { return nil, errors.New("connection refused") })
-	equal(t, 502, w.Code)
-	equal(t, `{"type":"error","error":{"type":"api_error","message":"model-gateway shim: upstream https://proxy.invalid failed: connection refused"}}`, w.Body.String())
-	equal(t, 502, r.Status)
-	equal(t, "upstream_error", r.StatusOverride)
-	equal(t, true, r.Incomplete)
+	tests := map[string]struct{ committed bool }{
+		"error: before response headers": {false},
+		"error: after response headers":  {true},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			w := &countedWriter{ResponseRecorder: httptest.NewRecorder()}
+			if tc.committed {
+				w.WriteHeader(200)
+			}
+			r, err := reply.Handle(t.Context(), w, reply.Request{Origin: "https://proxy.invalid", Compaction: true, HeadWritten: tc.committed}, func(context.Context) (*http.Response, error) { return nil, errors.New("connection refused") })
+			if tc.committed {
+				if !errors.Is(err, http.ErrAbortHandler) {
+					t.Fatalf("committed response: got %v, want http.ErrAbortHandler", err)
+				}
+				equal(t, []int{200}, w.heads)
+				equal(t, 0, w.Body.Len())
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				equal(t, []int{502}, w.heads)
+				equal(t, `{"type":"error","error":{"type":"api_error","message":"model-gateway shim: upstream https://proxy.invalid failed: connection refused"}}`, w.Body.String())
+			}
+			equal(t, 502, r.Status)
+			equal(t, "upstream_error", r.StatusOverride)
+			equal(t, "upstream_error", r.CompactionOutcome)
+			equal(t, true, r.Incomplete)
+		})
+	}
 }
 
 func TestUnbufferedOwnership(t *testing.T) {
@@ -223,7 +302,12 @@ func TestUnbufferedOwnership(t *testing.T) {
 		status            int
 		contentType, body string
 		committed         bool
-	}{"Anthropic genuine-looking failure": {"", "", 413, "application/json", ` { "error": {"type":"request_too_large", "message":"context window"} } `, false}, "proxy redirect": {"codex", "shown", 307, "application/octet-stream", "\x00\xff", false}, "proxy event stream": {"codex", "shown", 200, "text/event-stream; charset=utf-8", ":keep\n\n", false}, "committed successful stream": {"codex", "shown", 200, "text/event-stream", "data: {}\n\n", true}}
+	}{
+		"error: Anthropic genuine-looking failure": {"", "", 413, "application/json", ` { "error": {"type":"request_too_large", "message":"context window"} } `, false},
+		"success: proxy redirect":                  {"codex", "shown", 307, "application/octet-stream", "\x00\xff", false},
+		"success: proxy event stream":              {"codex", "shown", 200, "text/event-stream; charset=utf-8", ":keep\n\n", false},
+		"success: committed successful stream":     {"codex", "shown", 200, "text/event-stream", "data: {}\n\n", true},
+	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			w, r := handle(t, reply.Request{Provider: tc.provider, AdvertisedModel: tc.model, Compaction: tc.committed, HeadWritten: tc.committed, SentryEnabled: true}, upstream(t, func(w http.ResponseWriter, _ *http.Request) {

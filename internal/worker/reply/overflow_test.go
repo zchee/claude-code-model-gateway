@@ -29,29 +29,29 @@ import (
 
 func TestOverflowNormalization(t *testing.T) {
 	const first = `{"messages":[{"role":"user","content":"private-prompt-🎵"}]}`
-	const genuine = `{"type":"error","error":{"type":"request_too_large","message":"upstream wording (118 tokens > 110 tokens)"}}`
+	const genuine = `{"type":"error","error":{"type":"request_too_large","message":"upstream wording (118 tokens > 95 tokens)"}}`
 	const noCounts = `{"type":"error","error":{"type":"request_too_large","message":"upstream wording"}}`
-	const engine = `{"error":{"type":"exceed_context_size_error","n_prompt_tokens":118,"n_ctx":110,"message":"private-backend-detail"}}`
+	const engine = `{"error":{"type":"exceed_context_size_error","n_prompt_tokens":118,"n_ctx":95,"message":"private-backend-detail"}}`
 	const legacy = `{"error":{"message":"private-backend-detail: context length exceeded"}}`
 	const normalized = "Input exceeds the model context window; compact and retry."
 	tests := map[string]struct {
-		code    int
-		body    string
-		enabled bool
-		prior   int
-		lead    string
-		tokens  int
-		from    string
-		learns  bool
+		code          int
+		body          string
+		enabled       bool
+		prior         int
+		lead          string
+		tokens, limit int
+		from          string
+		learns        bool
 	}{
-		"genuine with exact counts learns":          {413, genuine, true, 80, "upstream wording (118 tokens > 110 tokens)", 118, "upstream", true},
-		"genuine without counts uses previous turn": {413, noCounts, true, 80, "upstream wording (80 tokens > 110 tokens)", 80, "previous_turn_usage", true},
-		"genuine without measurements":              {413, noCounts, true, 0, "upstream wording (111 tokens > 110 tokens)", 0, "", false},
-		"engine with exact limit does not learn":    {400, engine, true, 80, normalized + " (118 tokens > 110 tokens)", 118, "upstream", false},
-		"engine missing its limit learns":           {500, `{"error":{"type":"exceed_context_size_error","n_prompt_tokens":118,"message":"private-backend-detail"}}`, true, 80, normalized + " (118 tokens > 110 tokens)", 118, "upstream", true},
-		"engine with sentry off uses own counts":    {400, engine, false, 80, normalized + " (118 tokens > 110 tokens)", 118, "upstream", false},
-		"legacy learns from previous turn":          {502, legacy, true, 80, normalized + " (80 tokens > 110 tokens)", 80, "previous_turn_usage", true},
-		"legacy with sentry off has no numbers":     {400, legacy, false, 80, normalized, 0, "", false},
+		"error: genuine with exact counts learns":          {413, genuine, true, 80, "upstream wording (118 tokens > 95 tokens)", 118, 95, "upstream", true},
+		"error: genuine without counts uses previous turn": {413, noCounts, true, 80, "upstream wording (80 tokens > 110 tokens)", 80, 110, "previous_turn_usage", true},
+		"error: genuine without measurements":              {413, noCounts, true, 0, "upstream wording (111 tokens > 110 tokens)", 0, 110, "", false},
+		"error: engine with exact limit does not learn":    {400, engine, true, 80, normalized + " (118 tokens > 95 tokens)", 118, 95, "upstream", false},
+		"error: engine missing its limit learns":           {500, `{"error":{"type":"exceed_context_size_error","n_prompt_tokens":118,"message":"private-backend-detail"}}`, true, 80, normalized + " (118 tokens > 110 tokens)", 118, 110, "upstream", true},
+		"error: engine with sentry off uses own counts":    {400, engine, false, 80, normalized + " (118 tokens > 95 tokens)", 118, 95, "upstream", false},
+		"error: legacy learns from previous turn":          {502, legacy, true, 80, normalized + " (80 tokens > 110 tokens)", 80, 110, "previous_turn_usage", true},
+		"error: legacy with sentry off has no numbers":     {400, legacy, false, 80, normalized, 0, 110, "", false},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -88,7 +88,7 @@ func TestOverflowNormalization(t *testing.T) {
 			}
 			equal(t, "error", payload.Type)
 			equal(t, "request_too_large", payload.Error.Type)
-			details := map[string]any{"phase": "first_turn", "refused_by": "upstream", "request_bytes": float64(len(request)), "limit_tokens": float64(110), "tokens": nil, "tokens_from": nil}
+			details := map[string]any{"phase": "first_turn", "refused_by": "upstream", "request_bytes": float64(len(request)), "limit_tokens": float64(tc.limit), "tokens": nil, "tokens_from": nil}
 			measured := "tokens UNVERIFIED"
 			if tc.tokens > 0 {
 				details["tokens"] = float64(tc.tokens)
@@ -96,7 +96,7 @@ func TestOverflowNormalization(t *testing.T) {
 				measured = fmt.Sprintf("%d tokens from %s", tc.tokens, tc.from)
 			}
 			equal(t, details, payload.Error.Overflow)
-			equal(t, fmt.Sprintf("%s [model-gateway: phase first_turn, refused by upstream; request %d bytes, %s, limit 110 tokens; recovery: nothing to compact, the request has no prior turn: shrink the first prompt (a dispatched subagent's briefing) or route to a larger-window model]", tc.lead, len(request), measured), payload.Error.Message)
+			equal(t, fmt.Sprintf("%s [model-gateway: phase first_turn, refused by upstream; request %d bytes, %s, limit %d tokens; recovery: nothing to compact, the request has no prior turn: shrink the first prompt (a dispatched subagent's briefing) or route to a larger-window model]", tc.lead, len(request), measured, tc.limit), payload.Error.Message)
 			var logged map[string]any
 			if err := json.Unmarshal(result.Overflow, &logged); err != nil {
 				t.Fatal(err)
@@ -124,11 +124,11 @@ func TestEarlierResponseWins(t *testing.T) {
 		provider, body, want string
 		enabled              bool
 	}{
-		"forbidden precedes legacy overflow":            {403, "codex", `{"message":"context window","model":"gpt-hidden"}`, `{"message":"context window","model":"shown"}`, true},
-		"disabled genuine overflow only rewrites model": {413, "local", `{"error":{"type":"request_too_large","message":"context window"},"model":"engine"}`, `{"error":{"type":"request_too_large","message":"context window"},"model":"shown"}`, false},
-		"unrecognized genuine overflow":                 {413, "local", `{"error":{"type":"api_error","message":"context window"}}`, `{"error":{"type":"api_error","message":"context window"}}`, true},
-		"non Codex auth error":                          {401, "kimi", `{"error":{"message":"OpenAI not authenticated"}}`, `{"error":{"message":"OpenAI not authenticated"}}`, true},
-		"upstream invalid JSON stays raw":               {502, "kimi", "{invalid\xff", "{invalid\xff", true},
+		"error: forbidden precedes legacy overflow":            {403, "codex", `{"message":"context window","model":"gpt-hidden"}`, `{"message":"context window","model":"shown"}`, true},
+		"error: disabled genuine overflow only rewrites model": {413, "local", `{"error":{"type":"request_too_large","message":"context window"},"model":"engine"}`, `{"error":{"type":"request_too_large","message":"context window"},"model":"shown"}`, false},
+		"error: unrecognized genuine overflow":                 {413, "local", `{"error":{"type":"api_error","message":"context window"}}`, `{"error":{"type":"api_error","message":"context window"}}`, true},
+		"error: non Codex auth error":                          {401, "kimi", `{"error":{"message":"OpenAI not authenticated"}}`, `{"error":{"message":"OpenAI not authenticated"}}`, true},
+		"error: upstream invalid JSON stays raw":               {502, "kimi", "{invalid\xff", "{invalid\xff", true},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {

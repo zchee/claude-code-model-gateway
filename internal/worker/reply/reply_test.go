@@ -129,11 +129,16 @@ func TestCodexAuthFailure(t *testing.T) {
 			equal(t, "application/json", w.Header().Get("Content-Type"))
 			equal(t, strconv.Itoa(w.Body.Len()), w.Header().Get("Content-Length"))
 			var got struct {
-				Error struct{ Type, Message string }
+				Type  string `json:"type"`
+				Error struct {
+					Type    string `json:"type"`
+					Message string `json:"message"`
+				} `json:"error"`
 			}
-			if err := json.Unmarshal(w.Body.Bytes(), &got, json.MatchCaseInsensitiveNames(true)); err != nil {
+			if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
 				t.Fatal(err)
 			}
+			equal(t, "error", got.Type)
 			equal(t, "authentication_error", got.Error.Type)
 			match := regexp.MustCompile("`\"([^\"]+)\" login`").FindStringSubmatch(got.Error.Message)
 			if len(match) != 2 {
@@ -181,6 +186,8 @@ func TestUpgradeRetry(t *testing.T) {
 	}{
 		"success: third attempt":           {"codex", nil, nil, true, []time.Duration{0, 250 * time.Millisecond, 500 * time.Millisecond}, 200, `{"model":"public"}`},
 		"error: exhausted non Codex proxy": {"kimi", nil, nil, false, []time.Duration{0, 250 * time.Millisecond, 500 * time.Millisecond}, 503, `{"type":"error","error":{"type":"api_error","message":"model-gateway: Codex WebSocket upgrade was temporarily rejected after 3 attempts; retry the request."}}`},
+		"error: zero retries":              {"codex", new(0), nil, false, []time.Duration{0}, 503, `{"type":"error","error":{"type":"api_error","message":"model-gateway: Codex WebSocket upgrade was temporarily rejected after 1 attempts; retry the request."}}`},
+		"success: zero retry delay":        {"codex", nil, new(time.Duration(0)), true, []time.Duration{0, 0, 0}, 200, `{"model":"public"}`},
 		"error: configured retry budget":   {"codex", new(1), new(7 * time.Millisecond), false, []time.Duration{0, 7 * time.Millisecond}, 503, `{"type":"error","error":{"type":"api_error","message":"model-gateway: Codex WebSocket upgrade was temporarily rejected after 2 attempts; retry the request."}}`},
 	}
 	for name, tc := range tests {
@@ -195,6 +202,9 @@ func TestUpgradeRetry(t *testing.T) {
 					}
 					r := httptest.NewRecorder()
 					r.Header().Set("X-Attempt", "kept")
+					r.Header().Set("Transfer-Encoding", "chunked")
+					r.Header().Set("Connection", "keep-alive")
+					r.Header().Set("Keep-Alive", "timeout=5")
 					if tc.recover && len(calls) == 3 {
 						r.WriteHeader(200)
 						_, _ = io.WriteString(r, `{"model":"gpt-test"}`)
@@ -209,8 +219,45 @@ func TestUpgradeRetry(t *testing.T) {
 				equal(t, tc.want, w.Body.String())
 				equal(t, "kept", w.Header().Get("X-Attempt"))
 				equal(t, tc.status, res.CaptureStatus)
+				if tc.status == 503 {
+					equal(t, 503, res.Status)
+					equal(t, "upstream_error", res.StatusOverride)
+				}
+				for _, key := range []string{"Transfer-Encoding", "Connection", "Keep-Alive"} {
+					if _, ok := w.Result().Header[key]; ok {
+						t.Errorf("forwarded hop-by-hop header %s", key)
+					}
+				}
 				equal(t, strconv.Itoa(w.Body.Len()), w.Header().Get("Content-Length"))
 			})
 		})
 	}
+	t.Run("error: disconnect during retry delay", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			var attempts int
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				_, _ = reply.Handle(ctx, httptest.NewRecorder(), reply.Request{Provider: "codex", Body: []byte(`{}`)}, func(context.Context) (*http.Response, error) {
+					attempts++
+					r := httptest.NewRecorder()
+					r.WriteHeader(403)
+					_, _ = io.WriteString(r, rejection)
+					return r.Result(), nil
+				})
+			}()
+			synctest.Wait()
+			select {
+			case <-done:
+				t.Fatal("Handle returned before waiting to retry")
+			default:
+			}
+			equal(t, 1, attempts)
+			cancel()
+			<-done
+			equal(t, 1, attempts)
+		})
+	})
 }
