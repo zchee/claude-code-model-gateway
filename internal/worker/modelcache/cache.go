@@ -21,6 +21,8 @@ import (
 	json "encoding/json/v2"
 	"errors"
 	"maps"
+	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -62,12 +64,25 @@ const (
 	// (lib/runtime.js:30).
 	dispatchModel   = "auto"
 	dispatchModelID = "claude-codex-auto"
+	// llamaProvider and studioProvider are the route providers served by the local engines.
+	llamaProvider  = "local"
+	studioProvider = "lmstudio"
 	// maxListingBytes bounds the proxy listing body; a larger body counts as an unreadable listing.
 	maxListingBytes = 16 << 20
-	// nodeTimerMax is the largest delay in milliseconds a Node timer keeps; the source's interval
-	// timer runs every millisecond for any value outside [1, nodeTimerMax].
+	// nodeTimerMax is the largest delay in milliseconds a Node timer keeps.
 	nodeTimerMax = 1<<31 - 1
+	// maxRedirects bounds the redirect chain of a proxy listing request.
+	maxRedirects = 10
 )
+
+// directTransport carries the cache's requests when the injected client has no transport of its own
+// or names the process-wide default. It never consults the environment's proxy settings and keeps no
+// idle connections, so it outlives no request.
+var directTransport = &http.Transport{
+	Proxy:             nil,
+	DialContext:       (&net.Dialer{}).DialContext,
+	DisableKeepAlives: true,
+}
 
 // defaultModels are the Codex backends advertised before a listing was read (lib/request-worker.js:226-228).
 var defaultModels = []string{"gpt-6.1-sol", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra"}
@@ -141,6 +156,8 @@ type catalogRow struct {
 // live local-provider probes, Anthropic catalog refresher, and discovery-cache writer.
 type Cache struct {
 	opts          Options
+	listingClient *http.Client
+	catalogClient *http.Client
 	lookup        config.LookupEnv
 	windows       policy.Windows
 	env           float64
@@ -155,9 +172,6 @@ type Cache struct {
 	globalConfig   string
 	proxyConfigDir string
 
-	llama  localprov.LlamaTracker
-	studio localprov.StudioTracker
-
 	current atomic.Pointer[committed]
 	// tickets orders refreshes by their start; a commit is dropped when a later-started refresh
 	// already committed.
@@ -169,10 +183,17 @@ type Cache struct {
 	// discoveryMu serializes the read-compare-write of the discovery cache. No network work runs under it.
 	discoveryMu sync.Mutex
 
+	// life bounds every Anthropic catalog refresh. Start ties it to the worker context, so a refresh
+	// started before Start ends with the worker too.
+	life     context.Context
+	stopLife context.CancelFunc
+	// catalogMu makes the catalog read and the election of the one refresh in flight one operation.
+	catalogMu sync.Mutex
+	flight    *catalogFlight
+
 	mu      sync.Mutex
 	worker  context.Context
 	started bool
-	flight  *catalogFlight
 	wg      sync.WaitGroup
 }
 
@@ -187,13 +208,22 @@ func New(opts Options) (*Cache, error) {
 	case opts.Sentry == nil:
 		return nil, errors.New("modelcache: a sentry publisher is required")
 	}
-	c := &Cache{
-		opts:    opts,
-		lookup:  opts.Lookup,
-		windows: maps.Clone(opts.Windows),
-		clock:   opts.Clock,
-		logf:    opts.Logf,
+	// Each request kind gets its own client built from the injected transport only: never a cookie
+	// jar, a client timeout or the process-wide default transport.
+	transport := opts.Client.Transport
+	if transport == nil || transport == http.DefaultTransport {
+		transport = directTransport
 	}
+	c := &Cache{
+		opts:          opts,
+		listingClient: &http.Client{Transport: transport, CheckRedirect: followListingRedirect},
+		catalogClient: &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
+		lookup:        opts.Lookup,
+		windows:       maps.Clone(opts.Windows),
+		clock:         opts.Clock,
+		logf:          opts.Logf,
+	}
+	c.life, c.stopLife = context.WithCancel(context.Background())
 	if c.lookup == nil {
 		c.lookup = func(string) (string, bool) { return "", false }
 	}
@@ -207,7 +237,12 @@ func New(opts Options) (*Cache, error) {
 	c.interval = nodeTimerDelay(config.ModelsRefresh.Get(c.lookup))
 	c.listDispatch = config.ListDispatchModel.Get(c.lookup)
 	if base, err := url.Parse(opts.AnthropicBaseURL); err == nil && base.Scheme != "" && base.Host != "" {
-		c.anthropicBase = base
+		// Credentials in the URL would become a Basic Authorization header the caller never sent.
+		if base.User != nil {
+			c.logf("model-gateway: the Anthropic catalog base URL carries credentials; the catalog is not refreshed")
+		} else {
+			c.anthropicBase = base
+		}
 	}
 	// An unresolvable path leaves its file absent for reads and skipped for writes.
 	c.stateDir, _ = opts.Paths.StateDir()
@@ -234,7 +269,7 @@ func New(opts Options) (*Cache, error) {
 	if err != nil {
 		return nil, err
 	}
-	c.commit(0, &committed{
+	c.commit(context.Background(), 0, nil, &committed{
 		snapshot: route.NewSnapshot(resolver, "fallback", catalog, c.grokIDs()),
 		source:   "fallback",
 		rows:     catalog,
@@ -243,12 +278,31 @@ func New(opts Options) (*Cache, error) {
 	return c, nil
 }
 
-// nodeTimerDelay converts a refresh interval in milliseconds the way a Node timer does.
+// followListingRedirect follows a proxy listing redirect as the source's fetch helper does, without a
+// Referer naming the previous URL and never to a target that carries credentials.
+func followListingRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxRedirects {
+		return errors.New("too many redirects")
+	}
+	if req.URL.User != nil {
+		return errors.New("redirect target carries credentials")
+	}
+	req.Header.Del("Referer")
+	return nil
+}
+
+// nodeTimerDelay converts a refresh interval in milliseconds the way a Node timer does: a fraction
+// is truncated and a value below one millisecond runs every millisecond. A value above the largest
+// timer delay, including +Inf, is held at that delay; the source's timer would instead run it every
+// millisecond.
 func nodeTimerDelay(ms float64) time.Duration {
-	if !(ms >= 1 && ms <= nodeTimerMax) {
+	switch {
+	case ms > nodeTimerMax:
+		ms = nodeTimerMax
+	case !(ms >= 1):
 		return time.Millisecond
 	}
-	return time.Duration(ms * float64(time.Millisecond))
+	return time.Duration(math.Trunc(ms)) * time.Millisecond
 }
 
 // Start runs the initial refresh and schedules periodic refreshes, exponential retries, and
@@ -261,6 +315,8 @@ func (c *Cache) Start(ctx context.Context) {
 	}
 	c.started = true
 	c.worker = ctx
+	// A catalog refresh already running, or started later, ends with the worker.
+	context.AfterFunc(ctx, c.stopLife)
 	c.wg.Go(func() { c.run(ctx) })
 }
 
@@ -324,22 +380,96 @@ func (c *Cache) refresh(ctx context.Context, onListing func(listed bool)) error 
 	if onListing != nil {
 		onListing(len(listing) > 0)
 	}
-	// A refresh that cannot read the listing keeps the last route table; only before any table
-	// exists do models.json and then the built-in Codex list stand in (lib/request-worker.js:1485-1499).
-	base := c.current.Load()
-	routes, source := base.routes, base.source
-	switch {
-	case len(listing) > 0:
-		routes, source = listing, "proxy"
-	case len(routes) == 0:
-		routes, source = c.modelsFileRoutes(), "models.json"
-		if len(routes) == 0 {
-			routes, source = defaultRoutes(), "fallback"
+	grokIDs := c.grokIDs()
+	var probes measurements
+	// Each pass builds on the generation committed when it began. When an earlier-started refresh
+	// commits meanwhile, the pass is rebuilt on that generation, so an empty listing keeps the latest
+	// route table and outage preservation reads the latest committed measurement. Only refreshes that
+	// started earlier can commit without superseding this one, so the loop ends.
+	for base := c.current.Load(); ; base = c.current.Load() {
+		routes, source := c.selectRoutes(base, listing)
+		c.measure(ctx, &probes, routes)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		next, err := c.prepare(base, routes, source, &probes, grokIDs)
+		if err != nil {
+			return err
+		}
+		switch c.commit(ctx, ticket, base, next) {
+		case published:
+			// A stand-in list is never persisted (lib/request-worker.js:1522-1523).
+			if source == "proxy" {
+				c.syncDiscovery(false)
+			}
+			return nil
+		case superseded:
+			return nil
+		case canceled:
+			return ctx.Err()
 		}
 	}
-	llama, studio := c.probe(ctx, routes)
-	if err := ctx.Err(); err != nil {
-		return err
+}
+
+// selectRoutes picks the route table of a refresh. A refresh that cannot read the listing keeps the
+// table of base; only before any table exists do models.json and then the built-in Codex list stand
+// in (lib/request-worker.js:1485-1499).
+func (c *Cache) selectRoutes(base *committed, listing []proxymodels.Route) ([]proxymodels.Route, string) {
+	switch {
+	case len(listing) > 0:
+		return listing, "proxy"
+	case len(base.routes) > 0:
+		return base.routes, base.source
+	}
+	if routes := c.modelsFileRoutes(); len(routes) > 0 {
+		return routes, "models.json"
+	}
+	return defaultRoutes(), "fallback"
+}
+
+// measurements are the local-engine probes one refresh took. A probe depends on the settings alone,
+// not on the route table, so a rebuilt pass reuses them and probes only an engine not yet measured.
+type measurements struct {
+	llamaDone, studioDone bool
+	llama                 localprov.LlamaState
+	studio                localprov.StudioState
+}
+
+// measure asks llama-server and LM Studio in parallel when routes list their rows and this refresh
+// has not measured them yet. Nothing here reaches the cache until the refresh commits.
+func (c *Cache) measure(ctx context.Context, m *measurements, routes []proxymodels.Route) {
+	opts := localprov.ProbeOptions{Client: c.listingClient}
+	var wg sync.WaitGroup
+	if !m.llamaDone && listsProvider(routes, llamaProvider) {
+		m.llamaDone = true
+		wg.Go(func() { m.llama = localprov.ProbeLlama(ctx, c.lookup, opts) })
+	}
+	if !m.studioDone && listsProvider(routes, studioProvider) {
+		m.studioDone = true
+		wg.Go(func() { m.studio = localprov.ProbeStudio(ctx, c.lookup, c.proxyConfigDir, opts) })
+	}
+	wg.Wait()
+}
+
+// prepare builds the generation that follows base. An engine the routes do not list has no state. An
+// engine that did not answer at the address base measured keeps base's window or models, so an outage
+// does not shrink the picker (lib/local-llama.js, lib/lmstudio.js).
+func (c *Cache) prepare(base *committed, routes []proxymodels.Route, source string, m *measurements, grokIDs []string) (*committed, error) {
+	var llama *localprov.LlamaState
+	if listsProvider(routes, llamaProvider) {
+		state := m.llama
+		if prev := base.llama; !state.Reachable && state.Port != 0 && prev != nil && prev.Port == state.Port && prev.ContextWindow != 0 {
+			state.ContextWindow = prev.ContextWindow
+		}
+		llama = &state
+	}
+	var studio *localprov.StudioState
+	if listsProvider(routes, studioProvider) {
+		state := m.studio
+		if prev := base.studio; !state.Reachable && state.BaseURL != "" && prev != nil && prev.BaseURL == state.BaseURL {
+			state.Models = prev.Models
+		}
+		studio = cloneStudio(&state)
 	}
 
 	inputs := policy.ResolverInputs{Routes: proxymodels.NewTable(routes), Windows: c.windows}
@@ -350,47 +480,58 @@ func (c *Cache) refresh(ctx context.Context, onListing func(listed bool)) error 
 		inputs.LMStudioURL, inputs.LMStudioWindows = studio.BaseURL, studio.Windows()
 	}
 	resolver := policy.NewResolver(inputs)
-	grokIDs := c.grokIDs()
 	rows := listingRows(resolver, routes, grokIDs, c.listDispatch)
 	catalog, err := json.Marshal(rows)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if !c.commit(ticket, &committed{
-		snapshot: route.NewSnapshot(resolver, source, catalog, grokIDs),
+	return &committed{
+		snapshot: route.NewSnapshot(resolver, source, catalog, slices.Clone(grokIDs)),
 		source:   source,
 		routes:   routes,
 		rows:     catalog,
 		count:    len(rows),
 		llama:    llama,
 		studio:   studio,
-	}) {
-		return nil
-	}
-	// A stand-in list is never persisted (lib/request-worker.js:1522-1523).
-	if source == "proxy" {
-		c.syncDiscovery(false)
-	}
-	return nil
+	}, nil
 }
 
-// commit publishes next unless a later-started refresh already committed. Sentry policy goes first,
-// then the route snapshot, then the snapshot and generation become visible to readers together.
-func (c *Cache) commit(ticket uint64, next *committed) bool {
+// commitResult is the outcome of one attempt to publish a generation.
+type commitResult int
+
+const (
+	published commitResult = iota
+	// superseded means a later-started refresh already committed; this one is dropped whole.
+	superseded
+	// canceled means the refresh's context ended before publication.
+	canceled
+	// rebased means another generation was committed after the attempt's base was read.
+	rebased
+)
+
+// commit publishes next when base is still the committed generation, the refresh was not canceled,
+// and no later-started refresh committed. Sentry policy goes first, then the route snapshot, then
+// the snapshot and generation become visible to readers together.
+func (c *Cache) commit(ctx context.Context, ticket uint64, base, next *committed) commitResult {
 	c.commitMu.Lock()
 	defer c.commitMu.Unlock()
-	if ticket < c.committedTicket {
-		return false
+	switch {
+	case ticket < c.committedTicket:
+		return superseded
+	case ctx.Err() != nil:
+		return canceled
+	case c.current.Load() != base:
+		return rebased
 	}
 	c.committedTicket = ticket
 	next.generation = 1
-	if previous := c.current.Load(); previous != nil {
-		next.generation = previous.generation + 1
+	if base != nil {
+		next.generation = base.generation + 1
 	}
 	c.opts.Sentry.Publish(next.generation, next.snapshot.Resolver(), maps.Clone(c.windows), c.env)
 	c.opts.Routes.Publish(next.snapshot)
 	c.current.Store(next)
-	return true
+	return published
 }
 
 // fetchListing reads the proxy's GET /v1/models and parses the raw data member of its last
@@ -403,7 +544,7 @@ func (c *Cache) fetchListing(ctx context.Context) []proxymodels.Route {
 		return nil
 	}
 	req.Header.Set("User-Agent", "model-gateway")
-	resp, err := c.opts.Client.Do(req)
+	resp, err := c.listingClient.Do(req)
 	if err != nil {
 		return nil
 	}
@@ -442,15 +583,8 @@ func defaultRoutes() []proxymodels.Route {
 	return routes
 }
 
-// probe asks llama-server and LM Studio in parallel when the table lists their rows. The trackers keep
-// the last measurement for an outage at the same address; the results belong to this refresh only.
-func (c *Cache) probe(ctx context.Context, routes []proxymodels.Route) (llama *localprov.LlamaState, studio *localprov.StudioState) {
-	opts := localprov.ProbeOptions{Client: c.opts.Client}
-	var wg sync.WaitGroup
-	wg.Go(func() { llama = c.llama.Refresh(ctx, routes, c.lookup, opts) })
-	wg.Go(func() { studio = c.studio.Refresh(ctx, routes, c.lookup, c.proxyConfigDir, opts) })
-	wg.Wait()
-	return llama, studio
+func listsProvider(routes []proxymodels.Route, provider string) bool {
+	return slices.ContainsFunc(routes, func(r proxymodels.Route) bool { return r.Provider == provider })
 }
 
 func (c *Cache) grokIDs() []string {
@@ -573,7 +707,11 @@ func (c *Cache) LlamaState() *localprov.LlamaState {
 
 // StudioState returns a deep copy of the latest tracked LM Studio state, or nil if inactive.
 func (c *Cache) StudioState() *localprov.StudioState {
-	state := c.current.Load().studio
+	return cloneStudio(c.current.Load().studio)
+}
+
+// cloneStudio returns a deep copy of state, or nil.
+func cloneStudio(state *localprov.StudioState) *localprov.StudioState {
 	if state == nil {
 		return nil
 	}

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"unicode/utf16"
 
@@ -29,17 +30,33 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/policy"
 )
 
-// discoveryModel is one gateway-models.json entry; the display name is omitted when the row has none.
+// discoveryModel is one gateway-models.json entry. The display name keeps the row's exact UTF-16
+// code units, an unpaired surrogate included; named is false when the row has no string name.
 type discoveryModel struct {
-	ID          string  `json:"id"`
-	DisplayName *string `json:"display_name,omitzero"`
+	id    string
+	name  []uint16
+	named bool
 }
 
-// discoveryDocument is the whole gateway-models.json file (lib/runtime.js:629).
-type discoveryDocument struct {
-	BaseURL   string           `json:"baseUrl"`
-	FetchedAt int64            `json:"fetchedAt"`
-	Models    []discoveryModel `json:"models"`
+// discoveryDocument is the whole gateway-models.json file in its member order (lib/runtime.js:629).
+func discoveryDocument(baseURL string, fetchedAt int64, models []discoveryModel) jsonx.WireValue {
+	list := jsonx.WireValue{Kind: '[', Elements: make([]jsonx.WireValue, 0, len(models))}
+	for _, m := range models {
+		entry := jsonx.WireValue{Kind: '{', Members: []jsonx.Member{{Name: utf16.Encode([]rune("id")), Value: wireText(m.id)}}}
+		if m.named {
+			entry.Members = append(entry.Members, jsonx.Member{Name: utf16.Encode([]rune("display_name")), Value: jsonx.WireValue{Kind: '"', Text: m.name}})
+		}
+		list.Elements = append(list.Elements, entry)
+	}
+	return jsonx.WireValue{Kind: '{', Members: []jsonx.Member{
+		{Name: utf16.Encode([]rune("baseUrl")), Value: wireText(baseURL)},
+		{Name: utf16.Encode([]rune("fetchedAt")), Value: jsonx.WireValue{Kind: '0', Number: float64(fetchedAt)}},
+		{Name: utf16.Encode([]rune("models")), Value: list},
+	}}
+}
+
+func wireText(s string) jsonx.WireValue {
+	return jsonx.WireValue{Kind: '"', Text: utf16.Encode([]rune(s))}
 }
 
 // SyncDiscoveryCache writes the gateway discovery cache when EffectiveBaseURL returns DefaultBaseURL
@@ -50,6 +67,12 @@ func (c *Cache) SyncDiscoveryCache(force bool) (DiscoverySyncResult, error) {
 		result.State, result.Reason = "skipped", "shadow"
 		return result, nil
 	}
+	// The wiring, the committed generation, the Anthropic rows and the pins are read inside the same
+	// serialized operation that writes the file, so a writer that read older inputs can never write
+	// after one that read newer inputs. No commit lock is taken, so a sync completes while a refresh
+	// waits on a local probe.
+	c.discoveryMu.Lock()
+	defer c.discoveryMu.Unlock()
 	var baseURL string
 	if c.opts.EffectiveBaseURL != nil {
 		var err error
@@ -74,15 +97,12 @@ func (c *Cache) SyncDiscoveryCache(force bool) (DiscoverySyncResult, error) {
 	if err != nil {
 		return result, err
 	}
-
-	c.discoveryMu.Lock()
-	defer c.discoveryMu.Unlock()
 	result.ModelCount = len(models)
 	if existing, err := readSmallFile(c.discoveryPath); err == nil && !force && sameDiscoveryModels(existing, models) {
 		result.State = "unchanged"
 		return result, nil
 	}
-	data, err := jsonx.EncodeState(discoveryDocument{BaseURL: baseURL, FetchedAt: c.clock().UnixMilli(), Models: models})
+	data, err := jsonx.EncodeState(discoveryDocument(baseURL, c.clock().UnixMilli(), models))
 	if err != nil {
 		return result, err
 	}
@@ -120,9 +140,9 @@ func discoveryModels(rows jsontext.Value, resolver policy.Resolver) ([]discovery
 		if lower := asciiLower(text); !strings.Contains(lower, "claude") && !strings.Contains(lower, "anthropic") {
 			continue
 		}
-		entry := discoveryModel{ID: resolver.ClientID(text)}
+		entry := discoveryModel{id: resolver.ClientID(text)}
 		if name := member(row, "display_name"); name.Kind == '"' {
-			entry.DisplayName = new(string(utf16.Decode(name.Text)))
+			entry.name, entry.named = slices.Clone(name.Text), true
 		}
 		models = append(models, entry)
 	}
@@ -142,17 +162,17 @@ func sameDiscoveryModels(raw []byte, models []discoveryModel) bool {
 	}
 	for i, existing := range list.Elements {
 		id := member(existing, "id")
-		if id.Kind != '"' || string(utf16.Decode(id.Text)) != models[i].ID {
+		if id.Kind != '"' || string(utf16.Decode(id.Text)) != models[i].id {
 			return false
 		}
 		name := member(existing, "display_name")
-		if models[i].DisplayName == nil {
+		if !models[i].named {
 			if name.Kind != 0 {
 				return false
 			}
 			continue
 		}
-		if name.Kind != '"' || string(utf16.Decode(name.Text)) != *models[i].DisplayName {
+		if name.Kind != '"' || !slices.Equal(name.Text, models[i].name) {
 			return false
 		}
 	}

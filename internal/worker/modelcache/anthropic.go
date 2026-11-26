@@ -30,6 +30,9 @@ import (
 	"unicode/utf16"
 	"unicode/utf8"
 
+	"golang.org/x/text/encoding/unicode"
+	"golang.org/x/text/transform"
+
 	"github.com/zchee/claude-code-model-gateway/internal/anthropiccatalog"
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
 )
@@ -83,18 +86,38 @@ func (c *Cache) TriggerAnthropicRefresh(incoming http.Header) {
 }
 
 // anthropicRows returns the cached catalog rows and their count, and starts or joins a refresh when
-// the cache is stale and the request carries credentials.
+// the cache is stale and the request carries credentials. The read and the election are one
+// operation: a refresh clears its flight only after its write, so a caller that finds no flight reads
+// what the last refresh wrote and never starts a redundant one from an older snapshot.
 func (c *Cache) anthropicRows(incoming http.Header) (jsontext.Value, int, *catalogFlight) {
+	headers := catalogHeaders(incoming)
+	c.catalogMu.Lock()
+	defer c.catalogMu.Unlock()
 	cached := anthropiccatalog.Read(c.catalogPath())
 	rows, count := catalogData(cached)
 	if cached.Fresh(c.clock()) || c.anthropicBase == nil {
 		return rows, count, nil
 	}
-	headers := catalogHeaders(incoming)
 	if headers.Get("Authorization") == "" && headers.Get("X-Api-Key") == "" {
 		return rows, count, nil
 	}
-	return rows, count, c.startCatalogRefresh(headers, cached)
+	if c.flight != nil {
+		return rows, count, c.flight
+	}
+	// After the worker context ends nothing new starts, so no goroutine races Wait.
+	if !c.admitted() {
+		return rows, count, nil
+	}
+	flight := &catalogFlight{done: make(chan struct{})}
+	c.flight = flight
+	c.wg.Go(func() {
+		flight.rows = c.refreshCatalog(headers, cached)
+		c.catalogMu.Lock()
+		c.flight = nil
+		c.catalogMu.Unlock()
+		close(flight.done)
+	})
+	return rows, count, flight
 }
 
 func (c *Cache) catalogPath() string {
@@ -104,51 +127,38 @@ func (c *Cache) catalogPath() string {
 	return filepath.Join(c.stateDir, "anthropic-models.json")
 }
 
-// startCatalogRefresh returns the in-flight refresh, or starts one under the worker context. Before
-// Start the refresh runs to its own end. After the worker context ends nothing new starts, so no
-// goroutine races Wait.
-func (c *Cache) startCatalogRefresh(headers http.Header, cached anthropiccatalog.Snapshot) *catalogFlight {
+// admitted reports whether background catalog work may still start or write: neither the worker
+// context from Start nor the catalog lifetime has ended.
+func (c *Cache) admitted() bool {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.flight != nil {
-		return c.flight
-	}
-	ctx := c.worker
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if ctx.Err() != nil {
-		return nil
-	}
-	flight := &catalogFlight{done: make(chan struct{})}
-	c.flight = flight
-	c.wg.Go(func() {
-		flight.rows = c.refreshCatalog(ctx, headers, cached)
-		c.mu.Lock()
-		c.flight = nil
-		c.mu.Unlock()
-		close(flight.done)
-	})
-	return flight
+	worker := c.worker
+	c.mu.Unlock()
+	return c.life.Err() == nil && (worker == nil || worker.Err() == nil)
 }
 
 // refreshCatalog fetches every page and records the outcome against the snapshot that triggered it.
-// Worker shutdown records nothing (lib/anthropic-catalog.js:83-95).
-func (c *Cache) refreshCatalog(ctx context.Context, headers http.Header, cached anthropiccatalog.Snapshot) jsontext.Value {
+// It runs under the catalog lifetime, which worker shutdown cancels. No write is admitted once the
+// worker context ended (lib/anthropic-catalog.js:83-95).
+func (c *Cache) refreshCatalog(headers http.Header, cached anthropiccatalog.Snapshot) jsontext.Value {
 	path := c.catalogPath()
-	rows, failure := c.fetchCatalog(ctx, headers)
+	rows, failure := c.fetchCatalog(c.life, headers)
 	cachedRows, _ := catalogData(cached)
-	if ctx.Err() != nil {
+	if !c.admitted() {
 		return cachedRows
 	}
 	now := c.clock()
 	if failure == "" {
 		if err := anthropiccatalog.WriteSuccess(path, rows, now); err == nil {
-			c.syncDiscovery(true)
+			if c.admitted() {
+				c.syncDiscovery(true)
+			}
 			saved, _ := catalogData(anthropiccatalog.Read(path))
 			return saved
 		}
 		failure = "catalog write failed"
+		if !c.admitted() {
+			return cachedRows
+		}
 	}
 	if err := anthropiccatalog.WriteFailure(path, cached, failure, now); err != nil {
 		c.logf("model-gateway: could not record the Anthropic catalog refresh failure (%s)", errorClass(err))
@@ -174,7 +184,8 @@ func (c *Cache) fetchCatalog(ctx context.Context, headers http.Header) (jsontext
 		if data.Kind != '[' {
 			return nil, "invalid catalog data"
 		}
-		all.Elements = append(all.Elements, data.Elements...)
+		// Each page keeps only its valid rows before the next one is read (lib/anthropic-catalog.js:63).
+		all.Elements = append(all.Elements, slices.DeleteFunc(data.Elements, invalidCatalogRow)...)
 		if !truthy(member(page, "has_more")) {
 			encoded, err := jsonx.EncodeWire(all)
 			if err != nil {
@@ -210,9 +221,7 @@ func (c *Cache) fetchCatalogPage(ctx context.Context, query string, headers http
 		// An empty value keeps the client from adding its own User-Agent.
 		req.Header["User-Agent"] = []string{""}
 	}
-	client := *c.opts.Client
-	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	resp, err := client.Do(req)
+	resp, err := c.catalogClient.Do(req)
 	if err != nil {
 		return jsonx.WireValue{}, pageFailure(pageCtx)
 	}
@@ -220,14 +229,12 @@ func (c *Cache) fetchCatalogPage(ctx context.Context, query string, headers http
 	if resp.StatusCode != http.StatusOK {
 		return jsonx.WireValue{}, "upstream HTTP " + strconv.Itoa(resp.StatusCode)
 	}
-	// Every UTF-16 code unit takes at least one and at most three UTF-8 bytes, so this bound always
-	// reads past the limit of a page that exceeds it.
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 3*MaxAnthropicPageUTF16Units+4))
-	if err != nil {
-		return jsonx.WireValue{}, pageFailure(pageCtx)
-	}
-	if utf16Units(body) > MaxAnthropicPageUTF16Units {
+	body, tooLarge, err := readCatalogPage(resp.Body)
+	switch {
+	case tooLarge:
 		return jsonx.WireValue{}, "catalog too large"
+	case err != nil:
+		return jsonx.WireValue{}, pageFailure(pageCtx)
 	}
 	page, err := jsonx.DecodeWire(body)
 	if err != nil {
@@ -340,17 +347,61 @@ func formEncode(s string) string {
 	return b.String()
 }
 
-// utf16Units counts the UTF-16 code units of b decoded as UTF-8, with each invalid byte replaced by
-// U+FFFD.
-func utf16Units(b []byte) int {
-	units := 0
-	for len(b) > 0 {
-		r, size := utf8.DecodeRune(b)
-		units++
-		if r >= 0x10000 {
+// readCatalogPage decodes a page body as the source's UTF-8 string decoder does, one U+FFFD for each
+// maximal ill-formed subsequence, and counts the decoded UTF-16 code units as they arrive. It stops at
+// the first unit over the bound and reports the page too large, whatever the rest of the body would
+// have done (lib/anthropic-catalog.js:43-47). The returned text is valid UTF-8.
+func readCatalogPage(body io.Reader) ([]byte, bool, error) {
+	decoder := transform.NewReader(body, unicode.UTF8.NewDecoder())
+	buf := make([]byte, 32<<10)
+	var text []byte
+	units, counted := 0, 0
+	for {
+		n, err := decoder.Read(buf)
+		text = append(text, buf[:n]...)
+		for counted < len(text) && utf8.FullRune(text[counted:]) {
+			r, size := utf8.DecodeRune(text[counted:])
 			units++
+			if r >= 0x10000 {
+				units++
+			}
+			counted += size
 		}
-		b = b[size:]
+		if units > MaxAnthropicPageUTF16Units {
+			return nil, true, nil
+		}
+		switch {
+		case errors.Is(err, io.EOF):
+			return text, false, nil
+		case err != nil:
+			return nil, false, err
+		}
 	}
-	return units
+}
+
+// invalidCatalogRow reports a row the source's validCatalogRows drops: one whose id is not a string
+// "claude-" followed by at least one of [a-z0-9._-], or whose display_name is not a string. An id
+// holding an unpaired surrogate is invalid, as the catalog store also treats it.
+func invalidCatalogRow(row jsonx.WireValue) bool {
+	id := member(row, "id")
+	if id.Kind != '"' || member(row, "display_name").Kind != '"' {
+		return true
+	}
+	for i := 0; i < len(id.Text); i++ {
+		u := rune(id.Text[i])
+		if !utf16.IsSurrogate(u) {
+			continue
+		}
+		i++
+		if i == len(id.Text) || utf16.DecodeRune(u, rune(id.Text[i])) == utf8.RuneError {
+			return true
+		}
+	}
+	rest, ok := strings.CutPrefix(string(utf16.Decode(id.Text)), "claude-")
+	if !ok || rest == "" {
+		return true
+	}
+	return strings.ContainsFunc(rest, func(r rune) bool {
+		return (r < 'a' || r > 'z') && (r < '0' || r > '9') && !strings.ContainsRune("._-", r)
+	})
 }

@@ -16,6 +16,7 @@ package readiness
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -43,6 +44,8 @@ type ProxyAuthResult struct {
 }
 
 // ProxyAuthProbe configures a live proxy and Codex auth status check.
+// Only Client's transport is used: never its cookie jar, timeout or redirect policy.
+// RunAuthStatus receives a context that ends after the source's fifteen-second command timeout.
 type ProxyAuthProbe struct {
 	ProxyBinary    string
 	ProxyModelsURL string
@@ -50,11 +53,21 @@ type ProxyAuthProbe struct {
 	RunAuthStatus  func(ctx context.Context, binary string, args []string) (stdout, stderr []byte, err error)
 }
 
-// proxyModelsTimeout bounds the /v1/models answer the shared check waits for (lib/request-worker.js:56-61).
-const proxyModelsTimeout = 2 * time.Second
+const (
+	// proxyModelsTimeout bounds the /v1/models answer the shared check waits for (lib/request-worker.js:56-61).
+	proxyModelsTimeout = 2 * time.Second
+	// maxProxyModelsBody bounds the /v1/models body the shared check reads.
+	maxProxyModelsBody = 1 << 20
+	// statusTimeout bounds one auth status command, as the source's execFile timeout does
+	// (lib/request-worker.js:51, lib/commands.js:1689).
+	statusTimeout = 15 * time.Second
+	// maxRedirects bounds the redirect chain of the /v1/models check.
+	maxRedirects = 10
+)
 
-// checkTransport carries the /v1/models probe of checks given no client. It never consults the
-// environment's proxy settings and keeps no idle connections.
+// checkTransport carries the /v1/models probe when the probe's client has no transport of its own or
+// names the process-wide default. It never consults the environment's proxy settings and keeps no
+// idle connections.
 var checkTransport = &http.Transport{
 	Proxy:             nil,
 	DialContext:       (&net.Dialer{}).DialContext,
@@ -88,10 +101,11 @@ func proxyModelsAnswering(ctx context.Context, probe ProxyAuthProbe) bool {
 	}
 	ctx, cancel := context.WithTimeout(ctx, proxyModelsTimeout)
 	defer cancel()
-	client := &http.Client{Transport: checkTransport}
-	if probe.Client != nil {
-		client = probe.Client
+	var transport http.RoundTripper = checkTransport
+	if probe.Client != nil && probe.Client.Transport != nil && probe.Client.Transport != http.DefaultTransport {
+		transport = probe.Client.Transport
 	}
+	client := &http.Client{Transport: transport, CheckRedirect: followCheckRedirect}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, probe.ProxyModelsURL, http.NoBody)
 	if err != nil {
 		return false
@@ -101,15 +115,36 @@ func proxyModelsAnswering(ctx context.Context, probe ProxyAuthProbe) bool {
 	if err != nil {
 		return false
 	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-	_ = resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
+	// The source answers only after the whole body arrived (lib/process-supervision.js:33-37). A body
+	// that fails or times out before its end is no answer. A body over maxProxyModelsBody is not read
+	// further and is no answer either: a healthy listing is far smaller.
+	n, err := io.Copy(io.Discard, io.LimitReader(resp.Body, maxProxyModelsBody+1))
+	if err != nil || n > maxProxyModelsBody {
+		return false
+	}
 	return resp.StatusCode == http.StatusOK
+}
+
+// followCheckRedirect follows a redirect as the source's fetch helper does, without a Referer naming
+// the previous URL and never to a target that carries credentials.
+func followCheckRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxRedirects {
+		return errors.New("too many redirects")
+	}
+	if req.URL.User != nil {
+		return errors.New("redirect target carries credentials")
+	}
+	req.Header.Del("Referer")
+	return nil
 }
 
 func codexAuthenticated(ctx context.Context, probe ProxyAuthProbe) bool {
 	if probe.RunAuthStatus == nil {
 		return false
 	}
+	ctx, cancel := context.WithTimeout(ctx, statusTimeout)
+	defer cancel()
 	stdout, stderr, err := probe.RunAuthStatus(ctx, probe.ProxyBinary, []string{"codex", "auth", "status"})
 	if err != nil {
 		return false

@@ -20,7 +20,6 @@ import (
 	"errors"
 	"io"
 	"io/fs"
-	"os"
 	"slices"
 	"syscall"
 )
@@ -45,18 +44,13 @@ func readLimited(r io.Reader, limit int64) ([]byte, error) {
 	return data, nil
 }
 
-// readSmallFile reads a regular file, following symlinks, up to maxFileBytes. The opened file is
-// checked again so a replacement after the first check is never read as a regular file.
+// readSmallFile reads a regular file, following symlinks, up to maxFileBytes. The open never waits on
+// a FIFO, and the opened handle is checked, so only a regular file is ever read.
 func readSmallFile(path string) ([]byte, error) {
 	if path == "" {
 		return nil, fs.ErrNotExist
 	}
-	if info, err := os.Stat(path); err != nil {
-		return nil, err
-	} else if !info.Mode().IsRegular() {
-		return nil, errNotRegular
-	}
-	f, err := os.Open(path)
+	f, err := openForRead(path)
 	if err != nil {
 		return nil, err
 	}

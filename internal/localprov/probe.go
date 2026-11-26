@@ -46,8 +46,9 @@ const (
 	maxProbeBody = 16 << 20
 )
 
-// probeTransport is the dedicated transport of probes that are not given a client. It never consults
-// the environment's proxy settings and keeps no idle connections, so it outlives no probe.
+// probeTransport is the dedicated transport of probes whose client has no transport of its own or
+// names the process-wide default. It never consults the environment's proxy settings and keeps no
+// idle connections, so it outlives no probe.
 var probeTransport = &http.Transport{
 	Proxy:             nil,
 	DialContext:       (&net.Dialer{}).DialContext,
@@ -57,6 +58,7 @@ var probeTransport = &http.Transport{
 // ProbeOptions configures live HTTP probes against local model servers.
 // Zero values use DefaultProbeTimeout and a client that follows HTTP 3xx redirects
 // while retaining the Authorization header only on the same origin.
+// Only Client's transport is used: never its cookie jar, timeout or redirect policy.
 type ProbeOptions struct {
 	Client  *http.Client
 	Timeout time.Duration
@@ -68,9 +70,9 @@ type probeResponse struct {
 	body   []byte
 }
 
-// get issues one GET through the configured client. The redirect policy is always the probe's own,
-// whichever client carries the request. A transport failure is returned as a classified, payload-free
-// code such as "ECONNREFUSED".
+// get issues one GET through the configured client's transport. The redirect policy is always the
+// probe's own and no cookie jar is consulted. A transport failure is returned as a classified,
+// payload-free code such as "ECONNREFUSED"; a body over maxProbeBody is "response too large".
 func (o ProbeOptions) get(ctx context.Context, target, authorization string) (probeResponse, string) {
 	timeout := o.Timeout
 	if timeout <= 0 {
@@ -79,13 +81,11 @@ func (o ProbeOptions) get(ctx context.Context, target, authorization string) (pr
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	client := &http.Client{Transport: probeTransport}
-	if o.Client != nil {
-		copied := *o.Client
-		client = &copied
-		client.Timeout = 0
+	var transport http.RoundTripper = probeTransport
+	if o.Client != nil && o.Client.Transport != nil && o.Client.Transport != http.DefaultTransport {
+		transport = o.Client.Transport
 	}
-	client.CheckRedirect = followProbeRedirect
+	client := &http.Client{Transport: transport, CheckRedirect: followProbeRedirect}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, http.NoBody)
 	if err != nil {
@@ -100,19 +100,29 @@ func (o ProbeOptions) get(ctx context.Context, target, authorization string) (pr
 		return probeResponse{}, transportFailure(ctx, err, target)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxProbeBody))
-	if err != nil {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxProbeBody+1))
+	switch {
+	case err != nil:
 		return probeResponse{}, transportFailure(ctx, err, target)
+	case len(body) > maxProbeBody:
+		// A body cut at the bound is not the server's answer; the probe counts as unreadable.
+		return probeResponse{}, "response too large"
 	}
 	return probeResponse{status: resp.StatusCode, body: body}, ""
 }
 
 // followProbeRedirect follows redirects as the source's fetch helper does: the Authorization header
-// survives only while every hop stays on the origin of the first request.
+// survives only while every hop stays on the origin of the first request. No Referer names the
+// previous URL, and a target that carries credentials is refused, since the client would turn them
+// into a new Authorization header.
 func followProbeRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) >= maxRedirects {
 		return errors.New("too many redirects")
 	}
+	if req.URL.User != nil {
+		return errors.New("redirect target carries credentials")
+	}
+	req.Header.Del("Referer")
 	first := origin(via[0].URL)
 	crossed := origin(req.URL) != first
 	for _, hop := range via[1:] {

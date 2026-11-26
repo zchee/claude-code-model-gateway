@@ -41,6 +41,7 @@ const (
 
 // StatusRunner executes `<binary> <provider> auth status` and returns its exit code.
 // A non-nil error indicates the command failed to run or timed out without an exit status.
+// The context it receives ends after the source's fifteen-second command timeout.
 type StatusRunner func(ctx context.Context, binary string, args []string) (exitCode int, err error)
 
 // ProviderAuthOptions supplies injected configuration, subprocess execution, and local server states.
@@ -78,6 +79,8 @@ func ProviderAuthState(ctx context.Context, provider string, opts ProviderAuthOp
 	if opts.RunStatus == nil {
 		return "auth-unknown"
 	}
+	ctx, cancel := context.WithTimeout(ctx, statusTimeout)
+	defer cancel()
 	code, err := opts.RunStatus(ctx, opts.ProxyBinary, []string{provider, "auth", "status"})
 	switch {
 	case err != nil:
