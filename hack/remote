@@ -275,7 +275,14 @@ case $op in
         [[ $# -lt 2 || $2 =~ ^MODEL_GATEWAY_[A-Z0-9_]+$ ]] || fail 'invalid sentinel variable'
         ;;
     run) [[ $# -gt 0 ]] || fail 'run requires at least one make target'
-         for target do [[ $target =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || fail 'invalid make target'; done ;;
+         if [[ $1 == conformance && "$*" == *=* ]]; then
+             for arg in "${@:2}"; do
+                 [[ $arg == CLASS=conformance || $arg =~ ^MODE=(suite|self-test|probes)$ || $arg =~ ^TARGET=(identity|binary:/[a-zA-Z0-9_./-]+)$ ||
+                    $arg =~ ^PHASE=phase-[0-9]+$ || $arg =~ ^PACKAGE=[a-zA-Z0-9_./-]+$ || $arg =~ ^GATE=(task|phase)$ ]] || fail 'invalid conformance selector'
+             done
+         else
+             for target do [[ $target =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || fail 'invalid make target'; done
+         fi ;;
     *) fail 'usage: remote {provision|run TARGET...|negative-control|status|deprovision}' ;;
 esac
 host=${VENUE_HOST:?set VENUE_HOST to the approved SSH destination}
@@ -293,7 +300,7 @@ program=$'set -euo pipefail\n'"$program"$'\nremote_main "$@"'
 encoded=$(printf '%s' "$program" | base64 | tr -d '\n')
 cmd="env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin GITHUB_ACTIONS=\"\${GITHUB_ACTIONS:-}\" /bin/bash -c \"\$(printf %s $encoded | base64 -d)\" remote"
 for arg in "$op" "$(hostname -s)" "$gover" v24.11.1 "$@"; do
-    [[ $arg =~ ^[a-zA-Z0-9_./-]+$ ]] || fail 'invalid remote argument'
+    [[ $arg =~ ^[a-zA-Z0-9_=.:/-]+$ ]] || fail 'invalid remote argument'
     cmd+=" $arg"
 done
 if [[ $op == negative-control ]]; then cmd="timeout --kill-after=30s 10m $cmd"; fi

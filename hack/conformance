@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Copyright 2026 The claude-code-model-gateway Authors.
+# SPDX-License-Identifier: Apache-2.0
+set -euo pipefail
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
+"$root/hack/venue-check"
+if command -v claude >/dev/null; then printf '%s\n' 'claude resolves on venue PATH' >&2; exit 1; fi
+plugin=$("$root/hack/pinned-source")/plugins/model-gateway
+"$root/hack/baseline-extract" --verify >&2
+work=$(mktemp -d "$root/.cache/conformance.XXXXXXXX")
+tmp=$(mktemp -d "${root%/*}/t.XXXXXX")
+mkdir "$work/home"
+clean=(env -i "PATH=$PATH" "HOME=$work/home" "TMPDIR=$tmp" "npm_config_cache=${npm_config_cache:?missing venue npm cache}")
+"${clean[@]}" npm --prefix "$plugin" ci --ignore-scripts --no-audit --no-fund >&2
+"${clean[@]}" node -e 'if (require(process.argv[1]).version !== "8.20.0") process.exit(1)' "$plugin/node_modules/ajv/package.json"
+case ${MODE:-suite} in
+    self-test) cc -std=c99 -Wall -Wextra -Werror -o "$work/standin" "$root/test/conformance/adapter/standin.c" ;;
+    suite|probes) ;;
+    *) printf 'unknown conformance MODE: %s\n' "$MODE" >&2; exit 1 ;;
+esac
+rc=0
+"${clean[@]}" node "$root/test/conformance/adapter/run.cjs" "$root" "$plugin" "$work" \
+    "${TARGET:-identity}" "${MODE:-suite}" "${PHASE:-}" "${PACKAGE:-}" "${GATE:-}" "${LAUNCH_LOG:-$work/launches.jsonl}" "${CLASS:-}" || rc=$?
+"$root/hack/venue-check"
+exit "$rc"
