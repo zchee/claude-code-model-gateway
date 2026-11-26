@@ -510,6 +510,96 @@ func TestLMStudioPeekShutdownWinsOverExpiredWait(t *testing.T) {
 	}
 }
 
+// eofCheckEndsServiceError is a read error that ends the service context while the reader asks it
+// whether it is io.EOF, and then gives its configured answer, so the service ends after the peek
+// has received the read result and while it classifies the error. Asked about any other target, it
+// answers false and ends nothing.
+type eofCheckEndsServiceError struct {
+	cancel   context.CancelFunc
+	isEOF    bool
+	eofAsked atomic.Int32
+}
+
+func (e *eofCheckEndsServiceError) Error() string {
+	return "upstream body read failed; asking whether it is io.EOF ends the service"
+}
+
+func (e *eofCheckEndsServiceError) Is(target error) bool {
+	if target != io.EOF {
+		return false
+	}
+	e.eofAsked.Add(1)
+	e.cancel()
+	return e.isEOF
+}
+
+// partialReadBody hands over its data together with its err from its first Read; later reads fail.
+type partialReadBody struct {
+	data   []byte
+	err    error
+	reads  atomic.Int32
+	closes atomic.Int32
+}
+
+func (b *partialReadBody) Read(p []byte) (int, error) {
+	if b.reads.Add(1) > 1 || b.closes.Load() > 0 {
+		return 0, io.ErrClosedPipe
+	}
+	return copy(p, b.data), b.err
+}
+
+func (b *partialReadBody) Close() error {
+	b.closes.Add(1)
+	return nil
+}
+
+func TestPeekFirstEventShutdownDuringReadErrorCheck(t *testing.T) {
+	tests := map[string]struct {
+		isEOF bool
+	}{
+		"error: a read with part of a first event whose error ends the service while it is checked for io.EOF and is io.EOF returns the context error and closes the body once": {
+			isEOF: true,
+		},
+		"error: a read with part of a first event whose error ends the service while it is checked for io.EOF and is not io.EOF returns the context error and closes the body once": {
+			isEOF: false,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			// The bubble's fake clock keeps the first-event wait from being a real deadline. The service
+			// is still running when the read result arrives and ends only inside the error check, so a
+			// single call reaches the moment the peek classifies the error with no scheduling choice.
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				readErr := &eofCheckEndsServiceError{cancel: cancel, isEOF: tt.isEOF}
+				src := &partialReadBody{data: []byte(lmStudioOrdinaryStream(19, 0)[:30]), err: readErr}
+
+				res, err := sse.PeekFirstEvent(ctx, src, 5*time.Second)
+				// The close count is taken before a returned Body is closed: the peek itself must have
+				// closed the body. A returned Body still owns the reader and is closed here so the test
+				// ends with no goroutine left.
+				closes := src.closes.Load()
+				bodyReturned := res.Body != nil
+				if bodyReturned {
+					_ = res.Body.Close()
+				}
+				if readErr.eofAsked.Load() == 0 {
+					t.Fatalf("the read error was never asked whether it is io.EOF, so the service did not end; PeekFirstEvent = %s", formatPeekOutcome(0, res, bodyReturned, err))
+				}
+				if !errors.Is(err, context.Canceled) || bodyReturned || res.Overflow != nil || res.EarlyEndOverride != "" {
+					t.Errorf("PeekFirstEvent = (Body returned=%t, Overflow=%v, EarlyEndOverride=%q, err=%v), want no Body, no Overflow, no EarlyEndOverride and context.Canceled",
+						bodyReturned, res.Overflow, res.EarlyEndOverride, err)
+				}
+				if closes != 1 {
+					t.Errorf("body close count by the peek = %d, want 1", closes)
+				}
+			})
+		})
+	}
+}
+
 // closeEndsServiceBody hands over a complete first event with its first Read and ends the service
 // context when it is closed, so the service ends exactly while the peek closes the body of an
 // overflow first event it has just recognized.

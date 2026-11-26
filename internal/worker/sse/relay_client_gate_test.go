@@ -174,11 +174,11 @@ func TestRelayHeadGatedOnClientDeparture(t *testing.T) {
 						cancel()
 						out = <-done
 					}
-					// The first read delivers the start frame and the second the rest of the stream
-					// with its clean end, so two reads and no chunk left mean the tail was consumed
-					// to its end.
-					if reads, left := src.reads.Load(), src.remaining(); reads != 2 || left != 0 {
-						t.Errorf("upstream reads = %d with %d chunks left, want 2 reads and the tail consumed to its end", reads, left)
+					// Draining means reading the body to its end: no scripted chunk is left and the
+					// clean end was delivered. The number of reads is not part of that, since a read
+					// may return only part of a chunk.
+					if left, ended := src.remaining(), src.endDelivered(); left != 0 || !ended {
+						t.Errorf("after the drain: %d chunks left, end of the body delivered = %t, want no chunk left and the end delivered", left, ended)
 					}
 				} else {
 					select {

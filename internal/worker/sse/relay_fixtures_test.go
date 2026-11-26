@@ -35,6 +35,7 @@ type eofChunkBody struct {
 	chunks [][]byte
 	reads  atomic.Int32
 	closes atomic.Int32
+	eofs   atomic.Int32
 }
 
 func newEOFChunkBody(chunks ...[]byte) *eofChunkBody {
@@ -49,6 +50,7 @@ func (b *eofChunkBody) Read(p []byte) (int, error) {
 		return 0, io.ErrClosedPipe
 	}
 	if len(b.chunks) == 0 {
+		b.eofs.Add(1)
 		return 0, io.EOF
 	}
 	n := copy(p, b.chunks[0])
@@ -58,6 +60,7 @@ func (b *eofChunkBody) Read(p []byte) (int, error) {
 	}
 	b.chunks = b.chunks[1:]
 	if len(b.chunks) == 0 {
+		b.eofs.Add(1)
 		return n, io.EOF
 	}
 	return n, nil
@@ -66,6 +69,11 @@ func (b *eofChunkBody) Read(p []byte) (int, error) {
 func (b *eofChunkBody) Close() error {
 	b.closes.Add(1)
 	return nil
+}
+
+// endDelivered reports whether a read has returned io.EOF, the clean end of the body.
+func (b *eofChunkBody) endDelivered() bool {
+	return b.eofs.Load() > 0
 }
 
 // remaining reports how many scripted chunks no read has delivered yet.
