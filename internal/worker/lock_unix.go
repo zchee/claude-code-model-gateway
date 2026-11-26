@@ -29,7 +29,8 @@ import (
 // locks the same file. A Linux abstract address has no file that could be reclaimed, so it gets no lock file and
 // lockReclaim reports locked false with no error. Any failure to take the lock is returned naming the lock file.
 func lockReclaim(path string) (unlock func(), locked bool, err error) {
-	// Go binds a name that starts with '@' or a NUL byte in the abstract namespace only on Linux and Android.
+	// On the systems this program supports that have an abstract namespace, Linux and Android, Go binds a name that
+	// starts with '@' or a NUL byte there. Elsewhere this code handles such a name as a path.
 	if (runtime.GOOS == "linux" || runtime.GOOS == "android") && path != "" && (path[0] == '@' || path[0] == 0) {
 		return nil, false, nil
 	}

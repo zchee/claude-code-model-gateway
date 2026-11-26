@@ -20,7 +20,6 @@ import (
 	"bufio"
 	"crypto/rand"
 	"errors"
-	"io"
 	"io/fs"
 	"net"
 	"os"
@@ -53,51 +52,6 @@ func entryNames(t *testing.T, dir string) []string {
 		names = append(names, entry.Name())
 	}
 	return names
-}
-
-// startInOwnDirectory runs the package's reclaim starter on name in a working directory of its own and returns that
-// directory and the starter's result line, "owner PID" or "refused PID". The starter lives until the test ends, so an
-// owner keeps answering connections on name with its process ID.
-func startInOwnDirectory(t *testing.T, env gatewaytest.Environment, name string) (dir, result string) {
-	t.Helper()
-	cmd, err := env.HelperCommand(t, reclaimStarterHelper, name)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// The fixture runner launches from the sandbox root and the starter then enters this directory.
-	dir = cmd.Dir
-	release, hold, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _, _ = release.Close(), hold.Close() }()
-	cmd.ExtraFiles = []*os.File{release}
-	stop, err := cmd.StdinPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	outR, outW := io.Pipe()
-	cmd.Stdout = outW
-	done := make(chan error, 1)
-	go func() {
-		err := env.RunFixtureWithin(cmd, 20*time.Second)
-		_ = outW.CloseWithError(err)
-		done <- err
-	}()
-	t.Cleanup(func() {
-		_, _ = stop.Close(), outR.Close()
-		<-done
-	})
-	lines := bufio.NewScanner(outR)
-	if !lines.Scan() || lines.Text() != "ready" {
-		t.Fatal(errors.Join(errors.New("the starter did not reach its barrier: "+lines.Text()), lines.Err()))
-	}
-	// The starter waits for end of file on the barrier; the test holds its only write end.
-	_ = hold.Close()
-	if !lines.Scan() {
-		t.Fatal(errors.Join(errors.New("the starter gave no result"), lines.Err()))
-	}
-	return dir, lines.Text()
 }
 
 // answerOf connects to name and returns the line its owner answers with.
@@ -141,7 +95,7 @@ func TestAbstractSocketStartsWithoutFiles(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			id := abstractID()
-			ownerDir, result := startInOwnDirectory(t, env, "@"+id)
+			ownerDir, result, joinOwner := startInOwnDirectory(t, env, "@"+id)
 			pid, owned := strings.CutPrefix(result, "owner ")
 			if !owned {
 				t.Fatalf("the first start on a free abstract address: %q, want an owner", result)
@@ -149,12 +103,18 @@ func TestAbstractSocketStartsWithoutFiles(t *testing.T) {
 			if diff := gocmp.Diff(pid, answerOf(t, tc.marker+id)); diff != "" {
 				t.Errorf("a connection did not reach the owner (-want +got):\n%s", diff)
 			}
-			secondDir, result := startInOwnDirectory(t, env, "@"+id)
+			secondDir, result, joinSecond := startInOwnDirectory(t, env, "@"+id)
 			if !strings.HasPrefix(result, "refused ") {
 				t.Errorf("a second start on the held abstract address: %q, want a refusal", result)
 			}
 			if diff := gocmp.Diff(pid, answerOf(t, tc.marker+id)); diff != "" {
 				t.Errorf("after the second start a connection did not reach the first owner (-want +got):\n%s", diff)
+			}
+			// Both starters must exit cleanly; the directories are judged after they have.
+			for _, join := range []func() error{joinSecond, joinOwner} {
+				if err := join(); err != nil {
+					t.Error(err)
+				}
 			}
 			for dir, start := range map[string]string{ownerDir: "owner", secondDir: "refused start"} {
 				if diff := gocmp.Diff([]string(nil), entryNames(t, dir)); diff != "" {
@@ -167,7 +127,8 @@ func TestAbstractSocketStartsWithoutFiles(t *testing.T) {
 
 // TestAbstractSocketSecondStartGetsBindError holds a Linux abstract address with ListenUnix and starts a second
 // ListenUnix on it. Nothing at an abstract address can be reclaimed, so the second start returns the error of its
-// single bind exactly as a plain bind reports it, and leaves no file in the working directory.
+// single bind exactly as a plain bind reports it, and creates no file named after the address in the working
+// directory.
 func TestAbstractSocketSecondStartGetsBindError(t *testing.T) {
 	tests := map[string]struct {
 		// owner and second spell the address for the holding and the second start.
@@ -189,7 +150,6 @@ func TestAbstractSocketSecondStartGetsBindError(t *testing.T) {
 					}
 				}
 			})
-			before := entryNames(t, ".")
 			owner, err := worker.ListenUnix(tc.owner + id)
 			if err != nil {
 				t.Fatalf("ListenUnix on a free abstract address: %v", err)
@@ -222,8 +182,18 @@ func TestAbstractSocketSecondStartGetsBindError(t *testing.T) {
 			if diff := gocmp.Diff(plainErr.Error(), err.Error()); diff != "" {
 				t.Errorf("the second start's error is not the bind's own (-plain bind +ListenUnix):\n%s", diff)
 			}
-			if diff := gocmp.Diff(before, entryNames(t, ".")); diff != "" {
-				t.Errorf("files in the working directory changed (-before +after):\n%s", diff)
+			// Only the two random names are judged: other files in the shared package directory are not this test's.
+			var created []string
+			for _, leftover := range []string{"@" + id, "@" + id + ".lock"} {
+				switch _, err := os.Lstat(leftover); {
+				case err == nil:
+					created = append(created, leftover)
+				case !errors.Is(err, fs.ErrNotExist):
+					created = append(created, leftover+": "+err.Error())
+				}
+			}
+			if diff := gocmp.Diff([]string(nil), created); diff != "" {
+				t.Errorf("files named after the address in the working directory (-want +got):\n%s", diff)
 			}
 		})
 	}

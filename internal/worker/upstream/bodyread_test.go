@@ -123,9 +123,10 @@ func TestBodyReadHidesBrokenTLSRecords(t *testing.T) {
 				if _, err := io.WriteString(tc, bodyHead(len(completeBody))+partialBody); err != nil {
 					return err
 				}
-				// tc.Close sends the TLS close alert before closing the raw connection, so the
-				// client and test cleanup can close the raw connection before tc.Close reaches
-				// its own close.
+				// tc.Close sends the TLS close alert before closing the raw connection. The alert
+				// lets the client finish reading the body, so the test can end and the fake's
+				// cleanup, not the client, can close the server's raw connection before tc.Close
+				// reaches its own close; that close then reports net.ErrClosed.
 				if err := tc.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 					return err
 				}

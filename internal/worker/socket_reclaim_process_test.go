@@ -218,6 +218,65 @@ func reclaimStarter(t testing.TB, args []string) {
 	os.Exit(0)
 }
 
+// startInOwnDirectory runs the package's reclaim starter on name in a working directory of its own and returns that
+// directory, the starter's result line, "owner PID" or "refused PID", and join. The starter lives until join, so an
+// owner keeps answering connections on name with its process ID. join ends the starter's stdin, reads its remaining
+// output and waits for it, and returns an error naming that output when the starter failed; the test calls it before
+// it ends. A test that ends without calling it still has the starter stopped and waited for, but its exit status is
+// discarded then: the command runs under the test's context, which is cancelled before cleanup and can kill it.
+func startInOwnDirectory(t *testing.T, env gatewaytest.Environment, name string) (dir, result string, join func() error) {
+	t.Helper()
+	cmd, err := env.HelperCommand(t, reclaimStarterHelper, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The fixture runner launches from the sandbox root and the starter then enters this directory.
+	dir = cmd.Dir
+	release, hold, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = release.Close(), hold.Close() }()
+	cmd.ExtraFiles = []*os.File{release}
+	stop, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	outR, outW := io.Pipe()
+	cmd.Stdout = outW
+	done := make(chan error, 1)
+	go func() {
+		err := env.RunFixtureWithin(cmd, 20*time.Second)
+		_ = outW.CloseWithError(err)
+		done <- err
+	}()
+	lines := bufio.NewScanner(outR)
+	join = sync.OnceValue(func() error {
+		_ = stop.Close()
+		// The output pipe has no buffer: a failing starter blocks on its failure text until it is read.
+		var rest []string
+		for lines.Scan() {
+			rest = append(rest, lines.Text())
+		}
+		err := <-done
+		_ = outR.Close()
+		if err != nil {
+			return fmt.Errorf("the starter on %q failed: %w; its output after the result: %q", name, err, rest)
+		}
+		return nil
+	})
+	t.Cleanup(func() { _ = join() })
+	if !lines.Scan() || lines.Text() != "ready" {
+		t.Fatal(errors.Join(errors.New("the starter did not reach its barrier: "+lines.Text()), lines.Err()))
+	}
+	// The starter waits for end of file on the barrier; the test holds its only write end.
+	_ = hold.Close()
+	if !lines.Scan() {
+		t.Fatal(errors.Join(errors.New("the starter gave no result"), lines.Err()))
+	}
+	return dir, lines.Text(), join
+}
+
 // processRound runs one round with every starter as its own helper process, released together by closing a shared
 // pipe. Each starter runs under gatewaytest's scrubbed environment in its own sandbox directory.
 func processRound(t *testing.T, env gatewaytest.Environment, path string, starters int) (reclaimVerdict, error) {

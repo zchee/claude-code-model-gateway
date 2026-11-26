@@ -152,10 +152,10 @@ func redact(s string) string {
 // raises a limit. The unlimited case keeps the inherited limit and checks it leaves room for a saved
 // catalog of savedSize bytes plus catalogSaveMargin. The limited case lowers the soft limit to
 // catalogSaveLimit unless it is already lower, comparing with an untyped constant because the limit's
-// field type differs between platforms (uint64 on Linux and macOS, int64 on the BSDs). The unlimited
-// case compares with a size known only at run time, so it converts the limit to uint64, which keeps
-// every value: no platform has a negative soft limit, and the BSDs' unlimited value is the largest
-// int64. A write past the soft limit fails with EFBIG; the Go runtime ignores the accompanying SIGXFSZ.
+// field type differs between platforms (int64 on FreeBSD and DragonFly; uint64 on NetBSD, OpenBSD,
+// macOS and Linux). The unlimited case compares with a size known only at run time, so it converts
+// the limit to uint64, which keeps every value: no platform has a negative soft limit, and the BSDs'
+// unlimited value is the largest int64. A write past the soft limit fails with EFBIG; the Go runtime ignores the accompanying SIGXFSZ.
 func setCatalogFileLimit(t testing.TB, arg string, savedSize int) unix.Rlimit {
 	var original unix.Rlimit
 	if err := unix.Getrlimit(unix.RLIMIT_FSIZE, &original); err != nil {

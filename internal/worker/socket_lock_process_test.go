@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -216,4 +217,62 @@ func lockInaccessible(t *testing.T, lockPath string) func(*testing.T) {
 		t.Fatal(err)
 	}
 	return nil
+}
+
+// missingParentStart is what one ListenUnix call on a path under a missing directory returned and left behind.
+type missingParentStart struct {
+	// Listener reports that ListenUnix returned a listener.
+	Listener bool
+	// NotExist reports that the returned error wraps ENOENT.
+	NotExist bool
+	// ErrorNamesLock reports that the returned error names the lock file.
+	ErrorNamesLock bool
+	// Missing describes the outermost missing directory after the call.
+	Missing string
+}
+
+// TestSocketStartUnderMissingDirectory starts the socket on a path whose parent directory does not exist. The lock is
+// taken before any bind, so the start fails opening the lock file: no listener is returned, the error wraps ENOENT and
+// names the lock file, and no directory on the way to the path is created.
+func TestSocketStartUnderMissingDirectory(t *testing.T) {
+	tests := map[string]struct {
+		// missing are the directories between the existing temporary directory and the socket, outermost first.
+		missing []string
+	}{
+		"error: the parent directory is missing":                   {missing: []string{"absent"}},
+		"error: the parent and its parent directories are missing": {missing: []string{"absent", "nested"}},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			// A subtest's descriptive name can by itself exceed sockaddr_un.sun_path.
+			dir, err := os.MkdirTemp("", "mg-lock-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := os.RemoveAll(dir); err != nil {
+					t.Error(err)
+				}
+			})
+			outermost := filepath.Join(dir, tc.missing[0])
+			path := filepath.Join(append([]string{dir}, append(tc.missing, "gw.sock")...)...)
+
+			ln, err := worker.ListenUnix(path)
+			got := missingParentStart{
+				Listener:       ln != nil,
+				NotExist:       errors.Is(err, syscall.ENOENT),
+				ErrorNamesLock: err != nil && strings.Contains(err.Error(), filepath.Base(path)+".lock"),
+				Missing:        socketState(outermost, nil),
+			}
+			if ln != nil {
+				if err := ln.Close(); err != nil {
+					t.Error(err)
+				}
+			}
+			want := missingParentStart{NotExist: true, ErrorNamesLock: true, Missing: "absent"}
+			if diff := gocmp.Diff(want, got); diff != "" {
+				t.Errorf("ListenUnix returned error %v (-want +got):\n%s", err, diff)
+			}
+		})
+	}
 }

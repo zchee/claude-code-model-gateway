@@ -106,8 +106,9 @@ func validToken(token string) bool {
 //     platform with no lock at all binds the path once, unlocked, and never reclaims it.
 //   - When the probe after a refused bind finds the path gone, because its previous owner closed in between, the path
 //     is bound once more under the lock without unlinking anything.
-//   - A Linux or Android abstract address, a name starting with '@' or a NUL byte, has no file to reclaim: it is bound
-//     once, with no lock file, and nothing is ever unlinked. On other systems such a name is an ordinary path.
+//   - On Linux and Android, the systems this program supports that have an abstract namespace, a name starting with
+//     '@' or a NUL byte is an abstract address and has no file to reclaim: it is bound once, with no lock file, and
+//     nothing is ever unlinked. Elsewhere this code handles such a name as a path.
 func ListenUnix(path string) (net.Listener, error) {
 	addr := &net.UnixAddr{Name: path, Net: "unix"}
 	unlock, locked, err := lockReclaim(path)
