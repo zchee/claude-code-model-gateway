@@ -234,6 +234,38 @@ func (h hookForms) replaceHooks(hooks jsonx.WireValue, present, enabled bool) ([
 	return []jsonx.Edit{e}, nil
 }
 
+// checkDuplicates verifies that raw hook paths have no duplicate owned keys before hook edits or reuse shortcuts.
+func (h hookForms) checkDuplicates(doc document, enabled bool) error {
+	if disabled, ok := member(doc.root, "disableAllHooks"); ok && disabled.Kind == 't' {
+		enabled = false
+	}
+	edits, err := h.sync(doc.root, enabled)
+	if err != nil {
+		return nil
+	}
+	if !enabled && len(edits) == 0 {
+		return nil
+	}
+	list := readinessEvents()
+	events := make(map[string]bool, len(list))
+	for _, event := range list {
+		events[event] = true
+	}
+	return checkRawDuplicates(doc.data, "hooks", events)
+}
+
+// hasAnyOwned reports whether either readiness hook event contains an owned gateway hook.
+func (h hookForms) hasAnyOwned(root jsonx.WireValue) bool {
+	hooks, _ := member(root, "hooks")
+	for _, event := range readinessEvents() {
+		groups, _ := member(hooks, event)
+		if groups.Kind == '[' && h.anyGroupOwned(groups.Elements) {
+			return true
+		}
+	}
+	return false
+}
+
 // present reports whether both events have a group holding an owned readiness hook (lib/readiness-hooks.js:48-51).
 // A shape the source cannot traverse counts as absent.
 func (h hookForms) present(root jsonx.WireValue) bool {

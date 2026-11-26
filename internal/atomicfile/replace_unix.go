@@ -279,6 +279,10 @@ func readSettings(root *directory, base string, conflict error, duringRead func(
 }
 
 func (w writer) replaceSettings(path string, edit func([]byte) ([]byte, error), afterStage func(preparedFile, string)) error {
+	return w.replaceSettingsInfo(path, func(data []byte, _ fs.FileInfo) ([]byte, error) { return edit(data) }, afterStage)
+}
+
+func (w writer) replaceSettingsInfo(path string, edit func([]byte, fs.FileInfo) ([]byte, error), afterStage func(preparedFile, string)) error {
 	root, base, err := openSettingsParent(path, true)
 	if err != nil {
 		return err
@@ -301,7 +305,7 @@ func (w writer) replaceSettings(path string, edit func([]byte) ([]byte, error), 
 		if before.info != nil && ownerOf(before.info).uid != uint32(os.Geteuid()) {
 			return &OwnershipError{path, fmt.Errorf("file belongs to uid %d", ownerOf(before.info).uid)}
 		}
-		data, err := edit(bytes.Clone(before.data))
+		data, err := edit(bytes.Clone(before.data), before.info)
 		if err != nil {
 			return err
 		}

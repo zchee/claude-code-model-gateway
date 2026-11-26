@@ -72,6 +72,7 @@ type Registration struct{ Project, File, Value string }
 type Pruned struct{ Project, Reason string }
 
 // Disagreement describes a registered pin. Present differentiates JSON null from an absent key.
+// Values containing unpaired UTF-16 surrogates are retained as jsonx.WireValue until serialization.
 type Disagreement struct {
 	Registration
 	Key, Expected string
@@ -80,6 +81,7 @@ type Disagreement struct {
 }
 
 // Skipped identifies a settings file or key a synchronization could not update.
+// Values containing unpaired UTF-16 surrogates are retained as jsonx.WireValue until serialization.
 type Skipped struct {
 	File, Key, Reason string
 	Value             any

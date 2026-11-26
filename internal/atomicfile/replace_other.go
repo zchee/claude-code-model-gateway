@@ -25,3 +25,7 @@ func (writer) writeFile(string, []byte, fs.FileMode) error { return errors.ErrUn
 func (writer) replaceSettings(string, func([]byte) ([]byte, error), func(preparedFile, string)) error {
 	return errors.ErrUnsupported
 }
+
+func (writer) replaceSettingsInfo(string, func([]byte, fs.FileInfo) ([]byte, error), func(preparedFile, string)) error {
+	return errors.ErrUnsupported
+}

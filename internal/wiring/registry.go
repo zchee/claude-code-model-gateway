@@ -39,7 +39,7 @@ type recorded struct {
 }
 
 func readRegistry(file string) recorded {
-	data, err := os.ReadFile(file)
+	data, _, err := readRegularFile(file)
 	if err != nil {
 		missing := errors.Is(err, fs.ErrNotExist)
 		return recorded{rewrite: !missing, exists: !missing}
@@ -197,6 +197,8 @@ func sameProjects(recordedList []jsonx.WireValue, projects []string) bool {
 }
 
 // Projects reads and deduplicates registrations. A writable scan also repairs an existing registry.
+// Concurrent updates to the project registry are last-writer-wins, matching the source
+// (lib/settings-wiring.js:201-253,317-331).
 func (s Store) Projects(readOnly bool) ([]Registration, []Pruned, error) {
 	return s.report(readOnly)
 }
@@ -222,6 +224,8 @@ func (s Store) registered() (bool, error) {
 }
 
 // RecordProject records the project only if its local settings are wired.
+// Concurrent updates to the project registry are last-writer-wins, matching the source
+// (lib/settings-wiring.js:201-253,317-331).
 func (s Store) RecordProject() error {
 	project, err := s.projectDir()
 	if err != nil {
@@ -306,6 +310,10 @@ func (s Store) SyncPins() (Changes, error) {
 		return Changes{}, err
 	}
 	r := Changes{Pruned: pruned}
+	checkKeys := map[string]bool{baseURLKey: true}
+	for _, key := range s.pinKeys() {
+		checkKeys[key] = true
+	}
 	for _, w := range wirings {
 		doc, err := readSettingsForWrite(w.File)
 		if err != nil {
@@ -319,14 +327,30 @@ func (s Store) SyncPins() (Changes, error) {
 		if len(s.stalePins(doc)) == 0 {
 			continue
 		}
-		changed, err := s.writeSettings(w.File, func(doc *document) error {
-			if _, _, unowned := s.firstUnowned(*doc); unowned {
-				return nil
+		var skipped *Skipped
+		changed, err := s.writeSettingsInfo(w.File, func(doc *document, info fs.FileInfo) error {
+			skipped = nil
+			if info == nil || !s.ours(doc.envValue(baseURLKey)) {
+				return errUnchanged
 			}
-			return applyPins(doc, s.stalePins(*doc))
+			if key, v, unowned := s.firstUnowned(*doc); unowned {
+				skipped = &Skipped{File: w.File, Key: key, Value: plain(v), Reason: "pin value is not gateway-owned"}
+				return errUnchanged
+			}
+			if err := checkRawDuplicates(doc.data, "env", checkKeys); err != nil {
+				return err
+			}
+			stale := s.stalePins(*doc)
+			if len(stale) == 0 {
+				return errUnchanged
+			}
+			return applyPins(doc, stale)
 		})
 		if err != nil {
 			return r, err
+		}
+		if skipped != nil {
+			r.Skipped = append(r.Skipped, *skipped)
 		}
 		if changed {
 			r.Changed = append(r.Changed, w.File)
@@ -362,9 +386,14 @@ func (s Store) PinDisagreements() ([]Disagreement, []Pruned, error) {
 	return out, pruned, nil
 }
 
-// Reconcile lists projects wired to the other gateway URL and removes only their owned entries on confirmation.
+// Reconcile lists projects wired to a conflicting gateway URL and removes only their owned entries on confirmation.
+// Only the configured default gateway URL is accepted as the target; the retired compatibility URL is rejected
+// before scanning or rewriting the project registry, while legacy entries remain recognized as owned.
 func (s Store) Reconcile(target string, confirm bool) (conflicting, reconciled []Registration, err error) {
-	if !s.oursString(target) {
+	if target == compatBaseURL {
+		return nil, nil, fmt.Errorf("Cannot reconcile project wiring to retired compatibility base URL: %s", target) //nolint:staticcheck // Matches the source's user-facing wording for target errors.
+	}
+	if target != s.defaultBaseURL() {
 		return nil, nil, fmt.Errorf("Cannot reconcile project wiring to unknown base URL: %s", target) //nolint:staticcheck // The message is the source's user-facing wording.
 	}
 	wirings, _, err := s.report(false)
@@ -394,7 +423,7 @@ func (s Store) Reconcile(target string, confirm bool) (conflicting, reconciled [
 	return conflicting, reconciled, nil
 }
 
-// removeOwnedWiring removes the owned entries of a project wired to our other URL (lib/settings-wiring.js:333-342).
+// removeOwnedWiring removes the owned entries of a project wired to a conflicting owned URL (lib/settings-wiring.js:333-342).
 func (s Store) removeOwnedWiring(file, target string) (bool, error) {
 	doc, err := readSettingsForWrite(file)
 	if err != nil {
@@ -408,11 +437,19 @@ func (s Store) removeOwnedWiring(file, target string) (bool, error) {
 	if len(s.ownedEntries(env)) == 0 {
 		return false, nil
 	}
-	if _, err := s.writeSettings(file, func(doc *document) error {
-		_, err := s.removeOwned(doc)
+	return s.writeSettingsInfo(file, func(doc *document, info fs.FileInfo) error {
+		if info == nil {
+			return errUnchanged
+		}
+		value, ok := doc.envValue(baseURLKey)
+		if !s.ours(value, ok) || wtf8(value.Text) == target {
+			return errUnchanged
+		}
+		env, _ := doc.env()
+		if len(s.ownedEntries(env)) == 0 {
+			return errUnchanged
+		}
+		_, err := s.removeOwned(doc, false)
 		return err
-	}); err != nil {
-		return false, err
-	}
-	return true, nil
+	})
 }

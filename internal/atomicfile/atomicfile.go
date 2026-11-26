@@ -98,3 +98,9 @@ func WriteFile(path string, data []byte, mode fs.FileMode) error {
 func ReplaceSettings(path string, edit func([]byte) ([]byte, error)) error {
 	return newWriter().replaceSettings(path, edit, nil)
 }
+
+// ReplaceSettingsInfo behaves like [ReplaceSettings] and also passes the file's
+// [fs.FileInfo] from the opened target, or nil when the file did not exist.
+func ReplaceSettingsInfo(path string, edit func([]byte, fs.FileInfo) ([]byte, error)) error {
+	return newWriter().replaceSettingsInfo(path, edit, nil)
+}

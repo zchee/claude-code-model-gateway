@@ -15,7 +15,6 @@
 package wiring
 
 import (
-	"bytes"
 	"cmp"
 	"errors"
 	"fmt"
@@ -43,6 +42,10 @@ const (
 	// The retired compact window is owned only with this value (lib/runtime.js:551).
 	legacyKey   = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
 	legacyValue = "950000"
+	// The retired global context cap is removed only during explicit writes when value-matched
+	// (lib/commands.js:148-151,1196-1199).
+	legacyMaxContextKey   = "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
+	legacyMaxContextValue = "920000"
 )
 
 // staticBlock is STATIC_ENV_BLOCK in source order (lib/runtime.js:522-527).
@@ -180,9 +183,30 @@ func (r Resolution) UnsafeProcessOverride() *Resolution {
 	return r.clone()
 }
 
+// asciiEqualFold compares two strings with ASCII-only case folding so non-ASCII Unicode characters
+// (such as Kelvin sign U+212A, dotted capital I U+0130, dotless i U+0131 or long s U+017F) never fold to ASCII.
+func asciiEqualFold(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range len(a) {
+		ca, cb := a[i], b[i]
+		if ca >= 'A' && ca <= 'Z' {
+			ca += 'a' - 'A'
+		}
+		if cb >= 'A' && cb <= 'Z' {
+			cb += 'a' - 'A'
+		}
+		if ca != cb {
+			return false
+		}
+	}
+	return true
+}
+
 // compatHTTPSURL reports whether WHATWG URL parsing gives protocol https:, hostname api.anthropic.com and the
-// default port (lib/settings-wiring.js:61-69). Hosts are compared after percent-decoding and ASCII
-// lowercasing; a host with non-ASCII characters is not mapped through IDNA and never matches.
+// default port (lib/settings-wiring.js:61-69). Scheme and host are compared with ASCII-only case folding after
+// percent-decoding the host; non-ASCII characters are not mapped through IDNA or Unicode folding and never match.
 func compatHTTPSURL(raw string) bool {
 	s := strings.TrimFunc(raw, func(r rune) bool { return r <= 0x20 })
 	s = strings.Map(func(r rune) rune {
@@ -192,7 +216,7 @@ func compatHTTPSURL(raw string) bool {
 		return r
 	}, s)
 	scheme, rest, ok := strings.Cut(s, ":")
-	if !ok || !strings.EqualFold(scheme, "https") {
+	if !ok || !asciiEqualFold(scheme, "https") {
 		return false
 	}
 	rest = strings.TrimLeft(rest, `/\`)
@@ -216,7 +240,7 @@ func compatHTTPSURL(raw string) bool {
 	if err != nil {
 		return false
 	}
-	return strings.ToLower(decoded) == compatHost
+	return asciiEqualFold(decoded, compatHost)
 }
 
 func percentDecode(s string) (string, error) {
@@ -311,6 +335,35 @@ func staticValue(key string) (string, bool) {
 	return "", false
 }
 
+func (s Store) isOwnedEnvMember(key string, v jsonx.WireValue) bool {
+	if key == baseURLKey && s.ours(v, true) {
+		return true
+	}
+	value := jsString(v)
+	if slices.Contains(s.Pins.Owned[key], value) {
+		return true
+	}
+	static, isStatic := staticValue(key)
+	return isStatic && value == static
+}
+
+func (s Store) ownedEnvKeySet(extra ...string) map[string]bool {
+	keys := map[string]bool{baseURLKey: true, legacyKey: true}
+	for _, e := range staticBlock() {
+		keys[e.Key] = true
+	}
+	for k := range s.Pins.Owned {
+		keys[k] = true
+	}
+	for _, e := range s.Pins.Current {
+		keys[e.Key] = true
+	}
+	for _, k := range extra {
+		keys[k] = true
+	}
+	return keys
+}
+
 // ownedEntries is ownedGatewayEnvEntries: our base URL, a pin value the gateway could have written, or a static
 // key holding its static value, all compared through String(value) (lib/settings-wiring.js:116-124).
 func (s Store) ownedEntries(env jsonx.WireValue) []jsonx.Member {
@@ -319,10 +372,7 @@ func (s Store) ownedEntries(env jsonx.WireValue) []jsonx.Member {
 	}
 	var owned []jsonx.Member
 	for _, m := range env.Members {
-		key := wtf8(m.Name)
-		value := jsString(m.Value)
-		static, isStatic := staticValue(key)
-		if (key == baseURLKey && s.ours(m.Value, true)) || slices.Contains(s.Pins.Owned[key], value) || (isStatic && value == static) {
+		if s.isOwnedEnvMember(wtf8(m.Name), m.Value) {
 			owned = append(owned, m)
 		}
 	}
@@ -330,8 +380,17 @@ func (s Store) ownedEntries(env jsonx.WireValue) []jsonx.Member {
 }
 
 // removeOwned is removeGatewayOwnedSettings, also removing the extra keys named: it deletes the owned entries and
-// an emptied env, and returns the pin keys that still hold a user's value (lib/settings-wiring.js:126-131).
-func (s Store) removeOwned(doc *document, extra ...string) ([]string, error) {
+// an emptied env (and a present empty env when deleteEmptyEnv is true), and returns the pin keys that still hold
+// a user's value (lib/settings-wiring.js:126-131). Raw owned paths are validated for duplicates before any edit
+// or parent-delete coalescing.
+func (s Store) removeOwned(doc *document, deleteEmptyEnv bool, extra ...string) ([]string, error) {
+	checkKeys := s.ownedEnvKeySet(extra...)
+	isOwnedOrExtra := func(k string, v jsonx.WireValue) bool {
+		return slices.Contains(extra, k) || s.isOwnedEnvMember(k, v)
+	}
+	if err := checkRawOwnedDuplicates(doc.data, checkKeys, isOwnedOrExtra); err != nil {
+		return nil, err
+	}
 	var before []string
 	for _, e := range s.expectedPins() {
 		if _, ok := doc.envValue(e.Key); ok {
@@ -344,6 +403,9 @@ func (s Store) removeOwned(doc *document, extra ...string) ([]string, error) {
 	}
 	if env.Kind != '{' {
 		if truthy(env) && keyCount(env) == 0 {
+			if err := checkRawDuplicates(doc.data, "env", nil); err != nil {
+				return nil, err
+			}
 			return nil, doc.edit(remove("env"))
 		}
 		return nil, nil
@@ -361,7 +423,13 @@ func (s Store) removeOwned(doc *document, extra ...string) ([]string, error) {
 			edits = append(edits, remove("env", name))
 		}
 	}
-	if len(edits) == len(env.Members) && len(edits) > 0 {
+	willDeleteEmpty := deleteEmptyEnv && len(env.Members) == 0
+	if len(edits) > 0 || willDeleteEmpty {
+		if err := checkRawDuplicates(doc.data, "env", checkKeys); err != nil {
+			return nil, err
+		}
+	}
+	if len(edits) == len(env.Members) && (len(edits) > 0 || deleteEmptyEnv) {
 		edits = []jsonx.Edit{remove("env")}
 	}
 	if err := doc.edit(edits...); err != nil {
@@ -376,8 +444,19 @@ func (s Store) removeOwned(doc *document, extra ...string) ([]string, error) {
 	return preserved, nil
 }
 
-// assignEnv is Object.assign(settings.env, block) followed by removal of the retired keys (lib/commands.js:1190-1198).
+// assignEnv is Object.assign(settings.env, block) followed by removal of the retired keys (lib/commands.js:1190-1199).
 func assignEnv(doc *document, file string, block []Entry) error {
+	checkKeys := map[string]bool{
+		socketKey:           true,
+		legacyKey:           true,
+		legacyMaxContextKey: true,
+	}
+	for _, e := range block {
+		checkKeys[e.Key] = true
+	}
+	if err := checkRawDuplicates(doc.data, "env", checkKeys); err != nil {
+		return err
+	}
 	env, has := doc.env()
 	if !has || !truthy(env) {
 		members := make([]jsonx.Member, len(block))
@@ -411,12 +490,17 @@ func assignEnv(doc *document, file string, block []Entry) error {
 	if current, ok := member(env, legacyKey); ok && jsString(current) == legacyValue {
 		edits = append(edits, remove("env", legacyKey))
 	}
+	if current, ok := member(env, legacyMaxContextKey); ok && jsString(current) == legacyMaxContextValue {
+		edits = append(edits, remove("env", legacyMaxContextKey))
+	}
 	return doc.edit(edits...)
 }
 
 // WriteEnv writes or removes gateway-owned settings in the specified scope and verifies the result.
 // An explicit write replaces the retired compatibility URL with the gateway URL; requesting the "compat" mode
-// for a write is an error, because the port cannot serve that URL.
+// for a write is an error, because the port cannot serve that URL. Explicit removal for the project scope
+// clears value-matched gateway-owned entries from both project settings files (local and shared) without
+// touching user settings or other projects.
 func (s Store) WriteEnv(scope, mode string, remove bool) error {
 	if !remove && mode == "compat" {
 		return errors.New("the remote-control compatibility mode is not supported; wire the default gateway URL")
@@ -434,22 +518,19 @@ func (s Store) recordIfProject(scope string) error {
 // writeEnv follows lib/commands.js:1177-1218 for the default mode only. Publishing the stable launcher, which the
 // source does here, belongs to installation.
 func (s Store) writeEnv(scope string, removeAll bool) error {
-	if !removeAll {
-		// A committed project settings.json with gateway keys outranks the user file, so migrate it even for a
-		// user-scope write. This write is explicit, so a migrated compatibility URL becomes the gateway URL.
-		if _, err := s.migrateLegacy(true); err != nil {
-			return err
-		}
+	if removeAll {
+		return s.removeEnv(scope)
+	}
+	// A committed project settings.json with gateway keys outranks the user file, so migrate it even for a
+	// user-scope write. This write is explicit, so a migrated compatibility URL becomes the gateway URL.
+	if _, err := s.migrateLegacy(true); err != nil {
+		return err
 	}
 	file, err := s.settingsPath(scope)
 	if err != nil {
 		return err
 	}
-	if removeAll && !exists(file) {
-		return s.recordIfProject(scope)
-	}
-	current, err := readSettingsForWrite(file)
-	if err != nil {
+	if _, err := readSettingsForWrite(file); err != nil {
 		return err
 	}
 	forms, err := s.hookForms()
@@ -457,37 +538,22 @@ func (s Store) writeEnv(scope string, removeAll bool) error {
 		return err
 	}
 	block := s.EnvBlock("default")
-	var final document
+	if cache, err := s.Paths.DiscoveryCachePath(); err == nil {
+		// Advisory, as in the source: a cache that cannot be cleaned never fails the write.
+		_, _ = s.CleanModelCache(cache, nil)
+	}
 	change := func(doc *document) error {
-		edits, err := forms.sync(doc.root, !removeAll)
+		if err := forms.checkDuplicates(*doc, true); err != nil {
+			return fmt.Errorf("%s: %w", file, err)
+		}
+		edits, err := forms.sync(doc.root, true)
 		if err != nil {
 			return fmt.Errorf("%s: %w", file, err)
 		}
 		if err := doc.edit(edits...); err != nil {
 			return err
 		}
-		if !removeAll {
-			err = assignEnv(doc, file, block)
-		} else if env, has := doc.env(); has && !truthy(env) {
-			// settings.env || {} turns a falsy env into an empty object, which removal then deletes.
-			err = doc.edit(remove("env"))
-		} else {
-			_, err = s.removeOwned(doc, socketKey)
-		}
-		final = *doc
-		return err
-	}
-	if removeAll {
-		probe := current
-		if err := change(&probe); err != nil {
-			return err
-		}
-		if bytes.Equal(probe.data, current.data) {
-			return s.recordIfProject(scope)
-		}
-	} else if cache, err := s.Paths.DiscoveryCachePath(); err == nil {
-		// Advisory, as in the source: a cache that cannot be cleaned never fails the write.
-		_, _ = s.CleanModelCache(cache, nil)
+		return assignEnv(doc, file, block)
 	}
 	if _, err := s.writeSettings(file, change); err != nil {
 		return err
@@ -497,14 +563,182 @@ func (s Store) writeEnv(scope string, removeAll bool) error {
 		return err
 	}
 	got, gotOK := verified.envValue(baseURLKey)
-	want, wantOK := text(block[0].Value), true
-	if removeAll {
-		want, wantOK = final.envValue(baseURLKey)
-	}
-	if !strictEqual(got, gotOK, want, wantOK) {
+	if !strictEqual(got, gotOK, text(block[0].Value), true) {
 		return fmt.Errorf("Could not verify gateway settings in %s", file) //nolint:staticcheck // The message is the source's user-facing wording.
 	}
 	return s.recordIfProject(scope)
+}
+
+func (s Store) removeEnv(scope string) error {
+	file, err := s.settingsPath(scope)
+	if err != nil {
+		return err
+	}
+	forms, err := s.hookForms()
+	if err != nil {
+		return err
+	}
+	localInfo, err := s.removeFromTargetFile(file, forms)
+	if err != nil {
+		return err
+	}
+	if scope == "project" {
+		if err := s.removeFromSharedProjectFile(localInfo, forms); err != nil {
+			return err
+		}
+	}
+	return s.recordIfProject(scope)
+}
+
+// removeFromTargetFile removes gateway-owned entries, retired socket key, readiness hooks and any present empty
+// env object from the explicitly targeted settings file. A missing file is never created.
+func (s Store) removeFromTargetFile(file string, forms hookForms) (fs.FileInfo, error) {
+	_, info, err := readDocumentSnapshot(file)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("Could not read %s: %w", file, err) //nolint:staticcheck // The message is the source's user-facing wording.
+	}
+	var final document
+	changed, err := s.writeSettingsInfo(file, func(doc *document, openInfo fs.FileInfo) error {
+		if openInfo == nil {
+			return errUnchanged
+		}
+		if err := forms.checkDuplicates(*doc, false); err != nil {
+			return fmt.Errorf("%s: %w", file, err)
+		}
+		edits, err := forms.sync(doc.root, false)
+		if err != nil {
+			return fmt.Errorf("%s: %w", file, err)
+		}
+		if err := doc.edit(edits...); err != nil {
+			return err
+		}
+		if env, has := doc.env(); has && !truthy(env) {
+			if err := checkRawDuplicates(doc.data, "env", nil); err != nil {
+				return err
+			}
+			// settings.env || {} turns a falsy env into an empty object, which removal then deletes.
+			err = doc.edit(remove("env"))
+		} else {
+			_, err = s.removeOwned(doc, true, socketKey)
+		}
+		final = *doc
+		return err
+	})
+	if err != nil {
+		return info, err
+	}
+	if !changed {
+		return info, nil
+	}
+	verified, err := readSettingsForWrite(file)
+	if err != nil {
+		return info, err
+	}
+	got, gotOK := verified.envValue(baseURLKey)
+	want, wantOK := final.envValue(baseURLKey)
+	if !strictEqual(got, gotOK, want, wantOK) {
+		return info, fmt.Errorf("Could not verify gateway settings in %s", file) //nolint:staticcheck // The message is the source's user-facing wording.
+	}
+	return info, nil
+}
+
+// removeFromSharedProjectFile clears value-matched gateway-owned entries and owned readiness hooks from the
+// project's shared .claude/settings.json during explicit project removal, leaving user settings and unrelated
+// shared files untouched.
+func (s Store) removeFromSharedProjectFile(localInfo fs.FileInfo, forms hookForms) error {
+	sharedFile, err := s.settingsPath("project-shared")
+	if err != nil {
+		return err
+	}
+	userFile, err := s.settingsPath("user")
+	if err != nil {
+		return err
+	}
+	if filepath.Clean(sharedFile) == filepath.Clean(userFile) {
+		return nil
+	}
+	_, sharedInfo, err := readDocumentSnapshot(sharedFile)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("Could not read %s: %w", sharedFile, err) //nolint:staticcheck // The message is the source's user-facing wording.
+	}
+	if localInfo != nil && sameFile(sharedInfo, localInfo) {
+		return nil
+	}
+	if isUserAliasOrUncertain(sharedInfo, userFile) {
+		return nil
+	}
+	var final document
+	changed, err := s.writeSettingsInfo(sharedFile, func(doc *document, openInfo fs.FileInfo) error {
+		if openInfo == nil || isUserAliasOrUncertain(openInfo, userFile) {
+			return errUnchanged
+		}
+		checkKeys := s.ownedEnvKeySet()
+		if err := checkRawOwnedDuplicates(doc.data, checkKeys, s.isOwnedEnvMember); err != nil {
+			return err
+		}
+		env, _ := doc.env()
+		hasOwnedEnv := len(s.ownedEntries(env)) > 0
+		hasOwnedHooks := forms.hasAnyOwned(doc.root)
+		if !hasOwnedEnv && !hasOwnedHooks {
+			return errUnchanged
+		}
+		if hasOwnedHooks {
+			if err := forms.checkDuplicates(*doc, false); err != nil {
+				return fmt.Errorf("%s: %w", sharedFile, err)
+			}
+			edits, err := forms.sync(doc.root, false)
+			if err != nil {
+				return fmt.Errorf("%s: %w", sharedFile, err)
+			}
+			if err := doc.edit(edits...); err != nil {
+				return err
+			}
+		}
+		if hasOwnedEnv {
+			if _, err := s.removeOwned(doc, false); err != nil {
+				return err
+			}
+		}
+		final = *doc
+		return nil
+	})
+	if err != nil || !changed {
+		return err
+	}
+	verified, err := readSettingsForWrite(sharedFile)
+	if err != nil {
+		return err
+	}
+	got, gotOK := verified.envValue(baseURLKey)
+	want, wantOK := final.envValue(baseURLKey)
+	if !strictEqual(got, gotOK, want, wantOK) {
+		return fmt.Errorf("Could not verify gateway settings in %s", sharedFile) //nolint:staticcheck // The message is the source's user-facing wording.
+	}
+	return nil
+}
+
+func sameFile(a, b fs.FileInfo) bool {
+	return a != nil && b != nil && os.SameFile(a, b)
+}
+
+// isUserAliasOrUncertain reports whether targetInfo refers to the same opened file as userFile, or whether
+// userFile's identity cannot be established (such as a symlink loop).
+func isUserAliasOrUncertain(targetInfo fs.FileInfo, userFile string) bool {
+	_, userInfo, err := readRegularFile(userFile)
+	switch {
+	case err == nil:
+		return sameFile(targetInfo, userInfo)
+	case errors.Is(err, fs.ErrNotExist):
+		return false
+	default:
+		return true
+	}
 }
 
 // SyncMode migrates eligible settings and verifies a mode change against the supplied health observations.
@@ -534,14 +768,101 @@ func (s Store) SyncMode(health *Health, required string) (ModeResult, error) {
 }
 
 // MigrateLegacy moves only gateway-owned entries from shared project settings to local settings.
-// It is the automatic migration: shared settings wired to the compatibility URL are left untouched.
+// It is the automatic migration: shared settings wired to the compatibility URL are left untouched,
+// and no edit is made if moving entries would change the effective base URL or if source and destination alias.
 func (s Store) MigrateLegacy() (bool, error) {
 	return s.migrateLegacy(false)
 }
 
-// migrateLegacy follows lib/settings-wiring.js:361-402. It refuses when the shared project file is, lexically or
-// after resolving links, the user file, or when that identity cannot be decided. A shared file wired to the
-// compatibility URL moves only in an explicit write, which copies the gateway URL in its place.
+type baseURLState struct {
+	present bool
+	value   string
+}
+
+func docBaseURL(doc document, ok bool) baseURLState {
+	if !ok {
+		return baseURLState{}
+	}
+	v, has := doc.envValue(baseURLKey)
+	if !has || v.Kind != '"' {
+		return baseURLState{}
+	}
+	return baseURLState{present: true, value: wtf8(v.Text)}
+}
+
+func effectiveBaseURLState(lookup config.LookupEnv, local, shared, user baseURLState) baseURLState {
+	if value := config.AnthropicBaseURL.Get(lookup); value != nil {
+		return baseURLState{present: true, value: *value}
+	}
+	for _, candidate := range [...]baseURLState{local, shared, user} {
+		if candidate.present {
+			return candidate
+		}
+	}
+	return baseURLState{}
+}
+
+func plannedLocalBaseURL(localDoc document, localOK bool, entries []jsonx.Member) baseURLState {
+	if localOK {
+		if env, has := localDoc.env(); has && truthy(env) {
+			if env.Kind == '{' {
+				if v, defined := member(env, baseURLKey); defined {
+					// copyMissing skips any already-defined key, including null or non-string values.
+					if v.Kind == '"' {
+						return baseURLState{present: true, value: wtf8(v.Text)}
+					}
+					return baseURLState{}
+				}
+			}
+		}
+	}
+	for _, m := range entries {
+		if wtf8(m.Name) == baseURLKey && m.Value.Kind == '"' {
+			return baseURLState{present: true, value: wtf8(m.Value.Text)}
+		}
+	}
+	return docBaseURL(localDoc, localOK)
+}
+
+func effectiveBaseURLPreserved(lookup config.LookupEnv, beforeLocal, afterLocal, beforeShared, afterShared, user baseURLState) bool {
+	before := effectiveBaseURLState(lookup, beforeLocal, beforeShared, user)
+	after := effectiveBaseURLState(lookup, afterLocal, afterShared, user)
+	if before != after {
+		return false
+	}
+	// Also keep the persisted file-backed effective URL unchanged even when a transient process env shadows files.
+	beforeFiles := effectiveBaseURLState(nil, beforeLocal, beforeShared, user)
+	afterFiles := effectiveBaseURLState(nil, afterLocal, afterShared, user)
+	return beforeFiles == afterFiles
+}
+
+func docBaseURLAfterDrop(doc document, drop []string) baseURLState {
+	if slices.Contains(drop, baseURLKey) {
+		return baseURLState{}
+	}
+	return docBaseURL(doc, true)
+}
+
+func readOptionalUserDoc(userFile string, legacyInfo fs.FileInfo) (doc document, ok, aliasOrUncertain bool) {
+	data, userInfo, err := readRegularFile(userFile)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return document{}, false, false
+	case err != nil:
+		return document{}, false, true
+	}
+	if sameFile(legacyInfo, userInfo) {
+		return document{}, false, true
+	}
+	parsed, err := parseDocument(data)
+	return parsed, err == nil, false
+}
+
+// migrateLegacy follows lib/settings-wiring.js:361-402. It refuses when the shared project file aliases the user
+// file or the local project file (compared on the opened file descriptors), or when user identity cannot be
+// decided. A shared file wired to the compatibility URL moves only in an explicit write, which copies the gateway
+// URL in its place. Automatic migration (!explicit) makes no edit if the planned changes would alter the
+// effective base URL.
 func (s Store) migrateLegacy(explicit bool) (bool, error) {
 	legacyFile, err := s.settingsPath("legacy-project")
 	if err != nil {
@@ -551,24 +872,32 @@ func (s Store) migrateLegacy(explicit bool) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if !exists(legacyFile) || filepath.Clean(legacyFile) == filepath.Clean(userFile) {
+	if filepath.Clean(legacyFile) == filepath.Clean(userFile) {
 		return false, nil
 	}
-	resolved, err := filepath.EvalSymlinks(legacyFile)
+	legacy, legacyInfo, err := readDocumentSnapshot(legacyFile)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
 	if err != nil {
+		return false, fmt.Errorf("Could not read %s: %w", legacyFile, err) //nolint:staticcheck // The message is the source's user-facing wording.
+	}
+	userDoc, userOK, skipUser := readOptionalUserDoc(userFile, legacyInfo)
+	if skipUser {
 		return false, nil
 	}
-	real, err := filepath.EvalSymlinks(userFile)
-	switch {
-	case err == nil && real == resolved:
-		return false, nil
-	case err != nil && !errors.Is(err, fs.ErrNotExist):
-		// A user file whose identity cannot be decided, such as a link loop, may be the same file.
-		return false, nil
-	}
-	legacy, err := readSettingsForWrite(legacyFile)
+	localFile, err := s.settingsPath("project")
 	if err != nil {
 		return false, err
+	}
+	localData, localInfo, localErr := readRegularFile(localFile)
+	switch {
+	case localErr == nil:
+		if sameFile(legacyInfo, localInfo) {
+			return false, nil
+		}
+	case !errors.Is(localErr, fs.ErrNotExist):
+		return false, fmt.Errorf("Could not read %s: %w", localFile, localErr) //nolint:staticcheck // The message is the source's user-facing wording.
 	}
 	base, ok := legacy.envValue(baseURLKey)
 	if !s.ours(base, ok) {
@@ -588,9 +917,12 @@ func (s Store) migrateLegacy(explicit bool) (bool, error) {
 			}
 		}
 	}
+	copiedKeys := make(map[string]bool, len(entries))
 	var drop []string
 	for _, m := range entries {
-		drop = append(drop, wtf8(m.Name))
+		name := wtf8(m.Name)
+		copiedKeys[name] = true
+		drop = append(drop, name)
 	}
 	if v, ok := member(env, legacyKey); ok && jsString(v) == legacyValue && !slices.Contains(drop, legacyKey) {
 		drop = append(drop, legacyKey)
@@ -598,23 +930,111 @@ func (s Store) migrateLegacy(explicit bool) (bool, error) {
 	if len(drop) == 0 {
 		return false, nil
 	}
-	if len(entries) > 0 {
-		localFile, err := s.settingsPath("project")
-		if err != nil {
-			return false, err
-		}
-		if _, err := s.writeSettings(localFile, func(doc *document) error { return copyMissing(doc, localFile, entries) }); err != nil {
-			return false, err
-		}
+	dropSet := make(map[string]bool, len(drop))
+	for _, k := range drop {
+		dropSet[k] = true
 	}
-	if _, err := s.writeSettings(legacyFile, func(doc *document) error { return removeEnvKeys(doc, drop) }); err != nil {
+	if err := checkRawDuplicates(legacy.data, "env", dropSet); err != nil {
 		return false, err
 	}
-	return true, nil
+	var localDoc document
+	localExists := localErr == nil
+	if localExists {
+		localDoc, err = parseDocument(localData)
+		if err != nil {
+			return false, fmt.Errorf("Could not read %s: %w", localFile, err) //nolint:staticcheck // The message is the source's user-facing wording.
+		}
+		if err := checkRawDuplicates(localDoc.data, "env", copiedKeys); err != nil {
+			return false, err
+		}
+	}
+	if !explicit && !effectiveBaseURLPreserved(s.Lookup, docBaseURL(localDoc, localExists), plannedLocalBaseURL(localDoc, localExists, entries), docBaseURL(legacy, true), docBaseURLAfterDrop(legacy, drop), docBaseURL(userDoc, userOK)) {
+		return false, nil
+	}
+	if len(entries) > 0 {
+		aborted := false
+		if _, err := s.writeSettingsInfo(localFile, func(doc *document, info fs.FileInfo) error {
+			aborted = false
+			if info != nil && sameFile(info, legacyInfo) {
+				aborted = true
+				return errUnchanged
+			}
+			if !explicit && !effectiveBaseURLPreserved(s.Lookup, docBaseURL(*doc, info != nil), plannedLocalBaseURL(*doc, info != nil, entries), docBaseURL(legacy, true), docBaseURLAfterDrop(legacy, drop), docBaseURL(userDoc, userOK)) {
+				aborted = true
+				return errUnchanged
+			}
+			return copyMissing(doc, localFile, entries)
+		}); err != nil {
+			return false, err
+		}
+		if aborted {
+			return false, nil
+		}
+	}
+	aborted := false
+	changed, err := s.writeSettingsInfo(legacyFile, func(doc *document, info fs.FileInfo) error {
+		aborted = false
+		if info == nil {
+			aborted = true
+			return errUnchanged
+		}
+		curUserDoc, curUserOK, curSkipUser := readOptionalUserDoc(userFile, info)
+		if curSkipUser {
+			aborted = true
+			return errUnchanged
+		}
+		curLocalData, curLocalInfo, curLocalErr := readRegularFile(localFile)
+		if curLocalErr == nil && sameFile(info, curLocalInfo) {
+			aborted = true
+			return errUnchanged
+		}
+		var curLocalDoc document
+		curLocalOK := false
+		if curLocalErr == nil {
+			if parsed, perr := parseDocument(curLocalData); perr == nil {
+				curLocalDoc, curLocalOK = parsed, true
+			}
+		}
+		curBase, ok := doc.envValue(baseURLKey)
+		if !s.ours(curBase, ok) || (isString(curBase, compatBaseURL) && !explicit) {
+			aborted = true
+			return errUnchanged
+		}
+		curEnv, _ := doc.env()
+		var dropNow []string
+		for _, m := range s.ownedEntries(curEnv) {
+			if name := wtf8(m.Name); copiedKeys[name] {
+				dropNow = append(dropNow, name)
+			}
+		}
+		if v, ok := member(curEnv, legacyKey); ok && jsString(v) == legacyValue && !slices.Contains(dropNow, legacyKey) {
+			dropNow = append(dropNow, legacyKey)
+		}
+		if len(dropNow) == 0 {
+			aborted = true
+			return errUnchanged
+		}
+		if !explicit && !effectiveBaseURLPreserved(s.Lookup, docBaseURL(curLocalDoc, curLocalOK), docBaseURL(curLocalDoc, curLocalOK), docBaseURL(*doc, true), docBaseURLAfterDrop(*doc, dropNow), docBaseURL(curUserDoc, curUserOK)) {
+			aborted = true
+			return errUnchanged
+		}
+		return removeEnvKeys(doc, dropNow)
+	})
+	if err != nil {
+		return false, err
+	}
+	return changed && !aborted, nil
 }
 
 // copyMissing sets each entry the local env does not already define.
 func copyMissing(doc *document, file string, entries []jsonx.Member) error {
+	checkKeys := make(map[string]bool, len(entries))
+	for _, m := range entries {
+		checkKeys[wtf8(m.Name)] = true
+	}
+	if err := checkRawDuplicates(doc.data, "env", checkKeys); err != nil {
+		return err
+	}
 	env, has := doc.env()
 	if !has || !truthy(env) {
 		e, err := set(object(entries...), "env")
@@ -641,8 +1061,15 @@ func copyMissing(doc *document, file string, entries []jsonx.Member) error {
 	return doc.edit(edits...)
 }
 
-// removeEnvKeys deletes the named env members and an env left empty.
+// removeEnvKeys deletes the named env members and an env left empty, after validating raw owned paths.
 func removeEnvKeys(doc *document, keys []string) error {
+	checkKeys := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		checkKeys[k] = true
+	}
+	if err := checkRawDuplicates(doc.data, "env", checkKeys); err != nil {
+		return err
+	}
 	env, _ := doc.env()
 	if env.Kind != '{' {
 		return nil
@@ -680,10 +1107,16 @@ func (s Store) CleanLegacyEnv() error {
 		if v, ok := member(env, legacyKey); !ok || jsString(v) != legacyValue {
 			continue
 		}
-		if _, err := s.writeSettings(file, func(doc *document) error {
-			env, _ := doc.env()
+		if _, err := s.writeSettingsInfo(file, func(doc *document, info fs.FileInfo) error {
+			if info == nil {
+				return errUnchanged
+			}
+			env, has := doc.env()
+			if !has || !truthy(env) || !s.ours(doc.envValue(baseURLKey)) {
+				return errUnchanged
+			}
 			if v, ok := member(env, legacyKey); !ok || jsString(v) != legacyValue {
-				return nil
+				return errUnchanged
 			}
 			return removeEnvKeys(doc, []string{legacyKey})
 		}); err != nil {
@@ -708,6 +1141,9 @@ func (s Store) SyncReadinessHooks(document []byte, enabled bool) ([]byte, error)
 	}
 	doc, err := parseDocument(document)
 	if err != nil {
+		return nil, err
+	}
+	if err := forms.checkDuplicates(doc, enabled); err != nil {
 		return nil, err
 	}
 	edits, err := forms.sync(doc.root, enabled)
@@ -763,7 +1199,12 @@ func (s Store) MigrateReadinessHooks() error {
 		if len(edits) == 0 {
 			continue
 		}
-		if _, err := s.writeSettings(file, nil); err != nil {
+		if _, err := s.writeSettingsInfo(file, func(doc *document, info fs.FileInfo) error {
+			if info == nil || !s.ours(doc.envValue(baseURLKey)) {
+				return errUnchanged
+			}
+			return nil
+		}); err != nil {
 			return err
 		}
 	}
@@ -787,12 +1228,12 @@ func (s Store) Repair(report func(string)) error {
 		if err != nil {
 			return err
 		}
-		if !exists(file) {
+		doc, _, err := readDocumentSnapshot(file)
+		if errors.Is(err, fs.ErrNotExist) {
 			continue
 		}
-		doc, err := readSettingsForWrite(file)
 		if err != nil {
-			return err
+			return fmt.Errorf("Could not read %s: %w", file, err) //nolint:staticcheck // The message is the source's user-facing wording.
 		}
 		env, _ := doc.env()
 		if v, ok := member(env, baseURLKey); ok {
@@ -821,13 +1262,32 @@ func (s Store) Repair(report func(string)) error {
 			continue
 		}
 		var preserved []string
-		if _, err := s.writeSettings(is.file, func(doc *document) (err error) {
-			preserved, err = s.removeOwned(doc)
+		var msg string
+		changed, err := s.writeSettingsInfo(is.file, func(doc *document, info fs.FileInfo) error {
+			preserved = nil
+			msg = ""
+			if info == nil {
+				return errUnchanged
+			}
+			env, _ := doc.env()
+			if _, ok := member(env, baseURLKey); ok {
+				return errUnchanged
+			}
+			var ok bool
+			msg, ok = orphanMessage(s.ownedEntries(env))
+			if !ok {
+				return errUnchanged
+			}
+			var err error
+			preserved, err = s.removeOwned(doc, false)
 			return err
-		}); err != nil {
+		})
+		if err != nil {
 			return err
 		}
-		report("model-gateway: repaired " + is.message + " in " + is.file + "; preserved user pins: " + cmp.Or(strings.Join(preserved, ", "), "none"))
+		if changed {
+			report("model-gateway: repaired " + msg + " in " + is.file + "; preserved user pins: " + cmp.Or(strings.Join(preserved, ", "), "none"))
+		}
 	}
 	return nil
 }
@@ -862,13 +1322,25 @@ func (s Store) SyncWindow(files []string, owned, next *int) (Changes, error) {
 			r.Skipped = append(r.Skipped, Skipped{File: file, Reason: "autoCompactWindow " + jsString(current) + " is not gateway-owned"})
 			continue
 		}
+		if err := checkRawDuplicates(doc.data, "autoCompactWindow", nil); err != nil {
+			return r, err
+		}
 		if !windowChanges(current, has, next) {
 			continue
 		}
+		var skipped *Skipped
 		changed, err := s.writeSettings(file, func(doc *document) error {
+			skipped = nil
 			current, has := member(doc.root, "autoCompactWindow")
+			if has && !windowMatches(current, owned) && !windowMatches(current, next) {
+				skipped = &Skipped{File: file, Reason: "autoCompactWindow " + jsString(current) + " is not gateway-owned"}
+				return errUnchanged
+			}
+			if err := checkRawDuplicates(doc.data, "autoCompactWindow", nil); err != nil {
+				return err
+			}
 			if !windowChanges(current, has, next) {
-				return nil
+				return errUnchanged
 			}
 			if next == nil {
 				return doc.edit(remove("autoCompactWindow"))
@@ -881,6 +1353,9 @@ func (s Store) SyncWindow(files []string, owned, next *int) (Changes, error) {
 		})
 		if err != nil {
 			return r, err
+		}
+		if skipped != nil {
+			r.Skipped = append(r.Skipped, *skipped)
 		}
 		if changed {
 			r.Changed = append(r.Changed, file)
@@ -908,9 +1383,10 @@ func windowChanges(current jsonx.WireValue, has bool, next *int) bool {
 }
 
 // CleanModelCache normalizes owned model IDs in valid gateway caches. A nil canonical function
-// selects the production policy adapter configured by Lookup and Paths.
+// selects the production policy adapter configured by Lookup and Paths. Write failures are advisory
+// and return false with a nil error, matching lib/settings-wiring.js:438-440.
 func (s Store) CleanModelCache(file string, canonical func(string) (string, bool)) (bool, error) {
-	data, err := os.ReadFile(file)
+	data, _, err := readRegularFile(file)
 	if err != nil {
 		return false, nil
 	}
@@ -962,7 +1438,7 @@ func (s Store) CleanModelCache(file string, canonical func(string) (string, bool
 		return false, err
 	}
 	if err := atomicfile.WriteFile(file, out, 0o600); err != nil {
-		return false, err
+		return false, nil
 	}
 	return true, nil
 }

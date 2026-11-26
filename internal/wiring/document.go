@@ -16,14 +16,12 @@ package wiring
 
 import (
 	"bytes"
-	"cmp"
 	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io/fs"
 	"math"
 	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"unicode/utf16"
@@ -33,15 +31,23 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
 )
 
+const utf8BOM = "\xef\xbb\xbf"
+
+// stripLeadingBOM removes at most one leading UTF-8 byte-order mark before decoding a settings document's
+// semantic view. The authored bytes keep any leading BOM so in-place edits preserve it.
+func stripLeadingBOM(data []byte) []byte {
+	return bytes.TrimPrefix(data, []byte(utf8BOM))
+}
+
 // document is a parsed settings file: the authored bytes, which every edit splices, and the value JSON.parse
-// would produce from them, which every decision reads.
+// would produce from them (after removing at most one leading UTF-8 BOM), which every decision reads.
 type document struct {
 	data []byte
 	root jsonx.WireValue
 }
 
 func parseDocument(data []byte) (document, error) {
-	root, err := jsonx.DecodeWire(data)
+	root, err := jsonx.DecodeWire(stripLeadingBOM(data))
 	if err != nil {
 		return document{}, err
 	}
@@ -57,7 +63,7 @@ func (d *document) edit(edits ...jsonx.Edit) error {
 	if err != nil {
 		return err
 	}
-	root, err := jsonx.DecodeWire(data)
+	root, err := jsonx.DecodeWire(stripLeadingBOM(data))
 	if err != nil {
 		return err
 	}
@@ -77,9 +83,10 @@ func (d document) envValue(key string) (jsonx.WireValue, bool) {
 	return member(env, key)
 }
 
-// readDocument mirrors the source's try { JSON.parse(readFileSync(file)) } catch {} readers: any failure means no document.
+// readDocument mirrors the source's try { JSON.parse(readFileSync(file)) } catch {} readers, bounded to regular
+// files so special files never block the readiness path. Any failure means no document.
 func readDocument(file string) (document, bool) {
-	data, err := os.ReadFile(file)
+	data, _, err := readRegularFile(file)
 	if err != nil {
 		return document{}, false
 	}
@@ -87,10 +94,24 @@ func readDocument(file string) (document, bool) {
 	return doc, err == nil
 }
 
+// readDocumentSnapshot reads a regular settings file once, returning both its parsed view and the FileInfo of
+// the opened descriptor. Missing files return fs.ErrNotExist unwrapped so callers can distinguish them.
+func readDocumentSnapshot(file string) (document, fs.FileInfo, error) {
+	data, info, err := readRegularFile(file)
+	if err != nil {
+		return document{}, nil, err
+	}
+	doc, err := parseDocument(data)
+	if err != nil {
+		return document{}, info, fmt.Errorf("Could not read %s: %w", file, err) //nolint:staticcheck // The message is the source's user-facing wording.
+	}
+	return doc, info, nil
+}
+
 // readSettingsForWrite treats a missing file as an empty object and names the file in every other failure
 // (lib/settings-wiring.js:76-83).
 func readSettingsForWrite(file string) (document, error) {
-	data, err := os.ReadFile(file)
+	data, _, err := readRegularFile(file)
 	if errors.Is(err, fs.ErrNotExist) {
 		data, err = []byte("{}"), nil
 	}
@@ -104,55 +125,43 @@ func readSettingsForWrite(file string) (document, error) {
 	return doc, nil
 }
 
-// errUnchanged tells the settings replacement that a recomputed edit has nothing to write, so a missing file
-// is not created as an empty object.
+// errUnchanged tells the settings replacement that a recomputed edit has nothing to write or is no longer
+// eligible, so a missing file is not created and no hooks are edited.
 var errUnchanged = errors.New("settings unchanged")
 
 // missingDocument is what the settings replacement hands an edit in place of a file that does not exist.
 const missingDocument = "{}"
 
-// settingsMissing reports whether file has no directory entry. An existing file holding exactly the empty
-// object reaches an edit with the same bytes as a missing one, so the bytes alone cannot tell the two apart.
-// The parent is handed to the kernel in the spelling the settings replacement resolves, and the name is looked
-// up in that opened directory without following a link: a link, even a dangling one, is an existing entry.
-func settingsMissing(file string) (bool, error) {
-	parent, name := filepath.Split(file)
-	dir, err := atomicfile.OpenDir(cmp.Or(parent, "."))
-	if errors.Is(err, fs.ErrNotExist) {
-		return true, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	defer func() { _ = dir.Close() }()
-	_, err = dir.ReadFile(name)
+// testSeamInfo derives existence and identity when a caller overrides Store.Replace, whose signature carries
+// only bytes. Production writes take the atomicfile.ReplaceSettingsInfo path directly with no extra lookup.
+func testSeamInfo(file string, old []byte) (fs.FileInfo, bool, error) {
+	info, err := os.Stat(file)
 	if err == nil {
-		return false, nil
+		return info, true, nil
+	}
+	if string(old) != missingDocument {
+		return nil, true, nil
 	}
 	if errors.Is(err, fs.ErrNotExist) {
-		return true, nil
+		if linfo, lerr := os.Lstat(file); lerr == nil {
+			return linfo, true, nil
+		}
+		return nil, false, nil
 	}
-	if _, ok := errors.AsType[*atomicfile.NonRegularError](err); ok {
-		return false, nil
-	}
-	return false, err
+	return nil, false, err
 }
 
-// replace runs change on the current bytes of file inside the configured settings replacement. change may run
-// more than once when another writer modifies the file concurrently. It reports whether the file was written.
+// replaceInfo runs change on the current bytes and opened-file info of file inside the settings replacement.
+// change may run more than once when another writer modifies the file concurrently. It reports whether the file
+// was written.
 //
-// An existing file is edited in place and keeps every byte the edits do not name, the bytes after the closing
-// brace included. A file this write creates has no authored bytes: it is written as the source writes settings,
-// JSON.stringify(settings, null, 2) followed by one newline (lib/settings-wiring.js:107-112). Whether the file
-// is being created is decided here, inside the replacement, and not by an earlier look at the path: the
-// replacement publishes the result only if its own re-read still finds the state it handed to this edit, so a
-// file that appears or disappears meanwhile sends the edit round again with the new state.
-func (s Store) replace(file string, change func(*document) error) (bool, error) {
-	replace := s.Replace
-	if replace == nil {
-		replace = atomicfile.ReplaceSettings
-	}
-	err := replace(file, func(old []byte) ([]byte, error) {
+// An existing file is edited in place and keeps every byte the edits do not name, including any leading UTF-8
+// BOM and trailing bytes after the closing brace. A file this write creates has no authored bytes: it is written
+// as the source writes settings, JSON.stringify(settings, null, 2) followed by one newline
+// (lib/settings-wiring.js:107-112). Production writes get existence directly from atomicfile.ReplaceSettingsInfo
+// on the same opened target that the replacement verifies before commit.
+func (s Store) replaceInfo(file string, change func(*document, fs.FileInfo) error) (bool, error) {
+	apply := func(old []byte, info fs.FileInfo, existed bool) ([]byte, error) {
 		doc, err := parseDocument(old)
 		if err != nil {
 			return nil, fmt.Errorf("Could not read %s: %w", file, err) //nolint:staticcheck // The message is the source's user-facing wording.
@@ -160,24 +169,31 @@ func (s Store) replace(file string, change func(*document) error) (bool, error) 
 		if doc.root.Kind != '{' {
 			return nil, fmt.Errorf("Could not read %s: settings must be a JSON object", file) //nolint:staticcheck // The message is the source's user-facing wording.
 		}
-		if err := change(&doc); err != nil {
+		if err := change(&doc, info); err != nil {
 			return nil, err
 		}
 		if bytes.Equal(doc.data, old) {
 			return nil, errUnchanged
 		}
-		if string(old) != missingDocument {
-			return doc.data, nil
-		}
-		missing, err := settingsMissing(file)
-		if err != nil {
-			return nil, err
-		}
-		if !missing {
+		if existed {
 			return doc.data, nil
 		}
 		return jsonx.EncodeState(doc.root)
-	})
+	}
+	var err error
+	if s.Replace == nil {
+		err = atomicfile.ReplaceSettingsInfo(file, func(old []byte, info fs.FileInfo) ([]byte, error) {
+			return apply(old, info, info != nil)
+		})
+	} else {
+		err = s.Replace(file, func(old []byte) ([]byte, error) {
+			info, existed, statErr := testSeamInfo(file, old)
+			if statErr != nil {
+				return nil, statErr
+			}
+			return apply(old, info, existed)
+		})
+	}
 	if errors.Is(err, errUnchanged) {
 		return false, nil
 	}
@@ -185,24 +201,223 @@ func (s Store) replace(file string, change func(*document) error) (bool, error) 
 }
 
 // writeSettings is the source's writeSettings: the caller's edits, then the readiness hooks re-derived from the
-// base URL the edited file holds (lib/settings-wiring.js:107-112).
+// base URL the edited file holds (lib/settings-wiring.js:107-112). Returning errUnchanged from change aborts
+// the transaction without editing hooks or writing the file.
 func (s Store) writeSettings(file string, change func(*document) error) (bool, error) {
+	return s.writeSettingsInfo(file, func(doc *document, _ fs.FileInfo) error {
+		if change == nil {
+			return nil
+		}
+		return change(doc)
+	})
+}
+
+func (s Store) writeSettingsInfo(file string, change func(*document, fs.FileInfo) error) (bool, error) {
 	forms, err := s.hookForms()
 	if err != nil {
 		return false, err
 	}
-	return s.replace(file, func(doc *document) error {
+	return s.replaceInfo(file, func(doc *document, info fs.FileInfo) error {
 		if change != nil {
-			if err := change(doc); err != nil {
+			if err := change(doc, info); err != nil {
 				return err
 			}
 		}
-		edits, err := forms.sync(doc.root, s.ours(doc.envValue(baseURLKey)))
+		enabled := s.ours(doc.envValue(baseURLKey))
+		if err := forms.checkDuplicates(*doc, enabled); err != nil {
+			return fmt.Errorf("%s: %w", file, err)
+		}
+		edits, err := forms.sync(doc.root, enabled)
 		if err != nil {
 			return fmt.Errorf("%s: %w", file, err)
 		}
 		return doc.edit(edits...)
 	})
+}
+
+func decodeRawKey(raw []byte) (string, bool) {
+	v, err := jsonx.DecodeWire(raw)
+	if err != nil || v.Kind != '"' {
+		return "", false
+	}
+	return wtf8(v.Text), true
+}
+
+// checkRawDuplicates inspects raw JSON text for duplicate member names on parentKey at the root and, when
+// childKeys is non-empty and parentKey holds a JSON object, for duplicate member names among childKeys inside
+// that object. Checking raw text catches duplicates before parent-delete coalescing or equal-value shortcuts.
+func checkRawDuplicates(data []byte, parentKey string, childKeys map[string]bool) error {
+	src := stripLeadingBOM(data)
+	d := jsontext.NewDecoder(bytes.NewReader(src), jsontext.AllowInvalidUTF8(true), jsontext.AllowDuplicateNames(true))
+	if d.PeekKind() != '{' {
+		return nil
+	}
+	if _, err := d.ReadToken(); err != nil {
+		return nil
+	}
+	parentCount := 0
+	var parentVal []byte
+	for d.PeekKind() != '}' {
+		rawKey, err := d.ReadValue()
+		if err != nil {
+			return nil
+		}
+		k, ok := decodeRawKey(rawKey)
+		rawVal, err := d.ReadValue()
+		if err != nil {
+			return nil
+		}
+		if !ok || k != parentKey {
+			continue
+		}
+		parentCount++
+		if parentCount > 1 {
+			return fmt.Errorf("settings %s: duplicate owned key %q", pointer(parentKey), parentKey)
+		}
+		parentVal = bytes.Clone(rawVal)
+	}
+	if parentCount != 1 || len(childKeys) == 0 || len(parentVal) == 0 || parentVal[0] != '{' {
+		return nil
+	}
+	cd := jsontext.NewDecoder(bytes.NewReader(parentVal), jsontext.AllowInvalidUTF8(true), jsontext.AllowDuplicateNames(true))
+	if _, err := cd.ReadToken(); err != nil {
+		return nil
+	}
+	seen := make(map[string]int, len(childKeys))
+	for cd.PeekKind() != '}' {
+		rawKey, err := cd.ReadValue()
+		if err != nil {
+			return nil
+		}
+		k, ok := decodeRawKey(rawKey)
+		if _, err := cd.ReadValue(); err != nil {
+			return nil
+		}
+		if !ok || !childKeys[k] {
+			continue
+		}
+		seen[k]++
+		if seen[k] > 1 {
+			return fmt.Errorf("settings %s: duplicate owned key %q", pointer(parentKey, k), k)
+		}
+	}
+	return nil
+}
+
+// checkRawOwnedDuplicates refuses a raw env object where a watched key appears more than once and at least one
+// occurrence matches isOwned. This prevents a later personal value from masking an earlier owned duplicate.
+func checkRawOwnedDuplicates(data []byte, keys map[string]bool, isOwned func(string, jsonx.WireValue) bool) error {
+	src := stripLeadingBOM(data)
+	d := jsontext.NewDecoder(bytes.NewReader(src), jsontext.AllowInvalidUTF8(true), jsontext.AllowDuplicateNames(true))
+	if d.PeekKind() != '{' {
+		return nil
+	}
+	if _, err := d.ReadToken(); err != nil {
+		return nil
+	}
+	envCount := 0
+	var envVal []byte
+	for d.PeekKind() != '}' {
+		rawKey, err := d.ReadValue()
+		if err != nil {
+			return nil
+		}
+		k, ok := decodeRawKey(rawKey)
+		rawVal, err := d.ReadValue()
+		if err != nil {
+			return nil
+		}
+		if ok && k == "env" {
+			envCount++
+			envVal = bytes.Clone(rawVal)
+		}
+	}
+	if envCount == 0 || len(envVal) == 0 || envVal[0] != '{' {
+		return nil
+	}
+	if envCount > 1 {
+		// Check whether any occurrence of env has an owned value; if so, duplicate env is ambiguous.
+		if hasAnyOwnedInRaw(src, keys, isOwned) {
+			return fmt.Errorf("settings %s: duplicate owned key %q", pointer("env"), "env")
+		}
+		return nil
+	}
+	cd := jsontext.NewDecoder(bytes.NewReader(envVal), jsontext.AllowInvalidUTF8(true), jsontext.AllowDuplicateNames(true))
+	if _, err := cd.ReadToken(); err != nil {
+		return nil
+	}
+	counts := make(map[string]int, len(keys))
+	owned := make(map[string]bool, len(keys))
+	for cd.PeekKind() != '}' {
+		rawKey, err := cd.ReadValue()
+		if err != nil {
+			return nil
+		}
+		k, ok := decodeRawKey(rawKey)
+		rawVal, err := cd.ReadValue()
+		if err != nil {
+			return nil
+		}
+		if !ok || !keys[k] {
+			continue
+		}
+		counts[k]++
+		if !owned[k] {
+			if v, err := jsonx.DecodeWire(rawVal); err == nil && isOwned(k, v) {
+				owned[k] = true
+			}
+		}
+		if counts[k] > 1 && owned[k] {
+			return fmt.Errorf("settings %s: duplicate owned key %q", pointer("env", k), k)
+		}
+	}
+	return nil
+}
+
+func hasAnyOwnedInRaw(src []byte, keys map[string]bool, isOwned func(string, jsonx.WireValue) bool) bool {
+	d := jsontext.NewDecoder(bytes.NewReader(src), jsontext.AllowInvalidUTF8(true), jsontext.AllowDuplicateNames(true))
+	if d.PeekKind() != '{' {
+		return false
+	}
+	if _, err := d.ReadToken(); err != nil {
+		return false
+	}
+	for d.PeekKind() != '}' {
+		rawKey, err := d.ReadValue()
+		if err != nil {
+			return false
+		}
+		k, ok := decodeRawKey(rawKey)
+		rawVal, err := d.ReadValue()
+		if err != nil {
+			return false
+		}
+		if !ok || k != "env" || len(rawVal) == 0 || rawVal[0] != '{' {
+			continue
+		}
+		cd := jsontext.NewDecoder(bytes.NewReader(bytes.Clone(rawVal)), jsontext.AllowInvalidUTF8(true), jsontext.AllowDuplicateNames(true))
+		if _, err := cd.ReadToken(); err != nil {
+			continue
+		}
+		for cd.PeekKind() != '}' {
+			ek, err := cd.ReadValue()
+			if err != nil {
+				break
+			}
+			name, ok := decodeRawKey(ek)
+			ev, err := cd.ReadValue()
+			if err != nil {
+				break
+			}
+			if !ok || !keys[name] {
+				continue
+			}
+			if v, err := jsonx.DecodeWire(ev); err == nil && isOwned(name, v) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func exists(file string) bool {
@@ -376,8 +591,31 @@ func strictEqual(a jsonx.WireValue, aok bool, b jsonx.WireValue, bok bool) bool 
 	}
 }
 
-// plain converts a parsed value into the Go values a report carries: string, float64, bool, nil, []any or map[string]any.
+// hasUnpairedSurrogate reports whether v or any nested member name or value contains an unpaired UTF-16 surrogate.
+func hasUnpairedSurrogate(v jsonx.WireValue) bool {
+	switch v.Kind {
+	case '"':
+		_, ok := wellFormed(v.Text)
+		return !ok
+	case '[':
+		return slices.ContainsFunc(v.Elements, hasUnpairedSurrogate)
+	case '{':
+		for _, m := range v.Members {
+			if _, ok := wellFormed(m.Name); !ok || hasUnpairedSurrogate(m.Value) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// plain converts a parsed value into the Go values a report carries: string, float64, bool, nil, []any or
+// map[string]any for well-formed values, or the lossless jsonx.WireValue when an unpaired UTF-16 surrogate is
+// present so neither string content nor distinct surrogate object keys are lost before serialization.
 func plain(v jsonx.WireValue) any {
+	if hasUnpairedSurrogate(v) {
+		return v
+	}
 	switch v.Kind {
 	case '"':
 		return string(utf16.Decode(v.Text))
