@@ -48,6 +48,16 @@ func TestScan(t *testing.T) {
 			wantFlag:  true,
 			wantPairs: []argscan.Pair{{}},
 		},
+		// The pair consumers must see an invalid positional rather than silently skipping it.
+		"success: bare first token stays paired": {
+			args:     []string{"positional", "--unknown", "value"},
+			flag:     "--unknown",
+			wantFlag: true,
+			wantPairs: []argscan.Pair{
+				{Option: "positional", Value: "--unknown", HasValue: true},
+				{Option: "value"},
+			},
+		},
 		// lib/commands.js:199-201,2078-2080: the presence check matches only the complete token.
 		"success: equals does not enable a presence flag": {
 			args:      []string{"--refresh=true"},
