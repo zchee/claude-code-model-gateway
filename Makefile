@@ -60,13 +60,16 @@ build-windows:
 override fmt_environment := GOFLAGS=-mod=readonly GOWORK=off
 # modernize's -tags flag is a no-op; GOFLAGS passes tags to go list.
 override fmt_process_flags := GOFLAGS='-mod=readonly -tags=process'
+# modernize fails when its patterns match no package, which is what a directory whose
+# files all carry the process tag gives without the tag. A go list failure is not a skip.
+override no_untagged_packages = { untagged=$$(go list -- $(fmt_packages) 2>/dev/null) && [ -z "$$untagged" ]; }
 
 fmt:
 	@$(validate_fmt_paths); \
 	export $(fmt_environment); \
 	gofmt -s -w -- $(fmt_paths) && \
 	gofumpt -w -extra -- $(fmt_paths) && \
-	modernize -fix -test -- $(fmt_packages) && \
+	{ $(no_untagged_packages) || modernize -fix -test -- $(fmt_packages); } && \
 	$(fmt_process_flags) modernize -fix -test -- $(fmt_packages) && \
 	goimports-rereviser $(imports_flags) -- $(fmt_paths)
 
@@ -81,7 +84,7 @@ fmt-check:
 	}; \
 	check gofmt -s -l -- $(fmt_paths); \
 	check gofumpt -l -extra -- $(fmt_paths); \
-	check modernize -fix -diff -test -- $(fmt_packages); \
+	$(no_untagged_packages) || check modernize -fix -diff -test -- $(fmt_packages); \
 	check env $(fmt_process_flags) modernize -fix -diff -test -- $(fmt_packages); \
 	check goimports-rereviser $(imports_flags) -list-diff -- $(fmt_paths); \
 	host_os=$$(go env GOHOSTOS) && host_arch=$$(go env GOHOSTARCH) || exit 1; \
