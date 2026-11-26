@@ -24,6 +24,9 @@ import (
 // OpenDir returns errors.ErrUnsupported on non-Unix platforms.
 func OpenDir(path string) (*Dir, error) { return nil, errors.ErrUnsupported }
 
+// OpenDirCreate returns errors.ErrUnsupported on non-Unix platforms.
+func OpenDirCreate(path string, perm fs.FileMode) (*Dir, error) { return nil, errors.ErrUnsupported }
+
 // ReadFile returns fs.ErrClosed because no Dir can be opened on this platform.
 func (d *Dir) ReadFile(name string) ([]byte, error) { return nil, fs.ErrClosed }
 

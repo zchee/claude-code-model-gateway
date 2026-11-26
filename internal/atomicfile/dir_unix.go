@@ -21,6 +21,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"strings"
 
 	"golang.org/x/sys/unix"
 )
@@ -28,9 +29,54 @@ import (
 // OpenDir opens an existing directory, resolving path as written. Subsequent
 // operations use this directory, not another lookup of path.
 func OpenDir(path string) (*Dir, error) {
-	fd, err := openDirectoryAt(unix.AT_FDCWD, path, false)
+	fd, err := openDirectoryAt(unix.AT_FDCWD, path, false, 0)
 	if err != nil {
 		return nil, err
+	}
+	return &Dir{root: directory{os.NewFile(uintptr(fd), path)}}, nil
+}
+
+// OpenDirCreate opens path, creating missing directories with the permission
+// bits of perm subject to the creation mask. Existing directories, including
+// those made by concurrent callers, keep their modes. A non-directory or
+// dangling symlink stops the walk; directories already created are not removed.
+//
+// The walk starts at the root or, for relative paths, the current directory.
+// An empty path is invalid. Trailing slashes are accepted, and . and .. are
+// resolved in place, including after a symlink. Each directory must be readable.
+// Existing symlinks to directories are followed; the walk is not confined to
+// any root. Each component is resolved relative to the last directory opened,
+// not by looking up the preceding path again. A later rename or symlink change
+// cannot redirect operations on the returned Dir. The caller must close it.
+func OpenDirCreate(path string, perm fs.FileMode) (*Dir, error) {
+	return openDirCreate(path, perm, nil)
+}
+
+func openDirCreate(path string, perm fs.FileMode, afterOpen func(string)) (*Dir, error) {
+	if path == "" {
+		return OpenDir(path)
+	}
+	start := "."
+	if strings.HasPrefix(path, "/") {
+		start = "/"
+	}
+	fd, err := openDirectoryAt(unix.AT_FDCWD, start, false, 0)
+	if err != nil {
+		return nil, err
+	}
+	for component := range strings.SplitSeq(path, "/") {
+		if component == "" {
+			continue
+		}
+		next, err := openDirectoryAt(fd, component, true, perm)
+		_ = unix.Close(fd)
+		if err != nil {
+			return nil, err
+		}
+		fd = next
+		if afterOpen != nil {
+			afterOpen(component)
+		}
 	}
 	return &Dir{root: directory{os.NewFile(uintptr(fd), path)}}, nil
 }
