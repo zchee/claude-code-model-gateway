@@ -26,7 +26,9 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf16"
+	"unicode/utf8"
 
+	"golang.org/x/text/cases"
 	"golang.org/x/text/collate"
 	"golang.org/x/text/language"
 
@@ -103,6 +105,9 @@ func ReadEntries(registries []string, pluginID string) []map[string]any {
 				continue
 			}
 			for _, plugin := range member.Value.Members {
+				if !wellFormedUTF16(plugin.Name) {
+					continue
+				}
 				key := string(utf16.Decode(plugin.Name))
 				if exact && key != pluginID || !exact && !strings.HasPrefix(key, prefix) {
 					continue
@@ -145,7 +150,9 @@ func jsonValue(value jsonx.WireValue) any {
 	case '{':
 		object := make(map[string]any, len(value.Members))
 		for _, member := range value.Members {
-			object[string(utf16.Decode(member.Name))] = jsonValue(member.Value)
+			if wellFormedUTF16(member.Name) {
+				object[string(utf16.Decode(member.Name))] = jsonValue(member.Value)
+			}
 		}
 		return object
 	case '[':
@@ -165,6 +172,18 @@ func jsonValue(value jsonx.WireValue) any {
 	default:
 		return nil
 	}
+}
+
+func wellFormedUTF16(units []uint16) bool {
+	for i := 0; i < len(units); i++ {
+		if r := rune(units[i]); utf16.IsSurrogate(r) {
+			if i+1 == len(units) || utf16.DecodeRune(r, rune(units[i+1])) == utf8.RuneError {
+				return false
+			}
+			i++
+		}
+	}
+	return true
 }
 
 // CompareEntries orders registry entries newest first by numeric version parts, then by update text.
@@ -267,15 +286,12 @@ func IsCacheParent(directory string, registryDirs []string) bool {
 	if !filepath.IsAbs(directory) || filepath.Clean(directory) != directory {
 		return false
 	}
-	return isCacheParent(directory, physicalPath(directory), registryDirs)
-}
-
-func isCacheParent(directory, physical string, registryDirs []string) bool {
-	if strings.EqualFold(filepath.Base(directory), "plugins") {
+	if asciiEqualFold(filepath.Base(directory), "plugins") {
 		return true
 	}
+	physical := normalPath(physicalPath(directory))
 	for _, registryDir := range registryDirs {
-		if filepath.IsAbs(registryDir) && filepath.Clean(registryDir) == registryDir && normalPath(physicalPath(registryDir)) == normalPath(physical) {
+		if filepath.IsAbs(registryDir) && filepath.Clean(registryDir) == registryDir && normalPath(physicalPath(registryDir)) == physical {
 			return true
 		}
 	}
@@ -283,6 +299,7 @@ func isCacheParent(directory, physical string, registryDirs []string) bool {
 }
 
 // CacheIdentity returns the common identity of sibling version directories, or the empty string.
+// The identity is only a comparison key, not authority to signal a process or delete a path.
 func CacheIdentity(installRoot string, registryDirs []string) string {
 	if !filepath.IsAbs(installRoot) || filepath.Clean(installRoot) != installRoot {
 		return ""
@@ -295,10 +312,11 @@ func CacheIdentity(installRoot string, registryDirs []string) string {
 	pluginDir := filepath.Dir(root)
 	cacheDir := filepath.Dir(filepath.Dir(pluginDir))
 	parent := filepath.Dir(cacheDir)
-	if !strings.EqualFold(filepath.Base(pluginDir), "model-gateway") || !strings.EqualFold(filepath.Base(cacheDir), "cache") || !isCacheParent(parent, parent, registryDirs) {
+	if !asciiEqualFold(filepath.Base(pluginDir), "model-gateway") || !asciiEqualFold(filepath.Base(cacheDir), "cache") || !IsCacheParent(parent, registryDirs) {
 		return ""
 	}
-	return normalPath(pluginDir)
+	// Even if the version leaf is absent, its parent may resolve through a symlink.
+	return normalPath(physicalPath(pluginDir))
 }
 
 func physicalPath(path string) string {
@@ -310,5 +328,21 @@ func physicalPath(path string) string {
 }
 
 func normalPath(path string) string {
-	return strings.ToLower(separators.ReplaceAllString(path, "/"))
+	return cases.Lower(language.Und).String(separators.ReplaceAllString(path, "/"))
+}
+
+func asciiEqualFold(text, lower string) bool {
+	if len(text) != len(lower) {
+		return false
+	}
+	for i := range len(text) {
+		b := text[i]
+		if 'A' <= b && b <= 'Z' {
+			b += 'a' - 'A'
+		}
+		if b != lower[i] {
+			return false
+		}
+	}
+	return true
 }

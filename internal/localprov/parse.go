@@ -49,12 +49,12 @@ func StudioModels(body []byte) ([]Model, error) {
 		return nil, errors.New("GET /api/v1/models returned no model list")
 	}
 
-	models := make([]Model, 0, len(list.Elements))
-	positions := make(map[string]int, len(list.Elements))
+	models := []Model{}
+	positions := make(map[string]int)
 	for _, entry := range list.Elements {
 		kind := property(entry, "type")
 		key := property(entry, "key")
-		if !asciiEqual(kind.Text, "llm") || key.Kind != '"' || len(key.Text) == 0 {
+		if !asciiEqual(kind.Text, "llm") || key.Kind != '"' || len(key.Text) == 0 || !wellFormedUTF16(key.Text) {
 			continue
 		}
 		instances := property(entry, "loaded_instances").Elements
@@ -107,4 +107,16 @@ func property(value jsonx.WireValue, name string) jsonx.WireValue {
 
 func asciiEqual(units []uint16, text string) bool {
 	return slices.EqualFunc(units, []byte(text), func(unit uint16, b byte) bool { return unit == uint16(b) })
+}
+
+func wellFormedUTF16(units []uint16) bool {
+	for i := 0; i < len(units); i++ {
+		if r := rune(units[i]); utf16.IsSurrogate(r) {
+			if i+1 == len(units) || utf16.DecodeRune(r, rune(units[i+1])) == '�' {
+				return false
+			}
+			i++
+		}
+	}
+	return true
 }

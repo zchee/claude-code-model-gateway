@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/zchee/claude-code-model-gateway/internal/config"
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
@@ -79,7 +80,8 @@ func readStudioFile(dir string) studioFile {
 		return studioFile{}
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "config.json"))
-	if err != nil {
+	// Do not use a token that decoding would silently change.
+	if err != nil || !utf8.Valid(data) {
 		return studioFile{}
 	}
 	root, err := jsonx.DecodeWire(data)
@@ -113,11 +115,23 @@ func parseStudioSection(section jsonx.WireValue) studioFile {
 			}
 			file.baseURL = string(utf16.Decode(value.Text))
 		case "apiKey":
-			if value.Kind != '"' {
+			if value.Kind != '"' || !wellFormedUTF16(value.Text) {
 				return studioFile{}
 			}
 			file.apiKey = string(utf16.Decode(value.Text))
 		}
 	}
 	return file
+}
+
+func wellFormedUTF16(units []uint16) bool {
+	for i := 0; i < len(units); i++ {
+		if r := rune(units[i]); utf16.IsSurrogate(r) {
+			if i+1 == len(units) || utf16.DecodeRune(r, rune(units[i+1])) == utf8.RuneError {
+				return false
+			}
+			i++
+		}
+	}
+	return true
 }
