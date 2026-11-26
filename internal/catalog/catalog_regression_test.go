@@ -15,6 +15,7 @@
 package catalog_test
 
 import (
+	"context"
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
 	"errors"
@@ -263,32 +264,56 @@ func TestPreparedReadinessSnapshot(t *testing.T) {
 	}
 }
 
+type readinessFunc func(string) catalog.Readiness
+
+func (f readinessFunc) Probe(_ context.Context, provider string) catalog.Readiness {
+	return f(provider)
+}
+func (f readinessFunc) SharedFailureMessage(state string) string { return f(state).Message }
+
+type readinessMap map[string]catalog.Readiness
+
+func (m readinessMap) Probe(_ context.Context, provider string) catalog.Readiness { return m[provider] }
+
+func (m readinessMap) SharedFailureMessage(state string) string { return m[state].Message }
+
+type readinessValue struct{ summary catalog.Readiness }
+
+func (v readinessValue) Probe(context.Context, string) catalog.Readiness { return v.summary }
+func (v readinessValue) SharedFailureMessage(string) string              { return v.summary.Message }
+
 func TestTypedNilFallback(t *testing.T) {
-	tests := map[string]struct{ prepared bool }{
-		"success: direct build ignores typed nil":   {},
-		"success: prepared build ignores typed nil": {prepared: true},
+	absent := map[string]catalog.Readiness{
+		"kimi": {State: "binary-missing", Message: "Readiness is unavailable."},
+		"grok": {State: "unavailable", Message: "grok readiness is unavailable."},
+	}
+	value := readinessValue{summary: catalog.Readiness{Ready: true, State: "ready", Message: "observed"}}
+	tests := map[string]struct {
+		fallback catalog.ReadinessSource
+		want     map[string]catalog.Readiness
+	}{
+		"success: ignore nil pointer":  {(*observations)(nil), absent},
+		"success: ignore nil function": {readinessFunc(nil), absent},
+		"success: ignore nil map":      {readinessMap(nil), absent},
+		"success: use struct value": {value, map[string]catalog.Readiness{
+			"kimi": {State: "binary-missing", Message: "observed"}, "grok": {Ready: true, State: "ready", Message: "observed"},
+		}},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			ids := []string{"claude-kimi-k3", "claude-grok-4.5"}
-			inputs := catalog.Inputs{Fallback: (*observations)(nil), SharedChecks: &catalog.Checks{}, Policy: modelPolicy}
-			var got catalog.Catalog
-			if tc.prepared {
-				routes := proxymodels.NewTable([]proxymodels.Route{{ID: "kimi-k3", Provider: "kimi"}})
-				prepared, err := catalog.Prepare(ids, inputs, policy.ResolverInputs{Routes: routes}, nil)
-				if err != nil {
-					t.Fatal(err)
-				}
-				got = prepared.Build(t.Context())
-			} else {
-				got = catalog.Build(t.Context(), ids, inputs)
+			inputs := catalog.Inputs{Fallback: tc.fallback, SharedChecks: &catalog.Checks{}, Policy: modelPolicy}
+			direct := catalog.Build(t.Context(), ids, inputs)
+			if diff := gocmp.Diff(tc.want, direct.Providers); diff != "" {
+				t.Errorf("direct providers (-want +got):\n%s", diff)
 			}
-			want := map[string]catalog.Readiness{
-				"kimi": {State: "binary-missing", Message: "Readiness is unavailable."},
-				"grok": {State: "unavailable", Message: "grok readiness is unavailable."},
+			routes := proxymodels.NewTable([]proxymodels.Route{{ID: "kimi-k3", Provider: "kimi"}})
+			prepared, err := catalog.Prepare(ids, inputs, policy.ResolverInputs{Routes: routes}, nil)
+			if err != nil {
+				t.Fatal(err)
 			}
-			if diff := gocmp.Diff(want, got.Providers); diff != "" {
-				t.Errorf("providers (-want +got):\n%s", diff)
+			if diff := gocmp.Diff(tc.want, prepared.Build(t.Context()).Providers); diff != "" {
+				t.Errorf("prepared providers (-want +got):\n%s", diff)
 			}
 		})
 	}

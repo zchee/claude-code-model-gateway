@@ -199,9 +199,13 @@ func prepareModels(ids []string, observe func(string) Policy, window func(id, pr
 }
 
 func build(ctx context.Context, inputs Inputs, models []Model) Catalog {
-	// An interface holding a nil pointer does not compare equal to nil.
-	if fallback := reflect.ValueOf(inputs.Fallback); fallback.Kind() == reflect.Pointer && fallback.IsNil() {
-		inputs.Fallback = nil
+	// An interface holding a typed nil does not compare equal to nil.
+	fallback := reflect.ValueOf(inputs.Fallback)
+	switch fallback.Kind() {
+	case reflect.Pointer, reflect.Func, reflect.Map, reflect.Slice, reflect.Chan, reflect.Interface, reflect.UnsafePointer:
+		if fallback.IsNil() {
+			inputs.Fallback = nil
+		}
 	}
 	catalog := Catalog{
 		SchemaVersion: 4,
