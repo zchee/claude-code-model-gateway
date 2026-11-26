@@ -278,7 +278,7 @@ func runLockChild(t testing.TB, args []string) {
 }
 
 func TestGatewayFixtureHelper(t *testing.T) {
-	gatewaytest.DispatchHelper(t, map[string]gatewaytest.HelperFunc{"lifecycle-lock": runLockChild})
+	gatewaytest.DispatchHelper(t, map[string]gatewaytest.HelperFunc{"lifecycle-lock": runLockChild, "stop-with-file-size-limit": stopWithFileSizeLimit})
 }
 
 type child struct {
