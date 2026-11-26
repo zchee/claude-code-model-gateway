@@ -29,7 +29,7 @@ def reject_local(names: list[str]) -> None:
         and fields[family] in ("inet", "inet6")
     }
     if not ours:
-        raise ValueError("cannot determine local interface addresses")
+        raise RuntimeError("cannot determine local interface addresses")
     local = {socket.gethostname().lower(), socket.getfqdn().lower()}
     local.update([n.split(".")[0] for n in local])
     for name in names:
@@ -46,11 +46,16 @@ def reject_local(names: list[str]) -> None:
 
 def main(args: list[str]) -> None:
     """Check the destination, verify an archive pin, or prune negative-control runs."""
+    if not args or len(args) != {"destination": 3, "checksum": 3, "prune": 1}.get(
+        args[0]
+    ):
+        print("remote: invalid transport operation or arguments", file=sys.stderr)
+        sys.exit(2)
     op, *values = args
     if op == "destination":
         try:
             reject_local(values)
-        except ValueError as exc:
+        except (ValueError, socket.gaierror) as exc:
             print(f"remote: {exc}", file=sys.stderr)
             sys.exit(2)
     elif op == "checksum":
@@ -70,9 +75,20 @@ def main(args: list[str]) -> None:
         )
         for old in runs[5:]:
             shutil.rmtree(old)
-    else:
-        raise ValueError("unknown transport operation")
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    try:
+        main(sys.argv[1:])
+    except (
+        OSError,
+        subprocess.SubprocessError,
+        RuntimeError,
+        ValueError,
+        LookupError,
+        TypeError,
+        StopIteration,
+    ) as exc:
+        # No local tool or archive error is a comparison verdict.
+        print(f"remote: transport setup failed: {exc}", file=sys.stderr)
+        sys.exit(70)

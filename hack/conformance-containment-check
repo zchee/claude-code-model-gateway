@@ -17,6 +17,13 @@ expect_usage 'empty conformance selection' run conformance PACKAGE=absent-packag
 printf '# containment control selector-refusal: pass\n'
 expect_usage 'TIMEOUT_SECONDS must be between 1 and 200' run test conformance TIMEOUT_SECONDS=201
 printf '# containment control timeout-ceiling: pass\n'
+# shellcheck source-path=SCRIPTDIR source=remote
+source "$root/hack/remote"
+for code in 80 81 82 83; do
+    rc=0; (conformance_failure "$code") || rc=$?
+    [[ $rc == 70 ]] || { printf 'payload exit %s became %s, expected 70\n' "$code" "$rc" >&2; exit 1; }
+done
+printf '# containment control private-status: pass\n'
 mkdir "$work/control-group"
 rc=0
 # The controlled shell, not this shell, writes its PID before exec.

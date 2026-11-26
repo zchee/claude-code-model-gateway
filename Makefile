@@ -129,7 +129,11 @@ toolschema-goldens toolschema-supplement:
 fuzz-settings:
 	@$(require_test_venue) && go test -run='^$$' -fuzz='^FuzzSettingsNoEdit$$' -parallel=4 -fuzztime=60s -fuzzminimizetime=1s ./internal/jsonx
 
-.PHONY: conformance-static
+.PHONY: conformance-static check-scope-leftover
+check-scope-leftover:
+	@$(require_test_venue) && test "$$CONFORMANCE_VENUE_SCOPED" = 1 || exit 97; \
+		sleep 60 </dev/null >/dev/null 2>&1 &
+
 conformance-static:
 	@bash hack/conformance-static
 

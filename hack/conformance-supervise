@@ -88,7 +88,11 @@ def stop_pgid_before_reap(job: subprocess.Popen[bytes], initial_rc: int | None) 
                 "conformance: suite process group survived termination", file=sys.stderr
             )
             return 70
-    reaped = job.wait(timeout=5)
+    try:
+        reaped = job.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        print("conformance: timed out reaping suite leader", file=sys.stderr)
+        return 70
     return initial_rc if initial_rc is not None else reaped or (70 if cleaned else 0)
 
 
@@ -97,9 +101,11 @@ def main() -> None:
     if len(sys.argv) < 4:
         sys.exit("usage: conformance-supervise WORK LIMIT CMD [ARGS...]")
     if not (hasattr(os, "waitid") and hasattr(os, "WNOWAIT")):
-        sys.exit(
-            "conformance: os.waitid with WNOWAIT is required for safe process-group containment"
+        print(
+            "conformance: os.waitid with WNOWAIT is required for safe process-group containment",
+            file=sys.stderr,
         )
+        sys.exit(70)
 
     for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, interrupt)

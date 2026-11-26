@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Own a venue launch from outside its scope; never reap an orphan."""
 
+import errno
 import os
 import re
 import shutil
@@ -258,6 +259,18 @@ def run(path: Path, unit: str, limit: int, args: list[str]) -> int:
     status = child.wait(timeout=5)
     expired = prop(unit, "Result") == "timeout"
     leftover = members(unit)
+    if control == "check-cancellation":
+        if port is None or not leftover:
+            raise RuntimeError("no live listener to drain after launcher exit")
+        with socket.socket() as probe:
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError as exc:
+                if exc.errno != errno.EADDRINUSE:
+                    raise
+            else:
+                raise RuntimeError(f"control port {port} was free before scope drain")
+        print(f"remote: launcher exited; port {port} still bound; members={leftover}")
     drain(unit)
     if port is not None:
         with socket.socket() as probe:
@@ -310,6 +323,11 @@ def main(args: list[str]) -> int:
     command, file, *rest = args
     try:
         if command == "listen" and os.environ.get("CONFORMANCE_VENUE_SCOPED") == "1":
+            if os.fork():
+                time.sleep(60)
+                return 70
+            os.setsid()
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
             with socket.socket() as listener:
                 listener.bind(("127.0.0.1", 0))
                 listener.listen(1)

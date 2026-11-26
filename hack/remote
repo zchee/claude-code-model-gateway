@@ -22,6 +22,13 @@ source "$(dirname "${BASH_SOURCE[0]}")/venue-check"
 fail() { printf 'remote: %s\n' "$*" >&2; exit 97; }
 usage_fail() { printf 'remote: %s\n' "$*" >&2; exit 2; }
 
+conformance_failure() {
+    case $1 in
+        1) exit 81 ;; 2) exit 82 ;; 124) exit 83 ;; 97) exit 97 ;;
+        *) if (( $1 > 128 )); then exit "$1"; fi; exit 70 ;;
+    esac
+}
+
 # Check the OpenSSH expansion as well as the alias; no connection is needed.
 reject_local() {
     python3 -I "$root/hack/conformance-transport.py" destination "$@"
@@ -217,11 +224,14 @@ remote_main() {
         fi
         if [[ -d $base && ! -L $base && -O $base && $(stat -c %a "$base") == 700 ]]; then
             if [[ -e $base/unavailable ]]; then
+                status_rc=97
                 printf 'venue: unavailable (%s)\n' "$(tr '\n' ' ' < "$base/unavailable")"
             elif flock -ns "$base" true; then
-                if [[ -f $base/active-scope ]]; then
-                    local scope_state
-                    scope_state=$(venue_scope_state "$base/active-scope" 2>&1 || :)
+                if [[ -e $base/active-scope || -L $base/active-scope ]]; then
+                    local scope_state='invalid reservation file'
+                    if [[ -f $base/active-scope && ! -L $base/active-scope ]]; then
+                        scope_state=$(venue_scope_state "$base/active-scope" 2>&1 || :)
+                    fi
                     printf 'venue: unavailable (reservation: %s/active-scope; %s)\n' "$base" "$scope_state"
                     status_rc=97
                 else
@@ -276,6 +286,7 @@ remote_main() {
             fail "venue marked unavailable ($(tr '\n' ' ' < "$base/unavailable")); run provision to verify and recover"
         fi
         if [[ -e $base/active-scope || -L $base/active-scope ]]; then
+            [[ -f $base/active-scope && ! -L $base/active-scope ]] || fail "invalid reservation: $base/active-scope"
             fail "venue has unverified prior reservation $base/active-scope ($(tr '\n' ' ' < "$base/active-scope")); run provision to verify and recover"
         fi
         case $op in run|check-cancellation|check-owner-deadline)
@@ -308,7 +319,7 @@ remote_main() {
         {
             printf '#!/usr/bin/env bash\nset -euo pipefail\n'
             declare -p transport_source
-            declare -f venue_refuse venue_home venue_file_kind venue_state_clear venue_ports_clear venue_attest venue_require fail fetch tool_version_ok install_tools
+            declare -f venue_refuse venue_home venue_file_kind venue_state_clear venue_ports_clear venue_attest venue_require fail conformance_failure fetch tool_version_ok install_tools
             cat <<'PAYLOAD'
 base=$1 run=$2 gover=$3 nodever=$4 op=$5; shift 5
 trap 'exit 70' ERR
@@ -326,7 +337,7 @@ for arg do
     if [[ $arg == *=* ]]; then continue; fi
     ./hack/venue-check || exit 97
     if [[ $arg == conformance ]]; then
-        ./hack/conformance || { code=$?; case $code in 1) exit 81 ;; 2) exit 82 ;; 124) exit 83 ;; *) exit "$code" ;; esac; }
+        ./hack/conformance || conformance_failure "$?"
     else make -- "$arg" || exit 81; fi
 done
 exit 80
@@ -425,7 +436,7 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
     root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
     gover=go1.27.4
     # Send only the functions and validated arguments; stdin remains the tree archive.
-    program=$(declare -f venue_refuse venue_home venue_file_kind venue_state_clear venue_ports_clear venue_attest venue_require fail usage_fail fetch tool_version_ok install_tools negative_control restore_attestation venue_owner venue_scope_state venue_recover_scopes prune_runs cleanup_neg_control remote_main)
+    program=$(declare -f venue_refuse venue_home venue_file_kind venue_state_clear venue_ports_clear venue_attest venue_require fail usage_fail conformance_failure fetch tool_version_ok install_tools negative_control restore_attestation venue_owner venue_scope_state venue_recover_scopes prune_runs cleanup_neg_control remote_main)
     owner_source=$(<"$root/hack/conformance-owner.py")
     transport_source=$(<"$root/hack/conformance-transport.py")
     printf -v owner_assignment 'owner_source=%q\ntransport_source=%q' "$owner_source" "$transport_source"
@@ -445,9 +456,13 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
     esac
     input=/dev/null
     if [[ $op == run || $op == check-cancellation || $op == check-owner-deadline || $op == negative-control ]]; then
-        input=$(mktemp "${TMPDIR:-/tmp}/venue-tree.XXXXXXXX")
+        if ! input=$(mktemp "${TMPDIR:-/tmp}/venue-tree.XXXXXXXX"); then
+            printf 'remote: failed to create checkout archive\n' >&2; exit 70
+        fi
         trap 'rm -f -- "$input"' EXIT
-        archive_tree "$root" >| "$input"
+        if ! archive_tree "$root" >| "$input"; then
+            printf 'remote: failed to archive checkout\n' >&2; exit 70
+        fi
     fi
     # cmd contains the encoded script and only validated positional arguments.
     rc=0

@@ -6,11 +6,20 @@ shell=(hack/conformance hack/conformance-containment-check hack/conformance-job 
 python=(hack/conformance-owner.py hack/conformance-supervise hack/conformance-transport.py)
 for file in "${shell[@]}"; do bash -n "$file"; done
 if [[ -n ${XDG_CACHE_HOME:-} ]]; then export PATH="$XDG_CACHE_HOME/adapter-static-tools/bin:$PATH"; fi
+for tool in shellcheck ruff; do
+    if ! command -v "$tool" >/dev/null; then
+        printf 'conformance-static: missing %s; install %s on PATH (Debian: apt install %s)\n' "$tool" "$tool" "$tool" >&2
+        exit 70
+    fi
+done
 shellcheck -x "${shell[@]}"
 ruff format --check "${python[@]}"
 ruff check "${python[@]}"
 if command -v mypy >/dev/null; then
     mypy --strict --platform linux "${python[@]}"
-else
+elif command -v uvx >/dev/null; then
     uvx mypy --strict --platform linux "${python[@]}"
+else
+    printf 'conformance-static: missing mypy; install it on PATH (Debian: apt install mypy)\n' >&2
+    exit 70
 fi

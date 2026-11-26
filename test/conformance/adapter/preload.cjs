@@ -36,6 +36,7 @@ module.exports = function install(config, inherited) {
     process.on('exit', () => fs.rmSync(running, { force: true }));
   }
   const execReal = fs.realpathSync.native(process.execPath);
+  const envReal = executable('/usr/bin/env', process.cwd(), null);
   const cli = path.join(plugin, 'bin/model-gateway.js');
   const cliBytes = fs.readFileSync(cli);
   const workerPath = path.join(plugin, 'lib/request-worker.js');
@@ -213,7 +214,7 @@ module.exports = function install(config, inherited) {
 
     let effCmd = program;
     let effArgs = argList;
-    if (program === '/usr/bin/env') {
+    if (envReal && program === envReal) {
       const index = argList[0] === '--' ? 1 : 0;
       if (!argList[index] || argList[index].startsWith('-') || argList[index].includes('=')) return null;
       effCmd = executable(argList[index], cwd, options);
