@@ -26,6 +26,7 @@ import (
 	gocmp "github.com/google/go-cmp/cmp"
 
 	"github.com/zchee/claude-code-model-gateway/internal/cli/argscan"
+	"github.com/zchee/claude-code-model-gateway/internal/cli/version"
 )
 
 const sandboxHome = "sandbox-home"
@@ -373,6 +374,50 @@ func TestRunVersion(t *testing.T) {
 				t.Errorf("stdout mismatch (-want +got):\n%s", diff)
 			}
 			if diff := gocmp.Diff(tt.wantError, stderr.String()); diff != "" {
+				t.Errorf("stderr mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestRunProcessWithoutLookups runs commands with a zero Process, which supplies none of the process facts. A command
+// that needs a missing fact fails with an exit status, never with a panic.
+func TestRunProcessWithoutLookups(t *testing.T) {
+	tests := map[string]struct {
+		args        []string
+		wantSuccess bool
+		wantStdout  string // Compared only for a success.
+	}{
+		"error: unknown command": {args: []string{"model-gateway", "no-such-command"}},
+		"success: version":       {args: []string{"model-gateway", "version"}, wantSuccess: true, wantStdout: version.String() + "\n"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			// The panic is recovered here so that it fails this case instead of ending the package's test binary.
+			status, panicked := func() (status int, panicked any) {
+				defer func() { panicked = recover() }()
+				return RunProcess(tt.args, strings.NewReader(""), &stdout, &stderr, Process{}), nil
+			}()
+			if panicked != nil {
+				t.Fatalf("RunProcess panicked with a zero Process: %v", panicked)
+			}
+			if !tt.wantSuccess {
+				if status == 0 {
+					t.Errorf("exit status 0; want a failure status (stdout %q, stderr %q)", stdout.String(), stderr.String())
+				}
+				if stdout.Len()+stderr.Len() == 0 {
+					t.Error("the command failed without writing anything to stdout or stderr")
+				}
+				return
+			}
+			if diff := gocmp.Diff(0, status); diff != "" {
+				t.Errorf("exit status mismatch (-want +got):\n%s", diff)
+			}
+			if diff := gocmp.Diff(tt.wantStdout, stdout.String()); diff != "" {
+				t.Errorf("stdout mismatch (-want +got):\n%s", diff)
+			}
+			if diff := gocmp.Diff("", stderr.String()); diff != "" {
 				t.Errorf("stderr mismatch (-want +got):\n%s", diff)
 			}
 		})

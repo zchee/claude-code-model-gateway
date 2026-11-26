@@ -18,7 +18,9 @@ package cli_test
 
 import (
 	"bytes"
+	"maps"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -64,10 +66,9 @@ func TestServeCommandsReachTheirImplementations(t *testing.T) {
 			if diff := gocmp.Diff("", stdout.String()); diff != "" {
 				t.Errorf("stdout mismatch (-want +got):\n%s", diff)
 			}
-			// The command line may put its own "model-gateway:" in front of the implementation's message.
-			line, ok := strings.CutSuffix(stderr.String(), "\n")
-			if !ok || strings.Contains(line, "\n") || (line != tc.want && line != "model-gateway: "+tc.want) {
-				t.Errorf("stderr %q; want one line carrying the implementation's refusal %q", stderr.String(), tc.want)
+			// The refusal is printed once, as one line with one "model-gateway: " prefix.
+			if diff := gocmp.Diff(tc.want+"\n", stderr.String()); diff != "" {
+				t.Errorf("stderr mismatch (-want +got):\n%s", diff)
 			}
 			entries, err := os.ReadDir(home)
 			if err != nil {
@@ -77,5 +78,82 @@ func TestServeCommandsReachTheirImplementations(t *testing.T) {
 				t.Errorf("the refused command left %d entries in its home directory", len(entries))
 			}
 		})
+	}
+}
+
+// TestServeShimReportsARefusalOnce runs serve-shim past its state-directory check, with a clean absolute state
+// directory and an absolute worker executable, to a port setting it refuses before it binds a listener or starts a
+// worker. The refusal reaches stderr once, as one line with one "model-gateway: " prefix.
+func TestServeShimReportsARefusalOnce(t *testing.T) {
+	tests := map[string]struct {
+		settings map[string]string
+		fragment string
+	}{
+		"error: worker port equal to the public port": {
+			// A privileged port: a wiring that binds before it checks the ports fails here instead of serving.
+			settings: map[string]string{"CODEX_GATEWAY_PORT": "1", "CODEX_GATEWAY_WORKER_PORT": "1"},
+			fragment: "CODEX_GATEWAY_WORKER_PORT 1 is the public port",
+		},
+		"error: public port out of range": {
+			settings: map[string]string{"CODEX_GATEWAY_PORT": "70000"},
+			fragment: "CODEX_GATEWAY_PORT is not a valid port",
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			status, stdout, stderr := runServeShim(t, tc.settings)
+			if diff := gocmp.Diff(1, status); diff != "" {
+				t.Errorf("exit status mismatch (-want +got):\n%s", diff)
+			}
+			if diff := gocmp.Diff("", stdout); diff != "" {
+				t.Errorf("stdout mismatch (-want +got):\n%s", diff)
+			}
+			checkReportedOnce(t, stderr, tc.fragment)
+		})
+	}
+}
+
+// runServeShim runs serve-shim through cli.RunProcess with a fresh home and state directory under t.TempDir and the
+// given settings, as both its environment list and its lookup. The worker executable is an absolute path to a file
+// that does not exist, so the command gets past its executable check but could never start a worker.
+func runServeShim(t *testing.T, settings map[string]string) (status int, stdout, stderr string) {
+	t.Helper()
+	home := t.TempDir()
+	env := map[string]string{"HOME": home, "MODEL_GATEWAY_STATE_DIR": t.TempDir()}
+	maps.Copy(env, settings)
+	environ := make([]string, 0, len(env))
+	for name, value := range env {
+		environ = append(environ, name+"="+value)
+	}
+	executable := filepath.Join(t.TempDir(), "model-gateway")
+	var out, errOut bytes.Buffer
+	status = cli.RunProcess([]string{"model-gateway", "serve-shim"}, strings.NewReader(""), &out, &errOut, cli.Process{
+		Lookup: func(key string) (string, bool) {
+			v, ok := env[key]
+			return v, ok
+		},
+		Environ:    func() []string { return environ },
+		Home:       func() (string, error) { return home, nil },
+		Cwd:        func() (string, error) { return home, nil },
+		Executable: func() (string, error) { return executable, nil },
+	})
+	return status, out.String(), errOut.String()
+}
+
+// checkReportedOnce checks that stderr holds exactly one line, ended by a newline, that starts with exactly one
+// "model-gateway: " prefix, names nothing else as model-gateway, and carries fragment.
+func checkReportedOnce(t *testing.T, stderr, fragment string) {
+	t.Helper()
+	const prefix = "model-gateway: "
+	lines := strings.Split(strings.TrimSuffix(stderr, "\n"), "\n")
+	switch {
+	case !strings.HasSuffix(stderr, "\n") || len(lines) != 1:
+		t.Errorf("stderr holds %d line(s); want the failure printed once as exactly one line:\n%s", len(lines), stderr)
+	case !strings.HasPrefix(lines[0], prefix):
+		t.Errorf("stderr line %q does not start with %q", lines[0], prefix)
+	case strings.Count(lines[0], "model-gateway:") != 1:
+		t.Errorf("stderr line %q carries the %q prefix more than once", lines[0], prefix)
+	case !strings.Contains(lines[0], fragment):
+		t.Errorf("stderr line %q does not carry the failure %q", lines[0], fragment)
 	}
 }

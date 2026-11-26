@@ -63,7 +63,8 @@ const (
 	// ends without a single response byte: no answer, success or refusal, exists for a request nobody finished.
 	abandoned
 	// malformed: a header field name is not an HTTP token, so the field cannot be judged under the name a check looks
-	// for. The request is refused with 400, never relayed, and the connection closes after the refusal.
+	// for, or a complete trailer line is not a valid field line. The request is refused with 400, never relayed, and
+	// the connection closes after the refusal.
 	malformed
 )
 
@@ -530,6 +531,33 @@ func TestHostAssociationPerRequest(t *testing.T) {
 			pipelined: true,
 			halfClose: true,
 		},
+		// A trailer line that the peer's half-close cut off was never finished, whatever its partial text looks like.
+		// net/textproto reports a cut-off line without a colon as a malformed line, not as the end of the stream.
+		"error: peer closes in the middle of a trailer field name": {
+			requests: []wireRequest{
+				{head: "POST /trailer HTTP/1.1\r\nHost: {own}\r\nX-Probe: {probe}\r\nTransfer-Encoding: chunked\r\n\r\n", body: "2\r\n{}\r\n0\r\nX-Tr", want: abandoned},
+			},
+			pipelined: true,
+			halfClose: true,
+		},
+		"error: peer closes in the middle of a trailer field value": {
+			requests: []wireRequest{
+				{head: "POST /trailer HTTP/1.1\r\nHost: {own}\r\nX-Probe: {probe}\r\nTransfer-Encoding: chunked\r\n\r\n", body: "2\r\n{}\r\n0\r\nX-Trailer: do", want: abandoned},
+			},
+			pipelined: true,
+			halfClose: true,
+		},
+		// The same trailer lines, finished: the client completed the request, so its malformed trailer is refused.
+		"error: complete trailer line without a colon": {
+			requests: []wireRequest{
+				{head: "POST /trailer HTTP/1.1\r\nHost: {own}\r\nX-Probe: {probe}\r\nTransfer-Encoding: chunked\r\n\r\n", body: "2\r\n{}\r\n0\r\nX-Tr\r\n\r\n", want: malformed},
+			},
+		},
+		"error: complete trailer field name with a space before the colon": {
+			requests: []wireRequest{
+				{head: "POST /trailer HTTP/1.1\r\nHost: {own}\r\nX-Probe: {probe}\r\nTransfer-Encoding: chunked\r\n\r\n", body: "2\r\n{}\r\n0\r\nX-Trailer : done\r\n\r\n", want: malformed},
+			},
+		},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -764,9 +792,9 @@ func judge(requests []wireRequest, outcomes []outcome, statuses []int, i, receiv
 	case malformed:
 		switch {
 		case received > 0:
-			return "relayed to the worker although a header field name is not a token"
+			return "relayed to the worker although a field line is malformed"
 		case o != outRefused || statuses[i] != http.StatusBadRequest:
-			return fmt.Sprintf("not refused with 400 although a header field name is not a token (%s, status %d)", o, statuses[i])
+			return fmt.Sprintf("not refused with 400 although a field line is malformed (%s, status %d)", o, statuses[i])
 		case i+1 < len(outcomes) && !nextClosed:
 			return "refused, and the connection stayed open for the next request"
 		}
