@@ -45,11 +45,13 @@ type Options struct {
 type Result struct {
 	Body                                         []byte
 	SelectedModel, EffectiveModel, Provider, Via string
-	Effort, Ticket                               *string
-	SessionKey                                   string
-	Target                                       sentry.Target
-	LocalStatus                                  int
-	Reason                                       string
+	Effort                                       *string
+	// Ticket attributes usage to a dispatch ticket, except on the turn inheriting another agent's route.
+	Ticket      *string
+	SessionKey  string
+	Target      sentry.Target
+	LocalStatus int
+	Reason      string
 }
 
 // Handler owns one worker's dispatch cache and shared request settings.

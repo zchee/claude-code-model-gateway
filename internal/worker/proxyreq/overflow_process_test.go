@@ -32,6 +32,45 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/gatewaytest"
 )
 
+// Request preparation owns the refusal; the running worker must not forward or reroute it.
+func TestToolSchemaEngineQuirkHTTPRefusal(t *testing.T) {
+	env := gatewaytest.NewEnv(t.TempDir(), nil, nil, nil)
+	var contacts atomic.Int32
+	upstream := env.StartUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		contacts.Add(1)
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/models" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"data":[{"id":"gpt-5.6-sol"}]}`)
+			return
+		}
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	env["CODEX_GATEWAY_ANTHROPIC_UPSTREAM"] = upstream
+	env["CODEX_GATEWAY_GROK_ENDPOINT"] = upstream + "/v1/responses"
+	withWorker(t, env, upstream, func(base string) {
+		client := &http.Client{Transport: &http.Transport{}}
+		defer client.CloseIdleConnections()
+		tests := map[string]struct{ body, refusal string }{
+			"error: non ASCII property spelling": {propertyQuirk, propertyRefusal},
+			"error: capture refusal precedes syntax checking": {
+				`{"model":"claude-gpt-5.6-sol[1m]","tools":[{"name":"artifact_tool","input_schema":{"pattern":"(?<x>a)(?:b|(?<x>c))[^\\p{Cc}x]"}}]}`,
+				`{"type":"error","error":{"type":"invalid_request_error","message":"model-gateway: Codex tool schema compatibility refused tool artifact_tool at /tools/0/input_schema/pattern; reason=capture-or-unsupported-group. Nothing was forwarded or rerouted."}}`,
+			},
+		}
+		for name, tc := range tests {
+			t.Run(name, func(t *testing.T) {
+				before := contacts.Load()
+				status, body := post(t, client, base, "/v1/messages", tc.body, nil)
+				calls := contacts.Load() - before
+				if diff := gocmp.Diff(tc.refusal, string(body)); diff != "" || status != 400 || calls != 0 {
+					t.Errorf("HTTP %d, upstream requests=%d, body (-want +got): %s", status, calls, diff)
+				}
+			})
+		}
+	})
+}
+
+// The client reply and matching trace need response usage and telemetry wired into the running worker.
 func TestSentryOriginalBytesOverHTTP(t *testing.T) {
 	const body = `{ "model": "claude-gpt-5.6-sol", "max_tokens":1, "messages":[{"role":"assistant","content":"prior"},{"role":"user","content":"next"}] }`
 	env := gatewaytest.NewEnv(t.TempDir(), nil, nil, map[string]string{"CODEX_GATEWAY_COMPACT_TRIGGER": "100", "CLAUDE_CODE_PROPAGATE_TRACEPARENT": "1"})
@@ -103,7 +142,7 @@ func TestSentryOriginalBytesOverHTTP(t *testing.T) {
 			http.NotFound(w, r)
 		}
 	}))
-	withWorker(t, env, proxy, func(base string, _ []string) {
+	withWorker(t, env, proxy, func(base string) {
 		client := &http.Client{Transport: &http.Transport{}}
 		defer client.CloseIdleConnections()
 		bad := `{"model":"claude-gpt-5.6-sol","tools":[{"name":"fixture","input_schema":` + schema + `}]}`

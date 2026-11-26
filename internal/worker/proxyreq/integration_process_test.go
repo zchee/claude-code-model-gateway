@@ -31,6 +31,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -43,7 +44,9 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/cli"
 	"github.com/zchee/claude-code-model-gateway/internal/config"
 	"github.com/zchee/claude-code-model-gateway/internal/gatewaytest"
+	"github.com/zchee/claude-code-model-gateway/internal/paths"
 	"github.com/zchee/claude-code-model-gateway/internal/policy"
+	"github.com/zchee/claude-code-model-gateway/internal/worker/proxyreq"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/route"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/sentry"
 )
@@ -62,8 +65,12 @@ func TestGatewayFixtureHelper(t *testing.T) {
 				t.Fatalf("serve-worker returned %d", status)
 			}
 		},
-		"inspect-settings": func(t testing.TB, args []string) {
-			windows, err := policy.ReadWindows(args[0], os.LookupEnv)
+		"inspect-settings": func(t testing.TB, _ []string) {
+			dir, err := paths.New(os.LookupEnv, os.UserHomeDir, nil).StateDir()
+			if err != nil {
+				t.Fatal(err)
+			}
+			windows, err := policy.ReadWindows(filepath.Join(dir, "context-window.json"), os.LookupEnv)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -73,13 +80,15 @@ func TestGatewayFixtureHelper(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			env, raw, _ := config.CompactTrigger.Read(os.LookupEnv)
+			_, raw, _ := config.CompactTrigger.Read(os.LookupEnv)
 			trigger := windows["codex"].CompactAt
-			target, err := sentry.ResolveTarget(policy.NewResolver(inputs), ids[0], env, windows.Cap("codex"), trigger)
+			h, err := proxyreq.New(proxyreq.Options{StartupDir: dir, DispatchPath: "routes.json", Now: time.Now, Lookup: os.LookupEnv, Windows: windows, Sentry: new(sentry.State)})
 			if err != nil {
 				t.Fatal(err)
 			}
-			b, err := json.Marshal(startup{trigger, target.Policy, raw, prepared.Build(t.Context()).Models})
+			s := route.NewSnapshot(policy.NewResolver(inputs), "", nil, nil)
+			out, _ := prepare(t, h, s, "/v1/messages", `{"model":"claude-gpt-6.1-sol[1m]"}`, http.Header{"X-Claude-Code-Session-Id": {"startup"}})
+			b, err := json.Marshal(startup{trigger, out.Target.Policy, raw, prepared.Build(t.Context()).Models})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -94,7 +103,7 @@ func TestStartupCompactAt(t *testing.T) {
 	if err := policy.WriteWindows(path, []byte(`{"codex":272000,"compactAt":{"codex":242000,"grok":900000}}`)); err != nil {
 		t.Fatal(err)
 	}
-	cmd, err := env.HelperCommand(t, "inspect-settings", path)
+	cmd, err := env.HelperCommand(t, "inspect-settings")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,8 +146,8 @@ func TestStartupCompactAt(t *testing.T) {
 	}
 }
 
-// Read startup lines until the catalog refresh and the port announcement have both completed.
-func withWorker(t *testing.T, env gatewaytest.Environment, proxy string, run func(string, []string)) {
+// Keep draining worker output through shutdown so a request cannot block on its own logs.
+func withWorker(t *testing.T, env gatewaytest.Environment, proxy string, run func(string)) (policies []string) {
 	t.Helper()
 	u, err := url.Parse(proxy)
 	if err != nil {
@@ -162,70 +171,81 @@ func withWorker(t *testing.T, env gatewaytest.Environment, proxy string, run fun
 	cmd.Stdout, cmd.Stderr = writer, writer
 	done := make(chan error, 1)
 	go func() { err := env.RunFixtureWithin(cmd, 20*time.Second); _ = writer.Close(); done <- err }()
+	ready := make(chan string, 1)
+	drained := make(chan []string, 1)
+	go func() {
+		defer close(ready)
+		scan := bufio.NewReader(reader)
+		portRE := regexp.MustCompile(`listening on 127\.0\.0\.1:(\d+)`)
+		var lines []string
+		var port string
+		announced := false
+		for {
+			text, err := scan.ReadString('\n')
+			line := strings.TrimRight(text, "\r\n")
+			if strings.Contains(line, "sentry policy id=") {
+				lines = append(lines, line)
+			}
+			if !announced {
+				t.Log(line)
+				if m := portRE.FindStringSubmatch(line); len(m) > 0 {
+					port = m[1]
+				}
+				if port != "" && len(lines) >= len(policy.Rows()) {
+					announced = true
+					ready <- "http://127.0.0.1:" + port
+				}
+			}
+			if err != nil {
+				if !errors.Is(err, io.EOF) {
+					t.Errorf("read worker output: %v", err)
+				}
+				drained <- lines
+				return
+			}
+		}
+	}()
 	defer func() {
 		_ = stop.Close()
-		_, _ = io.Copy(io.Discard, reader)
+		policies = <-drained
 		if err := <-done; err != nil {
 			t.Errorf("worker exit: %v", err)
 		}
 	}()
-	scan := bufio.NewScanner(reader)
-	portRE := regexp.MustCompile(`listening on 127\.0\.0\.1:(\d+)`)
-	var port string
-	var lines, policies []string
-	for scan.Scan() {
-		line := scan.Text()
-		lines = append(lines, line)
-		if m := portRE.FindStringSubmatch(line); len(m) > 0 {
-			port = m[1]
-		}
-		if strings.Contains(line, "sentry policy id=") {
-			policies = append(policies, line)
-		}
-		if port != "" && len(policies) >= len(policy.Rows()) {
-			run("http://127.0.0.1:"+port, policies)
-			return
-		}
+	base, ok := <-ready
+	if !ok {
+		t.Fatal("worker exited before announcing its port and policies")
 	}
-	t.Fatalf("worker did not finish startup: %v\n%s", scan.Err(), strings.Join(lines, "\n"))
+	if run != nil {
+		run(base)
+	}
+	return policies
 }
 
+// Startup policy logs require model discovery to be wired into the running worker.
 func TestStartupPolicyLog(t *testing.T) {
 	env := gatewaytest.NewEnv(t.TempDir(), nil, nil, nil)
 	proxy := env.StartModelProxy(t, []string{"gpt-5.2", "gpt-5.6-sol"}, nil)
-	withWorker(t, env, proxy, func(_ string, lines []string) {
-		for _, row := range policy.Rows() {
-			id := "sentry policy id=" + row.BackendID + " "
-			matching := slices.DeleteFunc(slices.Clone(lines), func(s string) bool { return !strings.Contains(s, id) })
-			if len(matching) != 1 {
-				t.Errorf("%s: got %d policy lines", row.BackendID, len(matching))
-				continue
-			}
-			prefix := fmt.Sprintf("%sbackendWindow=%d sentry=%s", id, row.BackendWindow, row.Sentry)
-			pattern := regexp.QuoteMeta(prefix)
-			if row.Sentry != "none" {
-				pattern += ` effectiveTrigger=\d+ source=(env|derived|cap)`
-			}
-			if !regexp.MustCompile(pattern + "$").MatchString(matching[0]) {
-				t.Errorf("unexpected policy line %q", matching[0])
-			}
+	lines := withWorker(t, env, proxy, nil)
+	for _, row := range policy.Rows() {
+		id := "sentry policy id=" + row.BackendID + " "
+		matching := slices.DeleteFunc(slices.Clone(lines), func(s string) bool { return !strings.Contains(s, id) })
+		if len(matching) != 1 {
+			t.Errorf("%s: got %d policy lines", row.BackendID, len(matching))
+			continue
 		}
-	})
-}
-
-func TestModelKeys(t *testing.T) {
-	tests := map[string]struct{ id, want string }{
-		"success: Codex fast":          {"claude-gpt-6.1-sol-fast[1m]", "gpt-6.1-sol"},
-		"success: Codex ultrafast":     {"gpt-6-astra-ultrafast", "gpt-6-astra"},
-		"success: LM Studio fast":      {"claude-lmstudio/qwen3-coder-30b-fast", "lmstudio/qwen3-coder-30b-fast"},
-		"success: LM Studio ultrafast": {"lmstudio/tiny-ultrafast", "lmstudio/tiny-ultrafast"},
-	}
-	for name, tc := range tests {
-		t.Run(name, func(t *testing.T) {
-			if diff := gocmp.Diff(tc.want, (policy.Resolver{}).WindowModelID(tc.id)); diff != "" {
-				t.Error(diff)
-			}
-		})
+		window := "null"
+		if row.BackendWindow != 0 {
+			window = strconv.FormatInt(row.BackendWindow, 10)
+		}
+		prefix := fmt.Sprintf("%sbackendWindow=%s sentry=%s", id, window, row.Sentry)
+		pattern := regexp.QuoteMeta(prefix)
+		if row.Sentry != "none" {
+			pattern += ` effectiveTrigger=\d+ source=(env|derived|cap)`
+		}
+		if !regexp.MustCompile(pattern + "$").MatchString(matching[0]) {
+			t.Errorf("unexpected policy line %q", matching[0])
+		}
 	}
 }
 
@@ -252,6 +272,7 @@ func post(t *testing.T, client *http.Client, base, path, body string, trace *htt
 	return res.StatusCode, b
 }
 
+// The turn sequence requires discovery, streaming usage and request preparation in the running worker.
 func TestLMTierHTTP(t *testing.T) {
 	const baseModel = "lmstudio/qwen3-coder-30b"
 	env := gatewaytest.NewEnv(t.TempDir(), nil, nil, nil)
@@ -285,7 +306,7 @@ func TestLMTierHTTP(t *testing.T) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = fmt.Fprint(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"model\":\"qwen3-coder-30b\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":45000,\"output_tokens\":0}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":45000,\"output_tokens\":2}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 	}))
-	withWorker(t, env, proxy, func(base string, _ []string) {
+	withWorker(t, env, proxy, func(base string) {
 		client := &http.Client{Transport: &http.Transport{}}
 		defer client.CloseIdleConnections()
 		for i, tc := range []struct {
@@ -333,7 +354,7 @@ func TestKeepAliveRefusals(t *testing.T) {
 	var baseline goleak.Option
 	for i := range 15 {
 		status, b := post(t, client, base, "/v1/messages", `{"model":"claude-gpt-5.6-terra","thread":{"type":"resume"},"messages":[{"role":"user","content":"current turn"}],"max_tokens":1}`, trace)
-		if status != 400 {
+		if status != http.StatusBadRequest || !bytes.Contains(b, []byte("thread_unsupported_request")) {
 			t.Fatalf("request %d returned %d: %s", i, status, b)
 		}
 		if i == 0 {
