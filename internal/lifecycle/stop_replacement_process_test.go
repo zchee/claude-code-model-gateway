@@ -48,8 +48,16 @@ func stopWithFileSizeLimit(t testing.TB, args []string) {
 	limit.Cur = 8
 	signal.Ignore(unix.SIGXFSZ)
 	noError(t, unix.Setrlimit(unix.RLIMIT_FSIZE, &limit))
-	if err := f.Stop(); !errors.Is(err, unix.EFBIG) && !errors.Is(err, io.ErrShortWrite) {
-		t.Fatalf("Stop() under an 8-byte file size limit: %v, want file size limit error", err)
+	err = f.Stop()
+	pathErr, ok := errors.AsType[*os.PathError](err)
+	if !ok || pathErr.Op != "write" || (!errors.Is(pathErr.Err, unix.EFBIG) && !errors.Is(pathErr.Err, io.ErrShortWrite)) {
+		t.Fatalf("Stop() under an 8-byte file size limit: %v (%T), want write *os.PathError with file size limit error", err, err)
+	}
+	dir, base := filepath.Dir(pathErr.Path), filepath.Base(pathErr.Path)
+	stem, hasPrefix := strings.CutPrefix(base, "intentionally-stopped.json.")
+	stem, hasSuffix := strings.CutSuffix(stem, ".tmp")
+	if dir != state || !hasPrefix || !hasSuffix || stem == "" || strings.HasPrefix(stem, ".") || strings.HasSuffix(stem, ".") {
+		t.Fatalf("Stop() write PathError path = %q, want staged sibling of intentionally-stopped.json in %q", pathErr.Path, state)
 	}
 	_, err = io.WriteString(os.Stdout, stopLimitWitness)
 	noError(t, err)

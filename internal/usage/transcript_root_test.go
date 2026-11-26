@@ -16,7 +16,6 @@ package usage
 
 import (
 	"bytes"
-	json "encoding/json/v2"
 	"os"
 	"path/filepath"
 	"testing"
@@ -29,26 +28,36 @@ func TestTranscriptLinkOutsideRoot(t *testing.T) {
 	// following symlinks that leave the projects root. The port confines transcript opens
 	// to the configured projects root and leaves project_name unset when none resolves inside it.
 	tests := map[string]struct {
-		relative    bool
-		chained     bool
-		withInRoot  bool
-		wantProject any
+		escape         bool
+		relative       bool
+		chained        bool
+		withInRootFile bool
+		withInRootLink bool
+		wantProject    any
 	}{
 		"success: absolute symlink outside projects root leaves project name unset": {
+			escape:      true,
 			wantProject: nil,
 		},
 		"success: relative symlink escaping projects root leaves project name unset": {
+			escape:      true,
 			relative:    true,
 			wantProject: nil,
 		},
 		"success: chained symlink escaping projects root leaves project name unset": {
+			escape:      true,
 			relative:    true,
 			chained:     true,
 			wantProject: nil,
 		},
 		"success: escaping symlink is ignored when a readable in-root transcript exists": {
-			withInRoot:  true,
-			wantProject: "inside-repo",
+			escape:         true,
+			withInRootFile: true,
+			wantProject:    "inside-repo",
+		},
+		"success: relative symlink inside projects root resolves project name": {
+			withInRootLink: true,
+			wantProject:    "inside-repo",
 		},
 	}
 	for name, tt := range tests {
@@ -57,50 +66,80 @@ func TestTranscriptLinkOutsideRoot(t *testing.T) {
 			projectsDir := filepath.Join(workspace, "projects")
 			outsideRepo := filepath.Join(workspace, "outside-repo")
 			outsideDir := filepath.Join(workspace, "outside")
-			escapedDir := filepath.Join(projectsDir, "00-escaped")
-			for _, dir := range []string{filepath.Join(outsideRepo, ".git"), outsideDir, escapedDir} {
-				if err := os.MkdirAll(dir, 0o700); err != nil {
-					t.Fatal(err)
-				}
-			}
-			outsideTranscript := filepath.Join(outsideDir, "escaped.jsonl")
-			if err := os.WriteFile(outsideTranscript, append(encoded(t, map[string]string{"cwd": outsideRepo}), '\n'), 0o600); err != nil {
+			if err := os.MkdirAll(projectsDir, 0o700); err != nil {
 				t.Fatal(err)
 			}
 
 			const session = "session-transcript-root"
-			target := outsideTranscript
-			if tt.relative {
-				rel, err := filepath.Rel(escapedDir, outsideTranscript)
-				if err != nil {
-					t.Fatal(err)
-				}
-				target = rel
-			}
-			linkPath := filepath.Join(escapedDir, session+".jsonl")
-			if tt.chained {
-				hop := filepath.Join(escapedDir, "hop.jsonl")
-				if err := os.Symlink(target, hop); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.Symlink("hop.jsonl", linkPath); err != nil {
-					t.Fatal(err)
-				}
-			} else if err := os.Symlink(target, linkPath); err != nil {
-				t.Fatal(err)
-			}
-
-			if tt.withInRoot {
-				insideRepo := filepath.Join(workspace, "inside-repo")
-				inRootDir := filepath.Join(projectsDir, "99-in-root")
-				for _, dir := range []string{filepath.Join(insideRepo, ".git"), inRootDir} {
+			if tt.escape {
+				escapedDir := filepath.Join(projectsDir, "00-escaped")
+				for _, dir := range []string{filepath.Join(outsideRepo, ".git"), outsideDir, escapedDir} {
 					if err := os.MkdirAll(dir, 0o700); err != nil {
 						t.Fatal(err)
 					}
 				}
-				inRootTranscript := filepath.Join(inRootDir, session+".jsonl")
-				if err := os.WriteFile(inRootTranscript, append(encoded(t, map[string]string{"cwd": insideRepo}), '\n'), 0o600); err != nil {
+				outsideTranscript := filepath.Join(outsideDir, "escaped.jsonl")
+				if err := os.WriteFile(outsideTranscript, append(encoded(t, map[string]string{"cwd": outsideRepo}), '\n'), 0o600); err != nil {
 					t.Fatal(err)
+				}
+
+				target := outsideTranscript
+				if tt.relative {
+					rel, err := filepath.Rel(escapedDir, outsideTranscript)
+					if err != nil {
+						t.Fatal(err)
+					}
+					target = rel
+				}
+				linkPath := filepath.Join(escapedDir, session+".jsonl")
+				if tt.chained {
+					hop := filepath.Join(escapedDir, "hop.jsonl")
+					if err := os.Symlink(target, hop); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Symlink("hop.jsonl", linkPath); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := os.Symlink(target, linkPath); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if tt.withInRootFile || tt.withInRootLink {
+				insideRepo := filepath.Join(workspace, "inside-repo")
+				if err := os.MkdirAll(filepath.Join(insideRepo, ".git"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				content := append(encoded(t, map[string]string{"cwd": insideRepo}), '\n')
+				if tt.withInRootFile {
+					inRootDir := filepath.Join(projectsDir, "99-in-root")
+					if err := os.MkdirAll(inRootDir, 0o700); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(filepath.Join(inRootDir, session+".jsonl"), content, 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if tt.withInRootLink {
+					// Keep the target under a different filename so only the relative symlink can locate it.
+					targetDir := filepath.Join(projectsDir, "shared")
+					linkDir := filepath.Join(projectsDir, "50-in-root-link")
+					for _, dir := range []string{targetDir, linkDir} {
+						if err := os.MkdirAll(dir, 0o700); err != nil {
+							t.Fatal(err)
+						}
+					}
+					targetFile := filepath.Join(targetDir, "actual.jsonl")
+					if err := os.WriteFile(targetFile, content, 0o600); err != nil {
+						t.Fatal(err)
+					}
+					rel, err := filepath.Rel(linkDir, targetFile)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Symlink(rel, filepath.Join(linkDir, session+".jsonl")); err != nil {
+						t.Fatal(err)
+					}
 				}
 			}
 
@@ -125,25 +164,14 @@ func TestTranscriptLinkOutsideRoot(t *testing.T) {
 				if bytes.Contains(payload, []byte("outside-repo")) || bytes.Contains(payload, []byte(workspace)) {
 					t.Errorf("%s OTLP payload leaked outside path: %s", r.EventName, payload)
 				}
-				var envelope struct {
-					ResourceLogs []struct {
-						ScopeLogs []struct {
-							LogRecords []struct {
-								Attributes []struct {
-									Key   string            `json:"key"`
-									Value map[string]string `json:"value"`
-								} `json:"attributes"`
-							} `json:"logRecords"`
-						} `json:"scopeLogs"`
-					} `json:"resourceLogs"`
-				}
-				if err := json.Unmarshal(payload, &envelope); err != nil {
-					t.Fatal(err)
-				}
 				var gotExported any
-				for _, attr := range envelope.ResourceLogs[0].ScopeLogs[0].LogRecords[0].Attributes {
+				for _, attr := range otlpLogAttributes(t, payload) {
 					if attr.Key == "project_name" {
-						gotExported = attr.Value["stringValue"]
+						val, ok := attr.Value["stringValue"].(string)
+						if !ok {
+							t.Fatalf("%s OTLP project_name value = %#v, want stringValue", r.EventName, attr.Value)
+						}
+						gotExported = val
 					}
 				}
 				if diff := gocmp.Diff(tt.wantProject, gotExported); diff != "" {
