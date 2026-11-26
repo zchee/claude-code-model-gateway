@@ -382,3 +382,171 @@ func TestBranchJSONSentryAfterEncode(t *testing.T) {
 		})
 	}
 }
+
+// TestBranchStreamTimeoutBeforeHeaders verifies the answer to an event stream whose body stops at
+// the upstream inactivity timeout before the stream's headers were committed to the client. A
+// client that left before the stream began never gets those headers, so the timeout has the outcome
+// of the buffered replies (status 502, upstream_error, contacted) and nothing at all is written to
+// it, even when frames arrived before the stall; a stream cut short keeps the abort. For a client
+// that is still there, the outcome follows whether the stream's headers were committed before the
+// timeout: committed headers end in the abort, uncommitted ones in the fixed timeout 502.
+func TestBranchStreamTimeoutBeforeHeaders(t *testing.T) {
+	const (
+		streamHead  = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n"
+		streamFrame = "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_stream\",\"model\":\"grok-4.7\"}}\n\n"
+		// streamCut announces a chunk and ends the connection inside it.
+		streamCut = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n40\r\ndata: {"
+	)
+	route := outcome.Route{SelectedModel: "claude-grok-4.7[1m]", EffectiveModel: "grok-4.7", Backend: "grok", Via: "direct"}
+	timeoutFacts := outcome.Result{Route: route, Status: http.StatusBadGateway, StatusOverride: "upstream_error", Contacted: true}
+
+	tests := map[string]struct {
+		head       string
+		stall      bool
+		clientGone bool
+		// wantTimeout wants the timeout facts; false wants the abort, unless followCommit is set.
+		wantTimeout bool
+		// followCommit decides between the two by whether the client received the stream's headers.
+		followCommit bool
+	}{
+		"error: event stream stalled for a departed client answers the timeout facts and writes nothing": {
+			head:        streamHead,
+			stall:       true,
+			clientGone:  true,
+			wantTimeout: true,
+		},
+		"error: event stream stalled after a frame for a departed client answers the timeout facts and writes nothing": {
+			head:        streamHead + streamFrame,
+			stall:       true,
+			clientGone:  true,
+			wantTimeout: true,
+		},
+		"error: event stream cut short for a departed client keeps the abort and writes nothing": {
+			head:       streamCut,
+			clientGone: true,
+		},
+		"error: event stream stalled for a present client answers by whether its headers were committed": {
+			head:         streamHead,
+			stall:        true,
+			followCommit: true,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Cleanup(func() { goleak.VerifyNone(t) })
+			synctest.Test(t, func(t *testing.T) {
+				now := time.UnixMilli(1_700_000_000_000)
+				clock := func() time.Time { return now }
+
+				served := make(chan struct{})
+				var dials atomic.Int32
+				var blockedDial atomic.Bool
+				client := upstream.NewClient(upstream.Options{
+					DialContext: func(_ context.Context, _, addr string) (net.Conn, error) {
+						if addr != "grok.fixture.test:80" || dials.Add(1) != 1 {
+							blockedDial.Store(true)
+							return nil, errors.New("blocked an unapproved inference dial")
+						}
+						clientEnd, serverEnd := net.Pipe()
+						go serveUpstreamHead(serverEnd, tt.head, tt.stall, served)
+						return clientEnd, nil
+					},
+				})
+				defer func() { _ = client.Close() }()
+
+				store := mustNewAuthStore(t, grok.AuthOptions{File: validAuthFixture(t, now), Transport: denyNetworkTransport(t), Now: clock})
+				branch := mustNewBranch(t, grok.BranchOptions{Endpoint: "http://grok.fixture.test/v1/responses", Auth: store, Client: client, Now: clock})
+
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				if tt.clientGone {
+					cancel()
+				}
+				body := `{"model":"claude-grok-4.7[1m]","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hello"}]}`
+				r := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/messages", strings.NewReader(body))
+				w := newHeaderProbe()
+				start := time.Now()
+				res, err := branch.Handle(w, r, grok.Request{
+					RawBody:         []byte(body),
+					Path:            "/v1/messages",
+					AdvertisedModel: "claude-grok-4.7[1m]",
+					BackendModel:    "grok-4.7",
+				})
+				elapsed := time.Since(start)
+				_ = client.Close()
+				select {
+				case <-served:
+				case <-time.After(time.Minute):
+					t.Errorf("the fixture upstream connection was not closed after Handle returned (dials=%d)", dials.Load())
+				}
+
+				assertBranchOutcome(t, res, err)
+				if blockedDial.Load() {
+					t.Error("Handle dialed something other than the one fixture upstream connection")
+				}
+				status, headerWrites, got := w.snapshot()
+				assertBranchText(t, "client body", got)
+				if tt.clientGone && (headerWrites != 0 || got != "") {
+					t.Errorf("a client that had left received status %d (%d header writes) and %d body bytes, want nothing", status, headerWrites, len(got))
+				}
+				if tt.stall && elapsed < time.Hour {
+					t.Errorf("stalled stream ended after %v of virtual time, want the one-hour inactivity timeout", elapsed)
+				}
+				if !tt.stall && elapsed >= time.Hour {
+					t.Errorf("a cut-short stream took %v of virtual time, want less than the inactivity timeout", elapsed)
+				}
+
+				wantTimeout := tt.wantTimeout
+				if tt.followCommit {
+					switch status {
+					case http.StatusOK:
+						t.Log("the stream's headers were committed before the timeout: the response aborts")
+						if diff := gocmp.Diff("text/event-stream", w.Header().Get("Content-Type")); diff != "" {
+							t.Errorf("committed stream Content-Type (-want +got):\n%s", diff)
+						}
+						if strings.Contains(got, "Grok upstream timeout") {
+							t.Error("the timeout reply was written after the stream's headers were committed")
+						}
+					case http.StatusBadGateway:
+						t.Log("the stream's headers were not committed before the timeout: the fixed 502 answers it")
+						wantTimeout = true
+						if headerWrites != 1 {
+							t.Errorf("client status written %d times, want once", headerWrites)
+						}
+						if diff := gocmp.Diff(upstreamTimeoutBody, got); diff != "" {
+							t.Errorf("client body (-want +got):\n%s", diff)
+						}
+						if diff := gocmp.Diff("application/json", w.Header().Get("Content-Type")); diff != "" {
+							t.Errorf("client Content-Type (-want +got):\n%s", diff)
+						}
+						if diff := gocmp.Diff(strconv.Itoa(len(upstreamTimeoutBody)), w.Header().Get("Content-Length")); diff != "" {
+							t.Errorf("client Content-Length (-want +got):\n%s", diff)
+						}
+					default:
+						t.Fatalf("a present client received status %d (%d header writes), want the stream's 200 or the timeout 502", status, headerWrites)
+					}
+				}
+
+				if wantTimeout {
+					if err != nil {
+						t.Errorf("Handle() error = %v, want nil with the timeout facts", err)
+					}
+					if diff := gocmp.Diff(timeoutFacts, res); diff != "" {
+						t.Errorf("outcome.Result (-want +got):\n%s", diff)
+					}
+					return
+				}
+				if !errors.Is(err, http.ErrAbortHandler) {
+					t.Errorf("Handle() error = %v, want an error wrapping http.ErrAbortHandler", err)
+				}
+				if !res.Contacted {
+					t.Error("outcome.Result.Contacted = false, want true")
+				}
+				if res.StatusOverride == "" {
+					t.Error("outcome.Result.StatusOverride is empty, want the upstream failure it aborted on")
+				}
+			})
+		})
+	}
+}

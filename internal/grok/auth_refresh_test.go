@@ -16,6 +16,7 @@ package grok_test
 
 import (
 	"context"
+	json "encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -53,7 +54,8 @@ var refreshSecrets = []string{
 	"fixture-issued-key",
 	"fixture-bounded-key",
 	"fixture-fallback-key",
-	"fixture-trap-key",
+	"fixture-rotated-key",
+	"fixture-rotated-refresh",
 }
 
 // tokenCall is one of the two AuthStore entry points that may start a shared refresh.
@@ -131,37 +133,226 @@ func awaitTokenCall(t *testing.T, label string, ch <-chan tokenResult, budget ti
 	}
 }
 
-// TestRefreshWithEndedContext verifies that a caller whose context has already ended starts and
-// joins no refresh: it gets its context's error, no request reaches the issuer and the auth file
-// stays as it was.
+// freshAuthJSON is an auth file whose key stays valid for another hour.
+func freshAuthJSON() string {
+	return fmt.Sprintf(`{"https://auth.x.ai::fixture-client":{"key":"fixture-fresh-token","refresh_token":"fixture-refresh-token","expires_at":%d,"oidc_client_id":"fixture-client","oidc_issuer":"%s"}}`, refreshFixtureNow.Add(time.Hour).UnixMilli(), refreshFixtureIssuer)
+}
+
+// discoveryResponse answers OIDC discovery with the fixture issuer's token endpoint.
+func discoveryResponse(req *http.Request) *http.Response {
+	return jsonHTTPResponse(req, http.StatusOK, `{"token_endpoint":"`+refreshFixtureIssuer+`/discovered/token"}`)
+}
+
+// rotatingIssuer is a fake token endpoint that honours only the refresh token it issued last. An
+// exchange that presents that token supersedes it on receipt, before any reply is sent, as an
+// issuer that rotates refresh tokens does; an exchange that presents any other token is refused.
+type rotatingIssuer struct {
+	mu       sync.Mutex
+	valid    string
+	accepted int
+	refused  int
+}
+
+func newRotatingIssuer(valid string) *rotatingIssuer { return &rotatingIssuer{valid: valid} }
+
+// exchange checks an exchange request and returns the status and body of its reply. The n-th
+// accepted exchange issues fixture-rotated-key-n and fixture-rotated-refresh-n.
+func (i *rotatingIssuer) exchange(req *http.Request) (int, string) {
+	raw, readErr := io.ReadAll(req.Body)
+	form, parseErr := url.ParseQuery(string(raw))
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if readErr != nil || parseErr != nil || form.Get("grant_type") != "refresh_token" || form.Get("client_id") != "fixture-client" || form.Get("refresh_token") != i.valid {
+		i.refused++
+		return http.StatusBadRequest, `{"error":"invalid_grant"}`
+	}
+	i.accepted++
+	i.valid = fmt.Sprintf("fixture-rotated-refresh-%d", i.accepted)
+	return http.StatusOK, fmt.Sprintf(`{"access_token":"fixture-rotated-key-%d","refresh_token":%q,"expires_in":3600}`, i.accepted, i.valid)
+}
+
+// rotate records a rotation made by another client of the issuer: only next is honoured from now on.
+func (i *rotatingIssuer) rotate(next string) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.valid = next
+}
+
+func (i *rotatingIssuer) counts() (accepted, refused int) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	return i.accepted, i.refused
+}
+
+// gatedBody is a response body that delivers content once gate is closed. When the request's
+// context ends first, the read fails with the context's error and cancelled counts it, as a
+// transport that honours cancellation behaves.
+type gatedBody struct {
+	ctx       context.Context
+	gate      <-chan struct{}
+	content   io.Reader
+	cancelled *atomic.Int32
+}
+
+func (b *gatedBody) Read(p []byte) (int, error) {
+	select {
+	case <-b.gate:
+		return b.content.Read(p)
+	default:
+	}
+	select {
+	case <-b.gate:
+		return b.content.Read(p)
+	case <-b.ctx.Done():
+		b.cancelled.Add(1)
+		return 0, b.ctx.Err()
+	}
+}
+
+func (b *gatedBody) Close() error { return nil }
+
+// stalledBody is a body whose bytes never arrive before the request's context ends or teardown.
+func stalledBody(req *http.Request, teardown <-chan struct{}, cancelled *atomic.Int32) io.ReadCloser {
+	return &gatedBody{ctx: req.Context(), gate: teardown, content: strings.NewReader(""), cancelled: cancelled}
+}
+
+// storedCredential returns the key and refresh token the auth file holds now.
+func storedCredential(t *testing.T, file string) (key, refreshToken string) {
+	t.Helper()
+	var doc map[string]struct {
+		Key          string `json:"key"`
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := json.Unmarshal([]byte(readFileString(t, file)), &doc); err != nil {
+		t.Fatal("auth file is not a JSON object of credential entries")
+	}
+	entry := doc["https://auth.x.ai::fixture-client"]
+	return entry.Key, entry.RefreshToken
+}
+
+// receiveNow returns the result of a call that must already have finished, at the current instant
+// of virtual time. When it has not, it reports that, releases every fixture stall and joins it.
+func receiveNow(t *testing.T, label string, ch <-chan tokenResult, release func()) tokenResult {
+	t.Helper()
+	select {
+	case res := <-ch:
+		return res
+	default:
+		t.Errorf("%s was still waiting after it left, with no virtual time passed", label)
+		release()
+		return <-ch
+	}
+}
+
+// TestRefreshWithEndedContext verifies that a caller whose context has already ended gets its
+// context's error and touches nothing: the answer does not depend on the auth file, no request
+// reaches the issuer, no refresh starts and the file stays as it was. That holds when the stored key
+// is fresh and in shadow mode too, where the context's error comes before the shadow refusal. A
+// context that ends after the entry check, during the caller's expiry check, still joins no refresh.
+//
+// The file's part in the answer shows in the result: a missing file would answer ErrAuthMissing and
+// a fresh stored key would be returned, so either means the file was read for an ended context.
 func TestRefreshWithEndedContext(t *testing.T) {
+	expired, fresh := expiredAuthJSON(), freshAuthJSON()
+
 	tests := map[string]struct {
 		call tokenCall
+		// content is the auth file; nil leaves it missing.
+		content *string
+		shadow  bool
+		// deadline ends the context by a deadline already passed instead of by cancellation.
+		deadline bool
+		// endInClock starts with a live context and ends it at the caller's first clock read.
+		endInClock bool
 	}{
-		"error: AccessToken with an ended context starts no refresh": {call: refreshEntryPoints["AccessToken"]},
-		"error: Refresh with an ended context starts no refresh":     {call: refreshEntryPoints["Refresh"]},
+		"error: AccessToken with an ended context starts no refresh": {
+			call:    refreshEntryPoints["AccessToken"],
+			content: &expired,
+		},
+		"error: Refresh with an ended context starts no refresh": {
+			call:    refreshEntryPoints["Refresh"],
+			content: &expired,
+		},
+		"error: AccessToken with an ended context returns no stored fresh key": {
+			call:    refreshEntryPoints["AccessToken"],
+			content: &fresh,
+		},
+		"error: AccessToken with a passed deadline returns no stored fresh key": {
+			call:     refreshEntryPoints["AccessToken"],
+			content:  &fresh,
+			deadline: true,
+		},
+		"error: AccessToken with an ended context reports the context rather than a missing auth file": {
+			call: refreshEntryPoints["AccessToken"],
+		},
+		"error: Refresh with an ended context reports the context rather than a missing auth file": {
+			call: refreshEntryPoints["Refresh"],
+		},
+		"error: shadow AccessToken with an ended context returns no stored fresh key": {
+			call:    refreshEntryPoints["AccessToken"],
+			content: &fresh,
+			shadow:  true,
+		},
+		"error: shadow AccessToken with an ended context reports the context rather than refusing an expired key": {
+			call:    refreshEntryPoints["AccessToken"],
+			content: &expired,
+			shadow:  true,
+		},
+		"error: shadow Refresh with an ended context reports the context before the shadow refusal": {
+			call:    refreshEntryPoints["Refresh"],
+			content: &expired,
+			shadow:  true,
+		},
+		"error: shadow Refresh with an ended context reports the context rather than a missing auth file": {
+			call:   refreshEntryPoints["Refresh"],
+			shadow: true,
+		},
+		"error: AccessToken whose context ends during its expiry check joins no refresh": {
+			call:       refreshEntryPoints["AccessToken"],
+			content:    &expired,
+			endInClock: true,
+		},
 	}
 
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Cleanup(func() { goleak.VerifyNone(t) })
 			synctest.Test(t, func(t *testing.T) {
-				file := filepath.Join(t.TempDir(), "auth.json")
-				content := expiredAuthJSON()
-				writeFixtureFile(t, file, content)
+				dir := t.TempDir()
+				file := filepath.Join(dir, "auth.json")
+				if tt.content != nil {
+					writeFixtureFile(t, file, *tt.content)
+				}
 
 				var requests atomic.Int32
 				tr := roundTripFunc(func(req *http.Request) (*http.Response, error) {
 					requests.Add(1)
 					if req.URL.Path == "/.well-known/openid-configuration" {
-						return jsonHTTPResponse(req, http.StatusOK, `{"token_endpoint":"`+refreshFixtureIssuer+`/discovered/token"}`), nil
+						return discoveryResponse(req), nil
 					}
-					return jsonHTTPResponse(req, http.StatusOK, `{"access_token":"fixture-fresh-token","expires_in":3600}`), nil
+					return jsonHTTPResponse(req, http.StatusOK, `{"access_token":"fixture-exchanged-key","expires_in":3600}`), nil
 				})
-				store := mustNewAuthStore(t, grok.AuthOptions{File: file, Transport: tr, Now: func() time.Time { return refreshFixtureNow }})
 
 				ctx, cancel := context.WithCancel(t.Context())
-				cancel()
+				defer cancel()
+				wantErr := context.Canceled
+				switch {
+				case tt.deadline:
+					ctx, cancel = context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+					defer cancel()
+					wantErr = context.DeadlineExceeded
+				case !tt.endInClock:
+					cancel()
+				}
+				endOnce := sync.OnceFunc(cancel)
+				clock := func() time.Time {
+					if tt.endInClock {
+						endOnce()
+					}
+					return refreshFixtureNow
+				}
+				store := mustNewAuthStore(t, grok.AuthOptions{File: file, Transport: tr, Now: clock, Shadow: tt.shadow})
+
 				token, err := tt.call(store, ctx)
 				// Anything the call left running finishes or blocks before the assertions.
 				synctest.Wait()
@@ -169,30 +360,56 @@ func TestRefreshWithEndedContext(t *testing.T) {
 				if err != nil {
 					assertNoSecrets(t, "ended-context error", err.Error(), refreshSecrets...)
 				}
-				if !errors.Is(err, context.Canceled) {
-					t.Errorf("error = %v, want the context's error %v", err, context.Canceled)
+				if !errors.Is(err, wantErr) {
+					t.Errorf("error = %v, want the context's error %v", err, wantErr)
 				}
 				if token != "" {
 					t.Errorf("returned a token with an ended context (len=%d)", len(token))
 				}
 				if got := requests.Load(); got != 0 {
-					t.Errorf("issuer requests = %d, want 0 for a caller whose context had already ended", got)
+					t.Errorf("issuer requests = %d, want 0 for a caller whose context had ended", got)
 				}
-				assertFileUnchanged(t, file, content)
+				entries, readErr := os.ReadDir(dir)
+				if readErr != nil {
+					t.Fatalf("read fixture directory: %v", readErr)
+				}
+				wantEntries := 0
+				if tt.content != nil {
+					wantEntries = 1
+					assertFileUnchanged(t, file, *tt.content)
+				}
+				if len(entries) != wantEntries {
+					t.Errorf("fixture directory entries = %d, want %d", len(entries), wantEntries)
+				}
 			})
 		})
 	}
 }
 
-// TestRefreshLastWaiterLeaving verifies that the shared refresh's own context ends when its last
-// waiter has left: the stalled issuer request observes the cancellation, no exchange is sent on a
-// live context and the auth file stays as it was.
+// TestRefreshLastWaiterLeaving verifies that the last waiter leaving during discovery stops the
+// shared refresh at once: the caller gets its context's error before any virtual time passes, the
+// stalled discovery request sees its context end at that same instant, and no exchange is ever sent,
+// not even after every request deadline would have passed. The auth file stays as it was.
 func TestRefreshLastWaiterLeaving(t *testing.T) {
 	tests := map[string]struct {
 		call tokenCall
+		// stallBody answers discovery's headers and stalls its body instead of stalling the headers.
+		stallBody bool
 	}{
-		"success: the sole AccessToken caller leaving ends the shared refresh": {call: refreshEntryPoints["AccessToken"]},
-		"success: the sole Refresh caller leaving ends the shared refresh":     {call: refreshEntryPoints["Refresh"]},
+		"success: the sole AccessToken caller leaving during discovery ends the shared refresh": {
+			call: refreshEntryPoints["AccessToken"],
+		},
+		"success: the sole Refresh caller leaving during discovery ends the shared refresh": {
+			call: refreshEntryPoints["Refresh"],
+		},
+		"success: the sole AccessToken caller leaving while the discovery body arrives ends the shared refresh": {
+			call:      refreshEntryPoints["AccessToken"],
+			stallBody: true,
+		},
+		"success: the sole Refresh caller leaving while the discovery body arrives ends the shared refresh": {
+			call:      refreshEntryPoints["Refresh"],
+			stallBody: true,
+		},
 	}
 
 	for name, tt := range tests {
@@ -207,15 +424,18 @@ func TestRefreshLastWaiterLeaving(t *testing.T) {
 				release := sync.OnceFunc(func() { close(teardown) })
 				defer release()
 
-				var stalls, cancelled, liveExchanges atomic.Int32
+				var discoveries, cancelled, exchanges atomic.Int32
 				tr := roundTripFunc(func(req *http.Request) (*http.Response, error) {
-					if req.Context().Err() != nil {
-						return nil, req.Context().Err()
-					}
 					if req.Method == http.MethodPost {
-						liveExchanges.Add(1)
+						exchanges.Add(1)
+						return jsonHTTPResponse(req, http.StatusOK, `{"access_token":"fixture-exchanged-key","expires_in":3600}`), nil
 					}
-					stalls.Add(1)
+					discoveries.Add(1)
+					if tt.stallBody {
+						resp := discoveryResponse(req)
+						resp.Body = stalledBody(req, teardown, &cancelled)
+						return resp, nil
+					}
 					select {
 					case <-req.Context().Done():
 						cancelled.Add(1)
@@ -229,12 +449,123 @@ func TestRefreshLastWaiterLeaving(t *testing.T) {
 				ctx, cancel := context.WithCancel(t.Context())
 				done := startTokenCall(store, ctx, tt.call)
 				synctest.Wait()
-				if got := stalls.Load(); got != 1 {
-					t.Fatalf("stalled issuer requests before the caller left = %d, want 1", got)
+				if got := discoveries.Load(); got != 1 {
+					release()
+					t.Fatalf("stalled discovery requests before the caller left = %d, want 1", got)
 				}
 
+				start := time.Now()
 				cancel()
-				res := awaitTokenCall(t, "departing caller", done, time.Minute, release)
+				synctest.Wait()
+				res := receiveNow(t, "departing caller", done, release)
+				if elapsed := time.Since(start); elapsed != 0 {
+					t.Errorf("departing caller got its answer after %v of virtual time, want at once", elapsed)
+				}
+				if res.err != nil {
+					assertNoSecrets(t, "departing caller error", res.err.Error(), refreshSecrets...)
+				}
+				if !errors.Is(res.err, context.Canceled) {
+					t.Errorf("departing caller error = %v, want %v", res.err, context.Canceled)
+				}
+				if res.token != "" {
+					t.Errorf("departing caller returned a token (len=%d)", len(res.token))
+				}
+				if got := cancelled.Load(); got == 0 {
+					t.Error("the stalled discovery request did not see its context end at the instant the last waiter left")
+				}
+
+				// Let every request deadline pass: a stopped refresh sends no late exchange.
+				time.Sleep(time.Minute)
+				synctest.Wait()
+				if got := exchanges.Load(); got != 0 {
+					t.Errorf("exchanges after the last waiter left during discovery = %d, want 0", got)
+				}
+				assertFileUnchanged(t, file, content)
+			})
+		})
+	}
+}
+
+// TestRefreshLastWaiterLeavingDuringExchange verifies that once the exchange request has reached the
+// issuer, its last waiter leaving no longer ends the refresh. The waiter gets its context's error at
+// once; the refresh reads the reply and stores the rotated credential. The issuer superseded the
+// presented refresh token when the request arrived, so the next refresh succeeds only by presenting
+// the rotated one the refresh stored.
+func TestRefreshLastWaiterLeavingDuringExchange(t *testing.T) {
+	tests := map[string]struct {
+		call tokenCall
+		// stallBody answers the exchange's headers and holds its body instead of holding the headers.
+		stallBody bool
+	}{
+		"success: AccessToken caller leaving before the exchange reply arrives keeps the rotated credential": {
+			call: refreshEntryPoints["AccessToken"],
+		},
+		"success: Refresh caller leaving before the exchange reply arrives keeps the rotated credential": {
+			call: refreshEntryPoints["Refresh"],
+		},
+		"success: AccessToken caller leaving while the exchange reply body arrives keeps the rotated credential": {
+			call:      refreshEntryPoints["AccessToken"],
+			stallBody: true,
+		},
+		"success: Refresh caller leaving while the exchange reply body arrives keeps the rotated credential": {
+			call:      refreshEntryPoints["Refresh"],
+			stallBody: true,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Cleanup(func() { goleak.VerifyNone(t) })
+			synctest.Test(t, func(t *testing.T) {
+				file := filepath.Join(t.TempDir(), "auth.json")
+				writeFixtureFile(t, file, expiredAuthJSON())
+
+				issuer := newRotatingIssuer("fixture-refresh-token")
+				gate := make(chan struct{})
+				release := sync.OnceFunc(func() { close(gate) })
+				defer release()
+
+				var held atomic.Bool
+				var cancelled atomic.Int32
+				tr := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					if req.URL.Path == "/.well-known/openid-configuration" {
+						return discoveryResponse(req), nil
+					}
+					status, body := issuer.exchange(req)
+					// Only the first exchange is held; the next refresh is answered at once.
+					if !held.CompareAndSwap(false, true) {
+						return jsonHTTPResponse(req, status, body), nil
+					}
+					if tt.stallBody {
+						resp := jsonHTTPResponse(req, status, "")
+						resp.Body = &gatedBody{ctx: req.Context(), gate: gate, content: strings.NewReader(body), cancelled: &cancelled}
+						return resp, nil
+					}
+					select {
+					case <-gate:
+						return jsonHTTPResponse(req, status, body), nil
+					case <-req.Context().Done():
+						cancelled.Add(1)
+						return nil, req.Context().Err()
+					}
+				})
+				store := mustNewAuthStore(t, grok.AuthOptions{File: file, Transport: tr, Now: func() time.Time { return refreshFixtureNow }})
+
+				ctx, cancel := context.WithCancel(t.Context())
+				done := startTokenCall(store, ctx, tt.call)
+				synctest.Wait()
+				if accepted, refused := issuer.counts(); accepted != 1 || refused != 0 {
+					release()
+					t.Fatalf("issuer accepted %d and refused %d exchanges before the caller left, want 1 accepted", accepted, refused)
+				}
+
+				start := time.Now()
+				cancel()
+				synctest.Wait()
+				res := receiveNow(t, "departing caller", done, release)
+				if elapsed := time.Since(start); elapsed != 0 {
+					t.Errorf("departing caller got its answer after %v of virtual time, want at once", elapsed)
+				}
 				if res.err != nil {
 					assertNoSecrets(t, "departing caller error", res.err.Error(), refreshSecrets...)
 				}
@@ -245,18 +576,26 @@ func TestRefreshLastWaiterLeaving(t *testing.T) {
 					t.Errorf("departing caller returned a token (len=%d)", len(res.token))
 				}
 
-				// With no waiter left, the shared refresh must end its own requests.
-				synctest.Wait()
-				if got := cancelled.Load(); got < 1 {
-					t.Errorf("stalled issuer requests that saw their context end after the last waiter left = %d, want at least 1", got)
-				}
-				if got := liveExchanges.Load(); got != 0 {
-					t.Errorf("exchanges sent on a live context after the last waiter left = %d, want 0", got)
-				}
-				assertFileUnchanged(t, file, content)
-
+				// The reply completes after its last waiter left.
 				release()
 				synctest.Wait()
+				if got := cancelled.Load(); got != 0 {
+					t.Errorf("the exchange saw its context end %d times after its last waiter left, although the issuer had already rotated the refresh token", got)
+				}
+				if key, refreshToken := storedCredential(t, file); key != "fixture-rotated-key-1" || refreshToken != "fixture-rotated-refresh-1" {
+					t.Errorf("auth file does not hold the rotated credential of the exchange its last waiter left (key len=%d, refresh token len=%d)", len(key), len(refreshToken))
+				}
+
+				token, err := store.Refresh(t.Context())
+				if err != nil {
+					assertNoSecrets(t, "next Refresh error", err.Error(), refreshSecrets...)
+					t.Errorf("next Refresh error = %v, want the key of an exchange that presents the rotated refresh token", err)
+				} else if token != "fixture-rotated-key-2" {
+					t.Errorf("next Refresh returned an unexpected token (len=%d)", len(token))
+				}
+				if accepted, refused := issuer.counts(); accepted != 2 || refused != 0 {
+					t.Errorf("issuer accepted %d and refused %d exchanges, want 2 accepted and none presenting a superseded refresh token", accepted, refused)
+				}
 			})
 		})
 	}
@@ -333,16 +672,94 @@ func TestRefreshWaiterLeavingKeepsOthers(t *testing.T) {
 	}
 }
 
-// TestRefreshStalledIssuerDeadline verifies that every discovery and exchange request has a finite
-// deadline: an issuer that accepts the request and never answers fails the refresh with the fixed
-// refresh failure within 60 seconds of virtual time (two requests of at most 30 seconds each), and
-// the auth file stays as it was.
+// TestRefreshStalledIssuerDeadline verifies that each discovery and exchange request has its own
+// 30 second deadline, and that the deadline covers the reply body as well as its headers. An issuer
+// that stalls one request fails the refresh with the fixed refresh failure exactly 30 seconds of
+// virtual time after that request started; a stalled discovery never leads to an exchange, even
+// after more time passes; the auth file stays as it was. An issuer that answers each request just
+// inside its own deadline refreshes normally, which a single budget for the whole refresh would not
+// allow.
 func TestRefreshStalledIssuerDeadline(t *testing.T) {
+	const (
+		requestDeadline = 30 * time.Second
+		discoveryPath   = "/.well-known/openid-configuration"
+		exchangePath    = "/discovered/token"
+	)
+
 	tests := map[string]struct {
 		call tokenCall
+		// stallPath is the request the issuer never answers; empty answers every request.
+		stallPath string
+		// stallBody answers the stalled request's headers and never sends its body.
+		stallBody bool
+		// delay is how long the issuer takes to answer each request it answers.
+		delay         time.Duration
+		wantElapsed   time.Duration
+		wantExchanges int32
+		wantToken     string
 	}{
-		"error: AccessToken against a stalled issuer fails within the request deadlines": {call: refreshEntryPoints["AccessToken"]},
-		"error: Refresh against a stalled issuer fails within the request deadlines":     {call: refreshEntryPoints["Refresh"]},
+		"error: AccessToken with discovery stalled before its headers fails at the request deadline": {
+			call:        refreshEntryPoints["AccessToken"],
+			stallPath:   discoveryPath,
+			wantElapsed: requestDeadline,
+		},
+		"error: Refresh with discovery stalled before its headers fails at the request deadline": {
+			call:        refreshEntryPoints["Refresh"],
+			stallPath:   discoveryPath,
+			wantElapsed: requestDeadline,
+		},
+		"error: AccessToken with the discovery body stalled fails at the request deadline": {
+			call:        refreshEntryPoints["AccessToken"],
+			stallPath:   discoveryPath,
+			stallBody:   true,
+			wantElapsed: requestDeadline,
+		},
+		"error: Refresh with the discovery body stalled fails at the request deadline": {
+			call:        refreshEntryPoints["Refresh"],
+			stallPath:   discoveryPath,
+			stallBody:   true,
+			wantElapsed: requestDeadline,
+		},
+		"error: AccessToken with the exchange stalled before its headers fails at the request deadline": {
+			call:          refreshEntryPoints["AccessToken"],
+			stallPath:     exchangePath,
+			wantElapsed:   requestDeadline,
+			wantExchanges: 1,
+		},
+		"error: Refresh with the exchange stalled before its headers fails at the request deadline": {
+			call:          refreshEntryPoints["Refresh"],
+			stallPath:     exchangePath,
+			wantElapsed:   requestDeadline,
+			wantExchanges: 1,
+		},
+		"error: AccessToken with the exchange body stalled fails at the request deadline": {
+			call:          refreshEntryPoints["AccessToken"],
+			stallPath:     exchangePath,
+			stallBody:     true,
+			wantElapsed:   requestDeadline,
+			wantExchanges: 1,
+		},
+		"error: Refresh with the exchange body stalled fails at the request deadline": {
+			call:          refreshEntryPoints["Refresh"],
+			stallPath:     exchangePath,
+			stallBody:     true,
+			wantElapsed:   requestDeadline,
+			wantExchanges: 1,
+		},
+		"success: AccessToken with each request answered just inside its own deadline refreshes": {
+			call:          refreshEntryPoints["AccessToken"],
+			delay:         requestDeadline - time.Second,
+			wantElapsed:   2 * (requestDeadline - time.Second),
+			wantExchanges: 1,
+			wantToken:     "fixture-exchanged-key",
+		},
+		"success: Refresh with each request answered just inside its own deadline refreshes": {
+			call:          refreshEntryPoints["Refresh"],
+			delay:         requestDeadline - time.Second,
+			wantElapsed:   2 * (requestDeadline - time.Second),
+			wantExchanges: 1,
+			wantToken:     "fixture-exchanged-key",
+		},
 	}
 
 	for name, tt := range tests {
@@ -357,54 +774,110 @@ func TestRefreshStalledIssuerDeadline(t *testing.T) {
 				release := sync.OnceFunc(func() { close(teardown) })
 				defer release()
 
-				var requests, deadlines atomic.Int32
+				type seenRequest struct {
+					path        string
+					hasDeadline bool
+					remaining   time.Duration
+				}
+				var (
+					mu        sync.Mutex
+					seen      []seenRequest
+					exchanges atomic.Int32
+					cancelled atomic.Int32
+				)
 				tr := roundTripFunc(func(req *http.Request) (*http.Response, error) {
-					requests.Add(1)
-					if _, ok := req.Context().Deadline(); ok {
-						deadlines.Add(1)
+					deadline, ok := req.Context().Deadline()
+					mu.Lock()
+					seen = append(seen, seenRequest{path: req.URL.Path, hasDeadline: ok, remaining: time.Until(deadline)})
+					mu.Unlock()
+					if req.Method == http.MethodPost {
+						exchanges.Add(1)
 					}
-					select {
-					case <-req.Context().Done():
-						return nil, req.Context().Err()
-					case <-teardown:
-						return nil, errors.New("fixture issuer released at teardown")
+					stalled := req.URL.Path == tt.stallPath
+					switch {
+					case stalled && !tt.stallBody:
+						select {
+						case <-req.Context().Done():
+							return nil, req.Context().Err()
+						case <-teardown:
+							return nil, errors.New("fixture issuer released at teardown")
+						}
+					case !stalled && tt.delay > 0:
+						select {
+						case <-time.After(tt.delay):
+						case <-req.Context().Done():
+							return nil, req.Context().Err()
+						}
 					}
+					resp := discoveryResponse(req)
+					if req.Method == http.MethodPost {
+						resp = jsonHTTPResponse(req, http.StatusOK, `{"access_token":"fixture-exchanged-key","expires_in":3600}`)
+					}
+					if stalled {
+						resp.Body = stalledBody(req, teardown, &cancelled)
+					}
+					return resp, nil
 				})
 				store := mustNewAuthStore(t, grok.AuthOptions{File: file, Transport: tr, Now: func() time.Time { return refreshFixtureNow }})
 
 				start := time.Now()
 				done := startTokenCall(store, t.Context(), tt.call)
-				res := awaitTokenCall(t, "refresh against a stalled issuer", done, 10*time.Minute, release)
-				elapsed := time.Since(start)
+				res := awaitTokenCall(t, "refresh against a stalling issuer", done, 10*time.Minute, release)
+				if elapsed := time.Since(start); elapsed != tt.wantElapsed {
+					t.Errorf("refresh answered after %v of virtual time, want exactly %v", elapsed, tt.wantElapsed)
+				}
 
-				if elapsed > time.Minute {
-					t.Errorf("refresh against a stalled issuer took %v of virtual time, want at most 1m0s", elapsed)
+				mu.Lock()
+				for _, r := range seen {
+					switch {
+					case !r.hasDeadline:
+						t.Errorf("request to %s carried no deadline", r.path)
+					case r.remaining != requestDeadline:
+						t.Errorf("request to %s started with %v left before its deadline, want %v", r.path, r.remaining, requestDeadline)
+					}
+				}
+				mu.Unlock()
+
+				// Let more time pass: a refresh that failed at discovery sends no late exchange.
+				time.Sleep(time.Minute)
+				synctest.Wait()
+				if got := exchanges.Load(); got != tt.wantExchanges {
+					t.Errorf("exchanges = %d, want %d", got, tt.wantExchanges)
+				}
+
+				if tt.wantToken != "" {
+					if res.err != nil {
+						assertNoSecrets(t, "refresh error", res.err.Error(), refreshSecrets...)
+						t.Fatalf("refresh error = %v, want the exchanged key", res.err)
+					}
+					if res.token != tt.wantToken {
+						t.Errorf("refresh returned an unexpected token (len=%d)", len(res.token))
+					}
+					if key, _ := storedCredential(t, file); key != tt.wantToken {
+						t.Errorf("auth file does not hold the exchanged key (len=%d)", len(key))
+					}
+					return
 				}
 				if res.token != "" {
-					t.Errorf("returned a token from a stalled issuer (len=%d)", len(res.token))
+					t.Errorf("returned a token from a stalling issuer (len=%d)", len(res.token))
 				}
-				assertExactErr(t, "stalled issuer", res.err, grok.ErrAuthRefreshFailed)
-				if got := requests.Load(); got < 1 {
-					t.Errorf("issuer requests = %d, want at least 1", got)
-				}
-				t.Logf("issuer requests=%d, with a deadline=%d, virtual elapsed=%v", requests.Load(), deadlines.Load(), elapsed)
+				assertExactErr(t, "stalling issuer", res.err, grok.ErrAuthRefreshFailed)
 				assertFileUnchanged(t, file, content)
-				release()
-				synctest.Wait()
 			})
 		})
 	}
 }
 
-// TestExplicitRefreshAfterFlightWithoutExchange verifies that an explicit Refresh joining a shared
-// refresh that made no exchange runs one exchange of its own afterwards and never returns a key no
-// exchange produced.
+// TestExplicitRefreshAfterFlightWithoutExchange verifies that an explicit Refresh that arrives while
+// a shared refresh is running, which then finds the stored key fresh and exchanges nothing, runs one
+// exchange of its own afterwards and never returns a key no exchange produced. Its exchange presents
+// the refresh token the file holds by then; the issuer honours no other.
 //
-// The AccessToken caller finds the stored key expiring; before its shared refresh re-reads the
-// file, another process stores a fresh key, so that refresh returns the fresh key without an
-// exchange. The clock hook drives the order: its first call (the caller's expiry check) stores the
-// fresh key, and its second call (the expiry check inside the shared refresh, after the re-read)
-// holds the shared refresh open until Refresh has joined it.
+// The AccessToken caller finds the stored key expired. At the first clock read, which follows the
+// caller's own read of the file, another client of the issuer rotates the refresh token and stores a
+// fresh key with it. Every later clock read waits at a barrier, which holds the shared refresh open
+// at its expiry check. Before the barrier is lifted, the test checks that Refresh is still waiting
+// and that no exchange has run, so Refresh demonstrably arrived while the shared refresh was open.
 func TestExplicitRefreshAfterFlightWithoutExchange(t *testing.T) {
 	t.Cleanup(func() { goleak.VerifyNone(t) })
 	synctest.Test(t, func(t *testing.T) {
@@ -412,36 +885,32 @@ func TestExplicitRefreshAfterFlightWithoutExchange(t *testing.T) {
 		writeFixtureFile(t, file, expiredAuthJSON())
 		external := fmt.Sprintf(`{"https://auth.x.ai::fixture-client":{"key":"fixture-external-key","refresh_token":"fixture-external-refresh","expires_at":%d,"oidc_client_id":"fixture-client","oidc_issuer":"%s"}}`, refreshFixtureNow.Add(time.Hour).UnixMilli(), refreshFixtureIssuer)
 
-		var exchanges atomic.Int32
+		issuer := newRotatingIssuer("fixture-refresh-token")
 		tr := roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			if req.URL.Path == "/.well-known/openid-configuration" {
-				return jsonHTTPResponse(req, http.StatusOK, `{"token_endpoint":"`+refreshFixtureIssuer+`/discovered/token"}`), nil
+				return discoveryResponse(req), nil
 			}
-			raw, _ := io.ReadAll(req.Body)
-			form, err := url.ParseQuery(string(raw))
-			if err != nil || form.Get("grant_type") != "refresh_token" || form.Get("client_id") != "fixture-client" || form.Get("refresh_token") == "" {
-				return jsonHTTPResponse(req, http.StatusBadRequest, `{"error":"invalid_grant"}`), nil
-			}
-			exchanges.Add(1)
-			return jsonHTTPResponse(req, http.StatusOK, `{"access_token":"fixture-exchanged-key","refresh_token":"fixture-exchanged-refresh","expires_in":3600}`), nil
+			status, body := issuer.exchange(req)
+			return jsonHTTPResponse(req, status, body), nil
 		})
 
-		gate := make(chan struct{})
-		release := sync.OnceFunc(func() { close(gate) })
-		defer release()
+		barrier := make(chan struct{})
+		lift := sync.OnceFunc(func() { close(barrier) })
+		defer lift()
 		entered := make(chan struct{})
+		enter := sync.OnceFunc(func() { close(entered) })
 		hookErr := make(chan error, 1)
-		var clockCalls atomic.Int32
+		var rotated atomic.Bool
 		clock := func() time.Time {
-			switch clockCalls.Add(1) {
-			case 1:
+			if rotated.CompareAndSwap(false, true) {
+				issuer.rotate("fixture-external-refresh")
 				if err := os.WriteFile(file, []byte(external), 0o600); err != nil {
 					hookErr <- err
 				}
-			case 2:
-				close(entered)
-				<-gate
+				return refreshFixtureNow
 			}
+			enter()
+			<-barrier
 			return refreshFixtureNow
 		}
 		store := mustNewAuthStore(t, grok.AuthOptions{File: file, Transport: tr, Now: clock})
@@ -450,42 +919,61 @@ func TestExplicitRefreshAfterFlightWithoutExchange(t *testing.T) {
 		select {
 		case <-entered:
 		case res := <-access:
-			t.Fatalf("AccessToken finished before its shared refresh checked the clock (err=%v, token len=%d); this test needs the expiry check inside the shared refresh", res.err, len(res.token))
+			t.Fatalf("AccessToken finished without a clock read after the stored key changed (err=%v, token len=%d); its shared refresh must check the expiry it re-read", res.err, len(res.token))
 		case <-time.After(time.Minute):
-			t.Fatal("AccessToken never reached the expiry check of its shared refresh")
+			lift()
+			t.Fatal("AccessToken never read the clock again after the stored key changed")
 		}
 		select {
 		case err := <-hookErr:
+			lift()
 			t.Fatalf("store the externally rotated key: %v", err)
 		default:
 		}
 
 		refresh := startTokenCall(store, t.Context(), refreshEntryPoints["Refresh"])
 		synctest.Wait()
-		release()
+		var gotRefresh tokenResult
+		refreshEnded := false
+		select {
+		case gotRefresh = <-refresh:
+			refreshEnded = true
+			accepted, refused := issuer.counts()
+			t.Errorf("Refresh finished while the shared refresh was held open (exchanges accepted=%d refused=%d); it must wait for the refresh in flight", accepted, refused)
+		default:
+			if accepted, refused := issuer.counts(); accepted+refused != 0 {
+				t.Errorf("exchanges while the shared refresh was held open: accepted=%d refused=%d, want none (Refresh ran an exchange beside the refresh in flight, or AccessToken read the clock again before starting it)", accepted, refused)
+			}
+		}
+		lift()
 
-		gotAccess := awaitTokenCall(t, "AccessToken", access, time.Minute, release)
-		gotRefresh := awaitTokenCall(t, "Refresh", refresh, time.Minute, release)
+		gotAccess := awaitTokenCall(t, "AccessToken", access, time.Minute, lift)
+		if !refreshEnded {
+			gotRefresh = awaitTokenCall(t, "Refresh", refresh, time.Minute, lift)
+		}
 
 		if gotAccess.err != nil {
 			assertNoSecrets(t, "AccessToken error", gotAccess.err.Error(), refreshSecrets...)
 			t.Errorf("AccessToken error = %v, want a valid key", gotAccess.err)
-		} else if gotAccess.token != "fixture-external-key" && gotAccess.token != "fixture-exchanged-key" {
+		} else if gotAccess.token != "fixture-external-key" && gotAccess.token != "fixture-rotated-key-1" {
 			t.Errorf("AccessToken returned neither the stored fresh key nor the exchanged key (len=%d)", len(gotAccess.token))
 		}
 		if gotRefresh.err != nil {
 			assertNoSecrets(t, "Refresh error", gotRefresh.err.Error(), refreshSecrets...)
-			t.Fatalf("Refresh error = %v, want the key of its own exchange", gotRefresh.err)
+			t.Fatalf("Refresh error = %v, want the key of its own exchange presenting the rotated refresh token", gotRefresh.err)
 		}
 		switch gotRefresh.token {
-		case "fixture-exchanged-key":
+		case "fixture-rotated-key-1":
 		case "fixture-external-key":
 			t.Error("Refresh returned the stored key that no exchange produced")
 		default:
 			t.Errorf("Refresh returned an unexpected token (len=%d)", len(gotRefresh.token))
 		}
-		if got := exchanges.Load(); got != 1 {
-			t.Errorf("exchanges = %d, want 1 (the one Refresh runs after the shared refresh made none)", got)
+		if accepted, refused := issuer.counts(); accepted != 1 || refused != 0 {
+			t.Errorf("issuer accepted %d and refused %d exchanges, want 1 accepted (the one Refresh runs after the shared refresh made none) and none presenting a superseded refresh token", accepted, refused)
+		}
+		if key, refreshToken := storedCredential(t, file); key != "fixture-rotated-key-1" || refreshToken != "fixture-rotated-refresh-1" {
+			t.Errorf("auth file does not hold the credential of Refresh's exchange (key len=%d, refresh token len=%d)", len(key), len(refreshToken))
 		}
 	})
 }
@@ -578,41 +1066,80 @@ func (b *countingBody) Read(p []byte) (int, error) {
 
 func (b *countingBody) Close() error { return nil }
 
-// paddedJSON returns head, a pad string member and the closing brace, exactly size bytes long.
-func paddedJSON(t *testing.T, head string, size int) string {
+// paddedJSON returns obj followed by spaces, exactly size bytes long: one complete JSON document, so
+// only the size bound can reject it.
+func paddedJSON(t *testing.T, obj string, size int) string {
 	t.Helper()
-	open := head + `,"pad":"`
-	const closing = `"}`
-	n := size - len(open) - len(closing)
-	if n < 0 {
-		t.Fatalf("padded JSON of %d bytes cannot hold its head", size)
+	if size < len(obj) {
+		t.Fatalf("padded JSON of %d bytes cannot hold its %d byte object", size, len(obj))
 	}
-	return open + strings.Repeat("x", n) + closing
+	return obj + strings.Repeat(" ", size-len(obj))
 }
 
+// breakingBody serves content, and on the read that takes the bytes served past limit it reports a
+// read error that is not io.EOF together with those bytes, as a connection reset mid-body may.
+type breakingBody struct {
+	content string
+	off     int
+	limit   int
+	n       *atomic.Int64
+}
+
+func (b *breakingBody) Read(p []byte) (int, error) {
+	if b.off >= len(b.content) {
+		return 0, io.EOF
+	}
+	n := copy(p, b.content[b.off:])
+	b.off += n
+	b.n.Add(int64(n))
+	if b.off > b.limit {
+		return n, errors.New("fixture connection reset")
+	}
+	return n, nil
+}
+
+func (b *breakingBody) Close() error { return nil }
+
 // TestRefreshBodyBound verifies that discovery and exchange response bodies are read through a
-// 1 MiB bound: a body of exactly 1 MiB is accepted, a larger exchange body fails the refresh
-// without rewriting the auth file, and no reader consumes much more than the bound of a larger
-// body.
+// 1 MiB bound. A complete body of exactly 1 MiB is used; one byte more fails the refresh, as does a
+// body past the bound whose last read also reported an error, and no reader consumes much more than
+// the bound of a larger body. A discovery body past the bound fails the refresh without any
+// exchange: neither the endpoint it names nor the conventional fallback is contacted.
 func TestRefreshBodyBound(t *testing.T) {
 	const (
 		mib = 1 << 20
 		// readSlack allows a bounded reader to look one buffer past the bound to detect a larger body.
 		readSlack = 64 << 10
 	)
+	discoveryObject := `{"token_endpoint":"` + refreshFixtureIssuer + `/discovered/token"}`
+	exchangeObject := `{"access_token":"fixture-bounded-key","expires_in":3600}`
 
 	tests := map[string]struct {
-		discoverySize int
-		exchangeSize  int
-		// eitherOutcome accepts both the fixed refresh failure and a refresh that fell back to the
-		// conventional token endpoint, for an oversized discovery body.
-		eitherOutcome bool
-		wantToken     string
-		wantErr       error
+		// discoverySize and exchangeSize pad the reply to that many bytes; zero sends the bare object.
+		discoverySize, exchangeSize int
+		// discoveryBreak and exchangeBreak report a read error with the read that passes one MiB.
+		discoveryBreak, exchangeBreak bool
+		// wantErr nil wants the bounded key from the discovered token endpoint.
+		wantErr error
 	}{
+		"success: discovery body of exactly one MiB names the token endpoint": {
+			discoverySize: mib,
+		},
+		"error: discovery body one byte over one MiB fails the refresh without an exchange": {
+			discoverySize: mib + 1,
+			wantErr:       grok.ErrAuthRefreshFailed,
+		},
+		"error: discovery body of eight MiB fails the refresh after a bounded read": {
+			discoverySize: 8 * mib,
+			wantErr:       grok.ErrAuthRefreshFailed,
+		},
+		"error: discovery body past one MiB read together with an error fails the refresh without an exchange": {
+			discoverySize:  2 * mib,
+			discoveryBreak: true,
+			wantErr:        grok.ErrAuthRefreshFailed,
+		},
 		"success: exchange body of exactly one MiB is accepted": {
 			exchangeSize: mib,
-			wantToken:    "fixture-bounded-key",
 		},
 		"error: exchange body one byte over one MiB fails the refresh": {
 			exchangeSize: mib + 1,
@@ -622,9 +1149,10 @@ func TestRefreshBodyBound(t *testing.T) {
 			exchangeSize: 8 * mib,
 			wantErr:      grok.ErrAuthRefreshFailed,
 		},
-		"error: discovery body of eight MiB is read through the bound and its endpoint is never used": {
-			discoverySize: 8 * mib,
-			eitherOutcome: true,
+		"error: exchange body past one MiB read together with an error fails the refresh": {
+			exchangeSize:  2 * mib,
+			exchangeBreak: true,
+			wantErr:       grok.ErrAuthRefreshFailed,
 		},
 	}
 
@@ -637,35 +1165,33 @@ func TestRefreshBodyBound(t *testing.T) {
 			content := expiredAuthJSON()
 			writeFixtureFile(t, file, content)
 
-			var discoveryRead, exchangeRead atomic.Int64
-			var trapHits, fallbackHits atomic.Int32
-			tr := roundTripFunc(func(req *http.Request) (*http.Response, error) {
-				switch req.URL.Path {
-				case "/.well-known/openid-configuration":
-					body := `{"token_endpoint":"` + refreshFixtureIssuer + `/discovered/token"}`
-					if tt.discoverySize > 0 {
-						body = paddedJSON(t, `{"token_endpoint":"`+refreshFixtureIssuer+`/trap/token"`, tt.discoverySize)
-					}
-					resp := jsonHTTPResponse(req, http.StatusOK, "")
-					resp.Body = &countingBody{r: strings.NewReader(body), n: &discoveryRead}
-					return resp, nil
-				case "/discovered/token":
-					body := `{"access_token":"fixture-bounded-key","expires_in":3600}`
-					if tt.exchangeSize > 0 {
-						body = paddedJSON(t, `{"access_token":"fixture-bounded-key","expires_in":3600`, tt.exchangeSize)
-					}
-					resp := jsonHTTPResponse(req, http.StatusOK, "")
-					resp.Body = &countingBody{r: strings.NewReader(body), n: &exchangeRead}
-					return resp, nil
-				case "/oauth/token":
-					fallbackHits.Add(1)
-					return jsonHTTPResponse(req, http.StatusOK, `{"access_token":"fixture-fallback-key","expires_in":3600}`), nil
-				case "/trap/token":
-					trapHits.Add(1)
-					return jsonHTTPResponse(req, http.StatusOK, `{"access_token":"fixture-trap-key","expires_in":3600}`), nil
-				default:
-					return jsonHTTPResponse(req, http.StatusNotFound, `{}`), nil
+			reply := func(obj string, size int, broken bool, n *atomic.Int64) io.ReadCloser {
+				body := obj
+				if size > 0 {
+					body = paddedJSON(t, obj, size)
 				}
+				if broken {
+					return &breakingBody{content: body, limit: mib, n: n}
+				}
+				return &countingBody{r: strings.NewReader(body), n: n}
+			}
+
+			var discoveryRead, exchangeRead atomic.Int64
+			var discoveredHits, otherHits atomic.Int32
+			tr := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				resp := jsonHTTPResponse(req, http.StatusOK, "")
+				switch {
+				case req.Method == http.MethodGet && req.URL.Path == "/.well-known/openid-configuration":
+					resp.Body = reply(discoveryObject, tt.discoverySize, tt.discoveryBreak, &discoveryRead)
+				case req.Method == http.MethodPost && req.URL.Path == "/discovered/token":
+					discoveredHits.Add(1)
+					resp.Body = reply(exchangeObject, tt.exchangeSize, tt.exchangeBreak, &exchangeRead)
+				default:
+					// The conventional fallback endpoint, or anything else: never wanted here.
+					otherHits.Add(1)
+					resp.Body = io.NopCloser(strings.NewReader(`{"access_token":"fixture-fallback-key","expires_in":3600}`))
+				}
+				return resp, nil
 			})
 			store := mustNewAuthStore(t, grok.AuthOptions{File: file, Transport: tr, Now: func() time.Time { return refreshFixtureNow }})
 
@@ -677,41 +1203,35 @@ func TestRefreshBodyBound(t *testing.T) {
 			if got := exchangeRead.Load(); got > mib+readSlack {
 				t.Errorf("exchange body bytes read = %d, want at most %d (1 MiB bound plus one read buffer)", got, mib+readSlack)
 			}
-			if got := trapHits.Load(); got != 0 {
-				t.Errorf("token endpoint named by an oversized discovery body was contacted %d times, want 0", got)
+			if got := otherHits.Load(); got != 0 {
+				t.Errorf("requests to anything but discovery and the discovered token endpoint = %d, want 0 (no fallback exchange)", got)
 			}
 
-			switch {
-			case tt.eitherOutcome:
+			if tt.wantErr == nil {
 				if err != nil {
-					assertExactErr(t, "oversized discovery", err, grok.ErrAuthRefreshFailed)
-					if token != "" {
-						t.Errorf("returned a token with an error (len=%d)", len(token))
-					}
-					assertFileUnchanged(t, file, content)
-					t.Log("oversized discovery body failed the refresh")
-					return
+					assertNoSecrets(t, "bounded refresh error", err.Error(), refreshSecrets...)
+					t.Fatalf("Refresh() error = %v, want the key of bodies within the bound", err)
 				}
-				if token != "fixture-fallback-key" || fallbackHits.Load() != 1 {
-					t.Errorf("oversized discovery body neither failed the refresh nor fell back to the conventional endpoint (token len=%d, fallback hits=%d)", len(token), fallbackHits.Load())
-					return
+				if token != "fixture-bounded-key" {
+					t.Errorf("Refresh() returned an unexpected token (len=%d)", len(token))
 				}
-				t.Log("oversized discovery body fell back to the conventional token endpoint")
-			case tt.wantErr != nil:
-				assertExactErr(t, "oversized exchange", err, tt.wantErr)
-				if token != "" {
-					t.Errorf("returned a token from an oversized exchange body (len=%d)", len(token))
+				if got := discoveredHits.Load(); got != 1 {
+					t.Errorf("exchanges at the discovered token endpoint = %d, want 1", got)
 				}
-				assertFileUnchanged(t, file, content)
-			default:
-				if err != nil {
-					assertNoSecrets(t, "bounded exchange error", err.Error(), refreshSecrets...)
-					t.Fatalf("Refresh() error = %v, want the key of a body within the bound", err)
-				}
-				if token != tt.wantToken {
-					t.Errorf("Refresh() returned an unexpected token (got len=%d, want len=%d)", len(token), len(tt.wantToken))
-				}
+				return
 			}
+			assertExactErr(t, "oversized body", err, tt.wantErr)
+			if token != "" {
+				t.Errorf("returned a token from an oversized body (len=%d)", len(token))
+			}
+			wantExchanges := int32(1)
+			if tt.discoverySize > mib {
+				wantExchanges = 0
+			}
+			if got := discoveredHits.Load(); got != wantExchanges {
+				t.Errorf("exchanges at the discovered token endpoint = %d, want %d", got, wantExchanges)
+			}
+			assertFileUnchanged(t, file, content)
 		})
 	}
 }
