@@ -1,0 +1,30 @@
+#!/usr/bin/env node
+// Copyright 2026 The claude-code-model-gateway Authors.
+// SPDX-License-Identifier: Apache-2.0
+'use strict';
+
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const data = path.join(__dirname, '../test/conformance');
+const { parentCredits, tsv, validLaunch } = require(path.join(data, 'adapter/evidence.cjs'));
+const [file, run_id, commit] = process.argv.slice(2);
+assert(process.argv.length === 5 && run_id && /^[a-f0-9]{40}$/.test(commit),
+  'usage: conformance-launches LAUNCH_LOG RUN_ID FULL_COMMIT');
+const records = fs.readFileSync(file, 'utf8').trimEnd().split('\n').map(line => JSON.parse(line));
+const { target, build } = records[0];
+const binary = target.slice('binary:'.length);
+assert(target.startsWith('binary:') && path.isAbsolute(binary) && path.normalize(binary) === binary &&
+  !binary.endsWith('/') && !/[\r\n\t\0]/.test(binary) && /^[a-f0-9]{64}$/.test(build), 'expected measured binary launch records');
+const parent = parentCredits(tsv(path.join(data, 'launch-sites.tsv')), tsv(path.join(data, 'baseline/census.tsv')));
+const lines = [JSON.stringify({ run_id, commit }), 'path\tline\tcolumn\tname\tbinary\tbinary_sha256'];
+const escape = v => String(v).replace(/[\\\t\r\n]/g, c => ({ '\\': '\\\\', '\t': '\\t', '\r': '\\r', '\n': '\\n' })[c]);
+for (const record of records) {
+  assert(validLaunch(record, target, build), 'invalid or mixed launch evidence');
+  assert(typeof record.path === 'string' && record.path && typeof record.name === 'string' && record.name &&
+    [record.line, record.column].every(n => Number.isSafeInteger(n) && n > 0), 'missing launch registration');
+  for (const r of [record, parent(record)].filter(Boolean)) {
+    lines.push([r.path, r.line, r.column, r.name, binary, build].map(escape).join('\t'));
+  }
+}
+process.stdout.write(lines.join('\n') + '\n');

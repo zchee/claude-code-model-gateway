@@ -277,7 +277,9 @@ case $op in
     run) [[ $# -gt 0 ]] || fail 'run requires at least one make target'
          if [[ $1 == conformance && "$*" == *=* ]]; then
              for arg in "${@:2}"; do
+                 if [[ $arg == TARGET=binary:* && ${arg#TARGET=binary:} =~ (^|/)\.\.(/|$) ]]; then fail 'binary target contains a parent component'; fi
                  [[ $arg == CLASS=conformance || $arg =~ ^MODE=(suite|self-test|probes)$ || $arg =~ ^TARGET=(identity|binary:/[a-zA-Z0-9_./-]+)$ ||
+                    $arg =~ ^TIMEOUT_SECONDS=[1-9][0-9]{0,2}$ || $arg =~ ^SITE=test/[a-zA-Z0-9_-]+\.test\.js:[1-9][0-9]*$ ||
                     $arg =~ ^PHASE=phase-[0-9]+$ || $arg =~ ^PACKAGE=[a-zA-Z0-9_./-]+$ || $arg =~ ^GATE=(task|phase)$ ]] || fail 'invalid conformance selector'
              done
          else

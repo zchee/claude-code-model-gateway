@@ -5,21 +5,31 @@ set -euo pipefail
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
 "$root/hack/venue-check"
 if command -v claude >/dev/null; then printf '%s\n' 'claude resolves on venue PATH' >&2; exit 1; fi
-plugin=$("$root/hack/pinned-source")/plugins/model-gateway
-"$root/hack/baseline-extract" --verify >&2
+umask 077
+mkdir -p "$root/.cache"
 work=$(mktemp -d "$root/.cache/conformance.XXXXXXXX")
+tmp=''
+# Invoked by the EXIT trap.
+# shellcheck disable=SC2329
+cleanup() {
+    local rc=$?
+    if [[ -n $tmp ]]; then rm -rf -- "$tmp"; fi
+    if (( rc == 0 )); then rm -rf -- "$work"; else printf 'conformance: diagnostics retained in %s\n' "$work" >&2; fi
+}
+trap cleanup EXIT
 tmp=$(mktemp -d "${root%/*}/t.XXXXXX")
 mkdir "$work/home"
-clean=(env -i "PATH=$PATH" "HOME=$work/home" "TMPDIR=$tmp" "npm_config_cache=${npm_config_cache:?missing venue npm cache}")
-"${clean[@]}" npm --prefix "$plugin" ci --ignore-scripts --no-audit --no-fund >&2
-"${clean[@]}" node -e 'if (require(process.argv[1]).version !== "8.20.0") process.exit(1)' "$plugin/node_modules/ajv/package.json"
-case ${MODE:-suite} in
-    self-test) cc -std=c99 -Wall -Wextra -Werror -o "$work/standin" "$root/test/conformance/adapter/standin.c" ;;
-    suite|probes) ;;
-    *) printf 'unknown conformance MODE: %s\n' "$MODE" >&2; exit 1 ;;
-esac
+limit=${TIMEOUT_SECONDS:-200}
+[[ $limit =~ ^[1-9][0-9]{0,2}$ && $limit -le 200 ]] || { printf 'TIMEOUT_SECONDS must be between 1 and 200\n' >&2; exit 1; }
 rc=0
-"${clean[@]}" node "$root/test/conformance/adapter/run.cjs" "$root" "$plugin" "$work" \
-    "${TARGET:-identity}" "${MODE:-suite}" "${PHASE:-}" "${PACKAGE:-}" "${GATE:-}" "${LAUNCH_LOG:-$work/launches.jsonl}" "${CLASS:-}" || rc=$?
+interrupted=0
+trap 'interrupted=1' HUP INT TERM
+python3 -I "$root/hack/conformance-supervise" "$work" "$limit" bash "$root/hack/conformance-job" "$root" "$work" "$tmp" 9<&- &
+pid=$!
+trap 'interrupted=1; kill -TERM "$pid" 2>/dev/null || :' HUP INT TERM
+if (( interrupted )); then kill -TERM "$pid" 2>/dev/null || :; fi
+wait "$pid" || rc=$?
+if (( interrupted )); then trap '' HUP INT TERM; wait "$pid" || :; rc=1; fi
+if [[ -f $work/job.log ]]; then cat -- "$work/job.log"; fi
 "$root/hack/venue-check"
 exit "$rc"
