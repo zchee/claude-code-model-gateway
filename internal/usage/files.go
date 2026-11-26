@@ -169,23 +169,17 @@ func transcriptCWD(f *os.File) string {
 }
 
 func readGitPointer(f *os.File, info fs.FileInfo) (string, bool) {
-	if !info.Mode().IsRegular() || info.Size() > maxProjectLookupBytes {
+	if !info.Mode().IsRegular() {
 		return "", false
 	}
-	data, err := io.ReadAll(io.LimitReader(f, maxProjectLookupBytes))
-	if err != nil {
+	data, err := io.ReadAll(io.LimitReader(f, maxProjectLookupBytes+1))
+	if err != nil || len(data) > maxProjectLookupBytes {
 		return "", false
-	}
-	if len(data) == maxProjectLookupBytes {
-		// Check the opened file again: it may have grown between stat and read.
-		after, err := f.Stat()
-		if err != nil || after.Size() != maxProjectLookupBytes {
-			return "", false
-		}
 	}
 	return string(data), true
 }
 
+// projectFromCWD follows .git and commondir symlinks, but accepts only bounded regular-file pointers; root confinement applies only to transcripts.
 func projectFromCWD(cwd string) string {
 	if !filepath.IsAbs(cwd) {
 		return ""
