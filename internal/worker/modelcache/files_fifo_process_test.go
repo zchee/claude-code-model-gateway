@@ -312,7 +312,7 @@ func TestBoundedReadSurvivesFIFOSwap(t *testing.T) {
 			case <-time.After(installLimit):
 				halt()
 				swapper.Wait()
-				t.Fatalf("inconclusive exercise: no FIFO was installed at the path within %v (%d regular-file installs); the host did not run the swapper in time", installLimit, installs[regularTarget])
+				t.Fatalf("inconclusive exercise: no FIFO install was observed at the path within %v (%d regular-file installs)", installLimit, installs[regularTarget])
 			}
 
 			var calls, failed, sawRegular atomic.Int64
@@ -372,8 +372,10 @@ func TestBoundedReadSurvivesFIFOSwap(t *testing.T) {
 				case <-readersDone:
 					break watch
 				case <-progress:
-					armedAt = calls.Load()
-					watchdog.Reset(stallLimit)
+					if n := calls.Load(); n != armedAt {
+						armedAt = n
+						watchdog.Reset(stallLimit)
+					}
 				case <-watchdog.C:
 					// The reads may have ended while the timer fired: select picks among ready cases at
 					// random. Only an interval in which the reads neither ended nor completed a listing
