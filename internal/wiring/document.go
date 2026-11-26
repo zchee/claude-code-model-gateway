@@ -23,6 +23,7 @@ import (
 	"math"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"unicode/utf16"
 	"unicode/utf8"
@@ -54,6 +55,41 @@ func parseDocument(data []byte) (document, error) {
 	return document{data: bytes.Clone(data), root: root}, nil
 }
 
+// sanitizeJSONError turns a JSON decoder or editor error into a fixed diagnostic string
+// without JSON pointers, property names or authored values from the document.
+func sanitizeJSONError(err error) string {
+	if syn, ok := errors.AsType[*jsontext.SyntacticError](err); ok {
+		if syn.ByteOffset > 0 {
+			return fmt.Sprintf("invalid JSON at byte offset %d", syn.ByteOffset)
+		}
+		return "invalid JSON"
+	}
+	if _, ok := errors.AsType[*jsonx.WireDepthError](err); ok {
+		return "JSON exceeds maximum nesting depth"
+	}
+	if _, ok := errors.AsType[*jsonx.InvalidMemberNameError](err); ok {
+		return "settings object contains a member name with invalid UTF-8"
+	}
+	return "invalid JSON"
+}
+
+func formatReadError(file string, err error) error {
+	if errors.Is(err, errSnapshotTooLarge) {
+		return err
+	}
+	if _, ok := errors.AsType[*jsontext.SyntacticError](err); ok {
+		return fmt.Errorf("Could not read %s: %s", file, sanitizeJSONError(err)) //nolint:staticcheck // The message is the source's user-facing wording.
+	}
+	if _, ok := errors.AsType[*jsonx.WireDepthError](err); ok {
+		return fmt.Errorf("Could not read %s: %s", file, sanitizeJSONError(err)) //nolint:staticcheck // The message is the source's user-facing wording.
+	}
+	return fmt.Errorf("Could not read %s: %w", file, err) //nolint:staticcheck // The message is the source's user-facing wording.
+}
+
+func formatParseError(file string, err error) error {
+	return fmt.Errorf("Could not read %s: %s", file, sanitizeJSONError(err)) //nolint:staticcheck // The message is the source's user-facing wording.
+}
+
 // edit splices the edits into the authored bytes and re-reads the result, so later decisions see the new state.
 func (d *document) edit(edits ...jsonx.Edit) error {
 	if len(edits) == 0 {
@@ -61,11 +97,14 @@ func (d *document) edit(edits ...jsonx.Edit) error {
 	}
 	data, err := jsonx.EditSettings(d.data, edits...)
 	if err != nil {
+		if _, ok := errors.AsType[*jsontext.SyntacticError](err); ok {
+			return errors.New(sanitizeJSONError(err))
+		}
 		return err
 	}
 	root, err := jsonx.DecodeWire(stripLeadingBOM(data))
 	if err != nil {
-		return err
+		return errors.New(sanitizeJSONError(err))
 	}
 	d.data, d.root = data, root
 	return nil
@@ -84,14 +123,18 @@ func (d document) envValue(key string) (jsonx.WireValue, bool) {
 }
 
 // readDocument mirrors the source's try { JSON.parse(readFileSync(file)) } catch {} readers, bounded to regular
-// files so special files never block the readiness path. Any failure means no document.
-func readDocument(file string) (document, bool) {
+// files so special files never block the readiness path. A file exceeding the size bound returns an error rather
+// than being treated as absent; any other read or parse failure means no document.
+func readDocument(file string) (document, bool, error) {
 	data, _, err := readRegularFile(file)
 	if err != nil {
-		return document{}, false
+		if errors.Is(err, errSnapshotTooLarge) {
+			return document{}, false, err
+		}
+		return document{}, false, nil
 	}
 	doc, err := parseDocument(data)
-	return doc, err == nil
+	return doc, err == nil, nil
 }
 
 // readDocumentSnapshot reads a regular settings file once, returning both its parsed view and the FileInfo of
@@ -99,11 +142,14 @@ func readDocument(file string) (document, bool) {
 func readDocumentSnapshot(file string) (document, fs.FileInfo, error) {
 	data, info, err := readRegularFile(file)
 	if err != nil {
-		return document{}, nil, err
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, errSnapshotTooLarge) {
+			return document{}, nil, err
+		}
+		return document{}, nil, formatReadError(file, err)
 	}
 	doc, err := parseDocument(data)
 	if err != nil {
-		return document{}, info, fmt.Errorf("Could not read %s: %w", file, err) //nolint:staticcheck // The message is the source's user-facing wording.
+		return document{}, info, formatParseError(file, err)
 	}
 	return doc, info, nil
 }
@@ -116,11 +162,11 @@ func readSettingsForWrite(file string) (document, error) {
 		data, err = []byte("{}"), nil
 	}
 	if err != nil {
-		return document{}, fmt.Errorf("Could not read %s: %w", file, err) //nolint:staticcheck // The message is the source's user-facing wording.
+		return document{}, formatReadError(file, err)
 	}
 	doc, err := parseDocument(data)
 	if err != nil {
-		return document{}, fmt.Errorf("Could not read %s: %w", file, err) //nolint:staticcheck // The message is the source's user-facing wording.
+		return document{}, formatParseError(file, err)
 	}
 	return doc, nil
 }
@@ -164,10 +210,13 @@ func (s Store) replaceInfo(file string, change func(*document, fs.FileInfo) erro
 	apply := func(old []byte, info fs.FileInfo, existed bool) ([]byte, error) {
 		doc, err := parseDocument(old)
 		if err != nil {
-			return nil, fmt.Errorf("Could not read %s: %w", file, err) //nolint:staticcheck // The message is the source's user-facing wording.
+			return nil, formatParseError(file, err)
 		}
 		if doc.root.Kind != '{' {
 			return nil, fmt.Errorf("Could not read %s: settings must be a JSON object", file) //nolint:staticcheck // The message is the source's user-facing wording.
+		}
+		if err := s.checkOwnedDuplicates(doc.data); err != nil {
+			return nil, fmt.Errorf("%s: %w", file, err)
 		}
 		if err := change(&doc, info); err != nil {
 			return nil, err
@@ -182,7 +231,11 @@ func (s Store) replaceInfo(file string, change func(*document, fs.FileInfo) erro
 	}
 	var err error
 	if s.Replace == nil {
-		err = atomicfile.ReplaceSettingsInfo(file, func(old []byte, info fs.FileInfo) ([]byte, error) {
+		replaceFn := atomicfile.ReplaceSettingsInfo
+		if s.replaceSettingsInfo != nil {
+			replaceFn = s.replaceSettingsInfo
+		}
+		err = replaceFn(file, func(old []byte, info fs.FileInfo) ([]byte, error) {
 			return apply(old, info, info != nil)
 		})
 	} else {
@@ -224,9 +277,6 @@ func (s Store) writeSettingsInfo(file string, change func(*document, fs.FileInfo
 			}
 		}
 		enabled := s.ours(doc.envValue(baseURLKey))
-		if err := forms.checkDuplicates(*doc, enabled); err != nil {
-			return fmt.Errorf("%s: %w", file, err)
-		}
 		edits, err := forms.sync(doc.root, enabled)
 		if err != nil {
 			return fmt.Errorf("%s: %w", file, err)
@@ -243,10 +293,39 @@ func decodeRawKey(raw []byte) (string, bool) {
 	return wtf8(v.Text), true
 }
 
-// checkRawDuplicates inspects raw JSON text for duplicate member names on parentKey at the root and, when
-// childKeys is non-empty and parentKey holds a JSON object, for duplicate member names among childKeys inside
-// that object. Checking raw text catches duplicates before parent-delete coalescing or equal-value shortcuts.
-func checkRawDuplicates(data []byte, parentKey string, childKeys map[string]bool) error {
+// allOwnedEnvKeys returns every environment key name the gateway inspects or edits, including
+// base URL, retired socket and window keys, static entries, standard pin keys and configured pins.
+func (s Store) allOwnedEnvKeys() map[string]bool {
+	keys := map[string]bool{
+		baseURLKey:                                  true,
+		socketKey:                                   true,
+		legacyKey:                                   true,
+		legacyMaxContextKey:                         true,
+		"ANTHROPIC_DEFAULT_OPUS_MODEL":              true,
+		"ANTHROPIC_DEFAULT_SONNET_MODEL":            true,
+		fableAliasKey:                               true,
+		"ANTHROPIC_CUSTOM_MODEL_OPTION":             true,
+		"ANTHROPIC_CUSTOM_MODEL_OPTION_NAME":        true,
+		"ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": true,
+	}
+	for _, e := range staticBlock() {
+		keys[e.Key] = true
+	}
+	for k := range s.Pins.Owned {
+		keys[k] = true
+	}
+	for _, e := range s.Pins.Current {
+		keys[e.Key] = true
+	}
+	return keys
+}
+
+// checkOwnedDuplicates inspects raw JSON text across every gateway-owned path in a settings document:
+// root owned containers and switches (env, hooks, autoCompactWindow, disableAllHooks), every owned env key,
+// the owned readiness hook event arrays (SessionStart, UserPromptSubmit), group hook arrays, and the fields
+// inside hook entries that decide ownership (type, command, args). Unrelated duplicate keys elsewhere are
+// permitted. Errors name only fixed owned keys and numeric array indexes, never authored content.
+func (s Store) checkOwnedDuplicates(data []byte) error {
 	src := stripLeadingBOM(data)
 	d := jsontext.NewDecoder(bytes.NewReader(src), jsontext.AllowInvalidUTF8(true), jsontext.AllowDuplicateNames(true))
 	if d.PeekKind() != '{' {
@@ -255,8 +334,14 @@ func checkRawDuplicates(data []byte, parentKey string, childKeys map[string]bool
 	if _, err := d.ReadToken(); err != nil {
 		return nil
 	}
-	parentCount := 0
-	var parentVal []byte
+	ownedRoot := map[string]bool{
+		"env":               true,
+		"hooks":             true,
+		"autoCompactWindow": true,
+		"disableAllHooks":   true,
+	}
+	seenRoot := make(map[string]int, len(ownedRoot))
+	var envRaw, hooksRaw []byte
 	for d.PeekKind() != '}' {
 		rawKey, err := d.ReadValue()
 		if err != nil {
@@ -267,56 +352,72 @@ func checkRawDuplicates(data []byte, parentKey string, childKeys map[string]bool
 		if err != nil {
 			return nil
 		}
-		if !ok || k != parentKey {
+		if !ok || !ownedRoot[k] {
 			continue
 		}
-		parentCount++
-		if parentCount > 1 {
-			return fmt.Errorf("settings %s: duplicate owned key %q", pointer(parentKey), parentKey)
+		seenRoot[k]++
+		if seenRoot[k] > 1 {
+			return fmt.Errorf("settings %s: duplicate owned key %q", pointer(k), k)
 		}
-		parentVal = bytes.Clone(rawVal)
+		switch k {
+		case "env":
+			envRaw = bytes.Clone(rawVal)
+		case "hooks":
+			hooksRaw = bytes.Clone(rawVal)
+		}
 	}
-	if parentCount != 1 || len(childKeys) == 0 || len(parentVal) == 0 || parentVal[0] != '{' {
+	if len(envRaw) > 0 && envRaw[0] == '{' {
+		if err := checkRawObjectDuplicates(envRaw, s.allOwnedEnvKeys(), "env"); err != nil {
+			return err
+		}
+	}
+	if len(hooksRaw) > 0 && hooksRaw[0] == '{' {
+		if err := checkRawHooksDuplicates(hooksRaw); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func checkRawObjectDuplicates(objRaw []byte, watched map[string]bool, prefix ...string) error {
+	d := jsontext.NewDecoder(bytes.NewReader(objRaw), jsontext.AllowInvalidUTF8(true), jsontext.AllowDuplicateNames(true))
+	if _, err := d.ReadToken(); err != nil {
 		return nil
 	}
-	cd := jsontext.NewDecoder(bytes.NewReader(parentVal), jsontext.AllowInvalidUTF8(true), jsontext.AllowDuplicateNames(true))
-	if _, err := cd.ReadToken(); err != nil {
-		return nil
-	}
-	seen := make(map[string]int, len(childKeys))
-	for cd.PeekKind() != '}' {
-		rawKey, err := cd.ReadValue()
+	seen := make(map[string]int, len(watched))
+	for d.PeekKind() != '}' {
+		rawKey, err := d.ReadValue()
 		if err != nil {
 			return nil
 		}
 		k, ok := decodeRawKey(rawKey)
-		if _, err := cd.ReadValue(); err != nil {
+		if _, err := d.ReadValue(); err != nil {
 			return nil
 		}
-		if !ok || !childKeys[k] {
+		if !ok || !watched[k] {
 			continue
 		}
 		seen[k]++
 		if seen[k] > 1 {
-			return fmt.Errorf("settings %s: duplicate owned key %q", pointer(parentKey, k), k)
+			tokens := append(slices.Clone(prefix), k)
+			return fmt.Errorf("settings %s: duplicate owned key %q", pointer(tokens...), k)
 		}
 	}
 	return nil
 }
 
-// checkRawOwnedDuplicates refuses a raw env object where a watched key appears more than once and at least one
-// occurrence matches isOwned. This prevents a later personal value from masking an earlier owned duplicate.
-func checkRawOwnedDuplicates(data []byte, keys map[string]bool, isOwned func(string, jsonx.WireValue) bool) error {
-	src := stripLeadingBOM(data)
-	d := jsontext.NewDecoder(bytes.NewReader(src), jsontext.AllowInvalidUTF8(true), jsontext.AllowDuplicateNames(true))
-	if d.PeekKind() != '{' {
-		return nil
-	}
+func checkRawHooksDuplicates(hooksRaw []byte) error {
+	d := jsontext.NewDecoder(bytes.NewReader(hooksRaw), jsontext.AllowInvalidUTF8(true), jsontext.AllowDuplicateNames(true))
 	if _, err := d.ReadToken(); err != nil {
 		return nil
 	}
-	envCount := 0
-	var envVal []byte
+	events := readinessEvents()
+	watched := make(map[string]bool, len(events))
+	for _, ev := range events {
+		watched[ev] = true
+	}
+	seen := make(map[string]int, len(events))
+	var eventVals [2][]byte
 	for d.PeekKind() != '}' {
 		rawKey, err := d.ReadValue()
 		if err != nil {
@@ -327,97 +428,97 @@ func checkRawOwnedDuplicates(data []byte, keys map[string]bool, isOwned func(str
 		if err != nil {
 			return nil
 		}
-		if ok && k == "env" {
-			envCount++
-			envVal = bytes.Clone(rawVal)
-		}
-	}
-	if envCount == 0 || len(envVal) == 0 || envVal[0] != '{' {
-		return nil
-	}
-	if envCount > 1 {
-		// Check whether any occurrence of env has an owned value; if so, duplicate env is ambiguous.
-		if hasAnyOwnedInRaw(src, keys, isOwned) {
-			return fmt.Errorf("settings %s: duplicate owned key %q", pointer("env"), "env")
-		}
-		return nil
-	}
-	cd := jsontext.NewDecoder(bytes.NewReader(envVal), jsontext.AllowInvalidUTF8(true), jsontext.AllowDuplicateNames(true))
-	if _, err := cd.ReadToken(); err != nil {
-		return nil
-	}
-	counts := make(map[string]int, len(keys))
-	owned := make(map[string]bool, len(keys))
-	for cd.PeekKind() != '}' {
-		rawKey, err := cd.ReadValue()
-		if err != nil {
-			return nil
-		}
-		k, ok := decodeRawKey(rawKey)
-		rawVal, err := cd.ReadValue()
-		if err != nil {
-			return nil
-		}
-		if !ok || !keys[k] {
+		if !ok || !watched[k] {
 			continue
 		}
-		counts[k]++
-		if !owned[k] {
-			if v, err := jsonx.DecodeWire(rawVal); err == nil && isOwned(k, v) {
-				owned[k] = true
+		seen[k]++
+		if seen[k] > 1 {
+			return fmt.Errorf("settings %s: duplicate owned key %q", pointer("hooks", k), k)
+		}
+		for i, ev := range events {
+			if k == ev {
+				eventVals[i] = bytes.Clone(rawVal)
 			}
 		}
-		if counts[k] > 1 && owned[k] {
-			return fmt.Errorf("settings %s: duplicate owned key %q", pointer("env", k), k)
+	}
+	for i, ev := range events {
+		if len(eventVals[i]) == 0 || eventVals[i][0] != '[' {
+			continue
+		}
+		if err := checkRawHookEventDuplicates(ev, eventVals[i]); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-func hasAnyOwnedInRaw(src []byte, keys map[string]bool, isOwned func(string, jsonx.WireValue) bool) bool {
-	d := jsontext.NewDecoder(bytes.NewReader(src), jsontext.AllowInvalidUTF8(true), jsontext.AllowDuplicateNames(true))
-	if d.PeekKind() != '{' {
-		return false
-	}
+func checkRawHookEventDuplicates(event string, arrRaw []byte) error {
+	d := jsontext.NewDecoder(bytes.NewReader(arrRaw), jsontext.AllowInvalidUTF8(true), jsontext.AllowDuplicateNames(true))
 	if _, err := d.ReadToken(); err != nil {
-		return false
+		return nil
 	}
+	for i := 0; d.PeekKind() != ']'; i++ {
+		groupRaw, err := d.ReadValue()
+		if err != nil {
+			return nil
+		}
+		if len(groupRaw) == 0 || groupRaw[0] != '{' {
+			continue
+		}
+		if err := checkRawHookGroupDuplicates(event, strconv.Itoa(i), bytes.Clone(groupRaw)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func checkRawHookGroupDuplicates(event, groupIdx string, groupRaw []byte) error {
+	d := jsontext.NewDecoder(bytes.NewReader(groupRaw), jsontext.AllowInvalidUTF8(true), jsontext.AllowDuplicateNames(true))
+	if _, err := d.ReadToken(); err != nil {
+		return nil
+	}
+	hooksCount := 0
+	var listRaw []byte
 	for d.PeekKind() != '}' {
 		rawKey, err := d.ReadValue()
 		if err != nil {
-			return false
+			return nil
 		}
 		k, ok := decodeRawKey(rawKey)
 		rawVal, err := d.ReadValue()
 		if err != nil {
-			return false
+			return nil
 		}
-		if !ok || k != "env" || len(rawVal) == 0 || rawVal[0] != '{' {
+		if !ok || k != "hooks" {
 			continue
 		}
-		cd := jsontext.NewDecoder(bytes.NewReader(bytes.Clone(rawVal)), jsontext.AllowInvalidUTF8(true), jsontext.AllowDuplicateNames(true))
-		if _, err := cd.ReadToken(); err != nil {
+		hooksCount++
+		if hooksCount > 1 {
+			return fmt.Errorf("settings %s: duplicate owned key %q", pointer("hooks", event, groupIdx, "hooks"), "hooks")
+		}
+		listRaw = bytes.Clone(rawVal)
+	}
+	if len(listRaw) == 0 || listRaw[0] != '[' {
+		return nil
+	}
+	ld := jsontext.NewDecoder(bytes.NewReader(listRaw), jsontext.AllowInvalidUTF8(true), jsontext.AllowDuplicateNames(true))
+	if _, err := ld.ReadToken(); err != nil {
+		return nil
+	}
+	hookFields := map[string]bool{"type": true, "command": true, "args": true}
+	for j := 0; ld.PeekKind() != ']'; j++ {
+		hookRaw, err := ld.ReadValue()
+		if err != nil {
+			return nil
+		}
+		if len(hookRaw) == 0 || hookRaw[0] != '{' {
 			continue
 		}
-		for cd.PeekKind() != '}' {
-			ek, err := cd.ReadValue()
-			if err != nil {
-				break
-			}
-			name, ok := decodeRawKey(ek)
-			ev, err := cd.ReadValue()
-			if err != nil {
-				break
-			}
-			if !ok || !keys[name] {
-				continue
-			}
-			if v, err := jsonx.DecodeWire(ev); err == nil && isOwned(name, v) {
-				return true
-			}
+		if err := checkRawObjectDuplicates(bytes.Clone(hookRaw), hookFields, "hooks", event, groupIdx, "hooks", strconv.Itoa(j)); err != nil {
+			return err
 		}
 	}
-	return false
+	return nil
 }
 
 func exists(file string) bool {
@@ -591,52 +692,24 @@ func strictEqual(a jsonx.WireValue, aok bool, b jsonx.WireValue, bok bool) bool 
 	}
 }
 
-// hasUnpairedSurrogate reports whether v or any nested member name or value contains an unpaired UTF-16 surrogate.
-func hasUnpairedSurrogate(v jsonx.WireValue) bool {
-	switch v.Kind {
-	case '"':
-		_, ok := wellFormed(v.Text)
-		return !ok
-	case '[':
-		return slices.ContainsFunc(v.Elements, hasUnpairedSurrogate)
-	case '{':
-		for _, m := range v.Members {
-			if _, ok := wellFormed(m.Name); !ok || hasUnpairedSurrogate(m.Value) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// plain converts a parsed value into the Go values a report carries: string, float64, bool, nil, []any or
-// map[string]any for well-formed values, or the lossless jsonx.WireValue when an unpaired UTF-16 surrogate is
-// present so neither string content nor distinct surrogate object keys are lost before serialization.
+// plain converts a parsed value into the Go values a report carries: string, float64, bool or nil for
+// well-formed scalars, or the lossless jsonx.WireValue for composites (objects and arrays) and strings
+// containing an unpaired UTF-16 surrogate, preserving wire member order and UTF-16 units without rescanning.
 func plain(v jsonx.WireValue) any {
-	if hasUnpairedSurrogate(v) {
-		return v
-	}
 	switch v.Kind {
 	case '"':
-		return string(utf16.Decode(v.Text))
+		if s, ok := wellFormed(v.Text); ok {
+			return s
+		}
+		return v
 	case '0':
 		return v.Number
 	case 't':
 		return true
 	case 'f':
 		return false
-	case '[':
-		out := make([]any, len(v.Elements))
-		for i, e := range v.Elements {
-			out[i] = plain(e)
-		}
-		return out
-	case '{':
-		out := make(map[string]any, len(v.Members))
-		for _, m := range v.Members {
-			out[string(utf16.Decode(m.Name))] = plain(m.Value)
-		}
-		return out
+	case '[', '{':
+		return v
 	default:
 		return nil
 	}

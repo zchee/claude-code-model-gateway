@@ -53,14 +53,14 @@ func readRegularFileLimit(path string, limit int64) ([]byte, fs.FileInfo, error)
 		return nil, nil, &atomicfile.NonRegularError{Path: path}
 	}
 	if info.Size() > limit {
-		return nil, nil, fmt.Errorf("%s: %w", path, errSnapshotTooLarge)
+		return nil, nil, fmt.Errorf("%s: %w (%d bytes)", path, errSnapshotTooLarge, limit)
 	}
 	data, err := io.ReadAll(io.LimitReader(f, limit+1))
 	if err != nil {
 		return nil, nil, err
 	}
 	if int64(len(data)) > limit {
-		return nil, nil, fmt.Errorf("%s: %w", path, errSnapshotTooLarge)
+		return nil, nil, fmt.Errorf("%s: %w (%d bytes)", path, errSnapshotTooLarge, limit)
 	}
 	return data, info, nil
 }

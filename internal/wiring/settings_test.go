@@ -69,7 +69,8 @@ func TestWriteEnvironment(t *testing.T) {
 				initial[base] = tt.start
 			}
 			if tt.remove {
-				const entries = `"ANTHROPIC_BASE_URL":"` + compat + `", "ANTHROPIC_UNIX_SOCKET":"retired-socket-value", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY":"1", `
+				socketPath := filepath.Join(filepath.Dir(f.registry), "gateway.sock")
+				entries := `"ANTHROPIC_BASE_URL":"` + compat + `", "ANTHROPIC_UNIX_SOCKET":` + encoded(t, socketPath) + `, "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY":"1", `
 				put(t, f.user, envPrefix+entries+userPair+envSuffix)
 			} else {
 				putEnv(t, f.user, initial)

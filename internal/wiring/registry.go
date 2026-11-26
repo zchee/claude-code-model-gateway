@@ -38,21 +38,24 @@ type recorded struct {
 	rewrite, exists bool
 }
 
-func readRegistry(file string) recorded {
+func readRegistry(file string) (recorded, error) {
 	data, _, err := readRegularFile(file)
 	if err != nil {
+		if errors.Is(err, errSnapshotTooLarge) {
+			return recorded{}, err
+		}
 		missing := errors.Is(err, fs.ErrNotExist)
-		return recorded{rewrite: !missing, exists: !missing}
+		return recorded{rewrite: !missing, exists: !missing}, nil
 	}
 	root, err := jsonx.DecodeWire(data)
 	if err != nil {
-		return recorded{rewrite: true, exists: true}
+		return recorded{rewrite: true, exists: true}, nil
 	}
 	projects, ok := member(root, "projects")
 	if !ok || projects.Kind != '[' {
-		return recorded{rewrite: true, exists: true}
+		return recorded{rewrite: true, exists: true}, nil
 	}
-	return recorded{projects: projects.Elements, exists: true}
+	return recorded{projects: projects.Elements, exists: true}, nil
 }
 
 // writeRegistry replaces the registry atomically with mode 0600, creating the state directory as the source's
@@ -116,31 +119,35 @@ func projectPath(entry jsonx.WireValue) (string, bool) {
 }
 
 // registeredWiring evaluates one registry entry (lib/settings-wiring.js:217-242). It returns a wiring, a pruned
-// directory, or neither for an entry that is unusable, already seen, or no longer wired.
-func (s Store) registeredWiring(entry jsonx.WireValue, seen map[string]bool) (*Registration, *Pruned) {
+// directory, neither for an entry that is unusable, already seen, or no longer wired, or an error if the project's
+// settings file exceeds the size bound.
+func (s Store) registeredWiring(entry jsonx.WireValue, seen map[string]bool) (*Registration, *Pruned, error) {
 	p, ok := projectPath(entry)
 	if !ok {
-		return nil, nil
+		return nil, nil, nil
 	}
 	project := normalize(p)
 	key := registryKey(project)
 	if seen[key] {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if info, err := os.Stat(project); err != nil || !info.IsDir() {
-		return nil, &Pruned{Project: project, Reason: "directory is missing"}
+		return nil, &Pruned{Project: project, Reason: "directory is missing"}, nil
 	}
 	file := filepath.Join(project, ".claude", "settings.local.json")
-	doc, ok := readDocument(file)
+	doc, ok, err := readDocument(file)
+	if err != nil {
+		return nil, nil, err
+	}
 	if !ok {
-		return nil, nil
+		return nil, nil, nil
 	}
 	value, ok := doc.envValue(baseURLKey)
 	if !s.ours(value, ok) {
-		return nil, nil
+		return nil, nil, nil
 	}
 	seen[key] = true
-	return &Registration{Project: project, File: file, Value: wtf8(value.Text)}, nil
+	return &Registration{Project: project, File: file, Value: wtf8(value.Text)}, nil, nil
 }
 
 // report is registeredProjectWiringReport: unless readOnly, an existing registry is rewritten with the surviving
@@ -150,12 +157,18 @@ func (s Store) report(readOnly bool) ([]Registration, []Pruned, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	rec := readRegistry(file)
+	rec, err := readRegistry(file)
+	if err != nil {
+		return nil, nil, err
+	}
 	seen := map[string]bool{}
 	var wirings []Registration
 	var pruned []Pruned
 	for _, entry := range rec.projects {
-		w, p := s.registeredWiring(entry, seen)
+		w, p, err := s.registeredWiring(entry, seen)
+		if err != nil {
+			return nil, nil, err
+		}
 		if w != nil {
 			wirings = append(wirings, *w)
 		}
@@ -214,8 +227,12 @@ func (s Store) registered() (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	rec, err := readRegistry(file)
+	if err != nil {
+		return false, err
+	}
 	key := registryKey(project)
-	for _, entry := range readRegistry(file).projects {
+	for _, entry := range rec.projects {
 		if p, ok := projectPath(entry); ok && registryKey(p) == key {
 			return true, nil
 		}
@@ -232,7 +249,10 @@ func (s Store) RecordProject() error {
 		return err
 	}
 	file := filepath.Join(project, ".claude", "settings.local.json")
-	doc, ok := readDocument(file)
+	doc, ok, err := readDocument(file)
+	if err != nil {
+		return err
+	}
 	if !ok || !s.ours(doc.envValue(baseURLKey)) {
 		// The source still refreshes the registry here (lib/settings-wiring.js:317-323).
 		_, _, err := s.report(false)
@@ -310,19 +330,21 @@ func (s Store) SyncPins() (Changes, error) {
 		return Changes{}, err
 	}
 	r := Changes{Pruned: pruned}
-	checkKeys := map[string]bool{baseURLKey: true}
-	for _, key := range s.pinKeys() {
-		checkKeys[key] = true
-	}
 	for _, w := range wirings {
 		doc, err := readSettingsForWrite(w.File)
 		if err != nil {
+			if errors.Is(err, errSnapshotTooLarge) {
+				return r, err
+			}
 			r.Skipped = append(r.Skipped, Skipped{File: w.File, Value: w.Value, Reason: err.Error()})
 			continue
 		}
 		if key, v, ok := s.firstUnowned(doc); ok {
 			r.Skipped = append(r.Skipped, Skipped{File: w.File, Key: key, Value: plain(v), Reason: "pin value is not gateway-owned"})
 			continue
+		}
+		if err := s.checkOwnedDuplicates(doc.data); err != nil {
+			return r, fmt.Errorf("%s: %w", w.File, err)
 		}
 		if len(s.stalePins(doc)) == 0 {
 			continue
@@ -336,9 +358,6 @@ func (s Store) SyncPins() (Changes, error) {
 			if key, v, unowned := s.firstUnowned(*doc); unowned {
 				skipped = &Skipped{File: w.File, Key: key, Value: plain(v), Reason: "pin value is not gateway-owned"}
 				return errUnchanged
-			}
-			if err := checkRawDuplicates(doc.data, "env", checkKeys); err != nil {
-				return err
 			}
 			stale := s.stalePins(*doc)
 			if len(stale) == 0 {

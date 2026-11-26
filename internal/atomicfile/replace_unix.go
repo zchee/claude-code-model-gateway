@@ -242,7 +242,15 @@ func sameLeaf(st *unix.Stat_t, info fs.FileInfo) bool {
 	return st.Dev == native.Dev && st.Ino == native.Ino
 }
 
+const maxSettingsBytes = 16 << 20
+
+var errSettingsTooLarge = errors.New("settings file exceeds size limit")
+
 func readSettings(root *directory, base string, conflict error, duringRead func()) (snapshot, error) {
+	return readSettingsLimit(root, base, base, 0, conflict, duringRead)
+}
+
+func readSettingsLimit(root *directory, base, path string, maxBytes int64, conflict error, duringRead func()) (snapshot, error) {
 	info, err := root.Lstat(base)
 	if duringRead != nil {
 		duringRead()
@@ -274,15 +282,29 @@ func readSettings(root *directory, base string, conflict error, duringRead func(
 	if !sameLeaf(info, opened) {
 		return snapshot{}, conflict
 	}
-	data, err := io.ReadAll(file)
+	if maxBytes > 0 && opened.Size() > maxBytes {
+		return snapshot{}, fmt.Errorf("%s: %w (%d bytes)", path, errSettingsTooLarge, maxBytes)
+	}
+	var reader io.Reader = file
+	if maxBytes > 0 {
+		reader = io.LimitReader(file, maxBytes+1)
+	}
+	data, err := io.ReadAll(reader)
+	if err == nil && maxBytes > 0 && int64(len(data)) > maxBytes {
+		return snapshot{}, fmt.Errorf("%s: %w (%d bytes)", path, errSettingsTooLarge, maxBytes)
+	}
 	return snapshot{opened, data}, err
 }
 
 func (w writer) replaceSettings(path string, edit func([]byte) ([]byte, error), afterStage func(preparedFile, string)) error {
-	return w.replaceSettingsInfo(path, func(data []byte, _ fs.FileInfo) ([]byte, error) { return edit(data) }, afterStage)
+	return w.replaceSettingsLoop(path, 0, func(data []byte, _ fs.FileInfo) ([]byte, error) { return edit(data) }, afterStage)
 }
 
 func (w writer) replaceSettingsInfo(path string, edit func([]byte, fs.FileInfo) ([]byte, error), afterStage func(preparedFile, string)) error {
+	return w.replaceSettingsLoop(path, maxSettingsBytes, edit, afterStage)
+}
+
+func (w writer) replaceSettingsLoop(path string, maxBytes int64, edit func([]byte, fs.FileInfo) ([]byte, error), afterStage func(preparedFile, string)) error {
 	root, base, err := openSettingsParent(path, true)
 	if err != nil {
 		return err
@@ -295,7 +317,7 @@ func (w writer) replaceSettingsInfo(path string, edit func([]byte, fs.FileInfo) 
 	target := root.path(base)
 	conflict := &settingsConflict{path}
 	for range 3 {
-		before, err := readSettings(root, base, conflict, nil)
+		before, err := readSettingsLimit(root, base, path, maxBytes, conflict, nil)
 		if errors.Is(err, conflict) {
 			continue
 		}
@@ -314,7 +336,7 @@ func (w writer) replaceSettingsInfo(path string, edit func([]byte, fs.FileInfo) 
 			if f != nil && afterStage != nil {
 				duringRead = func() { afterStage(f, target) }
 			}
-			after, err := readSettings(root, base, conflict, duringRead)
+			after, err := readSettingsLimit(root, base, path, maxBytes, conflict, duringRead)
 			if err != nil {
 				return err
 			}

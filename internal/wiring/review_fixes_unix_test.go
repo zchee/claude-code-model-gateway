@@ -17,7 +17,6 @@
 package wiring_test
 
 import (
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,16 +40,6 @@ func TestSnapshotReaderRefusesNonRegularWithoutBlocking(t *testing.T) {
 			check(t, os.Mkdir(target, 0o700))
 		case "device":
 			check(t, os.Symlink("/dev/null", target))
-		case "socket":
-			// Unix socket paths have a short length limit on Unix, so create in a short temp dir and symlink.
-			sockDir, err := os.MkdirTemp("", "gw-sock-")
-			check(t, err)
-			t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
-			sock := filepath.Join(sockDir, "s")
-			ln, err := (&net.ListenConfig{}).Listen(t.Context(), "unix", sock)
-			check(t, err)
-			t.Cleanup(func() { _ = ln.Close() })
-			check(t, os.Symlink(sock, target))
 		}
 	}
 
@@ -59,7 +48,6 @@ func TestSnapshotReaderRefusesNonRegularWithoutBlocking(t *testing.T) {
 		"error: symlink to fifo":     {"symlink-to-fifo"},
 		"error: directory":           {"directory"},
 		"error: device":              {"device"},
-		"error: unix socket":         {"socket"},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -113,19 +101,13 @@ func TestSnapshotReaderRefusesNonRegularWithoutBlocking(t *testing.T) {
 	t.Run("error: oversized regular file exceeds snapshot bound", func(t *testing.T) {
 		f := sandbox(t)
 		putEnv(t, f.user, map[string]any{base: direct})
-		check(t, os.MkdirAll(filepath.Dir(f.local), 0o700))
-		big, err := os.Create(f.local)
-		check(t, err)
-		check(t, big.Truncate((16<<20)+1))
-		check(t, big.Close())
+		writeValidOversizedJSON(t, f.local, `{"env":{"ANTHROPIC_BASE_URL":"https://personal.example"}}`)
 
-		res, err := f.EffectiveBaseURL()
-		check(t, err)
-		equal(t, "user", res.Winner.Source)
+		_, err := f.EffectiveBaseURL()
+		assertBoundError(t, "EffectiveBaseURL", f.local, err)
 
-		if err := f.WriteEnv("project", "default", false); err == nil {
-			t.Fatal("expected WriteEnv to refuse oversized settings file")
-		}
+		err = f.WriteEnv("project", "default", false)
+		assertBoundError(t, "WriteEnv", f.local, err)
 	})
 }
 

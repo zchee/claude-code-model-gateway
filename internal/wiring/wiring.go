@@ -16,6 +16,8 @@
 package wiring
 
 import (
+	"io/fs"
+
 	"github.com/zchee/claude-code-model-gateway/internal/config"
 	"github.com/zchee/claude-code-model-gateway/internal/paths"
 )
@@ -31,13 +33,16 @@ type Pins struct {
 }
 
 // Store resolves project and user settings without consulting the process environment.
-// Replace, when non-nil, wraps the settings replacement operation for a file transaction.
+// Replace is a byte-only test seam: when non-nil, it wraps the settings replacement operation and
+// derives existence and file identity on its own. Production writes leave Replace nil and call
+// atomicfile.ReplaceSettingsInfo directly on the opened target.
 type Store struct {
-	Paths   paths.Resolver
-	Project string
-	Lookup  config.LookupEnv
-	Pins    Pins
-	Replace func(string, func([]byte) ([]byte, error)) error
+	Paths               paths.Resolver
+	Project             string
+	Lookup              config.LookupEnv
+	Pins                Pins
+	Replace             func(string, func([]byte) ([]byte, error)) error
+	replaceSettingsInfo func(string, func([]byte, fs.FileInfo) ([]byte, error)) error
 }
 
 // Definition identifies a base URL and the file or environment that supplied it.
@@ -72,7 +77,8 @@ type Registration struct{ Project, File, Value string }
 type Pruned struct{ Project, Reason string }
 
 // Disagreement describes a registered pin. Present differentiates JSON null from an absent key.
-// Values containing unpaired UTF-16 surrogates are retained as jsonx.WireValue until serialization.
+// Composite values (objects and arrays) and strings containing unpaired UTF-16 surrogates are retained
+// as jsonx.WireValue until serialization so wire member order and UTF-16 code units survive intact.
 type Disagreement struct {
 	Registration
 	Key, Expected string
@@ -81,7 +87,8 @@ type Disagreement struct {
 }
 
 // Skipped identifies a settings file or key a synchronization could not update.
-// Values containing unpaired UTF-16 surrogates are retained as jsonx.WireValue until serialization.
+// Composite values (objects and arrays) and strings containing unpaired UTF-16 surrogates are retained
+// as jsonx.WireValue until serialization so wire member order and UTF-16 code units survive intact.
 type Skipped struct {
 	File, Key, Reason string
 	Value             any
