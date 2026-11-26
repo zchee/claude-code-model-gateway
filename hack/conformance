@@ -4,47 +4,41 @@
 set -euo pipefail
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
 "$root/hack/venue-check"
-if command -v claude >/dev/null; then printf '%s\n' 'claude resolves on venue PATH' >&2; exit 1; fi
+
+record_status() {
+    local code=$1
+    if [[ -n ${CONFORMANCE_STATUS_FILE:-} ]]; then
+        printf '%s\n' "$code" >| "$CONFORMANCE_STATUS_FILE" || :
+    fi
+}
+
+if command -v claude >/dev/null; then
+    printf '%s\n' 'claude resolves on venue PATH' >&2
+    record_status 1
+    exit 1
+fi
 max_limit=${MAX_TIMEOUT_SECONDS:-200}
-[[ $max_limit =~ ^[1-9][0-9]{0,3}$ && $max_limit -le 1800 ]] || {
+if ! [[ $max_limit =~ ^[1-9][0-9]{0,3}$ && $max_limit -le 1800 ]]; then
     printf 'MAX_TIMEOUT_SECONDS must be between 1 and 1800\n' >&2
-    exit 1
-}
+    record_status 2
+    exit 2
+fi
 limit=${TIMEOUT_SECONDS:-200}
-[[ $limit =~ ^[1-9][0-9]{0,3}$ && $limit -le $max_limit ]] || {
+if ! [[ $limit =~ ^[1-9][0-9]{0,3}$ && $limit -le $max_limit ]]; then
     printf 'TIMEOUT_SECONDS must be between 1 and %s\n' "$max_limit" >&2
-    exit 1
-}
+    record_status 2
+    exit 2
+fi
 umask 077
 mkdir -p "$root/.cache"
 work=$(mktemp -d "$root/.cache/conformance.XXXXXXXX")
 tmp=''
-job_unit='-'
-scope_verified=0
-
-mark_unavailable() {
-    local reason=$1
-    if [[ -n ${CONFORMANCE_UNAVAILABLE_FILE:-} ]]; then
-        printf '%s\n' "$reason" >| "$CONFORMANCE_UNAVAILABLE_FILE" || :
-    fi
-}
-
-verify_job_scope() {
-    if [[ $job_unit == '-' ]] || (( scope_verified )); then return 0; fi
-    if python3 -I "$root/hack/conformance-supervise" --stop-scope "$job_unit" 9<&-; then
-        scope_verified=1
-        return 0
-    fi
-    mark_unavailable "unverified job scope termination: $job_unit"
-    printf 'conformance: could not verify termination of job scope %s; venue marked unavailable\n' "$job_unit" >&2
-    return 1
-}
 
 # Invoked by the EXIT trap.
 # shellcheck disable=SC2329
 cleanup() {
     local rc=$?
-    verify_job_scope || rc=1
+    record_status "$rc"
     if [[ -n $tmp ]]; then rm -rf -- "$tmp"; fi
     if (( rc == 0 )); then rm -rf -- "$work"; else printf 'conformance: diagnostics retained in %s\n' "$work" >&2; fi
     exit "$rc"
@@ -53,33 +47,16 @@ trap cleanup EXIT
 tmp=$(mktemp -d "${root%/*}/t.XXXXXX")
 mkdir "$work/home"
 
-if [[ $(uname -s) == Linux ]]; then
-    if [[ -d /run/user/$EUID ]] && command -v systemd-run >/dev/null && command -v systemctl >/dev/null &&
-       XDG_RUNTIME_DIR="/run/user/$EUID" systemctl --user show -p Version --value >/dev/null 2>&1; then
-        suffix=$(basename -- "$work" | tr -c 'A-Za-z0-9_-' '_')
-        job_unit="mgw-job-$$-${suffix}.scope"
-    elif [[ ${CONFORMANCE_REQUIRE_SCOPE:-0} == 1 ]]; then
-        printf 'conformance: OS-owned user systemd scope is required on this Linux venue\n' >&2
-        exit 1
-    fi
-fi
-
-if [[ $job_unit != '-' && -n ${CONFORMANCE_SCOPE_FILE:-} ]]; then
-    printf 'job=%s\n' "$job_unit" >> "$CONFORMANCE_SCOPE_FILE"
-fi
-
 rc=0
 interrupted=0
 trap 'interrupted=1' HUP INT TERM
-python3 -I "$root/hack/conformance-supervise" "$work" "$limit" "$job_unit" \
+python3 -I "$root/hack/conformance-supervise" "$work" "$limit" \
     bash "$root/hack/conformance-job" "$root" "$work" "$tmp" 9<&- &
 pid=$!
 trap 'interrupted=1; kill -TERM "$pid" 2>/dev/null || :' HUP INT TERM
 if (( interrupted )); then kill -TERM "$pid" 2>/dev/null || :; fi
 wait "$pid" || rc=$?
 if (( interrupted )); then trap '' HUP INT TERM; wait "$pid" || :; rc=1; fi
-# Always stop and verify the OS-owned scope even if the inner supervisor died abruptly.
-verify_job_scope || rc=1
 if [[ -f $work/job.log ]]; then cat -- "$work/job.log"; fi
 if [[ ${MODE:-suite} == self-test && $rc == 0 && ${CONFORMANCE_SKIP_CONTAINMENT_CHECK:-0} != 1 ]]; then
     "$root/hack/conformance-containment-check" "$root" 9<&- || rc=$?

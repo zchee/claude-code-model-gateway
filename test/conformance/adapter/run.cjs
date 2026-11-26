@@ -120,7 +120,21 @@ if (mode === 'self-test') {
     ...records.map(r => [r.path, r.line, r.column, r.name, config.witness, binaryConfig.build].join('\t'))]);
   process.stdout.write(`# stand-in TSV: ${records.length} measured launches, matching metadata and rows\n`);
 
-  const controls = cp.spawnSync(process.execPath, ['--test', '--test-reporter=tap', path.join(__dirname, 'controls.test.js')], {
+  const requiredControls = [
+    'control: unattributed, alternate-node, and extra-option product launches fail closed while decoys stay on Node',
+    'control: real product launch falling back to Node inside a passing case fails the run',
+    'control: passing two-launch case fails when only one inventoried launch is redirected',
+    'control: premature suite summary before remaining events fails',
+    'control: withholding one required probe fails run.cjs',
+  ];
+  const controlEventsFile = path.join(work, 'control-events.jsonl');
+  const controls = cp.spawnSync(process.execPath, [
+    '--test',
+    '--test-reporter=tap', '--test-reporter-destination=stdout',
+    `--test-reporter=${path.join(root, 'hack/baseline-node-reporter.mjs')}`,
+    `--test-reporter-destination=${controlEventsFile}`,
+    path.join(__dirname, 'controls.test.js'),
+  ], {
     cwd: plugin,
     encoding: 'utf8',
     env: {
@@ -132,8 +146,33 @@ if (mode === 'self-test') {
       ADAPTER_CTRL_BUILD: standinBuild,
     },
   });
-  if (controls.status !== 0) error(`negative controls failed:\n${controls.stdout}\n${controls.stderr}`);
-  else process.stdout.write('# stand-in negative controls: mixed-target, partial-coverage, missing-summary, withheld-probe passed\n');
+  let controlEvents = [];
+  let controlError = null;
+  try {
+    controlEvents = ndjson(controlEventsFile);
+  } catch (err) {
+    controlError = `control reporter stream: ${err.message}`;
+  }
+  const passedControls = new Set();
+  const failedControls = [];
+  let controlSummary = null;
+  for (const ev of controlEvents) {
+    if (ev.type === 'test:pass' && ev.nesting === 0 && !Object.hasOwn(ev, 'skip') && !Object.hasOwn(ev, 'todo')) {
+      passedControls.add(ev.name);
+    } else if (ev.type === 'test:fail' && ev.nesting === 0) {
+      failedControls.push(ev.name);
+    } else if (ev.type === 'test:summary' && ev.file == null) {
+      controlSummary = ev;
+    }
+  }
+  const missingControls = requiredControls.filter(name => !passedControls.has(name));
+  const extraControls = [...passedControls].filter(name => !requiredControls.includes(name));
+  if (controls.status !== 0 || controlError || !controlSummary?.success || failedControls.length ||
+      missingControls.length || extraControls.length || controlSummary.counts?.passed !== requiredControls.length) {
+    error(`negative controls failed (status=${controls.status}, missing=${JSON.stringify(missingControls)}, extra=${JSON.stringify(extraControls)}, failed=${JSON.stringify(failedControls)}, err=${controlError}):\n${controls.stdout}\n${controls.stderr}`);
+  } else {
+    process.stdout.write(`# stand-in negative controls: ${requiredControls.length} controls verified (${requiredControls.join('; ')})\n`);
+  }
 }
 process.stdout.write(`# conformance ${JSON.stringify({ target, mode, selected: selected.length, counts: verdict.counts, launches: launches.length, ok: !failed })}\n`);
 process.exitCode = failed ? 1 : 0;

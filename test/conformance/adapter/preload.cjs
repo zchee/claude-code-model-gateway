@@ -9,6 +9,21 @@ const { createHook, executionAsyncId } = require('node:async_hooks');
 const { getCallSites } = require('node:util');
 const { tsv } = require('./evidence.cjs');
 
+const NODE_VALUE_FLAGS = new Set([
+  '-r', '--require', '--import', '--loader', '--experimental-loader',
+  '-C', '--conditions', '--input-type', '--title',
+  '--env-file', '--env-file-if-exists', '--redirect-warnings',
+  '--diagnostic-dir', '--test-reporter', '--test-reporter-destination',
+  '--test-name-pattern', '--max-old-space-size', '--heapsnapshot-near-heap-limit',
+  '--cpu-prof-dir', '--cpu-prof-name', '--heap-prof-dir', '--heap-prof-name',
+  '--inspect', '--inspect-brk', '--inspect-port', '--openssl-config',
+  '--icu-data-dir', '--policy-integrity', '--experimental-policy',
+  '--experimental-sea-config', '--report-directory', '--report-filename',
+  '--report-signal', '--heapsnapshot-signal', '--secure-heap', '--secure-heap-min',
+  '--tls-cipher-list', '--tls-keylog', '--v8-pool-size', '--watch-path',
+  '--allow-fs-read', '--allow-fs-write',
+]);
+
 module.exports = function install(config, inherited) {
   // --require propagates from the runner to its test files, not to gateway
   // children. Do not instrument the runner, npm, fixture proxies or fake CLIs.
@@ -20,10 +35,17 @@ module.exports = function install(config, inherited) {
     fs.writeFileSync(running, path.relative(plugin, process.argv[1]), { flag: 'wx' });
     process.on('exit', () => fs.rmSync(running, { force: true }));
   }
+  const execReal = fs.realpathSync.native(process.execPath);
   const cli = path.join(plugin, 'bin/model-gateway.js');
   const cliBytes = fs.readFileSync(cli);
+  const workerPath = path.join(plugin, 'lib/request-worker.js');
+  const workerEvalExact = `require(${JSON.stringify(workerPath)}).runWorker()`;
+  const hookRegistry = path.join(plugin, 'hooks/registry-writer.js');
+  const hookEnsure = path.join(plugin, 'hooks/ensure.js');
+
   const sites = new Map();
   let birthSeq = 0;
+  let inAdapter = false;
   for (const { path: file, line, kind, via, case: name } of tsv(path.join(root, 'test/conformance/launch-sites.tsv'))) {
     const key = `${file}:${line}`;
     if (!sites.has(key)) sites.set(key, []);
@@ -51,6 +73,243 @@ module.exports = function install(config, inherited) {
     const file = test.loc.file;
     return { path: path.relative(file.startsWith(plugin + '/') ? plugin : root, file),
       line: test.loc.line, column: test.loc.column, name: names.join(' > ') };
+  }
+
+  function resolveRealFile(arg, cwd) {
+    if (typeof arg !== 'string' || !arg) return null;
+    const candidate = path.resolve(cwd, arg);
+    try {
+      if (fs.statSync(candidate).isFile()) return fs.realpathSync.native(candidate);
+    } catch { /* Non-existent or unreadable path is not a product entry. */ }
+    return null;
+  }
+
+  function classifyProductScript(resolved, rawArg) {
+    if (!inherited && typeof rawArg === 'string' && path.basename(rawArg) === 'worker-birth.cjs') {
+      return { type: 'birth', kind: 'birth', isCli: false, isBirthObserver: true };
+    }
+    if (!resolved) return null;
+    if (resolved === cli || (resolved.endsWith('/bin/model-gateway.js') && fs.readFileSync(resolved).equals(cliBytes))) {
+      return { type: 'cli', kind: null, isCli: true, isBirthObserver: false };
+    }
+    if (resolved.endsWith('/model-gateway/model-gateway.js')) {
+      return { type: 'shim-cli', kind: 'shim', isCli: false, isBirthObserver: false };
+    }
+    if (resolved.endsWith('/model-gateway/update.js')) {
+      return { type: 'shim-update', kind: 'shim', isCli: false, isBirthObserver: false };
+    }
+    if (resolved === hookRegistry) {
+      return { type: 'hook-registry', kind: 'hook', isCli: false, isBirthObserver: false };
+    }
+    if (resolved === hookEnsure) {
+      return { type: 'hook-ensure', kind: 'hook', isCli: false, isBirthObserver: false };
+    }
+    return null;
+  }
+
+  function isNodeCommand(cmd, cwd, options) {
+    if (typeof cmd !== 'string' || !cmd) return false;
+    if (cmd === process.execPath) return true;
+    if (path.basename(cmd) === 'node') return true;
+    if (cmd.includes('/') || cmd.includes(path.sep)) {
+      return resolveRealFile(cmd, cwd) === execReal;
+    }
+    const envPath = options?.env?.PATH ?? process.env.PATH ?? '';
+    for (const dir of envPath.split(path.delimiter)) {
+      if (!dir) continue;
+      if (resolveRealFile(path.join(dir, cmd), cwd) === execReal) return true;
+    }
+    return false;
+  }
+
+  function unwrapEnv(cmd, args) {
+    if (typeof cmd !== 'string' || path.basename(cmd) !== 'env') return null;
+    let i = 0;
+    let modifiedEnv = false;
+    while (i < args.length) {
+      const a = args[i];
+      if (a === '--') { i++; break; }
+      if (a === '-i' || a === '-0' || a === '--ignore-environment') { modifiedEnv = true; i++; continue; }
+      if (a === '-u' || a === '-C' || a === '--unset' || a === '--chdir') { modifiedEnv = true; i += 2; continue; }
+      if (a.startsWith('--unset=') || a.startsWith('--chdir=')) { modifiedEnv = true; i++; continue; }
+      if (a === '-S' || a === '--split-string') return { splitString: args[i + 1] ?? '' };
+      if (a.startsWith('-')) return { unknownFlag: a, rest: args.slice(i) };
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(a)) { modifiedEnv = true; i++; continue; }
+      break;
+    }
+    if (i >= args.length) return null;
+    return { command: args[i], args: args.slice(i + 1), modifiedEnv };
+  }
+
+  function parseNodeArgs(nodeArgs) {
+    const nodeOptions = [];
+    let scriptIndex = -1;
+    let evalCode = null;
+    let printCode = null;
+    for (let i = 0; i < nodeArgs.length; i++) {
+      const a = nodeArgs[i];
+      if (a === '--') {
+        if (i + 1 < nodeArgs.length) scriptIndex = i + 1;
+        break;
+      }
+      if (a === '-e' || a === '--eval') {
+        evalCode = nodeArgs[i + 1] ?? '';
+        break;
+      }
+      if (a.startsWith('--eval=')) {
+        evalCode = a.slice('--eval='.length);
+        break;
+      }
+      if (a === '-p' || a === '--print') {
+        printCode = nodeArgs[i + 1] ?? '';
+        break;
+      }
+      if (a.startsWith('--print=')) {
+        printCode = a.slice('--print='.length);
+        break;
+      }
+      if (NODE_VALUE_FLAGS.has(a)) {
+        nodeOptions.push({ flag: a, value: nodeArgs[i + 1] ?? '' });
+        i++;
+        continue;
+      }
+      if (a.startsWith('-')) {
+        const eq = a.indexOf('=');
+        nodeOptions.push(eq === -1 ? { flag: a, value: null } : { flag: a.slice(0, eq), value: a.slice(eq + 1) });
+        continue;
+      }
+      scriptIndex = i;
+      break;
+    }
+    return { nodeOptions, scriptIndex, evalCode, printCode };
+  }
+
+  function isAllowedOptionsForProduct(prod, nodeOptions) {
+    if (nodeOptions.length === 0) return true;
+    // The pinned suite uses one --require/-r preload before bin/model-gateway.js.
+    if (prod.isCli && nodeOptions.length === 1 && (nodeOptions[0].flag === '--require' || nodeOptions[0].flag === '-r')) {
+      return true;
+    }
+    return false;
+  }
+
+  function productInvocationFromScript(prod, tailArgs) {
+    if (prod.isBirthObserver) {
+      return { kind: 'birth', binaryArgs: null, isCli: false, isBirthObserver: true };
+    }
+    if (prod.type === 'cli') {
+      const kind = tailArgs[0] === 'serve-shim' ? 'supervisor' : tailArgs[0] === 'serve-worker' ? 'worker' : 'cli';
+      return { kind, binaryArgs: tailArgs, isCli: true, isBirthObserver: false };
+    }
+    if (prod.type === 'shim-cli') {
+      return { kind: 'shim', binaryArgs: tailArgs, isCli: false, isBirthObserver: false };
+    }
+    if (prod.type === 'shim-update') {
+      return { kind: 'shim', binaryArgs: ['setup', '--preserve-wiring'], isCli: false, isBirthObserver: false };
+    }
+    if (prod.type === 'hook-registry') {
+      return { kind: 'hook', binaryArgs: ['hook', 'session-start', ...tailArgs], isCli: false, isBirthObserver: false };
+    }
+    if (prod.type === 'hook-ensure') {
+      return { kind: 'hook', binaryArgs: tailArgs, isCli: false, isBirthObserver: false };
+    }
+    return null;
+  }
+
+  function mentionsProductInShell(text) {
+    return text.includes(cli) || text.includes(hookRegistry) || text.includes(hookEnsure) ||
+      (text.includes('request-worker.js') && text.includes('runWorker')) ||
+      text.includes('/model-gateway/model-gateway.js') || text.includes('/model-gateway/update.js') ||
+      text.includes('worker-birth.cjs');
+  }
+
+  function inspectInvocation(command, args, options) {
+    const cwd = options?.cwd ?? process.cwd();
+    const argList = Array.isArray(args) ? args : [];
+    if (options?.shell) {
+      const combined = [command, ...argList].filter(Boolean).join(' ');
+      if (mentionsProductInShell(combined)) {
+        return { unsupported: true, kind: 'cli', reason: 'unsupported product invocation via shell' };
+      }
+      return null;
+    }
+
+    // Direct execution of a product script (shebang) without an explicit Node command.
+    const directProd = classifyProductScript(resolveRealFile(command, cwd), command);
+    if (directProd) {
+      const info = productInvocationFromScript(directProd, argList);
+      return { unsupported: true, kind: info.kind, reason: `unsupported direct product execution (${info.kind})` };
+    }
+
+    let effCmd = command;
+    let effArgs = argList;
+    let envModified = false;
+    const unwrapped = unwrapEnv(command, argList);
+    if (unwrapped) {
+      if (unwrapped.splitString !== undefined || unwrapped.unknownFlag !== undefined) {
+        const joined = [unwrapped.splitString ?? '', ...(unwrapped.rest ?? [])].join(' ');
+        if (mentionsProductInShell(joined) || argList.some(a => classifyProductScript(resolveRealFile(a, cwd), a))) {
+          return { unsupported: true, kind: 'cli', reason: 'unsupported env wrapper around product invocation' };
+        }
+        return null;
+      }
+      effCmd = unwrapped.command;
+      effArgs = unwrapped.args;
+      envModified = unwrapped.modifiedEnv;
+    }
+
+    if (!isNodeCommand(effCmd, cwd, options)) {
+      return null;
+    }
+
+    const parsed = parseNodeArgs(effArgs);
+    if (parsed.evalCode !== null) {
+      if (parsed.evalCode === workerEvalExact) {
+        if (envModified || parsed.nodeOptions.length > 0) {
+          return { unsupported: true, kind: 'worker', reason: `unsupported Node options before worker eval: ${parsed.nodeOptions.map(o => o.flag).join(' ')}` };
+        }
+        return { kind: 'worker', binaryArgs: ['serve-worker'], isCli: false, isBirthObserver: false };
+      }
+      if (parsed.evalCode.includes('request-worker.js') && parsed.evalCode.includes('runWorker')) {
+        return { unsupported: true, kind: 'worker', reason: 'unsupported inline worker eval invocation' };
+      }
+      return null;
+    }
+
+    if (parsed.printCode !== null) {
+      return null;
+    }
+
+    if (parsed.scriptIndex !== -1) {
+      const scriptArg = effArgs[parsed.scriptIndex];
+      const prod = classifyProductScript(resolveRealFile(scriptArg, cwd), scriptArg);
+      if (prod) {
+        const info = productInvocationFromScript(prod, effArgs.slice(parsed.scriptIndex + 1));
+        if (envModified) {
+          return { unsupported: true, kind: info.kind, reason: `unsupported env wrapper with flags/assignments before product entry (${info.kind})` };
+        }
+        if (!isAllowedOptionsForProduct(prod, parsed.nodeOptions)) {
+          return { unsupported: true, kind: info.kind, reason: `unsupported Node options before product entry (${info.kind}): ${parsed.nodeOptions.map(o => o.flag).join(' ')}` };
+        }
+        return info;
+      }
+    }
+
+    // Defense-in-depth: an unrecognized leading Node flag that takes a separate argument
+    // can shift scriptIndex past the real script. Never silently fall back to Node.
+    if (parsed.nodeOptions.length > 0) {
+      for (const a of effArgs) {
+        if (typeof a !== 'string' || a.startsWith('-')) continue;
+        const prod = classifyProductScript(resolveRealFile(a, cwd), a);
+        if (prod) {
+          const idx = effArgs.indexOf(a);
+          const info = productInvocationFromScript(prod, effArgs.slice(idx + 1));
+          return { unsupported: true, kind: info.kind, reason: `unsupported Node option layout before product entry (${info.kind})` };
+        }
+      }
+    }
+
+    return null;
   }
 
   const sync = cp.spawnSync;
@@ -86,42 +345,21 @@ module.exports = function install(config, inherited) {
   for (const method of ['spawn', 'spawnSync']) {
     const original = cp[method];
     cp[method] = function (command, args, options) {
-      if (command !== process.execPath || !Array.isArray(args)) return original.apply(this, arguments);
-
-      let binaryArgs, kind, isCli = false;
-      const entry = args[0];
-      const script = entry === '--require' || entry === '-r' ? 2 : 0;
-      const arg = args[script];
-      let resolved = null;
-      if (arg && !arg.startsWith('-')) {
-        const candidate = path.resolve(options?.cwd ?? process.cwd(), arg);
-        try {
-          if (fs.statSync(candidate).isFile()) resolved = fs.realpathSync.native(candidate);
-        } catch { /* Non-existent or unreadable script is not a product entry. */ }
-      }
-      const isBirthObserver = !inherited && arg && path.basename(arg) === 'worker-birth.cjs';
-      if (resolved === cli || (resolved && resolved.endsWith('/bin/model-gateway.js') && fs.readFileSync(resolved).equals(cliBytes))) {
-        isCli = true;
-        binaryArgs = args.slice(script + 1);
-        kind = binaryArgs[0] === 'serve-shim' ? 'supervisor' : binaryArgs[0] === 'serve-worker' ? 'worker' : 'cli';
-      } else if (entry === '-e' && args[1] === `require(${JSON.stringify(path.join(plugin, 'lib/request-worker.js'))}).runWorker()`) {
-        kind = 'worker'; binaryArgs = ['serve-worker'];
-      } else if (resolved && resolved.endsWith('/model-gateway/model-gateway.js')) {
-        kind = 'shim'; binaryArgs = args.slice(1);
-      } else if (resolved && resolved.endsWith('/model-gateway/update.js')) {
-        kind = 'shim'; binaryArgs = ['setup', '--preserve-wiring'];
-      } else if (resolved === path.join(plugin, 'hooks/registry-writer.js')) {
-        kind = 'hook'; binaryArgs = ['hook', 'session-start', ...args.slice(1)];
-      } else if (resolved === path.join(plugin, 'hooks/ensure.js')) {
-        kind = 'hook'; binaryArgs = args.slice(1);
-      } else if (!isBirthObserver) {
-        // Known decoys, fake fixtures and unrelated Node scripts stay on Node.
+      if (inAdapter) return original.apply(this, arguments);
+      const effOptions = Array.isArray(args) ? options : (args && typeof args === 'object' ? args : undefined);
+      const effArgs = Array.isArray(args) ? args : [];
+      const detected = inspectInvocation(command, effArgs, effOptions);
+      if (!detected) {
+        // Known decoys, fake fixtures and unrelated scripts stay on Node/OS.
         return original.apply(this, arguments);
       }
-
-      const detectedKind = kind ?? 'birth';
       const test = owner();
-      if (!test) failClosed(`product launch (${detectedKind}) without test owner`, detectedKind, null);
+      if (detected.unsupported) {
+        failClosed(detected.reason, detected.kind, test);
+      }
+
+      const { kind, binaryArgs, isCli, isBirthObserver } = detected;
+      if (!test) failClosed(`product launch (${kind}) without test owner`, kind, null);
 
       const matches = inherited ? [inherited.row] : getCallSites(100).flatMap(frame =>
         sites.get(`${path.relative(plugin, frame.scriptName)}:${frame.lineNumber}`) ?? []);
@@ -138,7 +376,7 @@ module.exports = function install(config, inherited) {
         }
       }
       if (!matches.length) {
-        failClosed(`product launch (${detectedKind}) outside inventoried sites for ${test.path}:${test.line}`, detectedKind, test);
+        failClosed(`product launch (${kind}) outside inventoried sites for ${test.path}:${test.line}`, kind, test);
       }
 
       const owned = matches.filter(r => r.name === test.name && !r.via.startsWith('subtest:'));
@@ -152,7 +390,12 @@ module.exports = function install(config, inherited) {
         if (!inner) failClosed(`missing worker birth launch site for ${test.path}:${test.line}`, 'birth', test);
         const preload = path.join(config.work, `birth-${process.pid}-${++birthSeq}.cjs`);
         fs.writeFileSync(preload, `require(${JSON.stringify(__filename)})(${JSON.stringify(config)},${JSON.stringify({ owner: test, row: inner })});\n`);
-        return original.call(this, command, ['--require', preload, ...args], options);
+        inAdapter = true;
+        try {
+          return original.call(this, command, ['--require', preload, ...effArgs], effOptions);
+        } finally {
+          inAdapter = false;
+        }
       }
 
       const allowSupportHelper = test.path.startsWith('test/conformance/');
@@ -163,8 +406,15 @@ module.exports = function install(config, inherited) {
         failClosed(`product launch (${kind}) has no matching inventory row for ${test.path}:${test.line} ${test.name}`, kind, test);
       }
 
-      const witnessPid = config.witness ? witness(command, args, binaryArgs, options) : null;
-      const child = dispatch(original, target, command, args, binaryArgs, options);
+      inAdapter = true;
+      let witnessPid = null;
+      let child;
+      try {
+        witnessPid = config.witness ? witness(command, effArgs, binaryArgs, effOptions) : null;
+        child = dispatch(original, target, command, effArgs, binaryArgs, effOptions);
+      } finally {
+        inAdapter = false;
+      }
       if (Number.isInteger(child.pid) && child.pid > 0) {
         const callers = [...new Set(matches.filter(r => r.name === test.name && r.kind === kind && r.site !== row.site).map(r => r.site))];
         fs.appendFileSync(log, JSON.stringify({ ...test, site: row.site, kind, target, pid: child.pid, build,
@@ -172,6 +422,45 @@ module.exports = function install(config, inherited) {
           ...(witnessPid ? { witnessPid } : {}) }) + '\n');
       }
       return child;
+    };
+  }
+
+  for (const method of ['execFile', 'execFileSync']) {
+    const original = cp[method];
+    cp[method] = function (file, args, options) {
+      if (!inAdapter) {
+        const effArgs = Array.isArray(args) ? args : [];
+        const effOptions = Array.isArray(args) ? options : (args && typeof args === 'object' ? args : undefined);
+        const detected = inspectInvocation(file, effArgs, effOptions);
+        if (detected) {
+          failClosed(`unsupported product invocation via child_process.${method} (${detected.kind})`, detected.kind, owner());
+        }
+      }
+      return original.apply(this, arguments);
+    };
+  }
+
+  const originalFork = cp.fork;
+  cp.fork = function (modulePath, args, options) {
+    if (!inAdapter) {
+      const effOptions = Array.isArray(args) ? options : (args && typeof args === 'object' ? args : undefined);
+      const cwd = effOptions?.cwd ?? process.cwd();
+      const prod = classifyProductScript(resolveRealFile(modulePath, cwd), modulePath);
+      if (prod) {
+        const info = productInvocationFromScript(prod, Array.isArray(args) ? args : []);
+        failClosed(`unsupported product invocation via child_process.fork (${info.kind})`, info.kind, owner());
+      }
+    }
+    return originalFork.apply(this, arguments);
+  };
+
+  for (const method of ['exec', 'execSync']) {
+    const original = cp[method];
+    cp[method] = function (cmdStr) {
+      if (!inAdapter && typeof cmdStr === 'string' && mentionsProductInShell(cmdStr)) {
+        failClosed(`unsupported product invocation via child_process.${method}`, 'cli', owner());
+      }
+      return original.apply(this, arguments);
     };
   }
 };

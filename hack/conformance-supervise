@@ -1,6 +1,6 @@
 # Copyright 2026 The claude-code-model-gateway Authors.
 # SPDX-License-Identifier: Apache-2.0
-"""Run the conformance suite inside an OS-owned scope without changing orphan parentage."""
+"""Run the conformance suite with non-reaping process-group containment."""
 
 import os
 import signal
@@ -16,135 +16,6 @@ def interrupt(_signal: int, _frame: object) -> None:
     """Request shutdown without interrupting process creation."""
     global interrupted
     interrupted = True
-
-
-def systemd_env() -> dict[str, str]:
-    """Build a minimal environment for user systemd control commands."""
-    env = dict(os.environ)
-    env["XDG_RUNTIME_DIR"] = f"/run/user/{os.getuid()}"
-    env.pop("DBUS_SESSION_BUS_ADDRESS", None)
-    return env
-
-
-def run_systemctl(
-    args: list[str], timeout: float = 10.0
-) -> subprocess.CompletedProcess[str] | None:
-    """Execute a user systemctl command and return its result, or None on timeout/OS error."""
-    try:
-        return subprocess.run(
-            ["systemctl", "--user", *args],
-            env=systemd_env(),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-
-
-def scope_cgroup_dir(unit: str) -> Path | None:
-    """Resolve the sysfs cgroup v2 directory for a user scope unit."""
-    res = run_systemctl(["show", "-p", "ControlGroup", "--value", unit])
-    if res is None or res.returncode != 0:
-        return None
-    cg = res.stdout.strip()
-    if not cg:
-        uid = os.getuid()
-        cg = f"/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/{unit}"
-    return Path("/sys/fs/cgroup") / cg.lstrip("/")
-
-
-def scope_active_state(unit: str) -> str | None:
-    """Query systemd ActiveState for a user scope unit, or None if unreadable."""
-    res = run_systemctl(["show", "-p", "ActiveState", "--value", unit])
-    if res is None or res.returncode != 0:
-        return None
-    return res.stdout.strip()
-
-
-def read_cgroup_pids(cg_dir: Path) -> list[int] | None:
-    """Return live PIDs in a cgroup directory, [] if absent, or None if unreadable."""
-    procs = cg_dir / "cgroup.procs"
-    try:
-        raw = procs.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return []
-    except OSError:
-        return None
-    return [int(line) for line in raw.splitlines() if line.strip()]
-
-
-def kill_cgroup_atomic(cg_dir: Path) -> None:
-    """Request atomic kernel termination of every process in a cgroup v2 directory."""
-    kill_file = cg_dir / "cgroup.kill"
-    try:
-        kill_file.write_text("1\n", encoding="utf-8")
-    except OSError:
-        return
-
-
-def wait_scope_clear(
-    unit: str, cg_dir: Path, timeout: float, job: subprocess.Popen[bytes] | None = None
-) -> bool:
-    """Poll until the cgroup has no live processes and the unit is no longer active."""
-    deadline = time.monotonic() + timeout
-    while True:
-        if job is not None:
-            job.poll()
-        pids = read_cgroup_pids(cg_dir)
-        state = scope_active_state(unit)
-        if pids == [] and state in ("inactive", "failed"):
-            if state == "failed":
-                run_systemctl(["reset-failed", unit])
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.05)
-
-
-def stop_and_verify_scope(
-    unit: str,
-    grace: float = 3.0,
-    kill_wait: float = 5.0,
-    job: subprocess.Popen[bytes] | None = None,
-) -> tuple[bool, list[int]]:
-    """Stop every process in a user scope and verify the cgroup is empty and inactive."""
-    cg_dir = scope_cgroup_dir(unit)
-    if cg_dir is None:
-        return False, []
-    initial = read_cgroup_pids(cg_dir)
-    if initial is None:
-        return False, []
-    state = scope_active_state(unit)
-    if state is None:
-        return False, initial
-    if initial or state not in ("inactive", "failed"):
-        if initial:
-            print(
-                f"conformance: stopping job scope {unit} (live pids: {sorted(initial)})",
-                file=sys.stderr,
-            )
-            run_systemctl(["kill", "-s", "SIGTERM", "--kill-who=all", unit])
-        if not wait_scope_clear(unit, cg_dir, grace, job=job):
-            remaining = read_cgroup_pids(cg_dir)
-            print(
-                f"conformance: forcing SIGKILL on job scope {unit} (remaining pids: {remaining})",
-                file=sys.stderr,
-            )
-            kill_cgroup_atomic(cg_dir)
-            run_systemctl(["kill", "-s", "SIGKILL", "--kill-who=all", unit])
-            run_systemctl(["stop", unit])
-            if not wait_scope_clear(unit, cg_dir, kill_wait, job=job):
-                return False, read_cgroup_pids(cg_dir) or []
-    elif state == "failed":
-        run_systemctl(["reset-failed", unit])
-    if job is not None:
-        job.poll()
-    final_pids = read_cgroup_pids(cg_dir)
-    final_state = scope_active_state(unit)
-    verified = final_pids == [] and final_state == "inactive"
-    return verified, initial
 
 
 def snapshot() -> set[tuple[int, int]]:
@@ -184,10 +55,8 @@ def active_test_files(work: Path) -> str:
 
 def wait_leader_nonreaping(pid: int) -> bool:
     """Return True when pid has exited without reaping it (keeps PGID non-reusable)."""
-    if hasattr(os, "waitid") and hasattr(os, "WNOWAIT"):
-        info = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
-        return info is not None
-    return False
+    info = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    return info is not None
 
 
 def live_pgid_members(pgid: int) -> list[int]:
@@ -246,21 +115,13 @@ def stop_pgid_before_reap(job: subprocess.Popen[bytes], initial_rc: int | None) 
 
 
 def main() -> None:
-    """Entry point for running or stopping a contained conformance job."""
-    if len(sys.argv) == 3 and sys.argv[1] == "--stop-scope":
-        unit = sys.argv[2]
-        ok, had_pids = stop_and_verify_scope(unit)
-        if not ok:
-            sys.exit(f"conformance: unable to verify termination of job scope {unit}")
-        if had_pids:
-            print(
-                f"# conformance containment: stopped and verified empty job scope {unit} "
-                f"(terminated {len(had_pids)} live process(es))"
-            )
-        sys.exit(0)
-
-    if len(sys.argv) < 5:
-        sys.exit("usage: conformance-supervise WORK LIMIT JOB_UNIT CMD [ARGS...]")
+    """Entry point for running a process-group-contained conformance job."""
+    if len(sys.argv) < 4:
+        sys.exit("usage: conformance-supervise WORK LIMIT CMD [ARGS...]")
+    if not (hasattr(os, "waitid") and hasattr(os, "WNOWAIT")):
+        sys.exit(
+            "conformance: os.waitid with WNOWAIT is required for safe process-group containment"
+        )
 
     for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, interrupt)
@@ -268,127 +129,57 @@ def main() -> None:
     linux = sys.platform == "linux"
     work = Path(sys.argv[1])
     limit = int(sys.argv[2])
-    job_unit = sys.argv[3]
-    job_cmd = sys.argv[4:]
-    use_scope = linux and job_unit != "-"
-    outer_unit = os.environ.get("CONFORMANCE_OUTER_UNIT", "")
+    job_cmd = sys.argv[3:]
 
     deadline = time.monotonic() + limit
     before = snapshot() if linux else set()
 
-    launch_cmd: list[str]
-    launch_env: dict[str, str] | None = None
-    if use_scope:
-        launch_cmd = [
-            "systemd-run",
-            "--user",
-            "--scope",
-            f"--unit={job_unit}",
-            f"--property=RuntimeMaxSec={limit + 15}",
-            "--property=TimeoutStopSec=5",
-            "--property=KillMode=control-group",
-            "--property=CollectMode=inactive-or-failed",
-            "--quiet",
-        ]
-        if outer_unit:
-            launch_cmd.append(f"--property=BindsTo={outer_unit}")
-        launch_cmd.extend(
-            [
-                "--",
-                "env",
-                "-u",
-                "XDG_RUNTIME_DIR",
-                "-u",
-                "DBUS_SESSION_BUS_ADDRESS",
-                *job_cmd,
-            ]
-        )
-        launch_env = systemd_env()
-    else:
-        launch_cmd = job_cmd
-
     # Detached fixture processes cannot hold the remote transport's pipes open.
     with (work / "job.log").open("xb") as output:
         job = subprocess.Popen(
-            launch_cmd,
-            env=launch_env,
+            job_cmd,
             start_new_session=True,
             stdout=output,
             stderr=subprocess.STDOUT,
         )
 
-    if use_scope:
-        while not interrupted and job.poll() is None and time.monotonic() < deadline:
-            time.sleep(0.05)
-        rc: int | None = job.returncode
-        timed_out = not interrupted and rc is None
-        if interrupted or timed_out:
-            rc = 1 if interrupted else 124
-            reason = (
-                "interrupted"
-                if interrupted
-                else f"wall-clock limit {limit}s reached (infrastructure timeout)"
-            )
-            print(
-                f"conformance: {reason}; active test files: {active_test_files(work)}",
-                file=sys.stderr,
-            )
-            ok, _ = stop_and_verify_scope(job_unit, job=job)
-            job.wait()
-            if not ok:
-                sys.exit(f"conformance: job scope {job_unit} survived termination")
-        else:
-            cg_dir = scope_cgroup_dir(job_unit)
-            survivors = read_cgroup_pids(cg_dir) if cg_dir is not None else None
-            if survivors is None:
-                sys.exit(f"conformance: unable to inspect job scope {job_unit}")
-            if survivors:
-                print(
-                    f"conformance: detached survivor(s) in job scope {job_unit}: {sorted(survivors)}",
-                    file=sys.stderr,
-                )
-                rc = rc if rc not in (None, 0) else 1
-            ok, _ = stop_and_verify_scope(job_unit)
-            if not ok:
-                sys.exit(f"conformance: job scope {job_unit} survived termination")
+    exited = False
+    while not interrupted and time.monotonic() < deadline:
+        if wait_leader_nonreaping(job.pid):
+            exited = True
+            break
+        time.sleep(0.05)
+
+    timed_out = not interrupted and not exited
+    if interrupted or timed_out:
+        rc = 1 if interrupted else 124
+        reason = (
+            "interrupted"
+            if interrupted
+            else f"wall-clock limit {limit}s reached (infrastructure timeout)"
+        )
+        print(
+            f"conformance: {reason}; active test files: {active_test_files(work)}",
+            file=sys.stderr,
+        )
+        rc = stop_pgid_before_reap(job, rc)
     else:
-        exited = False
-        while not interrupted and time.monotonic() < deadline:
-            if hasattr(os, "waitid") and hasattr(os, "WNOWAIT"):
-                if wait_leader_nonreaping(job.pid):
-                    exited = True
-                    break
-            elif job.poll() is not None:
-                exited = True
-                break
-            time.sleep(0.05)
-        rc = None
-        if interrupted or not exited:
-            rc = 1 if interrupted else 124
-            reason = (
-                "interrupted"
-                if interrupted
-                else f"wall-clock limit {limit}s reached (infrastructure timeout)"
-            )
-            print(
-                f"conformance: {reason}; active test files: {active_test_files(work)}",
-                file=sys.stderr,
-            )
-            rc = stop_pgid_before_reap(job, rc)
-        else:
-            # Keep leader unreaped until any stray group members are checked/signaled.
-            rc = stop_pgid_before_reap(job, None)
+        # Keep leader unreaped until any stray group members are checked/signaled.
+        rc = stop_pgid_before_reap(job, None)
 
     if linux:
         leftover = snapshot() - before
         if leftover:
-            sys.exit(
-                f"conformance: new live account processes (pid, start tick): {sorted(leftover)}"
+            print(
+                f"conformance: new live account processes (pid, start tick): {sorted(leftover)}",
+                file=sys.stderr,
             )
-        print("# conformance containment: no new live account processes")
+            if not timed_out:
+                rc = 1
+        else:
+            print("# conformance containment: no new live account processes")
 
-    final_rc = rc if rc is not None else 1
-    sys.exit(final_rc if final_rc >= 0 else 128 - final_rc)
+    sys.exit(rc if rc >= 0 else 128 - rc)
 
 
 if __name__ == "__main__":

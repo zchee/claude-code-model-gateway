@@ -27,7 +27,7 @@ function cleanEnv() {
   return env;
 }
 
-test('control: unattributed second product launch fails closed while decoys stay on Node', () => {
+test('control: unattributed, alternate-node, and extra-option product launches fail closed while decoys stay on Node', () => {
   const dir = fs.mkdtempSync(path.join(work, 'ctrl-mixed-'));
   const log = path.join(dir, 'launches.jsonl');
   fs.writeFileSync(log, '');
@@ -46,13 +46,15 @@ test('control: unattributed second product launch fails closed while decoys stay
   const records = ndjson(log);
   const valid = records.filter(r => !r.unattributed);
   const rejected = records.filter(r => r.unattributed);
-  assert.equal(valid.length, 1, `expected 1 redirected binary launch, got ${records.length}`);
+  assert.equal(valid.length, 1, `expected 1 redirected binary launch, got ${valid.length}`);
   assert.equal(valid[0].target, `binary:${standin}`);
   assert.equal(valid[0].build, build);
-  assert.equal(rejected.length, 1, 'expected 1 fail-closed unattributed record');
-  assert.match(rejected[0].reason, /outside inventoried sites/);
+  assert.equal(rejected.length, 8, `expected 8 fail-closed unattributed records, got ${rejected.length}`);
+  assert.ok(rejected.some(r => /outside inventoried sites/.test(r.reason)));
+  assert.ok(rejected.some(r => /unsupported Node options before product entry/.test(r.reason)));
+  assert.ok(rejected.some(r => /child_process\.execFileSync/.test(r.reason)));
 
-  // Even if the test caught the throw and exited 0, the suite evaluator must reject the run.
+  // Even if the test caught every throw and exited 0, the suite evaluator must reject the run.
   const syntheticEvent = { file: 'test/conformance/adapter/mixed-target.test.js', line: 1, column: 1, nesting: 0, name: 'mixed' };
   const verdict = evaluateSuite({
     target: `binary:${standin}`,
@@ -75,6 +77,84 @@ test('control: unattributed second product launch fails closed while decoys stay
   assert.equal(verdict.failed, true);
   assert.ok(verdict.errors.some(e => e.includes('unattributed or unredirected product launch')),
     `expected unattributed error, got: ${verdict.errors.join('; ')}`);
+});
+
+test('control: real product launch falling back to Node inside a passing case fails the run', () => {
+  // Part A: repeated-site mixed-target control on the real three-iteration case
+  // test/wiring-mode.test.js:137 (2 binary launches + 1 Node fallback at the same row).
+  const caseName = 'retired wiring-mode flags fail loudly';
+  const row = classes.find(r => r.path === 'test/wiring-mode.test.js' && r.name === caseName);
+  assert(row, 'expected wiring-mode case in classification');
+  const obligations = sites.filter(s => s.path === row.path && s.case === row.name && s.kind !== 'helper');
+  assert.equal(obligations.length, 1, 'expected one inventoried row executed repeatedly');
+  const siteCoord = `${row.path}:${obligations[0].line}`;
+
+  const events = [
+    { type: 'test:start', file: row.path, line: Number(row.line), column: Number(row.column), nesting: 0, name: row.name },
+    { type: 'test:pass', file: row.path, line: Number(row.line), column: Number(row.column), nesting: 0, name: row.name },
+    { type: 'test:summary', file: row.path, success: true, counts: { tests: 1, passed: 1, failed: 0, skipped: 0, todo: 0, cancelled: 0 } },
+    { type: 'test:summary', file: null, success: true, counts: { tests: 1, passed: 1, failed: 0, skipped: 0, todo: 0, cancelled: 0 } },
+  ];
+  const baseRec = { path: row.path, line: Number(row.line), column: Number(row.column), name: row.name,
+    site: siteCoord, kind: obligations[0].kind };
+  const twoBinOneNode = [
+    { ...baseRec, target: `binary:${standin}`, pid: 2001, build },
+    { ...baseRec, target: `binary:${standin}`, pid: 2002, build },
+    { ...baseRec, target: 'identity', pid: 2003, build: null },
+  ];
+  const mixedVerdict = evaluateSuite({
+    target: `binary:${standin}`, build, full: false, probes: false,
+    selected: [row], baseline, sites, launches: twoBinOneNode, events, expectedFiles: [row.path], runnerStatus: 0,
+  });
+  assert.equal(mixedVerdict.failed, true);
+  assert.ok(mixedVerdict.errors.some(e => e.includes(`invalid launch at ${siteCoord}`)),
+    `expected invalid launch error on repeated site, got: ${mixedVerdict.errors.join('; ')}`);
+
+  const threeBin = [
+    { ...baseRec, target: `binary:${standin}`, pid: 2001, build },
+    { ...baseRec, target: `binary:${standin}`, pid: 2002, build },
+    { ...baseRec, target: `binary:${standin}`, pid: 2003, build },
+  ];
+  const allBinVerdict = evaluateSuite({
+    target: `binary:${standin}`, build, full: false, probes: false,
+    selected: [row], baseline, sites, launches: threeBin, events, expectedFiles: [row.path], runnerStatus: 0,
+  });
+  assert.equal(allBinVerdict.failed, false, allBinVerdict.errors.join('; '));
+
+  // Part B: live passing test executes one redirected launch and one real product launch
+  // attempting Node fallback (caught so the test itself exits 0); the suite verdict fails.
+  const dir = fs.mkdtempSync(path.join(work, 'ctrl-fallback-'));
+  const log = path.join(dir, 'launches.jsonl');
+  fs.writeFileSync(log, '');
+  const preload = path.join(dir, 'preload.cjs');
+  const cfg = { root, plugin, target: `binary:${standin}`, work: dir, log, build, witness: null, trackActive: false };
+  fs.writeFileSync(preload, `require(${JSON.stringify(path.join(__dirname, 'preload.cjs'))})(${JSON.stringify(cfg)});\n`);
+  const caseFile = path.join(__dirname, 'fallback-pass.test.js');
+  const eventsPath = path.join(dir, 'events.jsonl');
+  const live = cp.spawnSync(process.execPath, [
+    '--require', './test/isolate-home.js',
+    '--require', preload,
+    '--test',
+    '--test-reporter=tap', '--test-reporter-destination=stdout',
+    `--test-reporter=${path.join(root, 'hack/baseline-node-reporter.mjs')}`,
+    `--test-reporter-destination=${eventsPath}`,
+    caseFile,
+  ], { cwd: plugin, encoding: 'utf8', env: cleanEnv() });
+  assert.equal(live.status, 0, `expected inner test to pass on its own:\n${live.stdout}\n${live.stderr}`);
+  const liveEvents = ndjson(eventsPath);
+  const liveLaunches = ndjson(log);
+  const passEv = liveEvents.find(e => e.type === 'test:pass');
+  assert(passEv, 'expected inner passing test event');
+  const norm = f => path.relative(root, path.resolve(plugin, f));
+  const relFile = norm(passEv.file);
+  const liveVerdict = evaluateSuite({
+    target: `binary:${standin}`, build, full: false, probes: false,
+    selected: [{ path: relFile, line: String(passEv.line), column: String(passEv.column), name: passEv.name, class: 'conformance' }],
+    baseline, sites, launches: liveLaunches, events: liveEvents, expectedFiles: [relFile], runnerStatus: live.status, normalizeFile: norm,
+  });
+  assert.equal(liveVerdict.failed, true);
+  assert.ok(liveVerdict.errors.some(e => e.includes('unattributed or unredirected product launch')),
+    `expected unattributed error from live Node-fallback attempt, got: ${liveVerdict.errors.join('; ')}`);
 });
 
 test('control: passing two-launch case fails when only one inventoried launch is redirected', () => {
@@ -121,6 +201,30 @@ test('control: passing two-launch case fails when only one inventoried launch is
     `expected missing file summary error, got: ${truncated.errors.join('; ')}`);
   assert.ok(truncated.errors.some(e => e.includes('missing test summary: suite')),
     `expected missing suite summary error, got: ${truncated.errors.join('; ')}`);
+});
+
+test('control: premature suite summary before remaining events fails', () => {
+  const caseName = 'a second supervisor exits when the singleton listener is already owned';
+  const row = classes.find(r => r.path === 'test/gateway-drain.test.js' && r.name === caseName);
+  const obligations = sites.filter(s => s.path === row.path && s.case === row.name && s.kind !== 'helper');
+  const launch1 = { path: row.path, line: Number(row.line), column: Number(row.column), name: row.name,
+    site: `${row.path}:${obligations[0].line}`, kind: obligations[0].kind, target: `binary:${standin}`, pid: 1001, build };
+  const launch2 = { path: row.path, line: Number(row.line), column: Number(row.column), name: row.name,
+    site: `${row.path}:${obligations[1].line}`, kind: obligations[1].kind, target: `binary:${standin}`, pid: 1002, build };
+  const reordered = [
+    { type: 'test:start', file: row.path, line: Number(row.line), column: Number(row.column), nesting: 0, name: row.name },
+    { type: 'test:pass', file: row.path, line: Number(row.line), column: Number(row.column), nesting: 0, name: row.name },
+    { type: 'test:summary', file: null, success: true, counts: { tests: 1, passed: 1, failed: 0, skipped: 0, todo: 0, cancelled: 0 } },
+    { type: 'test:summary', file: row.path, success: true, counts: { tests: 1, passed: 1, failed: 0, skipped: 0, todo: 0, cancelled: 0 } },
+  ];
+  const verdict = evaluateSuite({
+    target: `binary:${standin}`, build, full: false, probes: false,
+    selected: [row], baseline, sites, launches: [launch1, launch2],
+    events: reordered, expectedFiles: [row.path], runnerStatus: 0,
+  });
+  assert.equal(verdict.failed, true);
+  assert.ok(verdict.errors.some(e => e.includes('event after suite summary')),
+    `expected event-after-suite-summary error, got: ${verdict.errors.join('; ')}`);
 });
 
 test('control: withholding one required probe fails run.cjs', () => {

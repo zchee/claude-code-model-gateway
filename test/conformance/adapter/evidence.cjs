@@ -96,6 +96,10 @@ function evaluateSuite({
         error(`aborted test: ${event.name}`);
       }
       const file = event.file == null ? null : normalizeFile(event.file);
+      if (ends.has(null)) {
+        error(`event after suite summary: ${event.type}${file ? ` (${file})` : ''}`);
+        continue;
+      }
       if (event.type === 'test:summary') {
         if (!event.counts || event.counts.cancelled || !event.success) {
           error(`unsuccessful test summary: ${file ?? 'suite'}`);

@@ -14,7 +14,7 @@ clean=(env -i "PATH=$PATH" "HOME=$work/home" "TMPDIR=$tmp" "npm_config_cache=${n
 case ${MODE:-suite} in
     self-test) cc -std=c99 -Wall -Wextra -Werror -o "$work/standin" "$root/test/conformance/adapter/standin.c" ;;
     suite|probes) ;;
-    *) printf 'unknown conformance MODE: %s\n' "$MODE" >&2; exit 1 ;;
+    *) printf 'unknown conformance MODE: %s\n' "$MODE" >&2; exit 2 ;;
 esac
 exec "${clean[@]}" node "$root/test/conformance/adapter/run.cjs" "$root" "$plugin" "$work" \
     "${TARGET:-identity}" "${MODE:-suite}" "${PHASE:-}" "${PACKAGE:-}" "${GATE:-}" "${LAUNCH_LOG:-$work/launches.jsonl}" "${CLASS:-}" "${SITE:-}"
