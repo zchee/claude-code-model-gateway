@@ -44,8 +44,10 @@ type UsageCapture interface {
 // is respected.
 // NewMessageID supplies the complete ID for a synthesized message.
 // Diagnostics receives fixed operator lines that carry no request or response content; nil
-// discards them. Each line is written with exactly one Write call, and the writer must be safe for
-// concurrent use by every user of the same underlying sink.
+// discards them. A Codex rejection line is written whether or not the client is still there; the
+// empty-completion line only after the empty reply was written to the client and its body Write
+// returned no error. Each line is written with exactly one Write call, and the writer must be safe
+// for concurrent use by every user of the same underlying sink.
 type Request struct {
 	Provider, AdvertisedModel, BackendModel, Session, CommandPath, Origin string
 	Body                                                                  []byte
@@ -74,11 +76,18 @@ type Result struct {
 //
 // What the upstream sent is recorded whether or not the client is still there: the Codex
 // rejection state and its diagnostic line, the overflow latch and ceiling learning, and the usage
-// and sentry observations of a complete JSON body. Only a reply that is delivered counts as an
-// ordinary completed turn for the sentry. The client context is checked again immediately before
-// the first byte of a client response, after every such callback and after any rewriting; once it
-// is done Handle writes nothing to w and, for a buffered body, reads and closes it and returns a
-// nil error, Stream nil, Contacted as it happened, Status zero, and Cancelled false.
+// and sentry observations of a complete JSON body. The sentry observes such a body with one
+// call, including the rearming of a fired refusal that an ordinary completed turn brings, whatever
+// the client's state and whether or not the reply is then written.
+//
+// Each output operation toward the client has its own check of the client context, made after
+// every such callback and after any rewriting: after the header map was prepared and immediately
+// before WriteHeader, and before each later Write. A client that left before a head was committed
+// gets nothing written to w; for a buffered body Handle reads and closes it and returns a nil
+// error, Stream nil, Contacted as it happened, Status zero, and Cancelled false. When the caller
+// already wrote the head, the one in-band error frame is the only output and the same applies to
+// a client that left before it. A head that Handle committed is reported with its status and the
+// turn's facts, also when the client left before the body or the body write failed.
 //
 // A response that belongs to the stream relay is returned untouched and open whatever the client
 // context says; the relay, which learns of the departure itself, owns its body. Otherwise Handle

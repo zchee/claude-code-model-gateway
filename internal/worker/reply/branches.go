@@ -24,7 +24,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/outcome"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/sentry"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/upstream"
@@ -57,9 +56,43 @@ type turn struct {
 	result outcome.Result
 }
 
-// gone reports that the client has left. It is checked immediately before the first byte of a
-// client response, after every callback and rewrite, so nothing is written to a departed client.
+// gone reports that the client has left. It is checked after every callback and rewrite, before
+// each output operation toward the client.
 func (t *turn) gone() bool { return t.ctx.Err() != nil }
+
+// put writes one client response: set prepares the header map, then the status and body follow.
+// Each output operation has its own check of the client context, because the writer itself may
+// end it: before the header map is touched, after it was prepared and immediately before
+// WriteHeader, and before the body Write. head reports whether WriteHeader was called; delivered
+// reports that the body Write ran and returned no error.
+func put(ctx context.Context, w http.ResponseWriter, status int, body []byte, set func(http.Header)) (head, delivered bool) {
+	if ctx.Err() != nil {
+		return false, false
+	}
+	set(w.Header())
+	if ctx.Err() != nil {
+		return false, false
+	}
+	w.WriteHeader(status)
+	if ctx.Err() != nil {
+		return true, false
+	}
+	_, err := w.Write(body)
+	return true, err == nil
+}
+
+// send writes one client response with put. It reports errDeparted when the client left before
+// the head was committed. A committed head stands with the turn's facts whether or not its body
+// followed; delivered says whether it did.
+func (t *turn) send(status int, body []byte, set func(http.Header)) (delivered bool, err error) {
+	head, delivered := put(t.ctx, t.w, status, body, set)
+	if !head {
+		return false, errDeparted
+	}
+	return delivered, nil
+}
+
+func setJSON(h http.Header) { h.Set("Content-Type", "application/json") }
 
 // abort drops the client connection after a buffered body broke, unless the client already left.
 func (t *turn) abort() error {
@@ -110,41 +143,28 @@ func compactionFailure(status int) *outcome.Compaction {
 }
 
 // writeRelay answers with the upstream's relay headers, an optional content type and the length of
-// body, or reports errDeparted without touching the client response.
+// body, or reports errDeparted when the client left before the head was committed.
 func (t *turn) writeRelay(status int, body []byte, contentType string) error {
-	if t.gone() {
-		return errDeparted
-	}
-	h := t.w.Header()
-	maps.Copy(h, t.res.RelayHeader)
-	if contentType != "" {
-		h.Set("Content-Type", contentType)
-	}
-	h.Set("Content-Length", strconv.Itoa(len(body)))
-	t.w.WriteHeader(status)
-	// A client that leaves during the write cannot be answered; the facts stand either way.
-	_, _ = t.w.Write(body)
-	return nil
+	_, err := t.send(status, body, func(h http.Header) {
+		maps.Copy(h, t.res.RelayHeader)
+		if contentType != "" {
+			h.Set("Content-Type", contentType)
+		}
+		h.Set("Content-Length", strconv.Itoa(len(body)))
+	})
+	return err
 }
 
 // writeEarlyEnd answers a buffered body that broke before its end, unless the client has left.
 func (t *turn) writeEarlyEnd() error {
-	if t.gone() {
-		return errDeparted
-	}
-	writeJSON(t.w, http.StatusBadGateway, []byte(earlyEnd))
-	return nil
-}
-
-func writeJSON(w http.ResponseWriter, status int, body []byte) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_, _ = w.Write(body)
+	_, err := t.send(http.StatusBadGateway, []byte(earlyEnd), setJSON)
+	return err
 }
 
 // transportFailure answers an attempt that produced no response. The client context is checked
-// after the capture callback, immediately before the reply or the abort; a departed client gets
-// neither and the result carries only the facts it was given.
+// after the capture callback, before the abort and before each output operation of the reply; a
+// client that left before a head was committed gets nothing and the result carries only the
+// facts it was given.
 func transportFailure(ctx context.Context, w http.ResponseWriter, req Request, cause error, facts outcome.Result) (Result, error) {
 	result := facts
 	if req.Compaction {
@@ -160,13 +180,15 @@ func transportFailure(ctx context.Context, w http.ResponseWriter, req Request, c
 			return Result{Result: result}, err
 		}
 	}
-	if ctx.Err() != nil {
-		return Result{Result: facts}, nil
-	}
 	if req.HeadWritten {
+		if ctx.Err() != nil {
+			return Result{Result: facts}, nil
+		}
 		return Result{Result: result}, errAborted
 	}
-	writeJSON(w, http.StatusBadGateway, body)
+	if head, _ := put(ctx, w, http.StatusBadGateway, body, setJSON); !head {
+		return Result{Result: facts}, nil
+	}
 	return Result{Result: result}, nil
 }
 
@@ -302,20 +324,17 @@ func (t *turn) proxyFailure() error {
 		if err != nil {
 			return err
 		}
-		// The line reports an empty reply that is sent, so a departed client gets none.
-		if t.gone() {
-			return errDeparted
-		}
-		diagnose(t.req.Diagnostics, emptyCompletionLine)
-		if t.gone() {
-			return errDeparted
-		}
 		t.result.Status = http.StatusOK
-		t.w.Header().Set("Content-Type", contentType)
-		t.w.Header().Set("Content-Length", strconv.Itoa(len(answer)))
-		t.w.WriteHeader(http.StatusOK)
-		_, _ = t.w.Write(answer)
-		return nil
+		delivered, err := t.send(http.StatusOK, answer, func(h http.Header) {
+			h.Set("Content-Type", contentType)
+			h.Set("Content-Length", strconv.Itoa(len(answer)))
+		})
+		// The line reports an empty reply that was written, so a client that left before it or a
+		// failed write gets none.
+		if delivered {
+			diagnose(t.req.Diagnostics, emptyCompletionLine)
+		}
+		return err
 	}
 	if codex {
 		noteCodexRejection(t.req, status, t.res.Header, body)
@@ -325,12 +344,9 @@ func (t *turn) proxyFailure() error {
 		if err != nil {
 			return err
 		}
-		if t.gone() {
-			return errDeparted
-		}
 		t.result.Status, t.result.Route.Overflow = http.StatusRequestEntityTooLarge, overflow
-		writeOverflow(t.w, answer, &status)
-		return nil
+		_, err = t.send(http.StatusRequestEntityTooLarge, answer, overflowHeader(answer, &status))
+		return err
 	}
 	t.result.Status = status
 	return t.answerFailure(status, body, body)
@@ -366,8 +382,8 @@ func (t *turn) passFailure() error {
 
 // successJSON delivers a successful proxy JSON reply. LM Studio's usage is corrected before
 // usage capture and the sentry read it, and before the model rewrite and plan-tool filter. Both
-// observe the body whether or not the client is still there, but a reply that will not be
-// delivered is no ordinary completed turn, so it cannot rearm a fired refusal.
+// observe a complete body once, whether or not the client is still there and whether or not the
+// reply is then written; the sentry rearms a fired refusal for an ordinary completed turn.
 func (t *turn) successJSON() error {
 	status := t.res.StatusCode
 	body, err := t.readBody(false)
@@ -381,25 +397,11 @@ func (t *turn) successJSON() error {
 	t.req.Usage.ObserveJSON(body)
 	completed := completedJSON(body)
 	if completed && t.req.Sentry != nil {
-		if t.gone() {
-			observeUndelivered(t.req, body)
-		} else {
-			t.req.Sentry.ObserveJSON(t.req.Session, t.req.Target, t.req.Body, body)
-		}
+		t.req.Sentry.ObserveJSON(t.req.Session, t.req.Target, t.req.Body, body)
 	}
 	t.result.Status = status
 	if !completed {
 		t.result.StatusOverride = "upstream_error"
 	}
 	return t.writeRelay(status, rewriteCodexJSON(body, t.req.AdvertisedModel, t.req.FilterPlanTools, t.req.BackendModel), "")
-}
-
-// observeUndelivered records the usage of a complete JSON reply that no client receives, without
-// marking it an ordinary completed turn.
-func observeUndelivered(req Request, body []byte) {
-	v, err := jsonx.DecodeWire(body)
-	if err != nil {
-		return
-	}
-	req.Sentry.ObserveWire(req.Session, req.Target, object(field("type", wireString("message_delta")), field("usage", member(v, "usage"))), false)
 }

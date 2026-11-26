@@ -78,15 +78,21 @@ func overflowBody(message string, o *outcome.Overflow) ([]byte, error) {
 	))))
 }
 
-// writeOverflow answers 413 with only the headers the source sends; a refusal that came from the
-// upstream also names the upstream's status.
-func writeOverflow(w http.ResponseWriter, body []byte, upstreamStatus *int) {
-	h := w.Header()
-	h.Set("Content-Type", "application/json")
-	h.Set("Content-Length", strconv.Itoa(len(body)))
-	if upstreamStatus != nil {
-		h.Set("X-Model-Gateway-Upstream-Status", strconv.Itoa(*upstreamStatus))
+// overflowHeader sets only the headers the source sends with a 413 refusal of body; a refusal that
+// came from the upstream also names the upstream's status.
+func overflowHeader(body []byte, upstreamStatus *int) func(http.Header) {
+	return func(h http.Header) {
+		h.Set("Content-Type", "application/json")
+		h.Set("Content-Length", strconv.Itoa(len(body)))
+		if upstreamStatus != nil {
+			h.Set("X-Model-Gateway-Upstream-Status", strconv.Itoa(*upstreamStatus))
+		}
 	}
+}
+
+// writeOverflow answers 413 with overflowHeader's headers for a caller that owns the client check.
+func writeOverflow(w http.ResponseWriter, body []byte, upstreamStatus *int) {
+	overflowHeader(body, upstreamStatus)(w.Header())
 	w.WriteHeader(http.StatusRequestEntityTooLarge)
 	// A client that has gone away cannot be answered; the facts stand either way.
 	_, _ = w.Write(body)
