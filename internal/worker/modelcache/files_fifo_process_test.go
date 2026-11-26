@@ -197,20 +197,27 @@ func TestBoundedReadsTreatFIFOAsAbsent(t *testing.T) {
 
 // TestBoundedReadSurvivesFIFOSwap swaps the Claude global config between a regular file and a FIFO
 // while the cache keeps reading it, so a FIFO can appear between a type check and the open. No read
-// may block, the path must really have been swapped, and reads must have seen the regular file. The
-// swap is a race the test provokes many times, so a pass is evidence, not proof.
+// may block, both targets must really have been installed, a FIFO must have been installed before the
+// reads begin and again while they run, and reads must have seen the regular file. The swap is a race
+// the test provokes many times, so a pass is evidence, not proof.
 func TestBoundedReadSurvivesFIFOSwap(t *testing.T) {
 	const (
-		readFor    = 2 * time.Second
-		stuckAfter = 2 * time.Second
+		// readFor is how long the reads run once a FIFO has been installed.
+		readFor = 2 * time.Second
+		// stallLimit is how long the reads may go without completing one listing before the test treats
+		// a read as blocked. It runs on its own timer, reset by every completed listing.
+		stallLimit = 5 * time.Second
 		// previousID is the regular file's server row; a listing that carries it read the regular file.
 		previousID = `"claude-opus-4"`
+		// installLimit bounds the wait for the first FIFO install before the reads begin.
+		installLimit              = 5 * time.Second
+		regularTarget, fifoTarget = 0, 1
 	)
 	tests := map[string]struct {
-		swapTargets []string
+		swapTargets [2]string
 	}{
 		"success: symlink swapped between a regular file and a FIFO": {
-			swapTargets: []string{"regular.json", "pipe"},
+			swapTargets: [2]string{regularTarget: "regular.json", fifoTarget: "pipe"},
 		},
 	}
 	for name, tt := range tests {
@@ -236,8 +243,8 @@ func TestBoundedReadSurvivesFIFOSwap(t *testing.T) {
 				t.Fatal(err)
 			}
 			dir := t.TempDir()
-			regular := filepath.Join(dir, tt.swapTargets[0])
-			fifo := filepath.Join(dir, tt.swapTargets[1])
+			regular := filepath.Join(dir, tt.swapTargets[regularTarget])
+			fifo := filepath.Join(dir, tt.swapTargets[fifoTarget])
 			if err := os.WriteFile(regular, []byte(`{"additionalModelOptionsCache":[{"value":"claude-opus-4"}]}`), 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -256,27 +263,45 @@ func TestBoundedReadSurvivesFIFOSwap(t *testing.T) {
 			var stopOnce sync.Once
 			halt := func() { stopOnce.Do(func() { close(stop) }) }
 			defer halt()
-			var swaps atomic.Int64
+			// installs counts, per target, the renames that put a symbolic link to it at the path.
+			var installs [2]atomic.Int64
+			fifoInstalled := make(chan struct{})
+			var fifoOnce sync.Once
 			var swapper sync.WaitGroup
 			swapper.Go(func() {
 				staged := configPath + ".swap"
-				for i := 0; ; i++ {
+				// The path starts as a link to the regular file, so the first install is the FIFO.
+				for i := fifoTarget; ; i ^= 1 {
 					select {
 					case <-stop:
 						return
 					default:
 					}
 					_ = os.Remove(staged)
-					if err := os.Symlink(filepath.Join(dir, tt.swapTargets[i%2]), staged); err != nil {
+					if err := os.Symlink(filepath.Join(dir, tt.swapTargets[i]), staged); err != nil {
 						continue
 					}
 					if err := os.Rename(staged, configPath); err == nil {
-						swaps.Add(1)
+						installs[i].Add(1)
+						if i == fifoTarget {
+							fifoOnce.Do(func() { close(fifoInstalled) })
+						}
 					}
 				}
 			})
+			select {
+			case <-fifoInstalled:
+			case <-time.After(installLimit):
+				halt()
+				swapper.Wait()
+				t.Fatalf("test precondition: no FIFO was installed at the path within %v (%d regular-file installs)", installLimit, installs[regularTarget].Load())
+			}
 
 			var calls, failed, sawRegular atomic.Int64
+			// progress receives a token after each completed listing; the watchdog below resets on it.
+			progress := make(chan struct{}, 1)
+			fifoAtStart := installs[fifoTarget].Load()
+			var fifoDuringReads int64
 			var readers sync.WaitGroup
 			readers.Go(func() {
 				deadline := time.Now().Add(readFor)
@@ -294,7 +319,12 @@ func TestBoundedReadSurvivesFIFOSwap(t *testing.T) {
 						sawRegular.Add(1)
 					}
 					calls.Add(1)
+					select {
+					case progress <- struct{}{}:
+					default:
+					}
 				}
+				fifoDuringReads = installs[fifoTarget].Load() - fifoAtStart
 			})
 			readersDone := make(chan struct{})
 			go func() {
@@ -302,35 +332,37 @@ func TestBoundedReadSurvivesFIFOSwap(t *testing.T) {
 				close(readersDone)
 			}()
 
-			last, lastChange := calls.Load(), time.Now()
-			ticker := time.NewTicker(50 * time.Millisecond)
-			defer ticker.Stop()
+			watchdog := time.NewTimer(stallLimit)
+			defer watchdog.Stop()
 			stuck := false
 		watch:
 			for {
 				select {
 				case <-readersDone:
 					break watch
-				case <-ticker.C:
-					if n := calls.Load(); n != last {
-						last, lastChange = n, time.Now()
-					} else if time.Since(lastChange) >= stuckAfter {
-						stuck = true
-						break watch
-					}
+				case <-progress:
+					watchdog.Reset(stallLimit)
+				case <-watchdog.C:
+					stuck = true
+					break watch
 				}
 			}
 			halt()
 			swapper.Wait()
 			if stuck {
 				if !unblockFIFOReaderUntil(readersDone, fifo) {
-					t.Fatalf("a read of the Claude global config blocked on a FIFO after %d reads and could not be completed within %v", last, fifoUnblockLimit)
+					t.Fatalf("a read of the Claude global config blocked on a FIFO after %d reads and could not be completed within %v", calls.Load(), fifoUnblockLimit)
 				}
-				t.Errorf("a read of the Claude global config blocked on a FIFO swapped in after %d reads", last)
+				t.Errorf("a read of the Claude global config made no progress for %v after %d reads: it blocked on a FIFO swapped in", stallLimit, calls.Load())
 			}
-			t.Logf("%d listings (%d saw the regular file, %d failed) while the path was swapped %d times", calls.Load(), sawRegular.Load(), failed.Load(), swaps.Load())
-			if swaps.Load() == 0 {
-				t.Error("test precondition: the path was never swapped")
+			regularInstalls, fifoInstalls := installs[regularTarget].Load(), installs[fifoTarget].Load()
+			t.Logf("%d listings (%d saw the regular file, %d failed) while the path was swapped to the regular file %d times and to the FIFO %d times (%d while the reads ran)",
+				calls.Load(), sawRegular.Load(), failed.Load(), regularInstalls, fifoInstalls, fifoDuringReads)
+			if regularInstalls == 0 || fifoInstalls == 0 {
+				t.Errorf("test precondition: installs per target: regular file %d, FIFO %d; want both", regularInstalls, fifoInstalls)
+			}
+			if !stuck && fifoDuringReads == 0 {
+				t.Error("test precondition: no FIFO was installed while the reads ran")
 			}
 			if sawRegular.Load() == 0 {
 				t.Error("no listing saw the regular file while the path was swapped")

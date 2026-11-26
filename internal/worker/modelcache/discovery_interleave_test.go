@@ -157,10 +157,7 @@ func TestForcedDiscoverySyncNeverOverwritesNewerGeneration(t *testing.T) {
 				awaitSignal(t, routes.committed, "the newer refresh to commit its proxy table")
 				// The newer refresh either finishes its own sync, or waits on the lock the parked sync
 				// holds; only then is the older sync released.
-				refreshReturned, ok := doneOrLockWait(refreshDone, "modelcache_test.refreshBehindParkedSync")
-				if !ok {
-					t.Fatal("the newer refresh neither returned nor waited behind the parked sync")
-				}
+				refreshReturned := awaitReturnOrMutexWait(t, refreshDone, discoverySyncWait)
 
 				release()
 				var older syncOutcome
@@ -189,6 +186,13 @@ func TestForcedDiscoverySyncNeverOverwritesNewerGeneration(t *testing.T) {
 			})
 		})
 	}
+}
+
+// discoverySyncWait is where the newer refresh's sync parks behind the older forced sync: the
+// read-compare-write of the discovery cache takes one sync.Mutex in (*Cache).SyncDiscoveryCache.
+var discoverySyncWait = mutexWait{
+	entry:     "github.com/zchee/claude-code-model-gateway/internal/worker/modelcache_test.refreshBehindParkedSync",
+	blockedIn: modelcacheFunc + "(*Cache).SyncDiscoveryCache",
 }
 
 // refreshBehindParkedSync is the newer refresh's entry point; its frame names that goroutine in a

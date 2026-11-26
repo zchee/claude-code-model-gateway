@@ -15,80 +15,132 @@
 package modelcache_test
 
 import (
+	"bytes"
 	"runtime"
-	"strings"
+	"testing"
 )
 
 const (
-	// lockWaitPolls is how many consecutive polls must see a goroutine waiting on a lock before it
-	// counts as serialized, so a lock taken and released in passing is not mistaken for one.
-	lockWaitPolls = 50
-	// maxLockWaitPolls bounds one wait for a goroutine to return or wait on a lock.
-	maxLockWaitPolls = 200_000
+	// modelcacheFunc prefixes the package's functions as a goroutine dump names them.
+	modelcacheFunc = "github.com/zchee/claude-code-model-gateway/internal/worker/modelcache."
+	// mutexLockFunc is the frame of a sync.Mutex acquisition, as the pinned toolchain prints it.
+	mutexLockFunc = "sync.(*Mutex).Lock"
+	// mutexLockState is the scheduler wait state of a goroutine parked in a sync.Mutex acquisition.
+	mutexLockState = "sync.Mutex.Lock"
+	// maxLockWaitPolls bounds one wait for a goroutine to return or park on the lock. A goroutine that
+	// reaches the lock parks within a few scheduler yields; each poll stops the world for one dump.
+	maxLockWaitPolls = 20_000
+	// maxDumpBytes bounds the goroutine dump buffer.
+	maxDumpBytes = 16 << 20
 )
 
-// lockWaitStates are the scheduler wait states of a goroutine acquiring a sync.Mutex or sync.RWMutex,
-// as a goroutine dump prints them.
-var lockWaitStates = []string{"[sync.Mutex.Lock", "[sync.RWMutex.Lock", "[sync.RWMutex.RLock"}
+// mutexWait names the one place a goroutine of a test parks on a lock: entry is the test's own entry
+// function, which tells that goroutine apart from every other one, and blockedIn is the production
+// function whose sync.Mutex acquisition it waits in.
+//
+// The match is tied to the synchronization the production code uses now: blockedIn must acquire a
+// sync.Mutex itself, directly. When the production code changes how it serializes these callers
+// (another lock, a channel, the acquisition moved into a helper), the mutexWait values and this
+// matcher must be updated together with it; until then the gate fails with the last dump instead of
+// passing.
+type mutexWait struct {
+	entry     string
+	blockedIn string
+}
 
-// goroutineDump returns the stack of every goroutine, one entry per goroutine.
-func goroutineDump() []string {
-	buf := make([]byte, 1<<20)
+// awaitReturnOrMutexWait waits until done closes or until the goroutine named by w is seen parked in
+// its sync.Mutex acquisition, and reports whether done closed. One exact match is enough: the
+// goroutine's wait state is sync.Mutex.Lock and the frame directly above blockedIn is the mutex
+// acquisition itself, so no other lock and no lock taken in passing can match. A goroutine waiting on
+// a sync.Mutex is not durably blocked in a synctest bubble, so neither synctest.Wait nor the bubble's
+// clock can see this; the poll yields instead of sleeping and is bounded by count, which works inside
+// a bubble and outside one alike. When neither happens within maxLockWaitPolls polls the test fails
+// with the last dump.
+func awaitReturnOrMutexWait(t *testing.T, done <-chan struct{}, w mutexWait) bool {
+	t.Helper()
+	buf := make([]byte, 64<<10)
+	var dump []byte
+	for range maxLockWaitPolls {
+		select {
+		case <-done:
+			return true
+		default:
+		}
+		dump, buf = goroutineDump(buf)
+		if parkedOnMutex(dump, w) {
+			return false
+		}
+		runtime.Gosched()
+	}
+	t.Fatalf("after %d polls the goroutine entered at %s neither returned nor waited on the sync.Mutex acquired in %s; last goroutine dump:\n%s",
+		maxLockWaitPolls, w.entry, w.blockedIn, dump)
+	return false
+}
+
+// goroutineDump fills buf with the stack of every goroutine and returns the dump and the buffer to
+// reuse. The buffer doubles while the dump does not fit, up to maxDumpBytes; a dump still longer than
+// that is returned truncated.
+func goroutineDump(buf []byte) (dump, reuse []byte) {
 	for {
 		n := runtime.Stack(buf, true)
-		if n < len(buf) {
-			return strings.Split(string(buf[:n]), "\n\n")
+		if n < len(buf) || len(buf) >= maxDumpBytes {
+			return buf[:n], buf
 		}
-		buf = make([]byte, 2*len(buf))
+		buf = make([]byte, min(2*len(buf), maxDumpBytes))
 	}
 }
 
-// waitingOnLock reports whether a goroutine whose stack holds frame is waiting to acquire a lock.
-func waitingOnLock(frame string) bool {
-	for _, g := range goroutineDump() {
-		if !strings.Contains(g, frame) {
+// parkedOnMutex reports whether one goroutine in dump matches w exactly.
+func parkedOnMutex(dump []byte, w mutexWait) bool {
+	for g := range bytes.SplitSeq(dump, []byte("\n\n")) {
+		header, stack, _ := bytes.Cut(g, []byte("\n"))
+		if waitState(header) != mutexLockState {
 			continue
 		}
-		header, _, _ := strings.Cut(g, "\n")
-		for _, state := range lockWaitStates {
-			if strings.Contains(header, state) {
-				return true
+		frames := frameFuncs(stack)
+		hasEntry, blocked := false, false
+		for i, f := range frames {
+			switch {
+			case f == w.entry:
+				hasEntry = true
+			case f == w.blockedIn && i > 0 && frames[i-1] == mutexLockFunc:
+				blocked = true
 			}
+		}
+		if hasEntry && blocked {
+			return true
 		}
 	}
 	return false
 }
 
-// doneOrLockWait waits until done closes, or until the goroutine whose stack holds frame has been
-// seen waiting on a lock for lockWaitPolls consecutive polls. It reports whether done closed, and
-// ok is false when neither happened within maxLockWaitPolls polls.
-//
-// A goroutine waiting on a sync.Mutex is not durably blocked in a synctest bubble, so neither
-// synctest.Wait nor the bubble's clock can tell that it is serialized behind another caller. The
-// scheduler's own wait state can, and polling yields instead of sleeping, so this works inside a
-// bubble and outside one alike.
-func doneOrLockWait(done <-chan struct{}, frame string) (returned, ok bool) {
-	streak := 0
-	for range maxLockWaitPolls {
-		select {
-		case <-done:
-			return true, true
-		default:
-		}
-		if waitingOnLock(frame) {
-			if streak++; streak >= lockWaitPolls {
-				return false, true
-			}
-		} else {
-			streak = 0
-		}
-		runtime.Gosched()
+// waitState returns the state of a goroutine header such as
+// "goroutine 7 [sync.Mutex.Lock, synctest bubble 1]:", without the annotations after the first comma.
+func waitState(header []byte) string {
+	_, rest, ok := bytes.Cut(header, []byte(" ["))
+	if !ok {
+		return ""
 	}
-	return false, false
+	end := bytes.IndexAny(rest, ",]")
+	if end < 0 {
+		return ""
+	}
+	return string(rest[:end])
 }
 
-// onCurrentStack reports whether the calling goroutine's stack holds frame.
-func onCurrentStack(frame string) bool {
-	buf := make([]byte, 64<<10)
-	return strings.Contains(string(buf[:runtime.Stack(buf, false)]), frame)
+// frameFuncs returns the function of every frame of one goroutine's stack, innermost first. A frame is
+// a function line, "name(args)", followed by a tab-indented location line; inlined calls print as
+// frames of their own with "(...)" arguments.
+func frameFuncs(stack []byte) []string {
+	var funcs []string
+	for line := range bytes.Lines(stack) {
+		line = bytes.TrimRight(line, "\n")
+		if len(line) == 0 || line[0] == '\t' || bytes.HasPrefix(line, []byte("created by ")) {
+			continue
+		}
+		if open := bytes.LastIndexByte(line, '('); open > 0 && line[len(line)-1] == ')' {
+			funcs = append(funcs, string(line[:open]))
+		}
+	}
+	return funcs
 }

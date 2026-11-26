@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -120,17 +121,25 @@ func TestCanceledSupersededRefreshReturnsContextError(t *testing.T) {
 	}
 }
 
-// catalogRequests counts the Anthropic catalog page requests of one test and parks each until its
-// context ends, so a refresh that started stays in flight until shutdown reaches it.
-type catalogRequests struct {
+// lifetimeRequests counts the requests of one test: every request, and the Anthropic catalog page
+// requests apart. It answers the proxy listing with one row, and parks each catalog page request
+// until its context ends, so a catalog refresh that started stays in flight until shutdown reaches it.
+type lifetimeRequests struct {
+	all          atomic.Int32
+	catalog      atomic.Int32
 	active       atomic.Int32
-	started      atomic.Int32
 	afterWait    atomic.Int32
 	waitReturned atomic.Bool
 	arrived      chan struct{}
+	arriveOnce   sync.Once
 }
 
-func (c *catalogRequests) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func newLifetimeRequests() *lifetimeRequests {
+	return &lifetimeRequests{arrived: make(chan struct{})}
+}
+
+func (c *lifetimeRequests) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	c.all.Add(1)
 	if r.URL.Host != "anthropic.test" {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"data":[{"id":"kimi-k3","display_name":"kimi-k3 (kimi)"}]}`))
@@ -141,110 +150,143 @@ func (c *catalogRequests) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if c.waitReturned.Load() {
 		c.afterWait.Add(1)
 	}
-	if c.started.Add(1) == 1 {
-		close(c.arrived)
-	}
+	c.catalog.Add(1)
+	c.arriveOnce.Do(func() { close(c.arrived) })
 	select {
 	case <-r.Context().Done():
-	case <-time.After(time.Minute):
+	case <-time.After(time.Hour):
 	}
 	w.WriteHeader(http.StatusServiceUnavailable)
 }
 
-// waitForShutdown is the shutdown goroutine's entry point; its frame names that goroutine in a
-// goroutine dump. It records how many catalog requests were still running when Wait returned.
-//
-//go:noinline
-func waitForShutdown(cache *modelcache.Cache, requests *catalogRequests, inFlight *atomic.Int32, done chan<- struct{}) {
-	cache.Wait()
-	requests.waitReturned.Store(true)
-	inFlight.Store(requests.active.Load())
-	close(done)
+// newLifetimeCache builds a cache whose every request goes to requests. The periodic interval is ten
+// minutes, so after its first refresh a started cache makes no request on its own for that long.
+func newLifetimeCache(t *testing.T, requests *lifetimeRequests, routes modelcache.RoutePublisher) *modelcache.Cache {
+	t.Helper()
+	_, lookup, resolver := newTestPaths(t, map[string]string{"CODEX_GATEWAY_MODELS_REFRESH_MS": "600000"})
+	cache, err := modelcache.New(modelcache.Options{
+		Lookup:           lookup,
+		Paths:            resolver,
+		ProxyBaseURL:     "http://127.0.0.1:19991",
+		AnthropicBaseURL: catalogTestBase,
+		DefaultBaseURL:   "http://127.0.0.1:19999",
+		Client:           &http.Client{Transport: handlerTransport{handler: requests}},
+		Clock:            time.Now,
+		Routes:           routes,
+		Sentry:           &sentry.State{},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return cache
 }
 
-// TestCatalogRefreshAdmittedDuringShutdownIsJoined starts the cache, then asks for a catalog refresh
-// and ends the service context right after the refresh's admission checked the context, before the
-// refresh can register; shutdown then runs to the end of Wait. After Wait returns no catalog request
-// starts, and none is still running.
+// TestCatalogRefreshInFlightAtShutdownIsDrained starts the cache, starts a catalog refresh and lets
+// its first page request park, then ends the service context and calls Wait. Wait returns only after
+// the refresh ended: no catalog request is still running when it returns and none starts afterwards.
 //
-// A cache that does not consult the service context when it admits a refresh registers it normally;
-// shutdown then has to end the refresh in flight, and the same two facts must hold.
-func TestCatalogRefreshAdmittedDuringShutdownIsJoined(t *testing.T) {
+// This shows that shutdown drains a refresh that was already registered and running. It says nothing
+// about a refresh admitted while shutdown begins: the refresh here was admitted long before.
+func TestCatalogRefreshInFlightAtShutdownIsDrained(t *testing.T) {
 	tests := map[string]struct {
 		credentials http.Header
 	}{
-		"success: refresh admitted while shutdown begins": {
+		"success: refresh waiting for its first page when the service context ends": {
 			credentials: http.Header{"X-Api-Key": {apiKeyMarker}},
 		},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			_, lookup, resolver := newTestPaths(t, map[string]string{"CODEX_GATEWAY_MODELS_REFRESH_MS": "600000"})
-			requests := &catalogRequests{arrived: make(chan struct{})}
-			routes := &proxyCommitSignal{store: &route.Store{}, committed: make(chan struct{})}
-			cache, err := modelcache.New(modelcache.Options{
-				Lookup:           lookup,
-				Paths:            resolver,
-				ProxyBaseURL:     "http://127.0.0.1:19991",
-				AnthropicBaseURL: catalogTestBase,
-				DefaultBaseURL:   "http://127.0.0.1:19999",
-				Client:           &http.Client{Transport: handlerTransport{handler: requests}},
-				Clock:            time.Now,
-				Routes:           routes,
-				Sentry:           &sentry.State{},
-			})
-			if err != nil {
-				t.Fatalf("New: %v", err)
-			}
-			inner, cancel := context.WithCancel(t.Context())
-			defer cancel()
-			worker := &checkpointContext{Context: inner}
-			cache.Start(worker)
-			// The first refresh's listing has rows, so the periodic loop then idles until the
-			// ten-minute interval and makes no further check of the service context.
-			awaitSignal(t, routes.committed, "the first refresh to commit")
+			synctest.Test(t, func(t *testing.T) {
+				requests := newLifetimeRequests()
+				routes := &proxyCommitSignal{store: &route.Store{}, committed: make(chan struct{})}
+				cache := newLifetimeCache(t, requests, routes)
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				cache.Start(ctx)
+				awaitSignal(t, routes.committed, "the first refresh to commit")
 
-			var inFlight atomic.Int32
-			waitDone := make(chan struct{})
-			startShutdown := func() {
+				cache.TriggerAnthropicRefresh(tt.credentials)
+				awaitSignal(t, requests.arrived, "the catalog refresh to request its first page")
 				cancel()
-				go waitForShutdown(cache, requests, &inFlight, waitDone)
-			}
-			var gateReached, gateOK bool
-			var onAdmission func()
-			onAdmission = func() {
-				// Only the admission of the requested refresh is interrupted; a check made by any other
-				// goroutine passes and the hook stays armed.
-				if !onCurrentStack("modelcache.(*Cache).TriggerAnthropicRefresh") {
-					worker.arm(onAdmission)
-					return
-				}
-				gateReached = true
-				startShutdown()
-				// Shutdown either returns from Wait, or waits on a gate the admission holds while it
-				// checks the context; the admission then continues with what it observed.
-				_, gateOK = doneOrLockWait(waitDone, "modelcache_test.waitForShutdown")
-			}
-			worker.arm(onAdmission)
-			cache.TriggerAnthropicRefresh(tt.credentials)
-			switch {
-			case gateReached && !gateOK:
-				t.Fatal("shutdown neither returned from Wait nor waited on the admission")
-			case !gateReached:
-				t.Log("the admission did not check the service context; shutting down a registered refresh instead")
-				awaitSignal(t, requests.arrived, "the registered refresh to request its first page")
-				startShutdown()
-			}
-			awaitSignal(t, waitDone, "Wait to return after the service context ended")
-			// Anything registered after Wait returned is joined here, so no goroutine outlives the test.
-			cache.Wait()
+				cache.Wait()
+				inFlight := requests.active.Load()
+				requests.waitReturned.Store(true)
+				time.Sleep(time.Hour)
+				synctest.Wait()
 
-			if n := requests.afterWait.Load(); n != 0 {
-				t.Errorf("%d catalog request(s) started after Wait returned, want none", n)
-			}
-			if n := inFlight.Load(); n != 0 {
-				t.Errorf("%d catalog request(s) still running when Wait returned, want none", n)
-			}
+				if inFlight != 0 {
+					t.Errorf("%d catalog request(s) still running when Wait returned, want none", inFlight)
+				}
+				if n := requests.afterWait.Load(); n != 0 {
+					t.Errorf("%d catalog request(s) started after Wait returned, want none", n)
+				}
+				if n := requests.catalog.Load(); n != 1 {
+					t.Errorf("catalog requests = %d, want the one the drained refresh made", n)
+				}
+			})
+		})
+	}
+}
+
+// TestNoCatalogRefreshAdmittedAfterShutdown asks for catalog refreshes once shutdown has begun, with a
+// cold catalog and credentials that would otherwise start one, and counts the requests that reach the
+// transport.
+//
+// After Wait without any cancellation, neither a refresh request, a model listing, a Start nor a
+// refresh request after that Start sends anything: Wait alone closes admission. After the service
+// context ended but before Wait, a refresh request sends no catalog request: admission sees the ended
+// context.
+func TestNoCatalogRefreshAdmittedAfterShutdown(t *testing.T) {
+	credentials := http.Header{"X-Api-Key": {apiKeyMarker}}
+	tests := map[string]struct {
+		// cancelFirst starts the cache and ends its service context before the refresh request;
+		// otherwise the cache is never started before Wait.
+		cancelFirst bool
+	}{
+		"success: refresh requested and cache started after Wait without cancellation": {},
+		"success: refresh requested after the service context ended": {
+			cancelFirst: true,
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				requests := newLifetimeRequests()
+				routes := &proxyCommitSignal{store: &route.Store{}, committed: make(chan struct{})}
+				cache := newLifetimeCache(t, requests, routes)
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+
+				if tt.cancelFirst {
+					cache.Start(ctx)
+					awaitSignal(t, routes.committed, "the first refresh to commit")
+					cancel()
+					cache.TriggerAnthropicRefresh(credentials)
+					cache.Wait()
+				} else {
+					cache.Wait()
+					cache.TriggerAnthropicRefresh(credentials)
+					if _, err := cache.ModelsResponse(t.Context(), credentials); err != nil {
+						t.Errorf("ModelsResponse after Wait: %s", redactTestMarkers(err.Error()))
+					}
+					cache.Start(ctx)
+					cache.TriggerAnthropicRefresh(credentials)
+				}
+				time.Sleep(time.Hour)
+				synctest.Wait()
+				cancel()
+				cache.Wait()
+
+				if n := requests.catalog.Load(); n != 0 {
+					t.Errorf("%d catalog request(s) sent for a refresh requested after shutdown began, want none", n)
+				}
+				if !tt.cancelFirst {
+					if n := requests.all.Load(); n != 0 {
+						t.Errorf("%d request(s) sent by a cache started and asked for a refresh after Wait, want none", n)
+					}
+				}
+			})
 		})
 	}
 }

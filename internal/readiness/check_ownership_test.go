@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -115,9 +116,11 @@ func paddedModelsBody(t *testing.T, size int) []byte {
 }
 
 // TestProxyCheckRequiresCompleteBody answers /v1/models with HTTP 200 and a body that cannot be read
-// to its end, or one at or just over the size bound. Only a body read completely within the bound
-// counts as an answering proxy. The stalled body is served in memory, so the test also sees that the
-// check had the headers and was reading the body when it gave up at its own deadline.
+// to its end, or one at or over the size bound. Only a body read completely within the bound counts
+// as an answering proxy. The stalled body is served in memory, so the test also sees that the check
+// had the headers and was reading the body when it gave up at its own deadline. The size-bound bodies
+// are served in memory with no declared length, so the bound decides, never the transport or the
+// check's deadline, and the test sees how many body bytes the check read.
 func TestProxyCheckRequiresCompleteBody(t *testing.T) {
 	const (
 		declaredLength = "1000"
@@ -125,8 +128,13 @@ func TestProxyCheckRequiresCompleteBody(t *testing.T) {
 		proxyModelsBodyLimit = 1 << 20
 	)
 	tests := map[string]struct {
+		// handler serves the body over a loopback socket when neither body nor stallAfter is set.
 		handler func(w http.ResponseWriter, r *http.Request)
-		// stallAfter, when set, is the part of the body served before it stalls; handler is unused.
+		// body, when set, is served in memory with no declared length; wantDelivered is how many of its
+		// bytes the check reads.
+		body          []byte
+		wantDelivered int64
+		// stallAfter, when set, is the part of the body served before it stalls.
 		stallAfter string
 		want       bool
 	}{
@@ -137,15 +145,17 @@ func TestProxyCheckRequiresCompleteBody(t *testing.T) {
 			want: true,
 		},
 		"success: body exactly at the size bound is an answering proxy": {
-			handler: func(w http.ResponseWriter, _ *http.Request) {
-				_, _ = w.Write(paddedModelsBody(t, proxyModelsBodyLimit))
-			},
-			want: true,
+			body:          paddedModelsBody(t, proxyModelsBodyLimit),
+			want:          true,
+			wantDelivered: proxyModelsBodyLimit,
 		},
 		"error: body one byte over the size bound": {
-			handler: func(w http.ResponseWriter, _ *http.Request) {
-				_, _ = w.Write(paddedModelsBody(t, proxyModelsBodyLimit+1))
-			},
+			body:          paddedModelsBody(t, proxyModelsBodyLimit+1),
+			wantDelivered: proxyModelsBodyLimit + 1,
+		},
+		"error: body far over the size bound is read only one byte past it": {
+			body:          paddedModelsBody(t, 4*proxyModelsBodyLimit),
+			wantDelivered: proxyModelsBodyLimit + 1,
 		},
 		"error: body that breaks off before its declared length": {
 			handler: func(w http.ResponseWriter, _ *http.Request) {
@@ -167,6 +177,22 @@ func TestProxyCheckRequiresCompleteBody(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
+			if tt.body != nil {
+				var delivered atomic.Int64
+				got := readiness.ProbeProxyAndAuth(t.Context(), readiness.ProxyAuthProbe{
+					ProxyBinary:    fakeProxyBinary(t),
+					ProxyModelsURL: "http://proxy-models.test/v1/models",
+					Client:         &http.Client{Transport: memoryTransport{body: tt.body, delivered: &delivered}},
+				})
+				want := readiness.ProxyAuthResult{ProxyBinary: true, ProxyModels: tt.want}
+				if diff := gocmp.Diff(want, got); diff != "" {
+					t.Errorf("ProbeProxyAndAuth mismatch (-want +got):\n%s", diff)
+				}
+				if n := delivered.Load(); n != tt.wantDelivered {
+					t.Errorf("the check read %d bytes of a %d-byte body, want %d", n, len(tt.body), tt.wantDelivered)
+				}
+				return
+			}
 			if tt.stallAfter != "" {
 				synctest.Test(t, func(t *testing.T) {
 					entered := make(chan struct{})
@@ -200,6 +226,40 @@ func TestProxyCheckRequiresCompleteBody(t *testing.T) {
 		})
 	}
 }
+
+// memoryTransport answers every request with HTTP 200 headers, no declared length and body, served
+// from memory, and adds every body byte the caller reads to delivered.
+type memoryTransport struct {
+	body      []byte
+	delivered *atomic.Int64
+}
+
+func (m memoryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode:    http.StatusOK,
+		Header:        http.Header{"Content-Type": {"application/json"}},
+		ContentLength: -1,
+		Body:          &countingBody{rest: m.body, delivered: m.delivered},
+		Request:       req,
+	}, nil
+}
+
+type countingBody struct {
+	rest      []byte
+	delivered *atomic.Int64
+}
+
+func (b *countingBody) Read(p []byte) (int, error) {
+	if len(b.rest) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, b.rest)
+	b.rest = b.rest[n:]
+	b.delivered.Add(int64(n))
+	return n, nil
+}
+
+func (b *countingBody) Close() error { return nil }
 
 // stallingTransport answers every request with HTTP 200 headers and a body that yields prefix, then
 // closes entered and blocks until the request's context ends.

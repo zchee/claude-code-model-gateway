@@ -74,7 +74,8 @@ func readSavedCatalog(t *testing.T, path string) savedCatalog {
 // TestStaleCatalogReadNeverOverwritesNewerRows parks a caller right after it read a stale catalog,
 // lets another caller refresh the catalog to newer rows or wait behind the parked one, then releases
 // the first caller while every further catalog fetch fails. The newer rows stay on disk and no
-// redundant fetch starts.
+// redundant fetch starts. Admission stays open until both callers returned, so a redundant refresh
+// is never refused by shutdown instead of being avoided by the cache.
 func TestStaleCatalogReadNeverOverwritesNewerRows(t *testing.T) {
 	tests := map[string]struct {
 		newerRows string
@@ -155,23 +156,21 @@ func TestStaleCatalogReadNeverOverwritesNewerRows(t *testing.T) {
 					defer close(newerDone)
 					triggerBehindParkedCaller(cache, credentials)
 				}()
-				// The second caller either finishes its own refresh, or waits on the lock the parked caller
-				// holds; only then is the parked caller released.
-				newerReturned, ok := doneOrLockWait(newerDone, "modelcache_test.triggerBehindParkedCaller")
-				if !ok {
-					t.Fatal("the second caller neither returned nor waited behind the parked caller")
-				}
-				if newerReturned {
-					cache.Wait()
+				// The second caller either returns, or waits on the lock the parked caller holds; only then
+				// is the parked caller released.
+				if awaitReturnOrMutexWait(t, newerDone, catalogElectionWait) {
+					// The second caller was not serialized behind the parked one. Let the refresh it may
+					// have started finish without closing admission: Wait here would refuse the parked
+					// caller's later refresh and hide the defect this test looks for.
+					synctest.Wait()
 				}
 
 				release()
 				awaitSignal(t, staleDone, "the parked caller to return")
+				awaitSignal(t, newerDone, "the second caller to return")
+				// Both callers returned with admission still open; this single Wait joins every refresh
+				// either of them started.
 				cache.Wait()
-				if !newerReturned {
-					awaitSignal(t, newerDone, "the second caller to return")
-					cache.Wait()
-				}
 
 				got := readSavedCatalog(t, path)
 				if diff := gocmp.Diff(savedCatalog{IDs: tt.wantIDs}, got); diff != "" {
@@ -183,6 +182,13 @@ func TestStaleCatalogReadNeverOverwritesNewerRows(t *testing.T) {
 			})
 		})
 	}
+}
+
+// catalogElectionWait is where the second caller parks behind the first: the catalog read and the
+// election of the refresh in flight take one sync.Mutex in (*Cache).anthropicRows.
+var catalogElectionWait = mutexWait{
+	entry:     "github.com/zchee/claude-code-model-gateway/internal/worker/modelcache_test.triggerBehindParkedCaller",
+	blockedIn: modelcacheFunc + "(*Cache).anthropicRows",
 }
 
 // triggerBehindParkedCaller is the second caller's entry point; its frame names that goroutine in a
