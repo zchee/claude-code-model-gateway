@@ -129,10 +129,14 @@ type cacheEntry struct {
 }
 
 // Cache remembers session routes in least-recently-used order.
+// Starting at the first persistence that successfully opens the state directory,
+// it holds one directory descriptor for the worker's lifetime and has no Close method.
+// Later writes follow that directory if it is renamed. If the directory is deleted,
+// persistence stops until the worker restarts, but in-memory routing continues.
 type Cache struct {
 	mu          sync.Mutex
 	path        string
-	dir         *atomicfile.Dir // Held from the first successful open until the worker exits.
+	dir         *atomicfile.Dir
 	ttlMillis   float64
 	maxSessions int
 	now         func() time.Time
@@ -142,7 +146,9 @@ type Cache struct {
 
 // NewCache loads a cache using the supplied clock, idle lifetime in milliseconds and session limit.
 // The limit bounds live entries, not the size of the file read at startup.
-// An empty path disables persistence.
+// An empty path disables persistence. Otherwise, callers should pass an absolute path:
+// the directory of a relative path is resolved against the process working directory
+// on the first successful persistence open.
 func NewCache(path string, ttlMillis float64, maxSessions int, now func() time.Time) *Cache {
 	c := &Cache{path: path, ttlMillis: ttlMillis, maxSessions: max(maxSessions, 0), now: now, byKey: make(map[string]*list.Element)}
 	c.load()
