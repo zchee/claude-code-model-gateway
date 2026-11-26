@@ -259,9 +259,8 @@ func (s *State) Observe(session string, target Target, event jsontext.Value, ord
 	if !target.validFor(session) {
 		return
 	}
-	v, err := jsonx.DecodeWire(event)
-	if err == nil && text(member(v, "type")) == "message_delta" {
-		s.observe(session, target, member(v, "usage"), ordinaryCompleted)
+	if v, err := jsonx.DecodeWire(event); err == nil {
+		s.ObserveWire(session, target, v, ordinaryCompleted)
 	}
 }
 

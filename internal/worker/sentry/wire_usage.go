@@ -19,8 +19,17 @@ import "github.com/zchee/claude-code-model-gateway/internal/jsonx"
 // ObserveWire records a decoded message_delta's usage for the session and target.
 // An ordinary completed turn may rearm a fired refusal; an absent event has no effect.
 func (s *State) ObserveWire(session string, target Target, event jsonx.WireValue, ordinaryCompleted bool) {
+	if target.validFor(session) && text(member(event, "type")) == "message_delta" {
+		s.observe(session, target, member(event, "usage"), ordinaryCompleted)
+	}
 }
 
 // MergeWireUsage overlays usage supplied by a decoded stream event onto previous usage.
 // Without a usable usage member it returns the previous value unchanged.
-func MergeWireUsage(previous, event jsonx.WireValue) jsonx.WireValue { return previous }
+// A merged result has its own top-level member slice; nested values are shared with the inputs.
+func MergeWireUsage(previous, event jsonx.WireValue) jsonx.WireValue {
+	if merged, ok := mergeUsage(previous, event); ok {
+		return merged
+	}
+	return previous
+}
