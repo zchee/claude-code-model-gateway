@@ -70,17 +70,6 @@ func decodeRecord(data []byte, dst any) bool {
 
 func (f Files) timestamp() string { return clock(f.Now)().UTC().Format("2006-01-02T15:04:05.000Z") }
 
-func (f Files) write(name string, value any, mode fs.FileMode) error {
-	if !validStateDir(f.StateDir) {
-		return fs.ErrInvalid
-	}
-	data, err := compactRecord(value)
-	if err != nil {
-		return err
-	}
-	return atomicfile.WriteFile(filepath.Join(f.StateDir, name), data, mode)
-}
-
 // Stopped reports whether the intentional stop marker exists, without consuming it.
 func (f Files) Stopped() bool {
 	if !validStateDir(f.StateDir) {
@@ -95,12 +84,18 @@ func (f Files) Stop() error {
 	if !validStateDir(f.StateDir) {
 		return fs.ErrInvalid
 	}
-	if err := os.MkdirAll(f.StateDir, 0o777); err != nil {
+	dir, err := atomicfile.OpenDirCreate(f.StateDir, 0o777)
+	if err != nil {
 		return err
 	}
-	return f.write(stopMarker, struct {
+	defer func() { _ = dir.Close() }()
+	data, err := compactRecord(struct {
 		StoppedAt string `json:"stoppedAt"`
-	}{f.timestamp()}, 0o600)
+	}{f.timestamp()})
+	if err != nil {
+		return err
+	}
+	return dir.WriteFile(stopMarker, data, 0o600)
 }
 
 // Resume removes the marker if present.
@@ -127,7 +122,14 @@ func (f Files) WriteStartupFailure(pid int, generation *string, message string) 
 	if generation != nil {
 		v.Generation = *generation
 	}
-	return f.write(failureFile, v, 0o666)
+	if !validStateDir(f.StateDir) {
+		return fs.ErrInvalid
+	}
+	data, err := compactRecord(v)
+	if err != nil {
+		return err
+	}
+	return atomicfile.WriteFile(filepath.Join(f.StateDir, failureFile), data, 0o666)
 }
 
 // StartupFailure returns the matching supervisor's message; an empty generation matches any.
@@ -189,30 +191,33 @@ func (f Files) record(event string, fields map[string]any) ([]byte, error) {
 	}{f.timestamp(), event, field("component"), field("pid"), fields["startedAt"], fields["outcome"], fields["errorType"], field("signal"), field("exitCode"), child})
 }
 
+func trimJournal(dir *atomicfile.Dir, data []byte) error {
+	const bound = 200
+	lines := bytes.Split(bytes.ReplaceAll(data, []byte("\r\n"), []byte("\n")), []byte("\n"))
+	lines = slices.DeleteFunc(lines, func(line []byte) bool { return len(line) == 0 })
+	if len(lines) < bound {
+		return nil
+	}
+	trimmed := bytes.Join(lines[len(lines)-(bound-1):], []byte("\n"))
+	return dir.RewriteFile(journal, append(trimmed, '\n'))
+}
+
 // Record appends an allowlisted lifecycle event on a best-effort basis.
+// Trimming rewrites the existing regular file in place. If the journal disappears
+// or becomes a symlink before the rewrite, Record neither recreates it nor follows
+// the link, and skips this event. Trimming and appending are not serialized.
 func (f Files) Record(event string, fields map[string]any) {
 	if !validStateDir(f.StateDir) {
 		return
 	}
 	logs := filepath.Join(f.StateDir, "logs")
-	if err := os.MkdirAll(logs, 0o777); err != nil {
-		return
-	}
-	dir, err := atomicfile.OpenDir(logs)
+	dir, err := atomicfile.OpenDirCreate(logs, 0o777)
 	if err != nil {
 		return
 	}
 	defer func() { _ = dir.Close() }()
-	if data, err := dir.ReadFile(journal); err == nil {
-		const bound = 200
-		lines := bytes.Split(bytes.ReplaceAll(data, []byte("\r\n"), []byte("\n")), []byte("\n"))
-		lines = slices.DeleteFunc(lines, func(line []byte) bool { return len(line) == 0 })
-		if len(lines) >= bound {
-			trimmed := bytes.Join(lines[len(lines)-(bound-1):], []byte("\n"))
-			if err := dir.WriteFile(journal, append(trimmed, '\n'), 0o666); err != nil {
-				return
-			}
-		}
+	if data, err := dir.ReadFile(journal); err == nil && trimJournal(dir, data) != nil {
+		return
 	}
 	data, err := f.record(event, fields)
 	if err != nil {
