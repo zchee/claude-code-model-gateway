@@ -18,6 +18,7 @@ package serveshim
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -44,26 +45,52 @@ func imageOf(path string) (procinfo.Image, error) {
 	return procinfo.Image{Path: path, Device: uint64(st.Dev), Inode: st.Ino}, nil //nolint:gosec,unconvert // Stat_t.Dev is signed on some platforms.
 }
 
-// openFixtureChannel takes the inherited fixture channel named by NODE_CHANNEL_FD. It is made close-on-exec, so the
-// worker never inherits it, and non-blocking, so closing it ends a pending read.
-func openFixtureChannel(env environment) *os.File {
+// openFixtureChannel takes the inherited fixture channel named by NODE_CHANNEL_FD, after the same checks the worker
+// applies to its inherited descriptors: not a standard stream, a pipe or socket, and readable. A descriptor that fails
+// them is never touched: under the test guard that is a startup error, and outside it the setting is ignored. The
+// channel is made close-on-exec, so the worker never inherits it, and non-blocking, so closing it ends a pending read.
+func openFixtureChannel(env environment) (*os.File, error) {
 	raw, ok := env.lookup("NODE_CHANNEL_FD")
 	if !ok {
-		return nil
+		return nil, nil
 	}
 	fd, err := strconv.Atoi(raw)
 	if err != nil || fd <= 2 || strconv.Itoa(fd) != raw {
-		return nil
+		if env.guarded() {
+			return nil, fmt.Errorf("model-gateway: NODE_CHANNEL_FD names an unusable descriptor %q", raw)
+		}
+		return nil, nil
 	}
-	var st unix.Stat_t
-	if unix.Fstat(fd, &st) != nil {
-		return nil
+	if err := checkReadable(fd); err != nil {
+		if env.guarded() {
+			return nil, fmt.Errorf("model-gateway: NODE_CHANNEL_FD descriptor %d is unusable: %w", fd, err)
+		}
+		return nil, nil
 	}
 	unix.CloseOnExec(fd)
-	if unix.SetNonblock(fd, true) != nil {
-		return nil
+	if err := unix.SetNonblock(fd, true); err != nil {
+		return nil, fmt.Errorf("model-gateway: could not prepare the fixture channel descriptor %d: %w", fd, err)
 	}
-	return os.NewFile(uintptr(fd), "fixture channel")
+	return os.NewFile(uintptr(fd), "fixture channel"), nil
+}
+
+// checkReadable accepts an open pipe or socket that this process can read from.
+func checkReadable(fd int) error {
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return err
+	}
+	if kind := st.Mode & unix.S_IFMT; kind != unix.S_IFIFO && kind != unix.S_IFSOCK {
+		return errors.New("not a pipe or socket")
+	}
+	flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0)
+	if err != nil {
+		return err
+	}
+	if mode := flags & unix.O_ACCMODE; mode != unix.O_RDONLY && mode != unix.O_RDWR {
+		return errors.New("open in the wrong direction")
+	}
+	return nil
 }
 
 func signalName(sig syscall.Signal) string {

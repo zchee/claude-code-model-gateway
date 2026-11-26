@@ -29,6 +29,6 @@ func imageOf(string) (procinfo.Image, error) {
 	return procinfo.Image{}, errors.New("executable identity is not supported on this platform")
 }
 
-func openFixtureChannel(environment) *os.File { return nil }
+func openFixtureChannel(environment) (*os.File, error) { return nil, nil }
 
 func signalName(sig syscall.Signal) string { return strconv.Itoa(int(sig)) }

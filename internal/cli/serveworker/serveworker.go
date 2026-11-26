@@ -25,6 +25,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -61,8 +62,9 @@ const (
 // A supervised worker (MODEL_GATEWAY_CONTROL_FDS set) writes one listening report to the first descriptor, closes it,
 // and stops when the second descriptor reaches end of file. A standalone worker reads no descriptor; under the test
 // guard it stops when NODE_CHANNEL_FD reaches end of file, and otherwise it closes that descriptor unread. Both print
-// the TCP readiness line on Stdout after every listener is bound. A drain stops the listeners once in-flight requests
-// have finished; the other stops close them at once.
+// the TCP readiness line on Stdout after every listener is bound; it names the Anthropic upstream by its origin only.
+// A drain closes every listener at once and lets in-flight requests finish, unless the parent, the fixture channel or
+// cancellation ends the worker meanwhile; those stops close every connection at once.
 func Run(ctx context.Context, options Options) error {
 	lookup := options.Lookup
 	if lookup == nil {
@@ -92,6 +94,10 @@ func Run(ctx context.Context, options Options) error {
 	state, err := resolver.StateDir()
 	if err != nil {
 		return fmt.Errorf("model-gateway: could not resolve the state directory for the control token: %w", err)
+	}
+	if !filepath.IsAbs(state) || filepath.Clean(state) != state {
+		// The token path is derived from this spelling; a spelling the kernel resolves differently is refused.
+		return fmt.Errorf("model-gateway: the gateway state directory %q must be a clean absolute path", state)
 	}
 	token, err := controlauth.EnsureToken(filepath.Join(state, "control-token"), rand.Reader)
 	if err != nil {
@@ -135,19 +141,24 @@ func Run(ctx context.Context, options Options) error {
 	servers := make([]*http.Server, len(listeners))
 	served := make(chan error, len(listeners))
 	for i, ln := range listeners {
-		servers[i] = &http.Server{Handler: handler, ReadHeaderTimeout: headersTimeout, IdleTimeout: keepAliveTimeout}
+		// The general OPTIONS handler would answer "OPTIONS *" itself, past the handler's checks.
+		servers[i] = &http.Server{Handler: handler, ReadHeaderTimeout: headersTimeout, IdleTimeout: keepAliveTimeout, DisableGeneralOptionsHandler: true}
 		go func() { served <- servers[i].Serve(ln) }()
 	}
 
 	bound := tcp.Addr().(*net.TCPAddr).Port
 	if control != nil {
 		if err := control.report(bound); err != nil {
-			shutdown(servers, served, stopNow, 0)
+			stop.signal(stopNow)
+			shutdown(servers, served, stop, 0)
 			return err
 		}
 	}
-	_, _ = fmt.Fprintf(stdout, "model-gateway shim listening on 127.0.0.1:%d (proxy :%s, anthropic %s)\n", bound, jsNumber(config.ProxyPort.Get(lookup)), config.Upstream.Get(lookup))
+	_, _ = fmt.Fprintf(stdout, "model-gateway shim listening on 127.0.0.1:%d (proxy :%s, anthropic %s)\n", bound, jsNumber(config.ProxyPort.Get(lookup)), upstreamOrigin(config.Upstream.Get(lookup)))
 
+	// Cancellation, the parent's end of file and the fixture's end of file stop the worker at once, also while it drains.
+	stopOnCancel := context.AfterFunc(ctx, func() { stop.signal(stopNow) })
+	defer stopOnCancel()
 	var watchers sync.WaitGroup
 	switch {
 	case control != nil:
@@ -158,14 +169,12 @@ func Run(ctx context.Context, options Options) error {
 	var serveErr error
 	received := 0
 	select {
-	case <-ctx.Done():
-		stop.signal(stopNow)
 	case serveErr = <-served:
 		received++
 		stop.signal(stopNow)
 	case <-stop.done:
 	}
-	shutdown(servers, served, stop.mode(), received)
+	shutdown(servers, served, stop, received)
 	// Closing the descriptors ends a watcher that is still reading them.
 	if control != nil {
 		control.close()
@@ -194,14 +203,17 @@ const (
 	stopDrain
 )
 
+// stopper records the first stop and its kind. An immediate stop that follows a drain still ends the drain.
 type stopper struct {
-	once  sync.Once
-	done  chan struct{}
-	mu    sync.Mutex
-	which stopMode
+	once    sync.Once
+	done    chan struct{} // Closed by the first stop of either kind.
+	nowOnce sync.Once
+	now     chan struct{} // Closed by any immediate stop.
+	mu      sync.Mutex
+	which   stopMode
 }
 
-func newStopper() *stopper { return &stopper{done: make(chan struct{})} }
+func newStopper() *stopper { return &stopper{done: make(chan struct{}), now: make(chan struct{})} }
 
 func (s *stopper) signal(mode stopMode) {
 	s.once.Do(func() {
@@ -210,6 +222,9 @@ func (s *stopper) signal(mode stopMode) {
 		s.mu.Unlock()
 		close(s.done)
 	})
+	if mode == stopNow {
+		s.nowOnce.Do(func() { close(s.now) })
+	}
 }
 
 func (s *stopper) mode() stopMode {
@@ -218,16 +233,30 @@ func (s *stopper) mode() stopMode {
 	return s.which
 }
 
-// shutdown stops every server. A drain lets in-flight requests finish (lib/request-worker.js:1235-1258); any other
-// stop closes the connections, as the source's process exit does.
+// shutdown stops every server at the same time. A drain closes all listeners together and lets in-flight requests
+// finish (lib/request-worker.js:1235-1258) until an immediate stop arrives: the parent's or the fixture's end of file,
+// or cancellation. That closes every connection, as the source's exit on disconnect does (lib/request-worker.js:1210).
+// Any other stop closes the connections at once.
 // received is the number of Serve results the caller has already taken from served.
-func shutdown(servers []*http.Server, served chan error, mode stopMode, received int) {
-	for _, srv := range servers {
-		if mode == stopDrain {
-			_ = srv.Shutdown(context.Background())
-		} else {
-			_ = srv.Close()
+func shutdown(servers []*http.Server, served chan error, stop *stopper, received int) {
+	if stop.mode() == stopDrain {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		var draining sync.WaitGroup
+		for _, srv := range servers {
+			draining.Go(func() { _ = srv.Shutdown(ctx) })
 		}
+		drained := make(chan struct{})
+		go func() { draining.Wait(); close(drained) }()
+		select {
+		case <-drained:
+		case <-stop.now:
+			cancel()
+			<-drained
+		}
+	}
+	for _, srv := range servers {
+		_ = srv.Close()
 	}
 	// Every Serve call has returned once its server is closed; collect them so no goroutine outlives Run.
 	for range len(servers) - received {
@@ -254,6 +283,16 @@ func jsNumber(v float64) string {
 		return "-Infinity"
 	}
 	return strconv.FormatFloat(v, 'f', -1, 64)
+}
+
+// upstreamOrigin renders the configured Anthropic upstream for the readiness line as its origin only. Userinfo, path
+// and query can carry credentials, and the line is copied to the supervisor's log.
+func upstreamOrigin(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "(unparsable URL)"
+	}
+	return u.Scheme + "://" + u.Host
 }
 
 // awaitEOF reads until end of file or a read error. Data the other side writes is ignored.

@@ -24,7 +24,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
-	"sync/atomic"
+	"syscall"
 
 	"github.com/zchee/claude-code-model-gateway/internal/config"
 	"github.com/zchee/claude-code-model-gateway/internal/controlauth"
@@ -37,6 +37,12 @@ import (
 const (
 	restartingBody = `{"type":"error","error":{"type":"api_error","message":"model-gateway shim is restarting; retry this request shortly"}}`
 	noBranchBody   = `{"type":"error","error":{"type":"api_error","message":"model-gateway: no handler is configured for this route"}}`
+	// unreadBody answers a request body that failed to arrive while its client is still connected. The worker's source
+	// has no such case; this is the supervisor's answer to the same failure (lib/commands.js:2273-2283,2311-2323).
+	unreadBody = `{"type":"error","error":{"type":"invalid_request_error","message":"model-gateway could not read the request body"}}`
+	// modelsFailureBody answers a catalog listing whose hook failed. The listing step owns last-good and fallback rows;
+	// the worker root never substitutes them.
+	modelsFailureBody = `{"type":"error","error":{"type":"api_error","message":"model-gateway could not build the model listing"}}`
 )
 
 // refusalMessages holds the fixed answer for each classifier refusal. A parser diagnostic never reaches the client.
@@ -53,8 +59,10 @@ type handler struct {
 	compaction compactionHealth
 	usage      usageHealth
 
-	draining atomic.Bool
-	active   atomic.Int64
+	// stateMu makes the drain transition, the admission check and the activeRequests count one step.
+	stateMu  sync.Mutex
+	draining bool
+	active   int64
 
 	servedMu sync.Mutex
 	served   []servedCount
@@ -125,15 +133,15 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.drain(w, r)
 		return
 	}
-	if h.draining.Load() && local.Branch != "health" {
-		writeJSON(w, http.StatusServiceUnavailable, []byte(restartingBody))
-		return
-	}
 	if local.Branch == "health" {
 		h.health(w)
 		return
 	}
-	untrack := h.track()
+	untrack, admitted := h.track()
+	if !admitted {
+		writeJSON(w, http.StatusServiceUnavailable, []byte(restartingBody))
+		return
+	}
 	defer untrack()
 	switch local.Branch {
 	case "models":
@@ -145,10 +153,36 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// track counts a request in activeRequests until the returned function runs; later calls do nothing.
-func (h *handler) track() func() {
-	h.active.Add(1)
-	return sync.OnceFunc(func() { h.active.Add(-1) })
+// track counts a request in activeRequests until the returned function runs; later calls do nothing. While the worker
+// drains it admits nothing. The check and the count happen under the same lock as the drain transition, so a request
+// is either counted in the drain's answer or refused.
+func (h *handler) track() (func(), bool) {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+	if h.draining {
+		return nil, false
+	}
+	h.active++
+	return sync.OnceFunc(func() {
+		h.stateMu.Lock()
+		defer h.stateMu.Unlock()
+		h.active--
+	}), true
+}
+
+// drainState returns whether the worker drains and how many requests it has admitted, as one snapshot.
+func (h *handler) drainState() (bool, int64) {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+	return h.draining, h.active
+}
+
+// beginDraining stops admission and returns the requests admitted before it.
+func (h *handler) beginDraining() int64 {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+	h.draining = true
+	return h.active
 }
 
 func localPorts(r *http.Request) []int {
@@ -164,12 +198,12 @@ func (h *handler) drain(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 		return
 	}
-	h.draining.Store(true)
+	active := h.beginDraining()
 	body, err := json.Marshal(struct {
 		OK             bool  `json:"ok"`
 		Draining       bool  `json:"draining"`
 		ActiveRequests int64 `json:"activeRequests"`
-	}{true, true, h.active.Load()})
+	}{true, true, active})
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
@@ -182,6 +216,13 @@ func (h *handler) drain(w http.ResponseWriter, r *http.Request) {
 		// The drain callback stops the listeners and waits for active handlers, this one included.
 		go h.options.BeginDrain()
 	}
+}
+
+// clientDeparted reports whether a body read failed because the client went away rather than because its input was
+// malformed: a cancelled request, a connection that ended before the body did, or a reset.
+func clientDeparted(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, net.ErrClosed)
 }
 
 func writeJSON(w http.ResponseWriter, status int, body []byte) {
@@ -227,6 +268,7 @@ func checkingReadiness() readiness.CodexReadiness {
 
 func (h *handler) health(w http.ResponseWriter) {
 	source, models := h.catalogHealth()
+	draining, active := h.drainState()
 	codex := checkingReadiness()
 	if h.options.CodexReadiness != nil {
 		codex = h.options.CodexReadiness()
@@ -242,7 +284,7 @@ func (h *handler) health(w http.ResponseWriter) {
 		Compaction     compactionHealth         `json:"compaction"`
 		Usage          usageHealth              `json:"usage"`
 		CodexReadiness readiness.CodexReadiness `json:"codexReadiness"`
-	}{true, h.options.Version, models, source, h.servedJSON(), h.draining.Load(), h.active.Load(), h.compaction, h.usage, codex})
+	}{true, h.options.Version, models, source, h.servedJSON(), draining, active, h.compaction, h.usage, codex})
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
@@ -270,13 +312,19 @@ func (h *handler) models(w http.ResponseWriter, r *http.Request, snap route.Snap
 	h.count("models")
 	if h.options.Models != nil {
 		body, err := h.options.Models(r.Context(), r.Header.Clone())
-		if err == nil {
+		switch {
+		case r.Context().Err() != nil:
+			// The client left; nothing is written for it.
+		case err != nil:
+			writeJSON(w, http.StatusBadGateway, []byte(modelsFailureBody))
+			h.diagnose("model-gateway: the model listing failed; answered %d\n", http.StatusBadGateway)
+		default:
 			writeJSON(w, http.StatusOK, body)
-			return
 		}
-		if r.Context().Err() != nil {
-			return
-		}
+		return
+	}
+	if r.Context().Err() != nil {
+		return
 	}
 	_, rows := snap.Catalog()
 	if len(rows) == 0 {
@@ -376,18 +424,47 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request, snap route.Snaps
 		}
 	}()
 
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		// A body that cannot be read completely means the client is gone; nothing is answered.
+	// gone accounts a client that has left: the departure callback has delivered the cancelled result, or, when it
+	// could still be stopped, the same result is delivered here. Nothing is written for that client.
+	gone := func() bool {
+		if r.Context().Err() == nil {
+			return false
+		}
 		if !settle() {
-			t.deliver(outcome.Result{Cancelled: true})
+			t.deliver(outcome.Result{Route: t.admittedRoute(), Cancelled: true})
 			untrack()
 		}
-		panic(http.ErrAbortHandler)
+		return true
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		if clientDeparted(r.Context(), err) {
+			if !settle() {
+				t.deliver(outcome.Result{Cancelled: true})
+				untrack()
+			}
+			// The client is gone; nothing is answered and no status is recorded for it.
+			panic(http.ErrAbortHandler)
+		}
+		w.Header().Set("Connection", "close")
+		w.Header().Set("X-Should-Retry", "false")
+		writeJSON(w, http.StatusBadRequest, []byte(unreadBody))
+		h.diagnose("model-gateway: a request body could not be read; answered %d\n", http.StatusBadRequest)
+		if !settle() {
+			t.deliver(outcome.Result{Status: http.StatusBadRequest})
+		}
+		return
+	}
+	if gone() {
+		return
 	}
 
 	d := snap.Classify(r.Method, target, body)
 	if d.Branch == "refused" {
+		if gone() {
+			return
+		}
 		h.refuse(w, d.Reason)
 		if !settle() {
 			t.deliver(outcome.Result{Status: http.StatusBadRequest})
@@ -396,10 +473,16 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request, snap route.Snaps
 	}
 	forward := h.branch(d.Branch)
 	if forward == nil {
+		if gone() {
+			return
+		}
 		writeJSON(w, http.StatusBadGateway, []byte(noBranchBody))
 		if !settle() {
 			t.deliver(outcome.Result{Status: http.StatusBadGateway})
 		}
+		return
+	}
+	if gone() {
 		return
 	}
 	result, err := forward(w, r, snap, d, body, func(selected outcome.Route, audit *outcome.Audit) {
@@ -422,10 +505,12 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request, snap route.Snaps
 }
 
 // admit runs the branch's admission callback at most once per request: it counts the request and logs its accepted
-// audit before the branch can still refuse it (lib/request-worker.js:2551-2568,2620-2634,2648-2650).
+// audit before the branch can still refuse it (lib/request-worker.js:2551-2568,2620-2634,2648-2650). A request whose
+// client has already left is not admitted: it is not counted and starts no catalog refresh, and its cancelled result
+// carries no route.
 func (h *handler) admit(r *http.Request, d route.Decision, t *terminal, selected outcome.Route, audit *outcome.Audit) {
 	t.mu.Lock()
-	first := t.admitted == nil
+	first := t.admitted == nil && r.Context().Err() == nil
 	if first {
 		t.admitted = &selected
 	}

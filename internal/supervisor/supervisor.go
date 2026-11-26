@@ -20,13 +20,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/zchee/claude-code-model-gateway/internal/controlauth"
@@ -50,10 +51,13 @@ type handler struct {
 	token      string
 	version    string
 	pid        int
-	transport  *http.Transport
 }
 
-// NewHandler constructs a handler for an already bound public port. workerPort returns the current worker's port.
+// NewHandler constructs a handler for an already bound public port. workerPort returns the port of the worker that is
+// currently eligible to receive requests, or 0 while none is.
+//
+// The handler judges req.Host as the Host header the client sent. Serve supplies exactly that; a caller that dispatches
+// requests some other way must do the same.
 func NewHandler(publicPort int, workerPort func() int, token, version string, pid int) (http.Handler, error) {
 	if !validToken(token) {
 		return nil, errors.New("model-gateway: the supervisor needs a valid local control token before serving")
@@ -61,16 +65,7 @@ func NewHandler(publicPort int, workerPort func() int, token, version string, pi
 	if publicPort <= 0 || publicPort > 65535 || workerPort == nil {
 		return nil, errors.New("model-gateway: the supervisor needs its public port and a worker port source")
 	}
-	// One connection per relayed request, no environment proxy, no compression and no automatic replay: a pooled
-	// socket the worker closed at the same moment would be indistinguishable from a worker that took the body
-	// (lib/commands.js:2467-2472).
-	transport := &http.Transport{
-		Proxy:              nil,
-		DisableKeepAlives:  true,
-		DisableCompression: true,
-		ForceAttemptHTTP2:  false,
-	}
-	return &handler{publicPort: publicPort, workerPort: workerPort, token: token, version: version, pid: pid, transport: transport}, nil
+	return &handler{publicPort: publicPort, workerPort: workerPort, token: token, version: version, pid: pid}, nil
 }
 
 func validToken(token string) bool {
@@ -97,13 +92,6 @@ func refuse(w http.ResponseWriter) {
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	host, ok := wireHost(r.Context(), r.Host)
-	if !ok {
-		refuse(w)
-		return
-	}
-	// The controlauth checks read the Host header as sent from req.Host.
-	r.Host = host
 	port := strconv.Itoa(h.publicPort)
 	if !controlauth.LocalRequestAllowed(r, []string{"127.0.0.1:" + port, "localhost:" + port}) {
 		refuse(w)
@@ -126,18 +114,27 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // relay forwards one buffered request to the current worker and streams its answer back.
 func (h *handler) relay(w http.ResponseWriter, r *http.Request) {
+	target := requestTarget(r)
+	if !wireSafe(r.Method) || !wireSafe(target) {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
 	body, ok := readBody(w, r)
 	if !ok {
 		return
 	}
-	resp, err := h.deliver(r, body)
+	resp, err := h.deliver(r, target, body)
 	if err != nil {
+		if r.Context().Err() != nil {
+			// The client is gone; there is no one to answer.
+			return
+		}
 		writeWorkerFailure(w, errors.Is(err, errBodyTaken))
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
-	pathOnly, _, _ := strings.Cut(requestTarget(r), "?")
-	if pathOnly == "/healthz" {
+	pathOnly, _, _ := strings.Cut(target, "?")
+	if pathOnly == "/healthz" && bodyAllowed(r.Method, resp.StatusCode) {
 		h.relayHealth(w, resp)
 		return
 	}
@@ -149,11 +146,36 @@ func (h *handler) relay(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// bodyAllowed reports whether a response to method with status carries a body at all.
+func bodyAllowed(method string, status int) bool {
+	return method != http.MethodHead && status != http.StatusNoContent && status != http.StatusNotModified
+}
+
+// wireSafe reports whether s can be written into a request line unchanged.
+func wireSafe(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := range len(s) {
+		if b := s[i]; b <= ' ' || b == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// clientDeparted reports whether a body read failed because the client went away, as the source distinguishes it
+// (lib/commands.js:2311-2323).
+func clientDeparted(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, net.ErrClosed)
+}
+
 func readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 	data, err := io.ReadAll(io.LimitReader(r.Body, maxRelayBody+1))
 	switch {
 	case err != nil:
-		if r.Context().Err() == nil {
+		if !clientDeparted(r.Context(), err) {
 			w.Header().Set("Connection", "close")
 			w.Header().Set("X-Should-Retry", "false")
 			w.Header().Set("Content-Type", "application/json")
@@ -175,7 +197,9 @@ var errBodyTaken = errors.New("model-gateway: the worker took the request body a
 
 // deliver sends the body to the worker. A body that reached a worker is never sent to the same worker again: it may
 // already have been spent upstream. Only a worker on a different port, a replacement, receives it again.
-func (h *handler) deliver(r *http.Request, body []byte) (*http.Response, error) {
+// It returns the context's error once the client has gone.
+func (h *handler) deliver(r *http.Request, target string, body []byte) (*http.Response, error) {
+	ctx := r.Context()
 	var takenBy int
 	var lastErr error
 	for attempt := 0; ; attempt++ {
@@ -188,9 +212,9 @@ func (h *handler) deliver(r *http.Request, body []byte) (*http.Response, error) 
 			}
 			timer := time.NewTimer(relayWait)
 			select {
-			case <-r.Context().Done():
+			case <-ctx.Done():
 				timer.Stop()
-				return nil, r.Context().Err()
+				return nil, ctx.Err()
 			case <-timer.C:
 			}
 		}
@@ -198,10 +222,12 @@ func (h *handler) deliver(r *http.Request, body []byte) (*http.Response, error) 
 		if port <= 0 || port > 65535 || port == takenBy {
 			continue
 		}
-		var connected bool
-		resp, err := h.roundTrip(r, body, port, &connected)
+		resp, connected, err := roundTrip(ctx, r, target, body, port)
 		if err == nil {
 			return resp, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
 		lastErr = err
 		if connected {
@@ -210,56 +236,77 @@ func (h *handler) deliver(r *http.Request, body []byte) (*http.Response, error) 
 	}
 }
 
-func (h *handler) roundTrip(r *http.Request, body []byte, port int, connected *bool) (*http.Response, error) {
-	authority := "127.0.0.1:" + strconv.Itoa(port)
+// relayExcluded are the request header fields the relay writes itself or that describe only the client's connection.
+var relayExcluded = []string{"Host", "Content-Length", "Transfer-Encoding", "Trailer", "Connection", "Keep-Alive", "Expect"}
+
+// roundTrip sends one request on a connection of its own (lib/commands.js:2467-2472) and reads the response head.
+// connected reports whether the worker accepted the connection, after which it may have taken the body. The request
+// line carries target byte for byte. The returned body closes the connection.
+func roundTrip(ctx context.Context, r *http.Request, target string, body []byte, port int) (*http.Response, bool, error) {
+	authority := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, "tcp4", authority)
+	if err != nil {
+		return nil, false, err
+	}
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	release := func() {
+		stop()
+		_ = conn.Close()
+	}
 	header := r.Header.Clone()
 	if header == nil {
 		header = make(http.Header)
 	}
-	// The relayed connection is closed after this request; the client's own connection headers do not apply to it.
-	header.Del("Connection")
-	header.Del("Keep-Alive")
-	if _, ok := header["User-Agent"]; !ok {
-		// An explicitly empty value keeps net/http from adding its own User-Agent.
-		header["User-Agent"] = []string{""}
+	for _, name := range relayExcluded {
+		header.Del(name)
 	}
-	ctx := r.Context()
-	out := (&http.Request{
-		Method:        r.Method,
-		URL:           relayURL(authority, requestTarget(r)),
-		Proto:         "HTTP/1.1",
-		ProtoMajor:    1,
-		ProtoMinor:    1,
-		Header:        header,
-		Host:          authority,
-		ContentLength: int64(len(body)),
-	}).WithContext(ctx)
-	if len(body) > 0 {
-		out.Body = io.NopCloser(bytes.NewReader(body))
-	} else {
-		out.Body = http.NoBody
+	bw := bufio.NewWriter(conn)
+	_, _ = fmt.Fprintf(bw, "%s %s HTTP/1.1\r\nHost: %s\r\n", r.Method, target, authority)
+	_ = header.Write(bw)
+	if len(body) > 0 || r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch {
+		_, _ = fmt.Fprintf(bw, "Content-Length: %d\r\n", len(body))
 	}
-	transport := h.transport.Clone()
-	defer transport.CloseIdleConnections()
-	dialer := &net.Dialer{}
-	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-		conn, err := dialer.DialContext(ctx, network, address)
-		if err == nil {
-			*connected = true
+	_, _ = bw.WriteString("Connection: close\r\n\r\n")
+	_, _ = bw.Write(body)
+	if err := bw.Flush(); err != nil {
+		release()
+		return nil, true, err
+	}
+	br := bufio.NewReader(conn)
+	for {
+		resp, err := http.ReadResponse(br, &http.Request{Method: r.Method})
+		if err != nil {
+			release()
+			return nil, true, err
 		}
-		return conn, err
+		if resp.StatusCode >= http.StatusOK {
+			resp.Body = &relayBody{ReadCloser: resp.Body, release: release}
+			return resp, true, nil
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode == http.StatusSwitchingProtocols {
+			release()
+			return nil, true, errors.New("model-gateway: the worker switched protocols on a relayed request")
+		}
 	}
-	return transport.RoundTrip(out)
 }
 
-// relayURL keeps the request target byte for byte, including an absolute-form target and its query.
-func relayURL(authority, target string) *url.URL {
-	return &url.URL{Scheme: "http", Host: authority, Opaque: target}
+// relayBody closes the worker connection with the response body.
+type relayBody struct {
+	io.ReadCloser
+	release func()
+}
+
+func (b *relayBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.release()
+	return err
 }
 
 func copyHeader(dst, src http.Header) {
 	for key, values := range src {
-		dst[key] = append([]string(nil), values...)
+		dst[key] = slices.Clone(values)
 	}
 }
 
@@ -305,7 +352,7 @@ func (h *handler) relayHealth(w http.ResponseWriter, resp *http.Response) {
 		return
 	}
 	copyHeader(w.Header(), resp.Header)
-	w.Header().Del("Content-Length")
+	w.Header().Set("Content-Length", strconv.Itoa(len(out)))
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(out)
 }
@@ -359,34 +406,6 @@ func writeWorkerFailure(w http.ResponseWriter, bodyTaken bool) {
 	if err == nil {
 		_, _ = w.Write(out)
 	}
-}
-
-// Serve dispatches requests received on the bound public listener until cancellation or listener failure.
-// It returns nil after cancellation, once in-flight requests have finished or the shutdown grace has passed.
-func Serve(ctx context.Context, listener net.Listener, handler http.Handler) error {
-	srv := &http.Server{
-		Handler:           handler,
-		ReadHeaderTimeout: 120 * time.Second,
-		IdleTimeout:       75 * time.Second,
-		ConnContext:       withHeadParser,
-		ErrorLog:          nil,
-	}
-	served := make(chan error, 1)
-	go func() { served <- srv.Serve(headListener{listener}) }()
-	select {
-	case err := <-served:
-		return err
-	case <-ctx.Done():
-	}
-	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownGrace)
-	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		_ = srv.Close()
-	}
-	if err := <-served; !errors.Is(err, http.ErrServerClosed) {
-		return err
-	}
-	return nil
 }
 
 // FixtureShutdown consumes and closes the inherited fixture channel. Without a test guard it closes it unread.

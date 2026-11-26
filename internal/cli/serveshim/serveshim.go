@@ -88,6 +88,9 @@ func Run(ctx context.Context, opts Options) error {
 	if err != nil {
 		return err
 	}
+	if workerPort != 0 && workerPort == publicPort {
+		return samePortError(workerPort)
+	}
 
 	s := &shim{
 		lifetime: context.WithoutCancel(ctx), env: env, state: state, executable: executable, version: opts.Version, stderr: stderr,
@@ -103,7 +106,10 @@ func Run(ctx context.Context, opts Options) error {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
 	defer signal.Stop(signals)
-	fixture := s.watchFixtureChannel()
+	fixture, err := s.watchFixtureChannel()
+	if err != nil {
+		return err
+	}
 	defer fixture.close()
 
 	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(publicPort)))
@@ -113,6 +119,10 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	defer func() { _ = listener.Close() }()
 	bound := listener.Addr().(*net.TCPAddr).Port
+	if workerPort == bound {
+		// The public listener would relay to itself, or the worker could never bind its port.
+		return samePortError(bound)
+	}
 	handler, err := supervisor.NewHandler(bound, s.port, token, opts.Version, s.pid)
 	if err != nil {
 		return err
@@ -161,6 +171,10 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	exitCode = 0
 	return nil
+}
+
+func samePortError(port int) error {
+	return fmt.Errorf("model-gateway: CODEX_GATEWAY_WORKER_PORT %d is the public port; the worker needs a port of its own", port)
 }
 
 func writerOr(w io.Writer) io.Writer {

@@ -95,23 +95,46 @@ func validToken(token string) bool {
 //
 // A worker that died without closing leaves its socket file behind, and binding over it fails with EADDRINUSE although
 // nothing answers there. Only a refused connection to an actual socket proves that no process owns the path
-// (lib/request-worker.js:1180-1206). Any other bind failure is returned unchanged.
+// (lib/request-worker.js:1180-1206). Starters that reclaim the same path take an advisory lock on the sibling file
+// path+".lock" for the probe, the unlink and the rebind, so one of them cannot unlink the socket another has just bound.
+// A path that changed identity between the checks, or a lock that cannot be taken, is not reclaimed. Any other bind
+// failure is returned unchanged.
 func ListenUnix(path string) (net.Listener, error) {
 	addr := &net.UnixAddr{Name: path, Net: "unix"}
 	ln, err := net.ListenUnix("unix", addr)
 	if err == nil {
 		return ln, nil
 	}
+	if !errors.Is(err, syscall.EADDRINUSE) {
+		return nil, err
+	}
+	unlock, lockErr := lockReclaim(path)
+	if lockErr != nil {
+		return nil, err
+	}
+	defer unlock()
+	// Another starter may have reclaimed the path while this one waited for the lock.
+	if ln, err = net.ListenUnix("unix", addr); err == nil {
+		return ln, nil
+	}
 	if !errors.Is(err, syscall.EADDRINUSE) || !removeStaleSocket(path) {
 		return nil, err
 	}
-	return net.ListenUnix("unix", addr)
+	if ln, err = net.ListenUnix("unix", addr); err != nil {
+		return nil, err
+	}
+	return ln, nil
 }
 
 // staleProbeTimeout bounds the connection attempt that decides whether a socket file still has an owner.
 const staleProbeTimeout = 2 * time.Second
 
+// removeStaleSocket unlinks path when it is a socket that refuses connections and is still the same file afterwards.
 func removeStaleSocket(path string) bool {
+	before, err := os.Lstat(path)
+	if err != nil || before.Mode()&os.ModeSocket == 0 {
+		return false
+	}
 	conn, err := (&net.Dialer{Timeout: staleProbeTimeout}).Dial("unix", path)
 	if err == nil {
 		_ = conn.Close()
@@ -120,8 +143,8 @@ func removeStaleSocket(path string) bool {
 	if !errors.Is(err, syscall.ECONNREFUSED) {
 		return false
 	}
-	info, err := os.Lstat(path)
-	if err != nil || info.Mode()&os.ModeSocket == 0 {
+	after, err := os.Lstat(path)
+	if err != nil || !os.SameFile(before, after) {
 		return false
 	}
 	return os.Remove(path) == nil

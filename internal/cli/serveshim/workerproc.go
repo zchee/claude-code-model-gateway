@@ -60,13 +60,22 @@ type shim struct {
 	configuredPort int
 	fatal          chan error
 
-	workerPort atomic.Int64
+	// endpoint is the port of the worker that may receive requests, or 0. It is set only after the current worker
+	// reported its listener for its own generation and its pid record was published, and it is cleared under mu
+	// whenever that worker stops being current. A port number alone, configured or not, never makes a worker eligible.
+	endpoint atomic.Int64
 
-	mu           sync.Mutex
-	stopped      bool
-	current      *workerProc
-	respawn      *time.Timer
-	reportTimer  *time.Timer
+	// publishMu serializes the final current-worker check with the pid record write, so that a slow publication of an
+	// earlier worker can never land after its replacement's.
+	publishMu sync.Mutex
+
+	mu          sync.Mutex
+	stopped     bool
+	current     *workerProc
+	respawn     *time.Timer
+	reportTimer *time.Timer
+	// reportEpoch identifies the installed report timer; a callback carrying another epoch is stale and does nothing.
+	reportEpoch  uint64
 	stderrWrites sync.Mutex
 	tasks        sync.WaitGroup
 }
@@ -80,7 +89,7 @@ type workerProc struct {
 	exited     chan struct{}
 }
 
-func (s *shim) port() int { return int(s.workerPort.Load()) }
+func (s *shim) port() int { return int(s.endpoint.Load()) }
 
 func (s *shim) logf(format string, args ...any) {
 	s.stderrWrites.Lock()
@@ -108,28 +117,36 @@ func (s *shim) publishSelf(ctx context.Context, publicPort int) error {
 	if generation == "" {
 		generation = newGeneration()
 	}
-	return s.writeRecord(ctx, "guardian", "supervisor", s.pid, strings.Join(os.Args, " "), exe, generation, publicPort)
-}
-
-func (s *shim) writeRecord(ctx context.Context, name, role string, pid int, command, executable, generation string, port int) error {
-	image, err := imageOf(executable)
+	image, birth, err := s.evidence(ctx, s.pid, exe)
 	if err != nil {
 		return err
+	}
+	return s.writeRecord("guardian", "supervisor", s.pid, strings.Join(os.Args, " "), generation, publicPort, image, birth)
+}
+
+// evidence identifies a process for its pid record: the executable's image and the kernel's birth time of pid.
+func (s *shim) evidence(ctx context.Context, pid int, executable string) (procinfo.Image, time.Time, error) {
+	image, err := imageOf(executable)
+	if err != nil {
+		return procinfo.Image{}, time.Time{}, err
 	}
 	probe := procinfo.New(s.env.lookup)
 	birthCtx, cancel := context.WithTimeout(ctx, birthWait)
 	defer cancel()
-	var birth time.Time
 	for {
-		if birth, err = probe.Birth(birthCtx, pid); err == nil {
-			break
+		birth, err := probe.Birth(birthCtx, pid)
+		if err == nil {
+			return image, birth, nil
 		}
 		select {
 		case <-birthCtx.Done():
-			return err
+			return procinfo.Image{}, time.Time{}, err
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
+}
+
+func (s *shim) writeRecord(name, role string, pid int, command, generation string, port int, image procinfo.Image, birth time.Time) error {
 	return procinfo.WriteRecord(s.state, name, procinfo.Record{
 		PID: pid, Command: command, StartedAt: procinfo.LegacyStart(birth), Role: role, StateRoot: s.state,
 		Generation: generation, Port: uint16(port), Version: s.version, Image: image,
@@ -144,13 +161,12 @@ func (s *shim) startWorker() {
 	if s.stopped || s.current != nil {
 		return
 	}
-	if s.configuredPort == 0 {
-		s.workerPort.Store(0)
-		if s.reportTimer == nil {
-			s.reportTimer = time.AfterFunc(reportTimeout, s.reportExpired)
-		}
-	} else {
-		s.workerPort.Store(int64(s.configuredPort))
+	s.endpoint.Store(0)
+	if s.configuredPort == 0 && s.reportTimer == nil {
+		// An installed timer is kept across failed launches, so the deadline counts from the first of them.
+		s.reportEpoch++
+		epoch := s.reportEpoch
+		s.reportTimer = time.AfterFunc(reportTimeout, func() { s.reportExpired(epoch) })
 	}
 	w, err := s.spawn()
 	if err != nil {
@@ -195,11 +211,11 @@ func (s *shim) spawn() (*workerProc, error) {
 	return &workerProc{cmd: cmd, pid: cmd.Process.Pid, generation: generation, live: liveW, report: reportR, exited: make(chan struct{})}, nil
 }
 
-// readReport accepts one listening report from the worker's generation and publishes the worker's pid record.
+// readReport accepts one listening report from the worker's own generation, publishes the worker's pid record, and
+// only then makes the worker's port eligible for relay. A configured port must be the port the worker reports.
 func (s *shim) readReport(w *workerProc) {
 	defer func() { _ = w.report.Close() }()
-	command := s.executable + " serve-worker"
-	if err := s.writeRecord(context.Background(), "shim", "worker", w.pid, command, s.executable, w.generation, s.configuredPort); err != nil {
+	if err := s.publish(w, s.configuredPort, false); err != nil {
 		s.logf("model-gateway: could not publish the worker pid record: %v\n", err)
 	}
 	_ = w.report.SetReadDeadline(time.Now().Add(reportTimeout))
@@ -208,23 +224,57 @@ func (s *shim) readReport(w *workerProc) {
 		return
 	}
 	port, ok := parseReport(data, w.generation)
-	if !ok || s.configuredPort != 0 {
+	if !ok || (s.configuredPort != 0 && port != s.configuredPort) {
 		return
+	}
+	if err := s.publish(w, port, true); err != nil {
+		s.logf("model-gateway: could not publish the worker pid record: %v\n", err)
+		if s.isCurrent(w) {
+			// A worker the supervisor cannot track is not served, as the supervisor does not serve untracked itself.
+			s.fail(fmt.Errorf("model-gateway: the shim worker could not be tracked: %w", err))
+		}
+	}
+}
+
+func (s *shim) isCurrent(w *workerProc) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return !s.stopped && s.current == w
+}
+
+// publish writes w's pid record with port while w is still the current worker and, when eligible is set, then makes
+// port the relay endpoint. The identity evidence is gathered first, outside every lock.
+func (s *shim) publish(w *workerProc, port int, eligible bool) error {
+	image, birth, err := s.evidence(s.lifetime, w.pid, s.executable)
+	if err != nil {
+		if !s.isCurrent(w) {
+			return nil
+		}
+		return err
+	}
+	s.publishMu.Lock()
+	defer s.publishMu.Unlock()
+	if !s.isCurrent(w) {
+		return nil
+	}
+	if err := s.writeRecord("shim", "worker", w.pid, s.executable+" serve-worker", w.generation, port, image, birth); err != nil {
+		return err
+	}
+	if !eligible {
+		return nil
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.stopped || s.current != w {
-		s.mu.Unlock()
-		return
+		return nil
 	}
-	s.workerPort.Store(int64(port))
+	s.endpoint.Store(int64(port))
 	if s.reportTimer != nil {
 		s.reportTimer.Stop()
 		s.reportTimer = nil
+		s.reportEpoch++
 	}
-	s.mu.Unlock()
-	if err := s.writeRecord(context.Background(), "shim", "worker", w.pid, command, s.executable, w.generation, port); err != nil {
-		s.logf("model-gateway: could not publish the worker pid record: %v\n", err)
-	}
+	return nil
 }
 
 // parseReport accepts exactly one newline-terminated line of at most 256 bytes naming this generation and a valid port.
@@ -246,10 +296,16 @@ func parseReport(data []byte, generation string) (int, bool) {
 	return int(report.Port), true
 }
 
-func (s *shim) reportExpired() {
+// reportExpired stops the supervisor when no worker reported its listener in time. A callback whose timer was stopped
+// or replaced after it had already started finds another epoch and does nothing.
+func (s *shim) reportExpired(epoch uint64) {
 	s.mu.Lock()
-	expired := !s.stopped && s.configuredPort == 0 && s.workerPort.Load() == 0
+	if epoch != s.reportEpoch || s.reportTimer == nil {
+		s.mu.Unlock()
+		return
+	}
 	s.reportTimer = nil
+	expired := !s.stopped && s.endpoint.Load() == 0
 	s.mu.Unlock()
 	if expired {
 		s.fail(fmt.Errorf("model-gateway: shim worker did not report its listener port within %dms", reportTimeout.Milliseconds()))
@@ -267,6 +323,7 @@ func (s *shim) awaitExit(w *workerProc) {
 	defer s.mu.Unlock()
 	if s.current == w {
 		s.current = nil
+		s.endpoint.Store(0)
 	}
 	if !s.stopped {
 		s.respawn = time.AfterFunc(respawnDelay, s.startWorker)
@@ -296,12 +353,15 @@ func (s *shim) stop(signal string) {
 		return
 	}
 	s.stopped = true
+	s.endpoint.Store(0)
 	w := s.current
 	for _, t := range []*time.Timer{s.respawn, s.reportTimer} {
 		if t != nil {
 			t.Stop()
 		}
 	}
+	s.reportTimer = nil
+	s.reportEpoch++
 	s.mu.Unlock()
 	if signal != "" {
 		s.files.Record("supervisor-stop-requested", map[string]any{"component": "supervisor", "pid": s.pid, "startedAt": s.startedAt, "signal": signal})
@@ -360,10 +420,10 @@ func (f fixtureWatch) close() {
 
 // watchFixtureChannel reads the test harness's channel under the test guard; outside it the descriptor is closed
 // unread. The channel is never passed to the worker.
-func (s *shim) watchFixtureChannel() fixtureWatch {
-	file := openFixtureChannel(s.env)
-	if file == nil {
-		return fixtureWatch{}
+func (s *shim) watchFixtureChannel() (fixtureWatch, error) {
+	file, err := openFixtureChannel(s.env)
+	if err != nil || file == nil {
+		return fixtureWatch{}, err
 	}
 	watch := fixtureWatch{result: make(chan bool, 1), file: file, done: make(chan struct{})}
 	guarded := s.env.guarded()
@@ -372,5 +432,5 @@ func (s *shim) watchFixtureChannel() fixtureWatch {
 		stop, _ := supervisor.FixtureShutdown(file, guarded)
 		watch.result <- stop
 	}()
-	return watch
+	return watch, nil
 }
