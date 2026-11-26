@@ -29,6 +29,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -100,11 +101,15 @@ func (b *observedBody) Close() error {
 func (p proxyFixture) forward(body []byte) upstream.Send {
 	req := upstream.Request{Target: upstream.TargetProxy, BaseURL: p.server.URL, Method: http.MethodPost, RequestURI: "/v1/messages", Body: body}
 	var previous *observedBody
-	return func(context.Context) (*upstream.Response, error) {
+	return func(ctx context.Context) (*upstream.Response, error) {
 		if previous != nil && previous.closes.Load() != 1 {
 			p.t.Error("previous upstream body not closed before retry")
 		}
-		res, err := p.client.Do(p.t.Context(), req)
+		if ctx == nil {
+			p.t.Error("forward called with nil context")
+			ctx = p.t.Context()
+		}
+		res, err := p.client.Do(ctx, req)
 		if err == nil {
 			b := &observedBody{ReadCloser: res.Body}
 			res.Body = b
@@ -233,7 +238,12 @@ func outsideClock(t *testing.T, send upstream.Send) upstream.Send {
 		}
 	}()
 	t.Cleanup(func() { close(call); <-stopped })
-	return func(context.Context) (*upstream.Response, error) {
+	return func(ctx context.Context) (*upstream.Response, error) {
+		if ctx == nil {
+			t.Error("forward called with nil context")
+		} else if ctx.Err() != nil {
+			t.Errorf("forward called with done context: %v", ctx.Err())
+		}
 		call <- struct{}{}
 		r := <-returned
 		return r.response, r.err
@@ -329,24 +339,157 @@ func TestUpgradeRetry(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
+			w := &countedWriter{ResponseRecorder: httptest.NewRecorder()}
 			var result reply.Result
+			var err error
 			done := make(chan struct{})
 			go func() {
 				defer close(done)
-				result, _ = reply.Handle(ctx, httptest.NewRecorder(), req, send)
+				result, err = reply.Handle(ctx, w, req, send)
 			}()
 			synctest.Wait()
 			select {
 			case <-done:
-				t.Fatal("Handle returned before waiting to retry")
+				t.Fatalf("Handle returned before waiting to retry: %v", err)
 			default:
 			}
 			equal(t, 1, int(attempts.Load()))
 			cancel()
 			<-done
+			if err != nil {
+				t.Fatalf("Handle: %v", err)
+			}
+			equal(t, 0, len(w.heads))
+			equal(t, 0, w.Body.Len())
+			equal(t, true, result.Stream == nil)
 			equal(t, 1, int(attempts.Load()))
-			equal(t, true, result.Cancelled)
 			equal(t, true, result.Contacted)
+			equal(t, false, result.Cancelled)
+			equal(t, 0, result.Status)
 		})
+	})
+	t.Run("error: disconnect during in-flight attempt with zero retry delay", func(t *testing.T) {
+		type ctxKey struct{}
+		ctx, cancel := context.WithCancel(context.WithValue(t.Context(), ctxKey{}, "client"))
+		defer cancel()
+		req := reply.Request{Provider: "codex", Body: []byte(`{}`), RetryDelay: new(time.Duration(0))}
+		var attempts, forwardCalls atomic.Int32
+		inFlight, release := make(chan struct{}), make(chan struct{})
+		releaseOnce := sync.OnceFunc(func() { close(release) })
+		defer releaseOnce()
+		fixture := newProxy(t, func(w http.ResponseWriter, r *http.Request) {
+			if attempts.Add(1) == 1 {
+				close(inFlight)
+				select {
+				case <-release:
+				case <-r.Context().Done():
+					return
+				}
+			}
+			w.WriteHeader(403)
+			_, _ = io.WriteString(w, rejection)
+		})
+		base := fixture.forward(req.Body)
+		gotCtx := make(chan context.Context, 1)
+		var firstBody *observedBody
+		var firstErr error
+		var firstStatus int
+		send := func(callCtx context.Context) (*upstream.Response, error) {
+			n := forwardCalls.Add(1)
+			if n == 1 {
+				gotCtx <- callCtx
+			}
+			res, err := base(callCtx)
+			if n == 1 {
+				firstErr = err
+				if err == nil {
+					firstStatus = res.StatusCode
+					firstBody, _ = res.Body.(*observedBody)
+				}
+			}
+			return res, err
+		}
+		w := &countedWriter{ResponseRecorder: httptest.NewRecorder()}
+		var result reply.Result
+		var err error
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			result, err = reply.Handle(ctx, w, req, send)
+		}()
+		defer func() {
+			releaseOnce()
+			<-done
+		}()
+		select {
+		case <-inFlight:
+		case <-done:
+			t.Fatalf("Handle returned before attempt 1 reached upstream: err=%v result=%+v", err, result)
+		}
+		forwardCtx := <-gotCtx
+		if forwardCtx == nil {
+			t.Fatal("forward received nil context")
+		}
+		equal(t, "client", forwardCtx.Value(ctxKey{}))
+		if forwardCtx.Err() != nil {
+			t.Errorf("forward context done before client cancel: %v", forwardCtx.Err())
+		}
+		cancel()
+		if forwardCtx.Err() != nil {
+			t.Errorf("forward context cancelled by client cancel: %v", forwardCtx.Err())
+		}
+		select {
+		case <-forwardCtx.Done():
+			t.Error("forward context Done channel closed after client cancel")
+		default:
+		}
+		releaseOnce()
+		<-done
+		if err != nil {
+			t.Fatalf("Handle: %v", err)
+		}
+		if firstErr != nil {
+			t.Fatalf("attempt 1 failed: %v", firstErr)
+		}
+		equal(t, 403, firstStatus)
+		equal(t, 1, int(attempts.Load()))
+		equal(t, 0, len(w.heads))
+		equal(t, 0, w.Body.Len())
+		equal(t, true, result.Stream == nil)
+		equal(t, false, result.Cancelled)
+		equal(t, true, result.Contacted)
+		equal(t, 0, result.Status)
+		if firstBody == nil {
+			t.Fatal("attempt 1 returned no upstream body")
+		}
+		equal(t, int32(1), firstBody.closes.Load())
+	})
+	t.Run("error: already done client context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		req := reply.Request{Provider: "codex", Body: []byte(`{}`)}
+		var attempts, forwardCalls atomic.Int32
+		fixture := newProxy(t, func(w http.ResponseWriter, _ *http.Request) {
+			attempts.Add(1)
+			w.WriteHeader(200)
+		})
+		base := fixture.forward(req.Body)
+		send := func(callCtx context.Context) (*upstream.Response, error) {
+			forwardCalls.Add(1)
+			return base(callCtx)
+		}
+		w := &countedWriter{ResponseRecorder: httptest.NewRecorder()}
+		result, err := reply.Handle(ctx, w, req, send)
+		if err != nil {
+			t.Fatalf("Handle: %v", err)
+		}
+		equal(t, int32(0), forwardCalls.Load())
+		equal(t, int32(0), attempts.Load())
+		equal(t, false, result.Contacted)
+		equal(t, 0, len(w.heads))
+		equal(t, 0, w.Body.Len())
+		equal(t, true, result.Stream == nil)
+		equal(t, false, result.Cancelled)
+		equal(t, 0, result.Status)
 	})
 }

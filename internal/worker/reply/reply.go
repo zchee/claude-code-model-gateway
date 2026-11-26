@@ -60,7 +60,13 @@ type Result struct {
 }
 
 // Handle calls forward for each attempt, closes buffered bodies and writes one client response.
-// It returns an untouched open response for the stream relay, or an error wrapping http.ErrAbortHandler when the client connection must abort.
+// The ctx argument is the client context: no attempt starts once ctx is done (neither the first
+// attempt nor any retry, including with a zero retry delay), and an attempt in flight is never
+// cancelled by it because Handle passes context.WithoutCancel(ctx) to forward. When Handle stops
+// because the client context is done, it writes nothing to w, closes any buffered body it holds,
+// and returns Stream nil, a nil error, Contacted as it happened, Status zero, and Cancelled false.
+// Otherwise it returns an untouched open response for the stream relay, or an error wrapping
+// http.ErrAbortHandler when the client connection must abort.
 func Handle(ctx context.Context, w http.ResponseWriter, req Request, forward upstream.Send) (Result, error) {
 	return Result{}, errors.New("not implemented")
 }
@@ -71,6 +77,7 @@ func WriteSentry(w http.ResponseWriter, original []byte, provider string, cross 
 }
 
 // WriteEngineOverflow normalizes an upstream refusal using the prepared request and source HTTP status.
+// It always returns Contacted true because the refusal came from the upstream.
 func WriteEngineOverflow(w http.ResponseWriter, req Request, status int, counts sentry.Counts) (outcome.Result, error) {
 	return outcome.Result{}, errors.New("not implemented")
 }

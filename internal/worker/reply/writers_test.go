@@ -86,21 +86,25 @@ func TestWriteEngineOverflow(t *testing.T) {
 	tests := map[string]struct {
 		status                                        int
 		enabled                                       bool
+		prior                                         int
 		counts                                        sentry.Counts
 		tokens                                        *float64
 		limit                                         float64
 		from, numbers, measured, wireTokens, wireFrom string
 		learns                                        bool
 	}{
-		"error: first SSE event with exact limit": {200, true, sentry.Counts{Tokens: new(118.0), Limit: new(95.0)}, new(118.0), 95, "upstream", " (118 tokens > 95 tokens)", "118 tokens from upstream", "118", `"upstream"`, false},
-		"error: engine omitted both counts":       {400, true, sentry.Counts{}, new(80.0), 110, "previous_turn_usage", " (80 tokens > 110 tokens)", "80 tokens from previous_turn_usage", "80", `"previous_turn_usage"`, true},
-		"error: disabled sentry":                  {500, false, sentry.Counts{}, nil, 110, "", "", "tokens UNVERIFIED", "null", "null", false},
+		"error: first SSE event with exact limit":      {200, true, 80, sentry.Counts{Tokens: new(118.0), Limit: new(95.0)}, new(118.0), 95, "upstream", " (118 tokens > 95 tokens)", "118 tokens from upstream", "118", `"upstream"`, false},
+		"error: engine omitted both counts":            {400, true, 80, sentry.Counts{}, new(80.0), 110, "previous_turn_usage", " (80 tokens > 110 tokens)", "80 tokens from previous_turn_usage", "80", `"previous_turn_usage"`, true},
+		"error: enabled without counts or prior usage": {400, true, 0, sentry.Counts{}, nil, 110, "", " (111 tokens > 110 tokens)", "tokens UNVERIFIED", "null", "null", false},
+		"error: disabled sentry":                       {500, false, 80, sentry.Counts{}, nil, 110, "", "", "tokens UNVERIFIED", "null", "null", false},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			state := new(sentry.State)
 			target := sentry.Target{Key: "model", Policy: &policy.Sentry{BackendWindow: 110, CompactTrigger: 100, Source: "derived"}, Headroom: 10}
-			state.Observe("session", target, []byte(`{"type":"message_delta","usage":{"input_tokens":80}}`), false)
+			if tc.prior > 0 {
+				state.Observe("session", target, fmt.Appendf(nil, `{"type":"message_delta","usage":{"input_tokens":%d}}`, tc.prior), false)
+			}
 			w := httptest.NewRecorder()
 			r, err := reply.WriteEngineOverflow(w, reply.Request{Body: prepared, Provider: "lmstudio", Window: 110, Sentry: state, Session: "session", Target: target, SentryEnabled: tc.enabled}, tc.status, tc.counts)
 			if err != nil {
@@ -111,6 +115,7 @@ func TestWriteEngineOverflow(t *testing.T) {
 			equal(t, http.Header{"Content-Type": {"application/json"}, "Content-Length": {strconv.Itoa(len(want))}, "X-Model-Gateway-Upstream-Status": {strconv.Itoa(tc.status)}}, w.Result().Header)
 			equal(t, 413, w.Code)
 			equal(t, 413, r.Status)
+			equal(t, true, r.Contacted)
 			equal(t, &outcome.Overflow{Phase: "continuation", RefusedBy: "upstream", RequestBytes: int64(len(prepared)), Tokens: tc.tokens, TokensFrom: tc.from, LimitTokens: new(tc.limit)}, r.Route.Overflow)
 			state.Observe("session", target, []byte(`{"type":"message_delta","usage":{"input_tokens":101}}`), false)
 			_, crossed := state.Check("session", target, prepared)
