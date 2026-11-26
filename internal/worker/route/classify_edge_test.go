@@ -40,15 +40,18 @@ func TestClassifyBodyEdges(t *testing.T) {
 	grok := func(model string) route.Decision {
 		return route.Decision{Branch: "grok", Provider: "grok", Model: model}
 	}
+	refused := func(reason string) route.Decision {
+		return route.Decision{Branch: "refused", Reason: reason}
+	}
 	tests := map[string]struct {
 		target, body string
 		want         route.Decision
 	}{
 		"success: deepest accepted nesting is classified":                 {"/v1/messages", nestedBody(10000), codex("gpt-9")},
-		"success: nesting past the limit passes through":                  {"/v1/messages", nestedBody(10001), anthropic},
-		"success: escaped lone surrogate passes through":                  {"/v1/messages", `{"model":"claude-gpt-\ud800"}`, anthropic},
-		"success: lone low surrogate passes through":                      {"/v1/messages", `{"model":"claude-grok-\udc00x"}`, anthropic},
-		"success: reversed surrogate pair passes through":                 {"/v1/messages", `{"model":"claude-gpt-\udc00\ud800"}`, anthropic},
+		"error: nesting past the limit is refused":                        {"/v1/messages", nestedBody(10001), refused(route.RefusalNestingDepth)},
+		"error: escaped lone surrogate is refused":                        {"/v1/messages", "{\"model\":\"claude-gpt-\\ud800\"}", refused(route.RefusalIllFormedModel)},
+		"error: lone low surrogate is refused":                            {"/v1/messages", "{\"model\":\"claude-grok-\\udc00x\"}", refused(route.RefusalIllFormedModel)},
+		"error: reversed surrogate pair is refused":                       {"/v1/messages", "{\"model\":\"claude-gpt-\\udc00\\ud800\"}", refused(route.RefusalIllFormedModel)},
 		"success: escaped surrogate pair is one code point":               {"/v1/messages", "{\"model\":\"claude-gpt-\\ud83d\\ude00\"}", codex("gpt-\U0001F600")},
 		"success: ill-formed byte decodes as Node does":                   {"/v1/messages", "{\"model\":\"claude-gpt-\xff\"}", codex("gpt-\uFFFD")},
 		"success: escaped member name":                                    {"/v1/messages", "{\"mod\\u0065l\":\"claude-gpt-9\"}", codex("gpt-9")},

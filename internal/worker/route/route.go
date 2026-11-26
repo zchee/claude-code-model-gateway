@@ -17,6 +17,7 @@ package route
 
 import (
 	"encoding/json/jsontext"
+	"errors"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -115,7 +116,18 @@ func (s Snapshot) IsGatewayID(id string) bool {
 }
 
 // Decision identifies a local endpoint or upstream transport. Only proxy and Grok decisions carry a provider and backend ID.
-type Decision struct{ Branch, Provider, Model string }
+// Only a refused decision carries a Reason, which is one of the Refusal constants.
+type Decision struct{ Branch, Provider, Model, Reason string }
+
+// Reasons a /v1/messages body is refused locally rather than forwarded. Each names a limit of the port, not of the
+// source, so the source would have routed the request by its model; forwarding it to the default upstream instead could
+// send it to a provider the client did not ask for.
+const (
+	// RefusalNestingDepth is the reason for a body nested deeper than the wire decoder accepts.
+	RefusalNestingDepth = "nesting-depth"
+	// RefusalIllFormedModel is the reason for a top-level model string holding an unpaired UTF-16 surrogate.
+	RefusalIllFormedModel = "ill-formed-model"
+)
 
 // Classify selects a handler for a non-draining worker without modifying the buffered body.
 // Target is the original request target including any query. Headers do not select the route.
@@ -123,9 +135,13 @@ type Decision struct{ Branch, Provider, Model string }
 // The order follows lib/request-worker.js:2361-2416 and 2430-2648: the drain endpoint, the health endpoint for any
 // method, the catalog, any HEAD request, then the body of a request whose path starts with /v1/messages. A body
 // that does not parse as exactly one JSON document takes the source's catch path to Anthropic, as does a body whose
-// top-level value is null. A body nested deeper than 10,000 containers also goes to Anthropic, but that is a
-// recorded difference, not the source's behaviour: the source still parses and routes such a document by its
-// model, while the port refuses it at the wire decoder's depth limit and takes the default branch.
+// top-level value is null or whose top-level model is absent or not a string.
+//
+// Two bodies the source would route by their model are beyond the port's limits and take the "refused" branch, whose
+// Reason names the case; such a request is answered locally and never forwarded. A body nested deeper than 10,000
+// containers is refused with RefusalNestingDepth, and a top-level model string holding an unpaired UTF-16 surrogate
+// (one spelled as an escape; ill-formed UTF-8 bytes decode to U+FFFD as in Node and route normally) is refused with
+// RefusalIllFormedModel. A request settled before its body is read is never refused.
 func (s Snapshot) Classify(method, target string, body []byte) Decision {
 	path, _, _ := strings.Cut(target, "?")
 	switch {
@@ -141,7 +157,10 @@ func (s Snapshot) Classify(method, target string, body []byte) Decision {
 	if len(body) == 0 || !strings.HasPrefix(path, "/v1/messages") {
 		return Decision{Branch: "anthropic"}
 	}
-	model, ok := requestedModel(body)
+	model, refusal, ok := requestedModel(body)
+	if refusal != "" {
+		return Decision{Branch: "refused", Reason: refusal}
+	}
 	if !ok {
 		return Decision{Branch: "anthropic"}
 	}
@@ -155,25 +174,32 @@ func (s Snapshot) Classify(method, target string, body []byte) Decision {
 	return Decision{Branch: "anthropic"}
 }
 
-// requestedModel returns the string model member of a JSON object body. It reports false when the body does not
-// parse, when the model is absent or not a string, and when the model holds an unpaired UTF-16 surrogate: such a
-// spelling cannot become a Go string without U+FFFD standing in for the surrogate and merging distinct IDs, so the
-// request is passed through to Anthropic with its original bytes instead.
-func requestedModel(body []byte) (string, bool) {
+// requestedModel returns the string model member of a JSON object body, the last one when the name repeats. It
+// reports false when the body does not parse or the model is absent or not a string. It returns a refusal reason
+// instead when the body is nested past the wire decoder's limit, or when the model holds an unpaired UTF-16
+// surrogate: such a spelling cannot become a Go string without U+FFFD standing in for the surrogate and merging
+// distinct IDs, and the source would still route it by its model.
+func requestedModel(body []byte) (model, refusal string, ok bool) {
 	v, err := jsonx.DecodeWire(body)
+	if _, deep := errors.AsType[*jsonx.WireDepthError](err); deep {
+		return "", RefusalNestingDepth, false
+	}
 	if err != nil || v.Kind != '{' {
-		return "", false
+		return "", "", false
 	}
 	for _, m := range v.Members {
 		if !unitsEqual(m.Name, "model") {
 			continue
 		}
 		if m.Value.Kind != '"' {
-			return "", false
+			return "", "", false
 		}
-		return wellFormed(m.Value.Text)
+		if model, ok = wellFormed(m.Value.Text); !ok {
+			return "", RefusalIllFormedModel, false
+		}
+		return model, "", true
 	}
-	return "", false
+	return "", "", false
 }
 
 // grokModel maps a picker part to the first snapshot Grok ID with the same dot-flattened spelling, else to
