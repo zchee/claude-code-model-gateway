@@ -18,22 +18,34 @@ package worker
 
 import (
 	"errors"
+	"fmt"
+	"runtime"
 
 	"golang.org/x/sys/unix"
 )
 
-// lockReclaim takes an exclusive advisory lock on the regular file path+".lock", creating it, and returns its release.
-// The lock file is never followed through a symbolic link and is left in place, so that every starter locks the same
-// file.
-func lockReclaim(path string) (func(), error) {
-	fd, err := unix.Open(path+".lock", unix.O_RDWR|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
+// lockReclaim takes an exclusive advisory lock on the regular file path+".lock", creating it, and returns its release
+// with locked set. The lock file is never followed through a symbolic link and is left in place, so that every starter
+// locks the same file. A Linux abstract address has no file that could be reclaimed, so it gets no lock file and
+// lockReclaim reports locked false with no error. Any failure to take the lock is returned naming the lock file.
+func lockReclaim(path string) (unlock func(), locked bool, err error) {
+	// Go binds a name that starts with '@' or a NUL byte in the abstract namespace only on Linux and Android.
+	if (runtime.GOOS == "linux" || runtime.GOOS == "android") && path != "" && (path[0] == '@' || path[0] == 0) {
+		return nil, false, nil
+	}
+	name := path + ".lock"
+	fd, err := unix.Open(name, unix.O_RDWR|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
 	if err != nil {
-		return nil, err
+		return nil, false, fmt.Errorf("model-gateway: could not open the socket lock %s: %w", name, err)
 	}
 	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil || st.Mode&unix.S_IFMT != unix.S_IFREG {
+	if err := unix.Fstat(fd, &st); err != nil {
 		_ = unix.Close(fd)
-		return nil, errors.Join(errors.New("model-gateway: the socket lock is not a regular file"), err)
+		return nil, false, fmt.Errorf("model-gateway: could not inspect the socket lock %s: %w", name, err)
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		_ = unix.Close(fd)
+		return nil, false, fmt.Errorf("model-gateway: the socket lock %s is not a regular file", name)
 	}
 	for {
 		err = unix.Flock(fd, unix.LOCK_EX)
@@ -43,10 +55,10 @@ func lockReclaim(path string) (func(), error) {
 	}
 	if err != nil {
 		_ = unix.Close(fd)
-		return nil, err
+		return nil, false, fmt.Errorf("model-gateway: could not take the socket lock %s: %w", name, err)
 	}
 	return func() {
 		_ = unix.Flock(fd, unix.LOCK_UN)
 		_ = unix.Close(fd)
-	}, nil
+	}, true, nil
 }

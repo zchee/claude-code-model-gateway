@@ -99,22 +99,29 @@ func validToken(token string) bool {
 // connection in between is refused exactly as by a stale socket. Every starter therefore holds an advisory lock on the
 // sibling file path+".lock" from its first bind until it listens, and probes, unlinks and rebinds only while holding
 // it, so no starter can take another's half-bound socket for a stale one. A path that changed identity between the
-// checks is not reclaimed. When the lock cannot be taken the path is bound once and never reclaimed. Any other bind
-// failure is returned unchanged.
+// checks is not reclaimed. Any other bind failure is returned unchanged. Three further rules hold:
+//
+//   - On Unix a starter that cannot take the lock does not bind at all and returns the lock failure, which names the
+//     lock file: a socket bound without the lock could itself be taken for stale by a starter that holds it. Only a
+//     platform with no lock at all binds the path once, unlocked, and never reclaims it.
+//   - When the probe after a refused bind finds the path gone, because its previous owner closed in between, the path
+//     is bound once more under the lock without unlinking anything.
+//   - A Linux or Android abstract address, a name starting with '@' or a NUL byte, has no file to reclaim: it is bound
+//     once, with no lock file, and nothing is ever unlinked. On other systems such a name is an ordinary path.
 func ListenUnix(path string) (net.Listener, error) {
 	addr := &net.UnixAddr{Name: path, Net: "unix"}
-	unlock, lockErr := lockReclaim(path)
-	if lockErr == nil {
+	unlock, locked, err := lockReclaim(path)
+	if err != nil {
+		return nil, err
+	}
+	if locked {
 		defer unlock()
 	}
 	ln, err := net.ListenUnix("unix", addr)
 	if err == nil {
 		return ln, nil
 	}
-	if lockErr != nil {
-		return nil, err
-	}
-	if !errors.Is(err, syscall.EADDRINUSE) || !removeStaleSocket(path) {
+	if !locked || !errors.Is(err, syscall.EADDRINUSE) || !reclaimPath(path) {
 		return nil, err
 	}
 	if ln, err = net.ListenUnix("unix", addr); err != nil {
@@ -126,9 +133,13 @@ func ListenUnix(path string) (net.Listener, error) {
 // staleProbeTimeout bounds the connection attempt that decides whether a socket file still has an owner.
 const staleProbeTimeout = 2 * time.Second
 
-// removeStaleSocket unlinks path when it is a socket that refuses connections and is still the same file afterwards.
-func removeStaleSocket(path string) bool {
+// reclaimPath reports whether path may be bound again: it is missing, or it was a socket that refused a connection and
+// was unlinked while still the same file. A path found missing at any point of the probe is not unlinked.
+func reclaimPath(path string) bool {
 	before, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return true
+	}
 	if err != nil || before.Mode()&os.ModeSocket == 0 {
 		return false
 	}
@@ -137,10 +148,16 @@ func removeStaleSocket(path string) bool {
 		_ = conn.Close()
 		return false
 	}
+	if errors.Is(err, os.ErrNotExist) {
+		return true
+	}
 	if !errors.Is(err, syscall.ECONNREFUSED) {
 		return false
 	}
 	after, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return true
+	}
 	if err != nil || !os.SameFile(before, after) {
 		return false
 	}

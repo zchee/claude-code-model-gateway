@@ -16,9 +16,8 @@
 
 package worker
 
-import "errors"
-
-// lockReclaim cannot serialize reclamation on this platform, so a socket path in use is never reclaimed.
-func lockReclaim(string) (func(), error) {
-	return nil, errors.ErrUnsupported
+// lockReclaim has no lock to take on this platform, so it reports locked false with no error and a socket path in use is
+// never reclaimed.
+func lockReclaim(string) (unlock func(), locked bool, err error) {
+	return nil, false, nil
 }
