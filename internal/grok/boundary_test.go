@@ -113,6 +113,34 @@ func TestCoercionBoundaries(t *testing.T) {
 		}
 	})
 
+	t.Run("checked response", func(t *testing.T) {
+		tests := map[string]struct {
+			input, want string
+			wantErr     bool
+		}{
+			"error: usage count with own toString keeps the error type": {input: `{"output":[],"usage":{"output_tokens":{"toString":1}}}`, wantErr: true},
+			"success: ordinary usage has no error":                      {input: textResponse, want: `{"id":"resp_fixture","type":"message","role":"assistant","model":"claude-grok-4.5","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","stop_sequence":null,"usage":` + textUsage + `}`},
+		}
+		for name, tt := range tests {
+			t.Run(name, func(t *testing.T) {
+				got, err := grok.TranslateResponseChecked(decode(t, tt.input), model, clock)
+				if !tt.wantErr {
+					if err != nil {
+						t.Fatalf("TranslateResponseChecked: %v", err)
+					}
+					checkWire(t, tt.want, got)
+					return
+				}
+				if _, ok := errors.AsType[*grok.CoercionError](err); !ok {
+					t.Fatalf("error %v, want *grok.CoercionError", err)
+				}
+				if diff := gocmp.Diff(jsonx.WireValue{}, got); diff != "" {
+					t.Errorf("returned a value with the error (-want +got):\n%s", diff)
+				}
+			})
+		}
+	})
+
 	t.Run("stream", func(t *testing.T) {
 		start := event(created, messageStart("resp_fixture", zeroUsage))
 		text := event(`{"type":"response.output_text.delta","delta":"hi"}`, blockStart("0", textBlock)+blockDelta("0", textHi))
