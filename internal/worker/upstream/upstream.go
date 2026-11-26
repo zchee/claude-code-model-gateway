@@ -16,12 +16,18 @@
 package upstream
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
 	"io"
+	"maps"
 	"net"
 	"net/http"
+	"net/url"
+	"slices"
+	"strings"
+	"sync"
 )
 
 // ErrTimeout reports that an upstream connection exceeded its one-hour socket-inactivity deadline.
@@ -96,10 +102,17 @@ type Response struct {
 // connection may be retried by net/http if the connection fails before any response byte.
 type Send func(context.Context) (*Response, error)
 
+// errClientClosed reports a request made on, or ended by, a closed Client.
+var errClientClosed = errors.New("upstream client closed")
+
 // Client executes pooled HTTP/1.1 requests (up to 64 connections per host, 1-hour socket-inactivity
 // timeout) to upstream providers without environment proxy lookup, automatic decompression,
 // redirect following, or automatic replay of requests carrying a body.
-type Client struct{}
+type Client struct {
+	transport *http.Transport
+	lifetime  context.Context
+	cancel    context.CancelFunc
+}
 
 // NewTransport constructs a standalone pooled HTTP/1.1 transport with the same safe policy
 // used by NewClient: no environment proxy lookup, no automatic decompression, HTTP/1.1 only,
@@ -109,51 +122,198 @@ type Client struct{}
 // credential refresh to hold a distinct transport instance isolated from an inference Client's
 // lifetime.
 func NewTransport(opts Options) *http.Transport {
-	_ = opts
-	return nil
+	return newTransport(opts, nil)
+}
+
+// newTransport builds the shared transport policy. A non-nil lifetime ends outstanding dials and
+// closes every connection of the transport when it is done.
+func newTransport(opts Options, lifetime context.Context) *http.Transport {
+	// Clone so the caller's configuration is never changed, and offer only HTTP/1.1 in ALPN.
+	tlsConfig := opts.TLSConfig.Clone()
+	if tlsConfig == nil {
+		tlsConfig = &tls.Config{}
+	}
+	tlsConfig.NextProtos = []string{"http/1.1"}
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	// Start from a zero Transport: no environment proxy, and no timer other than the socket
+	// inactivity deadline (the source sets no connect, handshake or idle-pool timeout).
+	return &http.Transport{
+		DialContext:         inactivityDialer(opts.DialContext, lifetime),
+		TLSClientConfig:     tlsConfig,
+		DisableCompression:  true,
+		MaxConnsPerHost:     64,
+		MaxIdleConnsPerHost: 64,
+		Protocols:           protocols,
+	}
 }
 
 // NewClient constructs a pooled HTTP/1.1 upstream client using NewTransport with the given options.
 func NewClient(opts Options) *Client {
-	_ = opts
-	return &Client{}
+	lifetime, cancel := context.WithCancel(context.Background())
+	return &Client{
+		transport: newTransport(opts, lifetime),
+		lifetime:  lifetime,
+		cancel:    cancel,
+	}
 }
 
 // Do sends req over the upstream transport and returns the upstream response.
+// ctx bounds the whole exchange, including reads of the returned Body; Close on the Client ends it
+// too. The caller owns the returned Body and must close it.
 func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
-	_, _, _ = c, ctx, req
-	return nil, errors.New("not implemented")
+	if c == nil || c.transport == nil {
+		return nil, errors.New("upstream client not constructed by NewClient")
+	}
+	if c.lifetime.Err() != nil {
+		return nil, errClientClosed
+	}
+	outbound, err := buildRequest(req)
+	if err != nil {
+		return nil, err
+	}
+
+	reqCtx, cancel := context.WithCancelCause(ctx)
+	stop := context.AfterFunc(c.lifetime, func() { cancel(errClientClosed) })
+	release := func() {
+		stop()
+		cancel(nil)
+	}
+	resp, err := c.transport.RoundTrip(outbound.WithContext(reqCtx)) //nolint:bodyclose // The body is handed to the caller inside Response, which owns closing it.
+	if err != nil {
+		release()
+		return nil, err
+	}
+
+	relay := ResponseHeaders(resp.Header)
+	// net/http moves the Trailer declaration of a chunked response out of the header map.
+	if _, declared := relay["Trailer"]; !declared && len(resp.Trailer) > 0 {
+		relay["Trailer"] = []string{strings.Join(slices.Sorted(maps.Keys(resp.Trailer)), ", ")}
+	}
+	return &Response{
+		StatusCode:  resp.StatusCode,
+		Header:      resp.Header,
+		RelayHeader: relay,
+		Body:        &responseBody{body: resp.Body, release: release},
+	}, nil
 }
 
 // Close cancels in-flight upstream requests and closes idle connections for service shutdown.
 // It is safe to call more than once.
 func (c *Client) Close() error {
-	_ = c
-	return errors.New("not implemented")
-}
-
-// RequestHeaders returns a fresh normalized copy of incoming client headers filtered for target.
-// For TargetAnthropic, Host, Connection, Content-Length, Keep-Alive,
-// X-Model-Gateway-Control-Token, Traceparent, Tracestate, and Baggage are removed.
-// For TargetProxy, Authorization, Proxy-Authorization, X-Api-Key, and Cookie are also removed.
-// For TargetGrok or any unknown target, all client headers are removed.
-// Remaining headers are normalized to match the source runtime's parsed header object:
-// differently cased occurrences of the same name collapse into one field, single-value
-// headers keep their first value, Cookie values are joined with "; ", Set-Cookie values
-// remain separate, and other repeated headers are joined with ", ".
-// The input map is never mutated.
-func RequestHeaders(in http.Header, target Target) http.Header {
-	_, _ = in, target
+	if c == nil || c.cancel == nil {
+		return nil
+	}
+	c.cancel()
+	c.transport.CloseIdleConnections()
 	return nil
 }
 
-// ResponseHeaders returns a fresh normalized relay copy of upstream response headers with only
-// Transfer-Encoding, Connection, and Keep-Alive removed case-insensitively.
-// Differently cased occurrences of the same name collapse into one field, single-value
-// headers keep their first value, Cookie values are joined with "; ", Set-Cookie values
-// remain separate, and other repeated headers are joined with ", ".
-// Values are not additionally trimmed, and in is never mutated.
-func ResponseHeaders(in http.Header) http.Header {
-	_ = in
-	return nil
+// responseBody owns a live upstream response body and the request context bound to it.
+type responseBody struct {
+	body    io.ReadCloser
+	release func()
+	once    sync.Once
+	err     error
+}
+
+// Read reads the upstream response bytes as received.
+func (b *responseBody) Read(p []byte) (int, error) {
+	return b.body.Read(p)
+}
+
+// Close closes the upstream body and releases its request context; later calls return the
+// first call's result.
+func (b *responseBody) Close() error {
+	b.once.Do(func() {
+		b.err = b.body.Close()
+		b.release()
+	})
+	return b.err
+}
+
+// buildRequest turns req into an outbound HTTP/1.1 request without a context.
+func buildRequest(req Request) (*http.Request, error) {
+	var (
+		method string
+		target *url.URL
+		header http.Header
+		err    error
+	)
+	switch req.Target {
+	case TargetAnthropic, TargetProxy:
+		method = req.Method
+		if target, err = resolveTarget(req.BaseURL, req.RequestURI); err != nil {
+			return nil, err
+		}
+		header = RequestHeaders(req.ClientHeaders, req.Target)
+	case TargetGrok:
+		method = http.MethodPost
+		if target, err = parseBaseURL(req.BaseURL); err != nil {
+			return nil, err
+		}
+		header = make(http.Header, len(req.GrokHeaders))
+		for name, values := range req.GrokHeaders {
+			for _, value := range values {
+				header.Add(name, value)
+			}
+		}
+	default:
+		return nil, errors.New("upstream: unknown target")
+	}
+	// An empty User-Agent entry stops net/http from sending its own; the source adds none.
+	if _, ok := header["User-Agent"]; !ok {
+		header["User-Agent"] = []string{""}
+	}
+
+	outbound := &http.Request{
+		Method:     method,
+		URL:        target,
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     header,
+		Host:       target.Host,
+		Body:       http.NoBody,
+	}
+	if len(req.Body) > 0 {
+		// No GetBody: net/http may replay only a request it can rewind, so a request with a body
+		// is never sent twice by the transport.
+		outbound.Body = io.NopCloser(bytes.NewReader(req.Body))
+		outbound.ContentLength = int64(len(req.Body))
+	}
+	return outbound, nil
+}
+
+// parseBaseURL parses an absolute http or https upstream URL.
+func parseBaseURL(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, errors.New("upstream: invalid base URL")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, errors.New("upstream: base URL scheme must be http or https")
+	}
+	if u.Host == "" {
+		return nil, errors.New("upstream: base URL has no host")
+	}
+	return u, nil
+}
+
+// resolveTarget resolves the client request target against the upstream origin. A target that
+// names its own scheme or authority is refused, so client credentials never leave for an origin
+// other than the configured upstream.
+func resolveTarget(baseURL, requestURI string) (*url.URL, error) {
+	base, err := parseBaseURL(baseURL)
+	if err != nil {
+		return nil, err
+	}
+	ref, err := url.Parse(requestURI)
+	if err != nil {
+		return nil, errors.New("upstream: invalid request target")
+	}
+	if ref.Scheme != "" || ref.Host != "" || ref.User != nil || ref.Opaque != "" || strings.HasPrefix(requestURI, "//") {
+		return nil, errors.New("upstream: request target names its own origin")
+	}
+	return base.ResolveReference(ref), nil
 }
