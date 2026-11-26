@@ -20,10 +20,12 @@ package lifecycle
 
 import (
 	"context"
-	"encoding/json/jsontext"
 	"errors"
 	"io/fs"
+	"sync/atomic"
 	"time"
+
+	"github.com/zchee/claude-code-model-gateway/internal/procinfo"
 )
 
 // ProcessState distinguishes a confirmed absence from an inconclusive lookup.
@@ -54,7 +56,25 @@ type Owner struct {
 
 // Stale reports whether a local owner's process is absent or its PID was reused.
 func Stale(ctx context.Context, owner *Owner, host string, processes ProcessSource) bool {
-	return false
+	if owner == nil || owner.Host != host || owner.PID <= 0 || owner.StartedAt == nil {
+		return false
+	}
+	state, birth := processes.Lookup(ctx, owner.PID)
+	return state == Absent || state == Alive && birth != "" && birth != *owner.StartedAt
+}
+
+type nativeProcesses struct{ probe procinfo.Probe }
+
+func (p nativeProcesses) Lookup(ctx context.Context, pid int) (ProcessState, string) {
+	birth, err := p.probe.Birth(ctx, pid)
+	switch {
+	case err == nil:
+		return Alive, procinfo.LegacyStart(birth)
+	case errors.Is(err, fs.ErrNotExist):
+		return Absent, ""
+	default:
+		return Unknown, ""
+	}
 }
 
 // Lock describes the lifecycle.lock under StateDir. A nil Timeout uses fifteen seconds.
@@ -72,43 +92,41 @@ type Lock struct {
 
 // Acquire atomically installs a prepared directory and returns a token-specific release.
 func (l Lock) Acquire(ctx context.Context) (func(), error) {
-	return nil, errors.New("lifecycle lock not implemented")
+	if l.Processes == nil {
+		l.Processes = nativeProcesses{procinfo.New(nil)}
+	}
+	state, birth := l.Processes.Lookup(ctx, l.PID)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if state != Alive || birth == "" {
+		return nil, errors.New("could not establish lifecycle lock process identity; run doctor")
+	}
+	return l.acquire(ctx, birth)
 }
+
+type ownershipKey struct{ stateDir string }
 
 // With runs operation under the lock, permitting reentry only during its active context.
 func (l Lock) With(ctx context.Context, operation func(context.Context) error) error {
-	return errors.New("lifecycle lock not implemented")
+	key := ownershipKey{l.StateDir}
+	if active, ok := ctx.Value(key).(*atomic.Bool); ok && active.Load() {
+		return operation(ctx)
+	}
+	release, err := l.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	var active atomic.Bool
+	active.Store(true)
+	defer active.Store(false)
+	return operation(context.WithValue(ctx, key, &active))
 }
 
-// Files locates lifecycle evidence under StateDir and optionally supplies the timestamp clock.
-type Files struct {
-	StateDir string
-	Now      func() time.Time
-	// AppendFile appends one complete journal record. Nil uses atomicfile.AppendFile.
-	AppendFile func(path string, data []byte, mode fs.FileMode) error
+func clock(now func() time.Time) func() time.Time {
+	if now == nil {
+		return time.Now
+	}
+	return now
 }
-
-// Stopped reports whether the intentional stop marker exists, without consuming it.
-func (f Files) Stopped() bool { return false }
-
-// Stop records an intentional stop.
-func (f Files) Stop() error { return errors.New("stop marker not implemented") }
-
-// Resume removes the marker if present.
-func (f Files) Resume() error { return errors.New("stop marker not implemented") }
-
-// Record appends an allowlisted lifecycle event on a best-effort basis. Below the
-// trim threshold it passes the entire record, including its newline, to
-// atomicfile.AppendFile(path, data, 0o666) without replacing the journal.
-func (f Files) Record(event string, fields map[string]any) {}
-
-// Records returns parseable lifecycle records in file order.
-func (f Files) Records() []jsontext.Value { return nil }
-
-// WriteStartupFailure records a supervisor failure, omitting an unspecified generation.
-func (f Files) WriteStartupFailure(pid int, generation *string, message string) error {
-	return errors.New("startup failure not implemented")
-}
-
-// StartupFailure returns the matching supervisor's message; an empty generation matches any.
-func (f Files) StartupFailure(pid int, generation string) (string, bool) { return "", false }
