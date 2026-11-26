@@ -7,7 +7,7 @@ In [classification.tsv](../../test/conformance/classification.tsv), `package` is
 | phase-0 | `internal/atomicfile` | T0.3 | T2.0b | 3 | 0 |
 | phase-0 | `internal/gatewaytest` | T0.4b | T2.0b | 9 | 0 |
 | phase-0 | `internal/procinfo` | T0.5 | T2.0b | 9 | 0 |
-| phase-0 | **phase gate** | phase gate (§4, phase table line 590; AC-1, AC-2) | phase exit | 1 | 0 |
+| phase-0 | **phase gate** | phase gate (§4 phase table, phase 0 row; AC-1, AC-2) | phase exit | 1 | 0 |
 | phase-1 | `internal/anthropiccatalog` | T1.4 | T2.0b | 1 | 0 |
 | phase-1 | `internal/catalog` | T1.12c | T2.0b | 4 | 0 |
 | phase-1 | `internal/cli` | Verify that the removed command is unknown | CLI regression test | 23 | 0 |
@@ -27,7 +27,7 @@ In [classification.tsv](../../test/conformance/classification.tsv), `package` is
 | phase-1 | `internal/worker/dispatch` | T1.8 | T2.0b | 3 | 0 |
 | phase-1 | `internal/worker/route` | T1.7 | T2.0b | 3 | 0 |
 | phase-1 | `internal/worker/sentry` | T1.6 | T2.0b | 1 | 0 |
-| phase-1 | **phase gate** | phase gate (§4, phase table line 591; AC-3, AC-8) | phase exit | 2 | 0 |
+| phase-1 | **phase gate** | phase gate (§4 phase table, phase 1 row; AC-3, AC-8) | phase exit | 2 | 0 |
 | phase-2 | `internal/anthropiccatalog` | T2.1 | T2.1 | 6 | 6 |
 | phase-2 | `internal/catalog` | T2.1 | T2.1 | 2 | 1 |
 | phase-2 | `internal/grok` | T2.7 | T2.7 | 8 | 3 |
@@ -68,6 +68,6 @@ In [classification.tsv](../../test/conformance/classification.tsv), `package` is
 | phase-4 | `internal/status` | T4.2 | T4.2 | 0 | 0 |
 | phase-4 | **phase gate** | T4.7 | T4.7 | 15 | 6 |
 | phase-5 | `internal/selfinstall` | T5.1 | T5.1 | 8 | 1 |
-| phase-5 | **phase gate** | phase gate (§4, phase table line 595; packaging acceptance: AC-7, AC-15a, AC-16; AC-13 review) | phase exit | 0 | 0 |
+| phase-5 | **phase gate** | phase gate (§4 phase table, phase 5 row; packaging acceptance: AC-7, AC-15a, AC-16; AC-13 review) | phase exit | 0 | 0 |
 
 Total: 705 due cases (554 at task gates, 151 at phase gates).
