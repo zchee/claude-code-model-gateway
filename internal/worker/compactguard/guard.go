@@ -16,100 +16,50 @@ package compactguard
 
 import (
 	"context"
-	"encoding/json/jsontext"
 	"errors"
 	"io"
 	"net/http"
-	"time"
 
-	"github.com/zchee/claude-code-model-gateway/internal/worker/sentry"
+	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
+	"github.com/zchee/claude-code-model-gateway/internal/worker/outcome"
+	"github.com/zchee/claude-code-model-gateway/internal/worker/sse"
+	"github.com/zchee/claude-code-model-gateway/internal/worker/upstream"
 )
 
-var errNotImplemented = errors.New("not implemented")
-
-// Upstream sends one upstream HTTP attempt for a request.
-// Expected to be satisfied by internal/worker/upstream.
-type Upstream interface {
-	Do(ctx context.Context) (*http.Response, error)
-}
-
-// UpstreamFunc adapts a function to the Upstream interface.
-type UpstreamFunc func(ctx context.Context) (*http.Response, error)
-
-// Do calls f(ctx).
-func (f UpstreamFunc) Do(ctx context.Context) (*http.Response, error) {
-	return f(ctx)
-}
-
-// StreamTransformer reads one upstream SSE stream, calls observe on each parsed JSON event
-// before rewriting, and passes transformed wire chunks to emit.
-// Expected to be satisfied by internal/worker/sse.
-type StreamTransformer interface {
-	Transform(ctx context.Context, src io.Reader, emit func([]byte) error, observe func(jsontext.Value)) error
-}
-
-// PeekResult describes the result of inspecting the first SSE data event on an LM Studio stream.
-type PeekResult struct {
-	Stream           io.Reader
-	Overflow         *sentry.Counts
-	EarlyEndOverride string
-}
-
-// FirstEventPeeker inspects the first SSE data event before response headers are committed.
-// Expected to be satisfied by internal/worker/sse.
-type FirstEventPeeker interface {
-	Peek(ctx context.Context, body io.Reader) (PeekResult, error)
-}
-
-// UsageCapture records response metadata and token counts across guarded compaction attempts.
-// Expected to be satisfied by internal/usage.
+// UsageCapture observes raw response bytes and corrected events, independently of delivery.
 type UsageCapture interface {
-	SetResponse(statusCode int, headers http.Header)
-	NoteResponseBytes(n int64)
-	ObserveEvent(event jsontext.Value)
-	Snapshot() Usage
+	NoteResponseBytes(int64)
+	ObserveEvent(jsonx.WireValue)
+	Snapshot() map[string]any
 	ResetUsage()
-	SetResponseComplete(complete bool)
+	SetResponseComplete(bool)
 }
 
-// Telemetry records compaction diagnostics and completes the route span once per request.
-// Expected to be satisfied by internal/telemetry.
-type Telemetry interface {
-	SetCompaction(diag Diagnostics)
-	Finish(statusCode int, statusOverride string)
-}
-
-// Runner executes requests through the compaction stream guard using its configured settings.
+// Runner buffers eligible compaction streams and reports degradation to Stderr.
 type Runner struct {
-	Settings          Settings
-	HeartbeatInterval time.Duration
-	Stderr            io.Writer
+	// ServiceContext is set once when the worker builds the runner, not per request.
+	// It bounds peeking and relay work; a nil context is rejected before dispatch.
+	ServiceContext context.Context
+	Settings       Settings
+	Stderr         io.Writer
 }
 
-// Request carries the per-request routing metadata and callbacks needed to serve or guard a stream.
+// Request describes a prepared proxy request. Next invokes the bound reply handler;
+// its bool argument says whether the client has already received response headers.
+// A nil response is a settled verdict; a non-nil response transfers body ownership.
 type Request struct {
-	ProxyProvider          string
-	PathOnly               string
-	UpstreamOrigin         string
-	Body                   []byte
-	Upstream               Upstream
-	Transformer            StreamTransformer
-	Peeker                 FirstEventPeeker
-	Usage                  UsageCapture
-	Telemetry              Telemetry
-	Sentry                 *sentry.State
-	SentryEnabled          bool
-	SentrySession          string
-	SentryTarget           sentry.Target
-	HandleNonStream        func(ctx context.Context, w http.ResponseWriter, resp *http.Response) error
-	HandleLMStudioOverflow func(ctx context.Context, w http.ResponseWriter, upstreamStatus int, counts sentry.Counts) error
-	HandleUnguarded        func(ctx context.Context, w http.ResponseWriter, resp *http.Response) error
-	OnCodexRejection       func(statusCode int, headers http.Header, body []byte)
-	FormatCodexAuthFailure func(body []byte, statusCode int) (string, bool)
+	ProxyProvider  string
+	PathOnly       string
+	UpstreamOrigin string
+	Body           []byte
+	Next           func(context.Context, bool) (*upstream.Response, outcome.Result, error)
+	Stream         sse.ProxyOptions
+	Usage          UsageCapture
 }
 
-// Serve handles req, guarding eligible proxy compaction streams and streaming ineligible requests live.
-// It returns http.ErrAbortHandler when an already-committed response must be aborted after a retry transport error.
-func (r Runner) Serve(ctx context.Context, w http.ResponseWriter, req Request) error {
-	return errNotImplemented
+// Serve consumes one stream per attempt and returns the terminal response facts.
+// The client context ends retry waits, not upstream reads already in flight.
+// The caller dispatches unguarded requests directly to their ordinary relay.
+func (r Runner) Serve(ctx context.Context, w http.ResponseWriter, req Request) (outcome.Result, error) {
+	return outcome.Result{}, errors.New("not implemented")
 }

@@ -16,29 +16,14 @@
 // generations can be retried while the client remains writable.
 package compactguard
 
-import (
-	"time"
-
-	"github.com/zchee/claude-code-model-gateway/internal/config"
-)
-
-const (
-	// CompactionSystemPrompt is the literal system prompt fragment that identifies a compaction turn.
-	CompactionSystemPrompt = "You are a helpful AI assistant tasked with summarizing conversations."
-
-	// SynthesizedMessageStop is the wire frame appended when a generation finishes without a terminal event.
-	SynthesizedMessageStop = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
-
-	// TerminalMessageStop is the telemetry terminal code recorded when an upstream message_stop arrives.
-	TerminalMessageStop = "message_stop"
-)
+import "github.com/zchee/claude-code-model-gateway/internal/config"
 
 // Settings holds the compaction stream guard configuration loaded from an injected environment.
 type Settings struct {
-	StreamGuard      bool          `json:"streamGuard"`
-	Retries          int           `json:"retries"`
-	MaxBufferedBytes float64       `json:"maxBufferedBytes"`
-	RetryDelay       time.Duration `json:"-"`
+	StreamGuard      bool    `json:"streamGuard"`
+	Retries          float64 `json:"retries"`
+	MaxBufferedBytes float64 `json:"maxBufferedBytes"`
+	RetryDelayMillis float64 `json:"-"`
 }
 
 // LoadSettings reads the compaction guard settings from lookup.
@@ -46,7 +31,7 @@ func LoadSettings(lookup config.LookupEnv) Settings {
 	return Settings{}
 }
 
-// IsCompactionRequest reports whether body is a streaming JSON request whose system prompt contains CompactionSystemPrompt.
+// IsCompactionRequest reports whether body is a streaming JSON request whose system prompt contains the compaction prompt fragment.
 func IsCompactionRequest(body []byte) bool {
 	return false
 }

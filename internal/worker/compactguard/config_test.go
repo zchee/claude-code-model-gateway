@@ -17,7 +17,6 @@ package compactguard_test
 import (
 	json "encoding/json/v2"
 	"testing"
-	"time"
 
 	gocmp "github.com/google/go-cmp/cmp"
 
@@ -46,7 +45,7 @@ func TestLoadSettings(t *testing.T) {
 				StreamGuard:      true,
 				Retries:          2,
 				MaxBufferedBytes: 16 * 1024 * 1024,
-				RetryDelay:       250 * time.Millisecond,
+				RetryDelayMillis: 250,
 			},
 			wantJSON: `{"streamGuard":true,"retries":2,"maxBufferedBytes":16777216}`,
 		},
@@ -58,7 +57,7 @@ func TestLoadSettings(t *testing.T) {
 				StreamGuard:      false,
 				Retries:          2,
 				MaxBufferedBytes: 16 * 1024 * 1024,
-				RetryDelay:       250 * time.Millisecond,
+				RetryDelayMillis: 250,
 			},
 			wantJSON: `{"streamGuard":false,"retries":2,"maxBufferedBytes":16777216}`,
 		},
@@ -70,7 +69,7 @@ func TestLoadSettings(t *testing.T) {
 				StreamGuard:      true,
 				Retries:          2,
 				MaxBufferedBytes: 16 * 1024 * 1024,
-				RetryDelay:       250 * time.Millisecond,
+				RetryDelayMillis: 250,
 			},
 			wantJSON: `{"streamGuard":true,"retries":2,"maxBufferedBytes":16777216}`,
 		},
@@ -84,7 +83,7 @@ func TestLoadSettings(t *testing.T) {
 				StreamGuard:      true,
 				Retries:          0,
 				MaxBufferedBytes: 4096,
-				RetryDelay:       0,
+				RetryDelayMillis: 0,
 			},
 			wantJSON: `{"streamGuard":true,"retries":0,"maxBufferedBytes":4096}`,
 		},
@@ -97,9 +96,14 @@ func TestLoadSettings(t *testing.T) {
 				StreamGuard:      true,
 				Retries:          4,
 				MaxBufferedBytes: 16 * 1024 * 1024,
-				RetryDelay:       12500 * time.Microsecond,
+				RetryDelayMillis: 12.5,
 			},
 			wantJSON: `{"streamGuard":true,"retries":4,"maxBufferedBytes":16777216}`,
+		},
+		"success: numeric configuration can exceed machine counters and timer range": {
+			env:      map[string]string{"CODEX_GATEWAY_COMPACT_STREAM_RETRIES": "1e30", "CODEX_GATEWAY_COMPACT_STREAM_RETRY_DELAY_MS": "1e100", "CODEX_GATEWAY_COMPACT_STREAM_MAX_BYTES": "4096.5"},
+			expected: compactguard.Settings{StreamGuard: true, Retries: 1e30, RetryDelayMillis: 1e100, MaxBufferedBytes: 4096.5},
+			wantJSON: `{"streamGuard":true,"retries":1e+30,"maxBufferedBytes":4096.5}`,
 		},
 		"error: invalid numeric overrides fall back to defaults": {
 			env: map[string]string{
@@ -111,7 +115,7 @@ func TestLoadSettings(t *testing.T) {
 				StreamGuard:      true,
 				Retries:          2,
 				MaxBufferedBytes: 16 * 1024 * 1024,
-				RetryDelay:       250 * time.Millisecond,
+				RetryDelayMillis: 250,
 			},
 			wantJSON: `{"streamGuard":true,"retries":2,"maxBufferedBytes":16777216}`,
 		},
@@ -125,7 +129,7 @@ func TestLoadSettings(t *testing.T) {
 				StreamGuard:      true,
 				Retries:          2,
 				MaxBufferedBytes: 16 * 1024 * 1024,
-				RetryDelay:       250 * time.Millisecond,
+				RetryDelayMillis: 250,
 			},
 			wantJSON: `{"streamGuard":true,"retries":2,"maxBufferedBytes":16777216}`,
 		},

@@ -17,8 +17,8 @@ package compactguard_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
-	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -29,258 +29,219 @@ import (
 
 	gocmp "github.com/google/go-cmp/cmp"
 
-	"github.com/zchee/claude-code-model-gateway/internal/worker/compactguard"
+	"github.com/zchee/claude-code-model-gateway/internal/worker/outcome"
+	"github.com/zchee/claude-code-model-gateway/internal/worker/upstream"
 )
 
-func sseResponse(body io.ReadCloser) *http.Response {
-	return &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     http.Header{"Content-Type": {"text/event-stream"}},
-		Body:       body,
+func TestGuardRequiresServiceContext(t *testing.T) {
+	req := guardRequest()
+	req.Next = func(context.Context, bool) (*upstream.Response, outcome.Result, error) {
+		t.Error("contacted upstream without a service context")
+		return nil, outcome.Result{}, nil
 	}
+	r := guardRunner(t.Context(), 1)
+	r.ServiceContext = nil
+	if _, err := r.Serve(t.Context(), httptest.NewRecorder(), req); err == nil {
+		t.Error("missing service context accepted")
+	}
+}
+
+type peekReadBody struct {
+	*io.PipeReader
+	started chan struct{}
+	once    sync.Once
+	closes  atomic.Int32
+}
+
+func (b *peekReadBody) Read(p []byte) (int, error) {
+	b.once.Do(func() { close(b.started) })
+	return b.PipeReader.Read(p)
+}
+func (b *peekReadBody) Close() error { b.closes.Add(1); return b.PipeReader.Close() }
+
+func TestGuardPeekLifetime(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		service, stop := context.WithCancel(t.Context())
+		defer stop()
+		client, disconnect := context.WithCancel(t.Context())
+		defer disconnect()
+		rd, wr := io.Pipe()
+		defer func() { _ = wr.Close() }()
+		body := &peekReadBody{PipeReader: rd, started: make(chan struct{})}
+		req := guardRequest()
+		req.ProxyProvider = "lmstudio"
+		req.Stream.Provider = "lmstudio"
+		req.Stream.FirstEventWait = time.Hour
+		calls := 0
+		req.Next = func(ctx context.Context, head bool) (*upstream.Response, outcome.Result, error) {
+			calls++
+			if head || ctx.Done() != client.Done() {
+				t.Error("first dispatch must receive the client lifetime before commitment")
+			}
+			return sseResponse(body), outcome.Result{Contacted: true}, nil
+		}
+		done := make(chan error, 1)
+		go func() { _, err := guardRunner(service, 1).Serve(client, httptest.NewRecorder(), req); done <- err }()
+		select {
+		case <-body.started:
+		case err := <-done:
+			t.Fatalf("Serve ended before peek started: %v", err)
+		case <-time.After(time.Second):
+			_ = wr.Close()
+			t.Fatal("peek did not start")
+		}
+		disconnect()
+		synctest.Wait()
+		if n := body.closes.Load(); n != 0 {
+			t.Errorf("client disconnect closed the in-flight peek %d times", n)
+		}
+		stop()
+		synctest.Wait()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			_ = wr.Close()
+			t.Fatal("worker shutdown did not stop the peek")
+		}
+		if n := body.closes.Load(); n != 1 || calls != 1 {
+			t.Errorf("body closes=%d, attempts=%d; want one each", n, calls)
+		}
+	})
 }
 
 func TestGuardRetryDelaySynctest(t *testing.T) {
-	t.Parallel()
-
-	t.Run("success: retry waits configured delay before issuing second attempt", func(t *testing.T) {
-		t.Parallel()
-		synctest.Test(t, func(t *testing.T) {
-			const delay = 250 * time.Millisecond
-			var attemptTimes []time.Time
-
-			runner := compactguard.Runner{
-				Settings: compactguard.Settings{
-					StreamGuard:      true,
-					Retries:          1,
-					MaxBufferedBytes: 16 * 1024 * 1024,
-					RetryDelay:       delay,
-				},
-			}
-			rec := httptest.NewRecorder()
-			req := compactguard.Request{
-				ProxyProvider:  "codex",
-				PathOnly:       "/v1/messages",
-				UpstreamOrigin: "http://127.0.0.1:18765",
-				Body:           compactRequestBody("claude-gpt-5.6-sol", "Summarize."),
-				Upstream: compactguard.UpstreamFunc(func(_ context.Context) (*http.Response, error) {
-					attemptTimes = append(attemptTimes, time.Now())
-					if len(attemptTimes) == 1 {
-						return sseResponse(io.NopCloser(strings.NewReader(truncatedStream()))), nil
+	tests := map[string]struct {
+		millis float64
+		delay  time.Duration
+		cancel bool
+	}{
+		"success: configured delay":                                    {250, 250 * time.Millisecond, false},
+		"success: fractional milliseconds truncate for the timer only": {12.5, 12 * time.Millisecond, false},
+		"success: out of range timeout uses minimum timer":             {1e30, time.Millisecond, false},
+		"success: zero delay uses minimum timer":                       {0, time.Millisecond, false},
+		"success: client loss stops pending retry":                     {250, 100 * time.Millisecond, true},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				client, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				r := guardRunner(t.Context(), 1)
+				r.Settings.RetryDelayMillis = tt.millis
+				req := guardRequest()
+				start := time.Now()
+				var times []time.Duration
+				var heads []bool
+				req.Next = func(ctx context.Context, head bool) (*upstream.Response, outcome.Result, error) {
+					if ctx.Done() != client.Done() {
+						t.Error("attempt did not receive the client context")
 					}
-					return sseResponse(io.NopCloser(strings.NewReader(completeStream("delayed ok")))), nil
-				}),
-			}
-
-			if err := runner.Serve(t.Context(), rec, req); err != nil {
-				t.Fatalf("Serve returned error: %v", err)
-			}
-			if diff := gocmp.Diff(2, len(attemptTimes)); diff != "" {
-				t.Fatalf("attempt count mismatch (-want +got):\n%s", diff)
-			}
-			if diff := gocmp.Diff(delay, attemptTimes[1].Sub(attemptTimes[0])); diff != "" {
-				t.Fatalf("retry delay mismatch (-want +got):\n%s", diff)
-			}
-			if !strings.Contains(rec.Body.String(), "delayed ok") {
-				t.Fatalf("response body missing retried summary: %q", rec.Body.String())
-			}
-		})
-	})
-
-	t.Run("success: client cancellation during retry delay prevents second attempt", func(t *testing.T) {
-		t.Parallel()
-		synctest.Test(t, func(t *testing.T) {
-			const delay = 250 * time.Millisecond
-			ctx, cancel := context.WithCancel(t.Context())
-			defer cancel()
-
-			attempt1Done := make(chan struct{})
-			var attempts atomic.Int32
-			runner := compactguard.Runner{
-				Settings: compactguard.Settings{
-					StreamGuard:      true,
-					Retries:          1,
-					MaxBufferedBytes: 16 * 1024 * 1024,
-					RetryDelay:       delay,
-				},
-			}
-			rec := httptest.NewRecorder()
-			req := compactguard.Request{
-				ProxyProvider:  "codex",
-				PathOnly:       "/v1/messages",
-				UpstreamOrigin: "http://127.0.0.1:18765",
-				Body:           compactRequestBody("claude-gpt-5.6-sol", "Summarize."),
-				Upstream: compactguard.UpstreamFunc(func(_ context.Context) (*http.Response, error) {
-					if attempts.Add(1) == 1 {
-						close(attempt1Done)
-						return sseResponse(io.NopCloser(strings.NewReader(truncatedStream()))), nil
+					heads = append(heads, head)
+					times = append(times, time.Since(start))
+					stream := truncatedStream()
+					if head {
+						stream = completeStream("delayed ok")
 					}
-					return sseResponse(io.NopCloser(strings.NewReader(completeStream("must not run")))), nil
-				}),
-			}
-
-			start := time.Now()
-			errCh := make(chan error, 1)
-			go func() {
-				errCh <- runner.Serve(ctx, rec, req)
-			}()
-
-			select {
-			case <-attempt1Done:
-			case err := <-errCh:
-				t.Fatalf("Serve exited before first attempt completed: %v", err)
-			}
-
-			synctest.Wait()
-			time.Sleep(100 * time.Millisecond)
-			cancel()
-			synctest.Wait()
-
-			if err := <-errCh; err != nil {
-				t.Fatalf("Serve returned unexpected error on cancel during delay: %v", err)
-			}
-			if diff := gocmp.Diff(int32(1), attempts.Load()); diff != "" {
-				t.Fatalf("canceled retry must not issue second attempt (-want +got):\n%s", diff)
-			}
-			if elapsed := time.Since(start); elapsed != 100*time.Millisecond {
-				t.Fatalf("elapsed = %v, want 100ms", elapsed)
-			}
+					return sseResponse(io.NopCloser(strings.NewReader(stream))), outcome.Result{Contacted: true}, nil
+				}
+				var timer *time.Timer
+				if tt.cancel {
+					timer = time.AfterFunc(tt.delay, cancel)
+					defer timer.Stop()
+				}
+				w := httptest.NewRecorder()
+				_, err := r.Serve(client, w, req)
+				if err != nil && (!tt.cancel || !errors.Is(err, context.Canceled)) {
+					t.Fatalf("Serve: %v", err)
+				}
+				wantTimes := []time.Duration{0}
+				wantHeads := []bool{false}
+				if !tt.cancel {
+					wantTimes = append(wantTimes, tt.delay)
+					wantHeads = append(wantHeads, true)
+					if diff := gocmp.Diff(delivered(completeStream("delayed ok")), w.Body.String()); diff != "" {
+						t.Error(diff)
+					}
+				}
+				if diff := gocmp.Diff(wantTimes, times); diff != "" {
+					t.Error(diff)
+				}
+				if diff := gocmp.Diff(wantHeads, heads); diff != "" {
+					t.Error(diff)
+				}
+				if elapsed := time.Since(start); elapsed != tt.delay {
+					t.Errorf("Serve elapsed %s, want %s", elapsed, tt.delay)
+				}
+			})
 		})
-	})
+	}
 }
 
 type heartbeatRecorder struct {
+	*httptest.ResponseRecorder
 	mu      sync.Mutex
-	header  http.Header
-	status  int
-	buf     bytes.Buffer
-	pingCh  chan time.Time
-	flushes int
+	start   time.Time
+	flushed []time.Duration
 }
 
-func newHeartbeatRecorder() *heartbeatRecorder {
-	return &heartbeatRecorder{
-		header: make(http.Header),
-		pingCh: make(chan time.Time, 8),
-	}
-}
-
-func (r *heartbeatRecorder) Header() http.Header { return r.header }
-
-func (r *heartbeatRecorder) WriteHeader(code int) {
+func (r *heartbeatRecorder) Write(b []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.status == 0 {
-		r.status = code
-	}
-}
-
-func (r *heartbeatRecorder) Write(p []byte) (int, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.status == 0 {
-		r.status = http.StatusOK
-	}
-	n, err := r.buf.Write(p)
-	if bytes.Contains(p, []byte(": ping\n\n")) {
-		r.pingCh <- time.Now()
-	}
-	return n, err
+	return r.ResponseRecorder.Write(b)
 }
 
 func (r *heartbeatRecorder) Flush() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.flushes++
-}
-
-func (r *heartbeatRecorder) bodyString() string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.buf.String()
+	r.ResponseRecorder.Flush()
+	for n := bytes.Count(r.Body.Bytes(), []byte(": ping\n\n")); len(r.flushed) < n; {
+		r.flushed = append(r.flushed, time.Since(r.start))
+	}
 }
 
 func TestGuardHeartbeatSynctest(t *testing.T) {
-	t.Parallel()
-
 	synctest.Test(t, func(t *testing.T) {
-		const interval = 20 * time.Second
-		pr, pw := io.Pipe()
-		defer func() { _ = pw.Close() }()
-
-		rw := newHeartbeatRecorder()
-		runner := compactguard.Runner{
-			Settings: compactguard.Settings{
-				StreamGuard:      true,
-				Retries:          0,
-				MaxBufferedBytes: 16 * 1024 * 1024,
-			},
-			HeartbeatInterval: interval,
+		r := guardRunner(t.Context(), 1)
+		r.Settings.RetryDelayMillis = 250
+		req := guardRequest()
+		req.Stream.HeartbeatInterval = 20 * time.Second
+		w := &heartbeatRecorder{ResponseRecorder: httptest.NewRecorder(), start: time.Now()}
+		var wg sync.WaitGroup
+		var readers []*io.PipeReader
+		var heads []bool
+		req.Next = func(_ context.Context, head bool) (*upstream.Response, outcome.Result, error) {
+			heads = append(heads, head)
+			rd, wr := io.Pipe()
+			readers = append(readers, rd)
+			wg.Go(func() {
+				defer func() { _ = wr.Close() }()
+				time.Sleep(30 * time.Second)
+				if _, err := io.WriteString(wr, frameMessageStart); err != nil {
+					return
+				}
+				time.Sleep(25 * time.Second)
+				if head {
+					_, _ = io.WriteString(wr, frameTextDelta("still alive")+frameMessageStop)
+				}
+			})
+			return sseResponse(rd), outcome.Result{Contacted: true}, nil
 		}
-		req := compactguard.Request{
-			ProxyProvider:  "codex",
-			PathOnly:       "/v1/messages",
-			UpstreamOrigin: "http://127.0.0.1:18765",
-			Body:           compactRequestBody("claude-gpt-5.6-sol", "Summarize."),
-			Upstream: compactguard.UpstreamFunc(func(_ context.Context) (*http.Response, error) {
-				return sseResponse(pr), nil
-			}),
+		_, err := r.Serve(t.Context(), w, req)
+		for _, rd := range readers {
+			_ = rd.Close()
 		}
-
-		start := time.Now()
-		errCh := make(chan error, 1)
-		go func() {
-			errCh <- runner.Serve(t.Context(), rw, req)
-		}()
-
-		waitPing := func(step string) time.Time {
-			select {
-			case at := <-rw.pingCh:
-				return at
-			case err := <-errCh:
-				_ = pw.Close()
-				t.Fatalf("Serve exited before %s heartbeat: %v", step, err)
-				return time.Time{}
-			}
+		wg.Wait()
+		if err != nil {
+			t.Fatalf("Serve: %v", err)
 		}
-
-		firstPing := waitPing("first")
-		if diff := gocmp.Diff(interval, firstPing.Sub(start)); diff != "" {
-			_ = pw.Close()
-			t.Fatalf("first heartbeat time mismatch (-want +got):\n%s", diff)
+		if diff := gocmp.Diff([]bool{false, true}, heads); diff != "" {
+			t.Error(diff)
 		}
-
-		// Upstream activity at t=30s resets the 20s inactivity timer so the next ping arrives at t=50s.
-		time.Sleep(10 * time.Second)
-		if _, err := io.WriteString(pw, frameMessageStart+frameBlockStart+frameTextDelta("still alive")); err != nil {
-			t.Fatalf("write active chunk: %v", err)
+		if diff := gocmp.Diff([]time.Duration{20 * time.Second, 50 * time.Second, 75250 * time.Millisecond, 105250 * time.Millisecond}, w.flushed); diff != "" {
+			t.Error(diff)
 		}
-
-		secondPing := waitPing("second")
-		if diff := gocmp.Diff(50*time.Second, secondPing.Sub(start)); diff != "" {
-			_ = pw.Close()
-			t.Fatalf("second heartbeat time mismatch (-want +got):\n%s", diff)
-		}
-
-		time.Sleep(5 * time.Second)
-		if _, err := io.WriteString(pw, frameBlockStop+frameMessageDelta+frameMessageStop); err != nil {
-			t.Fatalf("write terminal frames: %v", err)
-		}
-		if err := pw.Close(); err != nil {
-			t.Fatalf("close upstream pipe: %v", err)
-		}
-
-		if err := <-errCh; err != nil {
-			t.Fatalf("Serve returned error: %v", err)
-		}
-		synctest.Wait()
-
-		body := rw.bodyString()
-		if got := strings.Count(body, ": ping\n\n"); got != 2 {
-			t.Fatalf("heartbeat ping count = %d, want 2 (body=%q)", got, body)
-		}
-		if !strings.Contains(body, "still alive") || !strings.Contains(body, `"type":"message_stop"`) {
-			t.Fatalf("response missing buffered summary after heartbeats: %q", body)
+		if diff := gocmp.Diff(strings.Repeat(": ping\n\n", 4)+advertisedStart+frameTextDelta("still alive")+frameMessageStop, w.Body.String()); diff != "" {
+			t.Error(diff)
 		}
 	})
 }
