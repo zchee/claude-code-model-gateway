@@ -75,10 +75,12 @@ type Result struct {
 // cancelled by it because Handle passes context.WithoutCancel(ctx) to forward.
 //
 // What the upstream sent is recorded whether or not the client is still there: the Codex
-// rejection state and its diagnostic line, the overflow latch and ceiling learning, and the usage
-// and sentry observations of a complete JSON body. The sentry observes such a body with one
-// call, including the rearming of a fired refusal that an ordinary completed turn brings, whatever
-// the client's state and whether or not the reply is then written.
+// rejection state and its diagnostic line, the overflow latch and ceiling learning, and, on the
+// ordinary buffered success path, the usage and sentry observations of the complete JSON body.
+// The sentry observes that body with one call only when it is a completed message — neither a
+// body answered through the committed path nor a JSON body that is no message is observed — and
+// the one call includes the rearming of a fired refusal that an ordinary completed turn brings,
+// whatever the client's state and whether or not the reply is then written.
 //
 // Each output operation toward the client has its own check of the client context, made after
 // every such callback and after any rewriting: after the header map was prepared and immediately
@@ -86,8 +88,11 @@ type Result struct {
 // gets nothing written to w; for a buffered body Handle reads and closes it and returns a nil
 // error, Stream nil, Contacted as it happened, Status zero, and Cancelled false. When the caller
 // already wrote the head, the one in-band error frame is the only output and the same applies to
-// a client that left before it. A head that Handle committed is reported with its status and the
-// turn's facts, also when the client left before the body or the body write failed.
+// a client that left before it. After a head that Handle committed, the Result carries the turn's
+// span status and status override, which is not necessarily the status written on the wire: a
+// truncated upstream reply is answered 502 while the Result keeps the upstream status with the
+// aborted override. That holds also when the client left before the body or the body write
+// failed.
 //
 // A response that belongs to the stream relay is returned untouched and open whatever the client
 // context says; the relay, which learns of the departure itself, owns its body. Otherwise Handle

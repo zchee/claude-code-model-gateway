@@ -110,43 +110,51 @@ const (
 // TestEachClientOutputChecked checks that the client is checked before each output operation on
 // its own: a client that leaves inside Header() gets no WriteHeader and no Write, and the Result
 // carries only the facts from before the reply; a client that leaves inside WriteHeader gets no
-// body Write, and the Result reports the head that was committed with the status and status
-// override the same reply reports to a client that stays. Neither gets the empty-completion line,
-// which follows only a reply that was written.
+// body Write, and the Result reports the turn's span status and override, which is not
+// necessarily the committed head's status: an upstream reply that ended early is answered 502
+// while the Result keeps the upstream status with the aborted override. Neither gets the
+// empty-completion line, which follows only a reply that was written.
 func TestEachClientOutputChecked(t *testing.T) {
 	type shape struct {
 		provider string
 		sentryOn bool
-		// refused makes the upstream unreachable, so the reply is the gateway's transport error.
-		refused bool
-		status  int
+		// sendFails closes the fixture's upstream client, so the send fails in transport without
+		// touching the network and the reply is the gateway's transport error.
+		sendFails bool
+		status    int
 		// length declares a longer body than the upstream sends, so the read ends early.
-		length   int
-		body     string
-		wantHead int
-		wantLine bool
+		length       int
+		body         string
+		wantHead     int
+		wantStatus   int
+		wantOverride string
+		wantLine     bool
 	}
 	shapes := map[string]shape{
 		"JSON reply": {
 			provider: "codex", status: http.StatusOK, body: completedReply, wantHead: http.StatusOK,
+			wantStatus: http.StatusOK,
 		},
 		"relayed error reply": {
 			provider: "codex", status: http.StatusInternalServerError, body: `{"error":{"type":"api_error","message":"upstream failed"}}`,
-			wantHead: http.StatusInternalServerError,
+			wantHead: http.StatusInternalServerError, wantStatus: http.StatusInternalServerError,
 		},
 		"early end error reply": {
 			provider: "codex", status: http.StatusInternalServerError, length: 100, body: "truncated", wantHead: http.StatusBadGateway,
+			wantStatus: http.StatusInternalServerError, wantOverride: "upstream_aborted",
 		},
 		"transport error reply": {
-			provider: "codex", refused: true, wantHead: http.StatusBadGateway,
+			provider: "codex", sendFails: true, wantHead: http.StatusBadGateway,
+			wantStatus: http.StatusBadGateway, wantOverride: "upstream_error",
 		},
 		"engine overflow reply": {
 			provider: "local", sentryOn: true, status: http.StatusBadRequest,
 			body:     `{"error":{"type":"exceed_context_size_error","n_prompt_tokens":3100,"n_ctx":3000,"message":"backend detail"}}`,
-			wantHead: http.StatusRequestEntityTooLarge,
+			wantHead: http.StatusRequestEntityTooLarge, wantStatus: http.StatusRequestEntityTooLarge,
 		},
 		"empty completion reply": {
-			provider: "codex", status: http.StatusServiceUnavailable, body: emptyReply, wantHead: http.StatusOK, wantLine: true,
+			provider: "codex", status: http.StatusServiceUnavailable, body: emptyReply, wantHead: http.StatusOK,
+			wantStatus: http.StatusOK, wantLine: true,
 		},
 	}
 	type run struct {
@@ -168,8 +176,8 @@ func TestEachClientOutputChecked(t *testing.T) {
 			w.WriteHeader(sh.status)
 			_, _ = io.WriteString(w, sh.body)
 		})
-		if sh.refused {
-			fixture.server.Close()
+		if sh.sendFails {
+			_ = fixture.client.Close()
 		}
 		sink := &loggedDiagnostics{}
 		req := reply.Request{
@@ -191,8 +199,8 @@ func TestEachClientOutputChecked(t *testing.T) {
 	}
 	for name, sh := range shapes {
 		t.Run(name, func(t *testing.T) {
-			// The client that stays is the control: it shows the head and the Result this reply
-			// produces when nothing interrupts it.
+			// The client that stays is the control: it proves the head, span status and override
+			// this reply produces when nothing interrupts it are the expected ones.
 			live := do(t, sh, "")
 			if live.err != nil {
 				t.Fatalf("Handle for a client that stays: %v", live.err)
@@ -201,6 +209,8 @@ func TestEachClientOutputChecked(t *testing.T) {
 				t.Fatal("a buffered reply was handed on as a stream")
 			}
 			equal(t, []int{sh.wantHead}, live.w.heads)
+			equal(t, sh.wantStatus, live.result.Status)
+			equal(t, sh.wantOverride, live.result.StatusOverride)
 			if len(live.w.writes) == 0 || live.w.Body.Len() == 0 {
 				t.Fatalf("client that stays got no body: writes %q", live.w.writes)
 			}
@@ -236,9 +246,9 @@ func TestEachClientOutputChecked(t *testing.T) {
 						equal(t, 0, got.result.Status)
 						equal(t, "", got.result.StatusOverride)
 					case "WriteHeader":
-						equal(t, live.w.heads, got.w.heads)
-						equal(t, live.result.Status, got.result.Status)
-						equal(t, live.result.StatusOverride, got.result.StatusOverride)
+						equal(t, []int{sh.wantHead}, got.w.heads)
+						equal(t, sh.wantStatus, got.result.Status)
+						equal(t, sh.wantOverride, got.result.StatusOverride)
 					}
 				})
 			}
@@ -246,27 +256,48 @@ func TestEachClientOutputChecked(t *testing.T) {
 	}
 }
 
+// checkOrderedEvents checks one reply's ordered events: the head first, then nothing but body
+// writes, and, when the diagnostic line is expected, that line exactly once after the last body
+// write. It does not require the body to arrive in one write.
+func checkOrderedEvents(t *testing.T, events []string, wantLine bool) {
+	t.Helper()
+	if len(events) == 0 || events[0] != "client head 200" {
+		t.Fatalf("events = %q, want the head status first", events)
+	}
+	rest := events[1:]
+	if wantLine {
+		if len(rest) == 0 || rest[len(rest)-1] != "diagnostics line" {
+			t.Fatalf("events = %q, want the diagnostic line after the last body write", events)
+		}
+		rest = rest[:len(rest)-1]
+	}
+	if len(rest) == 0 {
+		t.Fatalf("events = %q, want at least one body write", events)
+	}
+	for _, event := range rest {
+		if event != "client body" {
+			t.Fatalf("events = %q, want only body writes between the head and the line", events)
+		}
+	}
+}
+
 // TestEmptyCompletionLineFollowsReply checks that the empty-completion line reaches the
-// diagnostics writer only after the empty reply's head and bytes reached the client, in either
-// framing, and that a reply whose body write fails gets no line.
+// diagnostics writer only after the empty reply's head and its last body bytes reached the
+// client, in either framing, that the client received the whole reply's bytes in order, and that
+// a reply whose body write fails gets no line.
 func TestEmptyCompletionLineFollowsReply(t *testing.T) {
+	const prefix = `{"id":"msg_fixed","type":"message","role":"assistant","model":"shown","content":[],"stop_reason":`
+	const suffix = `,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}`
+	const wantJSON = prefix + `"end_turn"` + suffix
+	const wantSSE = "event: message_start\ndata: " + `{"type":"message_start","message":` + prefix + `null` + suffix + "}\n\nevent: message_delta\ndata: " + `{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":0}}` + "\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 	tests := map[string]struct {
 		stream    bool
 		failWrite bool
-		want      []string
 	}{
-		"success: line follows a JSON reply": {
-			want: []string{"client head 200", "client body", "diagnostics line"},
-		},
-		"success: line follows an event stream reply": {
-			stream: true, want: []string{"client head 200", "client body", "diagnostics line"},
-		},
-		"error: no line after a failed JSON write": {
-			failWrite: true, want: []string{"client head 200", "client body"},
-		},
-		"error: no line after a failed event stream write": {
-			stream: true, failWrite: true, want: []string{"client head 200", "client body"},
-		},
+		"success: line follows a JSON reply":               {},
+		"success: line follows an event stream reply":      {stream: true},
+		"error: no line after a failed JSON write":         {failWrite: true},
+		"error: no line after a failed event stream write": {stream: true, failWrite: true},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -289,12 +320,28 @@ func TestEmptyCompletionLineFollowsReply(t *testing.T) {
 				_ = result.Stream.Body.Close()
 				t.Fatal("an empty reply was handed on as a stream")
 			}
-			if !tc.failWrite && err != nil {
+			if err != nil {
 				t.Fatalf("Handle: %v", err)
 			}
-			equal(t, tc.want, log.events)
-			if len(w.writes) != 1 || w.writes[0] == "" {
-				t.Fatalf("client body writes = %q, want one non-empty write", w.writes)
+			equal(t, http.StatusOK, result.Status)
+			equal(t, "", result.StatusOverride)
+			checkOrderedEvents(t, log.events, !tc.failWrite)
+			wantBody := wantJSON
+			if tc.stream {
+				wantBody = wantSSE
+			}
+			received := strings.Join(w.writes, "")
+			if tc.failWrite {
+				// Every write fails, so the attempts stop at the first one: whatever was attempted
+				// is an opening piece of the reply, and none of it reached the recorder.
+				if received == "" || !strings.HasPrefix(wantBody, received) {
+					t.Fatalf("attempted body writes %q are not a prefix of the reply %q", received, wantBody)
+				}
+				equal(t, "", w.Body.String())
+				equal(t, []string(nil), sink.lines)
+			} else {
+				equal(t, wantBody, received)
+				equal(t, wantBody, w.Body.String())
 			}
 			wantType := "application/json"
 			if tc.stream {
@@ -302,6 +349,7 @@ func TestEmptyCompletionLineFollowsReply(t *testing.T) {
 			}
 			equal(t, wantType, w.Header().Get("Content-Type"))
 			if !tc.failWrite {
+				// The line itself is one Write carrying the whole line.
 				equal(t, 1, len(sink.lines))
 				checkOneLine(t, strings.Join(sink.lines, ""))
 			}
@@ -349,10 +397,26 @@ func TestCompletedJSONObservedOnce(t *testing.T) {
 				}
 			}
 			equal(t, tc.wantHeads, w.heads)
-			if tc.wantHeads == nil {
+			wantStatus := 0
+			if tc.wantHeads != nil {
+				wantStatus = http.StatusOK
+			}
+			equal(t, wantStatus, result.Status)
+			equal(t, "", result.StatusOverride)
+			rewritten := strings.ReplaceAll(completedReply, `"engine"`, `"shown"`)
+			received := strings.Join(w.writes, "")
+			switch {
+			case tc.wantHeads == nil:
 				equal(t, []string(nil), w.writes)
-			} else if len(w.writes) != 1 {
-				t.Errorf("client body writes = %q, want one", w.writes)
+			case tc.failWrite:
+				// Every write fails, so the attempts stop at the first one: whatever was attempted
+				// is an opening piece of the rewritten reply.
+				if received == "" || !strings.HasPrefix(rewritten, received) {
+					t.Errorf("attempted body writes %q are not a prefix of the reply %q", received, rewritten)
+				}
+			default:
+				equal(t, rewritten, received)
+				equal(t, rewritten, w.Body.String())
 			}
 
 			// The sentry's own calls cannot be counted from outside; its rearming and the usage it
