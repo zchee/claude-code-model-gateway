@@ -140,9 +140,11 @@ type peekOutcome struct {
 // peekFirst reads r up to the first complete SSE frame that carries data, the wait deadline,
 // or the end of the body. On an overflow or an abnormal end it closes r; otherwise r stays open
 // and may still have the read that was in flight when the wait ran out. A service context that
-// has ended closes r and returns its error: on entry (whatever the wait), before each read, and
-// over a read that failed, before any byte it delivered is looked at, since closing the transport
-// on shutdown also fails the read in flight.
+// has ended closes r once and returns its error: on entry (whatever the wait), before each read,
+// and whichever of a read result, the deadline or the context itself the wait picked, before
+// anything is decided, so nothing is handed back and no byte a read delivered is looked at.
+// The check precedes the close of an overflow or an early end, so a service that ends only while
+// that close runs still gets the decision.
 func peekFirst(ctx context.Context, r *asyncReader, wait time.Duration) (peekOutcome, error) {
 	if err := ctx.Err(); err != nil {
 		_ = r.close()
@@ -169,11 +171,12 @@ func peekFirst(ctx context.Context, r *asyncReader, wait time.Duration) (peekOut
 		select {
 		case res := <-r.results:
 			r.got(res)
-			// A read that failed because the service ended may still have delivered bytes; the
-			// shutdown wins before any of them is looked at.
-			if res.err != nil && !errors.Is(res.err, io.EOF) && ctx.Err() != nil {
+			// The service may have ended while this read ran, or made it fail; either way the
+			// shutdown wins before any byte it delivered is looked at, so no decision below hands
+			// a body, an overflow or an early end to a caller whose service has ended.
+			if err := ctx.Err(); err != nil {
 				_ = r.close()
-				return peekOutcome{}, ctx.Err()
+				return peekOutcome{}, err
 			}
 			prefix = append(prefix, res.data...)
 			if event, decided := firstDataEvent(scanner.Feed(res.data)); decided {
@@ -191,6 +194,12 @@ func peekFirst(ctx context.Context, r *asyncReader, wait time.Duration) (peekOut
 				return peekOutcome{earlyEnd: overrideAborted}, nil
 			}
 		case <-timer.C:
+			// The select picks at random among ready cases, so the deadline can win over a service
+			// that has already ended; the body is not handed over then.
+			if err := ctx.Err(); err != nil {
+				_ = r.close()
+				return peekOutcome{}, err
+			}
 			return peekOutcome{prefix: prefix}, nil
 		case <-ctx.Done():
 			_ = r.close()
@@ -274,13 +283,18 @@ func (b *replayBody) Close() error { return b.r.close() }
 // DefaultFirstEventWait; a negative wait times out immediately.
 //
 // A clean EOF before a first data event is not an error and returns a non-nil replay Body.
-// An abnormal upstream read error returns a nil Body, a non-empty EarlyEndOverride, and a nil error.
+// An abnormal upstream read error before a complete first data event returns a nil Body, a
+// non-empty EarlyEndOverride, and a nil error; a read that delivers a complete first data event
+// together with such an error decides on that event, and a replay Body then returns the error
+// after the event's bytes.
 // On wait expiration, PeekFirstEvent does not close the usable stream and does not leave a goroutine
 // racing a second reader; the single reader transfers to the returned Body whose Close unblocks and
-// joins it. On ctx cancellation, PeekFirstEvent closes body, joins its reader goroutine, and returns
-// ctx.Err(); so does a ctx that has already ended on entry (whatever the wait), and a ctx that has
-// ended by the time a read fails with an error other than io.EOF, whatever bytes that read
-// delivered: no Body, no Overflow and no EarlyEndOverride.
+// joins it. On ctx cancellation, PeekFirstEvent closes body once, joins its reader goroutine, and
+// returns ctx.Err() with no Body, no Overflow and no EarlyEndOverride. That holds for a ctx that has
+// already ended on entry (whatever the wait), and for one that has ended by the time a read result
+// or the wait deadline would decide, whichever arrived first and whatever bytes the read delivered.
+// A ctx that ends only while PeekFirstEvent closes the body of a recognized overflow, as a transport
+// that ends the service on close can, still returns the Overflow with a nil error.
 func PeekFirstEvent(ctx context.Context, body io.ReadCloser, wait time.Duration) (PeekResult, error) {
 	if body == nil {
 		return PeekResult{}, errNilBody

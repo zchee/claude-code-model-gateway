@@ -246,8 +246,12 @@ func (s *streamer) clientGone() bool {
 	return true
 }
 
-// head copies the relay headers and writes the status line; each step is gated on the client.
+// head copies the relay headers and writes the status line. Nothing is prepared for a client
+// that is already gone; each step stays gated for a client that leaves during the copy.
 func (s *streamer) head(resp *upstream.Response, status int, dropContentLength bool) {
+	if s.clientGone() {
+		return
+	}
 	copyRelayHeaders(s.out.Header(), resp, dropContentLength)
 	s.out.WriteHeader(status)
 	s.clientGone()
