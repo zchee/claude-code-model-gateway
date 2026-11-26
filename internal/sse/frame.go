@@ -22,6 +22,7 @@ import (
 
 // Frame contains the bytes preceding a blank line and the matched blank-line delimiter.
 // A nonempty unterminated tail has an empty delimiter.
+// Returned frames remain valid and unchanged across later calls to Feed and End.
 type Frame struct {
 	Body, Delimiter string
 }
@@ -62,11 +63,14 @@ func (f Frame) WithData(payload string) string {
 
 // Scanner buffers incomplete frames between chunks. Its zero value is ready to use.
 // A Scanner must not be copied after first use.
+// Like the upstream transformer, it holds the entire pending frame until a complete
+// blank-line separator arrives or End is called. Only the caller can impose a size limit.
 type Scanner struct {
 	pending strings.Builder
 }
 
 // Feed returns every frame completed by chunk, in wire order.
+// The caller may reuse the chunk's storage once Feed returns.
 func (s *Scanner) Feed(chunk []byte) []Frame {
 	var frames []Frame
 	for len(chunk) > 0 {
