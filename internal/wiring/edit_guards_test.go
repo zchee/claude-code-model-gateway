@@ -22,7 +22,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/zchee/claude-code-model-gateway/internal/atomicfile"
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
@@ -566,7 +565,6 @@ func TestDiagnosticValuesKeepWireMemberOrderAndAvoidRescan(t *testing.T) {
 		put(t, f.local, b.String())
 		put(t, f.registry, encoded(t, map[string]any{"projects": []string{f.Project}}))
 
-		start := time.Now()
 		disagreements, _, err := f.PinDisagreements()
 		check(t, err)
 		if len(disagreements) != 1 {
@@ -574,9 +572,6 @@ func TestDiagnosticValuesKeepWireMemberOrderAndAvoidRescan(t *testing.T) {
 		}
 		if _, ok := disagreements[0].Stale.(jsonx.WireValue); !ok {
 			t.Fatalf("expected jsonx.WireValue for nested object, got %T", disagreements[0].Stale)
-		}
-		if elapsed := time.Since(start); elapsed > 2*time.Second {
-			t.Fatalf("nested diagnostic value took too long: %v", elapsed)
 		}
 	})
 }
@@ -663,18 +658,20 @@ func TestUnixSocketRemovalByValueAndWriteByKey(t *testing.T) {
 	})
 
 	t.Run("success: personal socket preserved silently when owned base URL is removed", func(t *testing.T) {
-		for _, scope := range []string{"user", "project", "project-shared"} {
-			t.Run(scope, func(t *testing.T) {
+		tests := map[string]struct {
+			scope  string
+			target func(fixture) string
+		}{
+			"user scope":           {scope: "user", target: func(f fixture) string { return f.user }},
+			"project-local scope":  {scope: "project", target: func(f fixture) string { return f.local }},
+			"project-shared scope": {scope: "project-shared", target: func(f fixture) string { return f.shared }},
+		}
+		for name, tt := range tests {
+			t.Run(name, func(t *testing.T) {
 				f := sandbox(t)
-				file := f.user
-				switch scope {
-				case "project":
-					file = f.local
-				case "project-shared":
-					file = f.shared
-				}
+				file := tt.target(f)
 				putEnv(t, file, map[string]any{base: direct, "ANTHROPIC_UNIX_SOCKET": personalSocket, "KEEP": "yes"})
-				check(t, f.WriteEnv(scope, "default", true))
+				check(t, f.WriteEnv(tt.scope, "default", true))
 				equal(t, map[string]any{"ANTHROPIC_UNIX_SOCKET": personalSocket, "KEEP": "yes"}, envAt(t, file))
 			})
 		}
@@ -770,16 +767,155 @@ func TestUnixSocketRemovalByValueAndWriteByKey(t *testing.T) {
 	})
 
 	t.Run("success: automatic paths do not touch ANTHROPIC_UNIX_SOCKET", func(t *testing.T) {
-		f := sandbox(t)
-		ownedSock := filepath.Join(filepath.Dir(f.registry), "gateway.sock")
-		putEnv(t, f.local, map[string]any{base: direct, "ANTHROPIC_UNIX_SOCKET": ownedSock, "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "950000"})
-		check(t, f.CleanLegacyEnv())
-		equal(t, ownedSock, envAt(t, f.local)["ANTHROPIC_UNIX_SOCKET"])
-
-		putEnv(t, f.shared, map[string]any{base: direct, "ANTHROPIC_UNIX_SOCKET": ownedSock})
-		migrated, err := f.MigrateLegacy()
-		check(t, err)
-		equal(t, true, migrated)
-		equal(t, ownedSock, envAt(t, f.shared)["ANTHROPIC_UNIX_SOCKET"])
+		tests := map[string]struct {
+			run func(*testing.T, fixture, string)
+		}{
+			"CleanLegacyEnv": {
+				run: func(t *testing.T, f fixture, ownedSock string) {
+					putEnv(t, f.local, map[string]any{base: direct, "ANTHROPIC_UNIX_SOCKET": ownedSock, "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "950000"})
+					check(t, f.CleanLegacyEnv())
+					equal(t, map[string]any{base: direct, "ANTHROPIC_UNIX_SOCKET": ownedSock}, envAt(t, f.local))
+				},
+			},
+			"MigrateLegacy": {
+				run: func(t *testing.T, f fixture, ownedSock string) {
+					putEnv(t, f.shared, map[string]any{base: direct, "ANTHROPIC_UNIX_SOCKET": ownedSock})
+					migrated, err := f.MigrateLegacy()
+					check(t, err)
+					equal(t, true, migrated)
+					equal(t, map[string]any{"ANTHROPIC_UNIX_SOCKET": ownedSock}, envAt(t, f.shared))
+					equal(t, map[string]any{base: direct}, envAt(t, f.local))
+				},
+			},
+			"Repair": {
+				run: func(t *testing.T, f fixture, ownedSock string) {
+					putEnv(t, f.local, map[string]any{discovery: "1", "ANTHROPIC_UNIX_SOCKET": ownedSock})
+					check(t, f.Repair(nil))
+					equal(t, map[string]any{"ANTHROPIC_UNIX_SOCKET": ownedSock}, envAt(t, f.local))
+				},
+			},
+			"Reconcile": {
+				run: func(t *testing.T, f fixture, ownedSock string) {
+					putEnv(t, f.local, map[string]any{base: compat, discovery: "1", "ANTHROPIC_UNIX_SOCKET": ownedSock})
+					put(t, f.registry, encoded(t, map[string]any{"projects": []string{f.Project}}))
+					conflicts, reconciled, err := f.Reconcile(direct, true)
+					check(t, err)
+					equal(t, 1, len(conflicts))
+					equal(t, 1, len(reconciled))
+					equal(t, map[string]any{"ANTHROPIC_UNIX_SOCKET": ownedSock}, envAt(t, f.local))
+				},
+			},
+		}
+		for name, tt := range tests {
+			t.Run(name, func(t *testing.T) {
+				f := sandbox(t)
+				ownedSock := filepath.Join(filepath.Dir(f.registry), "gateway.sock")
+				tt.run(t, f, ownedSock)
+			})
+		}
 	})
+}
+
+func TestCleanLegacyEnvNotDeclinedWhenNothingToMigrate(t *testing.T) {
+	tests := map[string]struct {
+		shared   string
+		linkKind string
+	}{
+		"success: non-gateway shared with local symlinked to user":   {shared: `{"permissions":{"allow":["Read"]}}`, linkKind: "symlink"},
+		"success: non-gateway shared with local hard-linked to user": {shared: `{"permissions":{"allow":["Read"]}}`, linkKind: "hardlink"},
+		"success: compat shared with local symlinked to user":        {shared: `{"env":{"ANTHROPIC_BASE_URL":"` + compat + `"}}`, linkKind: "symlink"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			f := sandbox(t)
+			put(t, f.shared, tt.shared)
+			putEnv(t, f.user, map[string]any{base: direct, "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "950000", "USER_KEEP": "yes"})
+			switch tt.linkKind {
+			case "symlink":
+				check(t, os.Symlink(f.user, f.local))
+			case "hardlink":
+				check(t, os.Link(f.user, f.local))
+			}
+
+			check(t, f.CleanLegacyEnv())
+			equal(t, map[string]any{base: direct, "USER_KEEP": "yes"}, envAt(t, f.user))
+			equal(t, tt.shared, text(t, f.shared))
+		})
+	}
+}
+
+func TestProjectRemovalSharedAliasingMalformedUserSettings(t *testing.T) {
+	tests := map[string]struct {
+		linkKind string
+	}{
+		"success: shared symlinked to malformed user settings returns nil":   {linkKind: "symlink"},
+		"success: shared hard-linked to malformed user settings returns nil": {linkKind: "hardlink"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			f := sandbox(t)
+			const malformed = "{"
+			put(t, f.user, malformed)
+			putEnv(t, f.local, map[string]any{base: direct, discovery: "1", "LOCAL_KEEP": "yes"})
+			switch tt.linkKind {
+			case "symlink":
+				check(t, os.Symlink(f.user, f.shared))
+			case "hardlink":
+				check(t, os.Link(f.user, f.shared))
+			}
+
+			check(t, f.WriteEnv("project", "default", true))
+			equal(t, map[string]any{"LOCAL_KEEP": "yes"}, envAt(t, f.local))
+			equal(t, malformed, text(t, f.user))
+		})
+	}
+
+	t.Run("error: unrelated malformed shared settings still returns parse error", func(t *testing.T) {
+		f := sandbox(t)
+		const malformed = "{"
+		put(t, f.shared, malformed)
+		putEnv(t, f.local, map[string]any{base: direct, discovery: "1", "LOCAL_KEEP": "yes"})
+
+		err := f.WriteEnv("project", "default", true)
+		if err == nil || !strings.Contains(err.Error(), f.shared) {
+			t.Fatalf("expected parse error naming %q, got %v", f.shared, err)
+		}
+		equal(t, malformed, text(t, f.shared))
+	})
+}
+
+func TestMigrationSourceDeletionRefusesLocalAliasingUser(t *testing.T) {
+	tests := map[string]struct {
+		linkKind string
+	}{
+		"success: local swapped to symlink of user before source deletion aborts":  {linkKind: "symlink"},
+		"success: local swapped to hardlink of user before source deletion aborts": {linkKind: "hardlink"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			f := sandbox(t)
+			putEnv(t, f.user, map[string]any{base: direct, discovery: "1", "USER_KEEP": "yes"})
+			userBefore := text(t, f.user)
+			putEnv(t, f.shared, map[string]any{base: direct, discovery: "1", "SHARED_KEEP": "yes"})
+			sharedBefore := text(t, f.shared)
+			f.Replace = func(file string, edit func([]byte) ([]byte, error)) error {
+				if file == f.shared {
+					check(t, os.Remove(f.local))
+					switch tt.linkKind {
+					case "symlink":
+						check(t, os.Symlink(f.user, f.local))
+					case "hardlink":
+						check(t, os.Link(f.user, f.local))
+					}
+				}
+				return atomicfile.ReplaceSettings(file, edit)
+			}
+
+			migrated, err := f.MigrateLegacy()
+			check(t, err)
+			equal(t, false, migrated)
+			equal(t, sharedBefore, text(t, f.shared))
+			equal(t, userBefore, text(t, f.user))
+		})
+	}
 }

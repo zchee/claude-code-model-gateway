@@ -593,10 +593,10 @@ func (s Store) removeEnv(scope string) error {
 	return s.recordIfProject(scope)
 }
 
-// removeFromTargetFile removes gateway-owned entries, retired socket key, readiness hooks and any present empty
-// env object from the explicitly targeted settings file. For project scopes it verifies on the opened file
-// identity that the target does not alias user settings before any edit and on every retry. A missing file is
-// never created.
+// removeFromTargetFile removes gateway-owned entries, a value-matched gateway-owned socket entry, readiness hooks
+// and any present empty env object from the explicitly targeted settings file. For project scopes it verifies on
+// the opened file identity that the target does not alias user settings before any edit and on every retry. A
+// missing file is never created.
 func (s Store) removeFromTargetFile(scope, file string, forms hookForms) error {
 	var userFile string
 	checkUser := isProjectScope(scope)
@@ -617,28 +617,16 @@ func (s Store) removeFromTargetFile(scope, file string, forms hookForms) error {
 	if err != nil {
 		return err
 	}
-	if checkUser {
-		alias, aliasErr := userAliasState(targetInfo, userFile)
-		if aliasErr != nil {
-			return aliasErr
-		}
-		if alias {
-			return fmt.Errorf("%s: refuses to edit project settings aliasing user settings", file)
-		}
+	if checkUser && userAliasState(targetInfo, userFile) {
+		return fmt.Errorf("%s: refuses to edit project settings aliasing user settings", file)
 	}
 	var final document
 	changed, err := s.writeSettingsInfo(file, func(doc *document, openInfo fs.FileInfo) error {
 		if openInfo == nil {
 			return errUnchanged
 		}
-		if checkUser {
-			alias, aliasErr := userAliasState(openInfo, userFile)
-			if aliasErr != nil {
-				return aliasErr
-			}
-			if alias {
-				return fmt.Errorf("%s: refuses to edit project settings aliasing user settings", file)
-			}
+		if checkUser && userAliasState(openInfo, userFile) {
+			return fmt.Errorf("%s: refuses to edit project settings aliasing user settings", file)
 		}
 		edits, err := forms.sync(doc.root, false)
 		if err != nil {
@@ -695,26 +683,18 @@ func (s Store) removeFromSharedProjectFile(forms hookForms) error {
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
+	if sharedInfo != nil && userAliasState(sharedInfo, userFile) {
+		return nil
+	}
 	if err != nil {
 		return err
-	}
-	alias, aliasErr := userAliasState(sharedInfo, userFile)
-	if aliasErr != nil {
-		return aliasErr
-	}
-	if alias {
-		return nil
 	}
 	var final document
 	changed, err := s.writeSettingsInfo(sharedFile, func(doc *document, openInfo fs.FileInfo) error {
 		if openInfo == nil {
 			return errUnchanged
 		}
-		alias, aliasErr := userAliasState(openInfo, userFile)
-		if aliasErr != nil {
-			return aliasErr
-		}
-		if alias {
+		if userAliasState(openInfo, userFile) {
 			return errUnchanged
 		}
 		env, _ := doc.env()
@@ -765,19 +745,18 @@ func sameFile(a, b fs.FileInfo) bool {
 }
 
 // userAliasState reports whether targetInfo refers to the same opened file as userFile, or whether
-// userFile's identity cannot be established (such as a symlink loop). Oversized user settings return
-// the size-bound error rather than being treated as absent or uncertain.
-func userAliasState(targetInfo fs.FileInfo, userFile string) (bool, error) {
-	_, userInfo, err := readRegularFile(userFile)
+// userFile's identity cannot be established (such as a symlink loop or non-regular file). It checks
+// file identity without reading userFile's contents, so an unrelated oversized user file never blocks
+// project removal.
+func userAliasState(targetInfo fs.FileInfo, userFile string) bool {
+	userInfo, err := statRegularFile(userFile)
 	switch {
 	case err == nil:
-		return sameFile(targetInfo, userInfo), nil
+		return sameFile(targetInfo, userInfo)
 	case errors.Is(err, fs.ErrNotExist):
-		return false, nil
-	case errors.Is(err, errSnapshotTooLarge):
-		return false, err
+		return false
 	default:
-		return true, nil
+		return true
 	}
 }
 
@@ -810,6 +789,8 @@ func (s Store) SyncMode(health *Health, required string) (ModeResult, error) {
 // MigrateLegacy moves only gateway-owned entries from shared project settings to local settings.
 // It is the automatic migration: shared settings wired to the compatibility URL are left untouched,
 // and no edit is made if moving entries would change the effective base URL or if source and destination alias.
+// Migration executes as two separate single-file atomic replacements (copy to local, then delete from shared),
+// not a two-file transaction.
 func (s Store) MigrateLegacy() (bool, error) {
 	return s.migrateLegacy(false)
 }
@@ -905,13 +886,17 @@ func (s Store) migrateLegacy(explicit bool) (bool, error) {
 	return migrated, err
 }
 
-// migrateLegacyStatus follows lib/settings-wiring.js:361-402. It refuses when the shared project file aliases the
-// user file or the local project file (compared on the opened file descriptors), or when user identity cannot be
-// decided. A shared file wired to the compatibility URL moves only in an explicit write, which copies the gateway
-// URL in its place. Automatic migration (!explicit) makes no edit if the planned changes would alter the
-// effective base URL. Every decision about the source file is re-verified against the current source identity and
-// snapshot inside the destination and source replacement callbacks. declined is true when safety guards refused
-// a migration so callers such as CleanLegacyEnv can stop without making further edits in that run.
+// migrateLegacyStatus follows lib/settings-wiring.js:361-402. It decides whether the shared project file is
+// gateway-wired before reading the user or local files, and refuses when the shared or local file aliases the
+// user file, when shared and local alias each other (compared on the opened file descriptors), or when user
+// identity cannot be decided. A shared file wired to the compatibility URL moves only in an explicit write, which
+// copies the gateway URL in its place. Automatic migration (!explicit) makes no edit if the planned changes would
+// alter the effective base URL. Migration runs as two separate single-file atomic replacements rather than a
+// two-file transaction: the destination copy callback re-verifies the same opened source file and identical bytes
+// (along with alias and effective-URL guards), and the source deletion callback re-verifies the same opened source
+// file, non-aliasing current local and user files, and each copied entry's original value before dropping it.
+// declined is true when safety guards refused a migration so callers such as CleanLegacyEnv can stop without
+// making further edits in that run.
 func (s Store) migrateLegacyStatus(explicit bool) (migrated, declined bool, err error) {
 	legacyFile, err := s.settingsPath("legacy-project")
 	if err != nil {
@@ -930,26 +915,6 @@ func (s Store) migrateLegacyStatus(explicit bool) (migrated, declined bool, err 
 	}
 	if err != nil {
 		return false, false, err
-	}
-	userDoc, userInfo, userOK, skipUser, err := readOptionalUserDoc(userFile, legacyInfo)
-	if err != nil {
-		return false, false, err
-	}
-	if skipUser {
-		return false, true, nil
-	}
-	localFile, err := s.settingsPath("project")
-	if err != nil {
-		return false, false, err
-	}
-	localData, localInfo, localErr := readRegularFile(localFile)
-	switch {
-	case localErr == nil:
-		if sameFile(legacyInfo, localInfo) || sameFile(localInfo, userInfo) {
-			return false, true, nil
-		}
-	case !errors.Is(localErr, fs.ErrNotExist):
-		return false, false, formatReadError(localFile, localErr)
 	}
 	base, ok := legacy.envValue(baseURLKey)
 	if !s.ours(base, ok) {
@@ -986,6 +951,26 @@ func (s Store) migrateLegacyStatus(explicit bool) (migrated, declined bool, err 
 	}
 	if len(drop) == 0 {
 		return false, false, nil
+	}
+	userDoc, userInfo, userOK, skipUser, err := readOptionalUserDoc(userFile, legacyInfo)
+	if err != nil {
+		return false, false, err
+	}
+	if skipUser {
+		return false, true, nil
+	}
+	localFile, err := s.settingsPath("project")
+	if err != nil {
+		return false, false, err
+	}
+	localData, localInfo, localErr := readRegularFile(localFile)
+	switch {
+	case localErr == nil:
+		if sameFile(legacyInfo, localInfo) || sameFile(localInfo, userInfo) {
+			return false, true, nil
+		}
+	case !errors.Is(localErr, fs.ErrNotExist):
+		return false, false, formatReadError(localFile, localErr)
 	}
 	if err := s.checkOwnedDuplicates(legacy.data); err != nil {
 		return false, false, fmt.Errorf("%s: %w", legacyFile, err)
@@ -1047,7 +1032,7 @@ func (s Store) migrateLegacyStatus(explicit bool) (migrated, declined bool, err 
 			aborted = true
 			return errUnchanged
 		}
-		curUserDoc, _, curUserOK, curSkipUser, curUserErr := readOptionalUserDoc(userFile, info)
+		curUserDoc, curUserInfo, curUserOK, curSkipUser, curUserErr := readOptionalUserDoc(userFile, info)
 		if curUserErr != nil {
 			return curUserErr
 		}
@@ -1059,7 +1044,7 @@ func (s Store) migrateLegacyStatus(explicit bool) (migrated, declined bool, err 
 		if errors.Is(curLocalErr, errSnapshotTooLarge) {
 			return curLocalErr
 		}
-		if curLocalErr != nil || sameFile(info, curLocalInfo) {
+		if curLocalErr != nil || sameFile(info, curLocalInfo) || sameFile(curLocalInfo, curUserInfo) {
 			aborted = true
 			return errUnchanged
 		}

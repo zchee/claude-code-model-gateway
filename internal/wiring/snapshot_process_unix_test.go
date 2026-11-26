@@ -41,7 +41,10 @@ func TestSnapshotReaderRefusesUnixSocketWithoutBlocking(t *testing.T) {
 	go func() {
 		defer close(done)
 		res, err := f.EffectiveBaseURL()
-		check(t, err)
+		if err != nil {
+			t.Errorf("EffectiveBaseURL: %v", err)
+			return
+		}
 		if res.Winner == nil || res.Winner.Source != "user" {
 			t.Errorf("expected fallback to user, got %+v", res)
 		}

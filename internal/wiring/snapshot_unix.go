@@ -64,3 +64,23 @@ func readRegularFileLimit(path string, limit int64) ([]byte, fs.FileInfo, error)
 	}
 	return data, info, nil
 }
+
+// statRegularFile opens path without blocking on non-regular files, verifies on the opened
+// descriptor that the target is a regular file, and returns its FileInfo without reading the
+// file contents. Symlinks to regular files are followed; FIFOs, devices, directories and sockets
+// are refused.
+func statRegularFile(path string) (fs.FileInfo, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, &atomicfile.NonRegularError{Path: path}
+	}
+	return info, nil
+}
