@@ -15,7 +15,7 @@ module.exports = function install(config, inherited) {
   if (!inherited && !process.argv[1]?.endsWith('.test.js')) return;
   const { plugin, root, target, build, log } = config;
   if (!inherited && process.execArgv.includes('--test')) return;
-  if (!inherited) {
+  if (!inherited && config.trackActive !== false) {
     const running = path.join(config.work, `active-${process.pid}`);
     fs.writeFileSync(running, path.relative(plugin, process.argv[1]), { flag: 'wx' });
     process.on('exit', () => fs.rmSync(running, { force: true }));
@@ -71,12 +71,58 @@ module.exports = function install(config, inherited) {
         JSON.stringify(expectedEnv) !== JSON.stringify(fields.slice(count).sort())) throw new Error('recording binary observed different argv or environment');
     return result.pid;
   }
+  function failClosed(reason, kind, testInfo) {
+    fs.appendFileSync(log, JSON.stringify({
+      ...(testInfo ?? {}),
+      unattributed: true,
+      reason,
+      kind,
+      target,
+      build,
+    }) + '\n');
+    throw new Error(`conformance adapter: ${reason}`);
+  }
+
   for (const method of ['spawn', 'spawnSync']) {
     const original = cp[method];
     cp[method] = function (command, args, options) {
       if (command !== process.execPath || !Array.isArray(args)) return original.apply(this, arguments);
+
+      let binaryArgs, kind, isCli = false;
+      const entry = args[0];
+      const script = entry === '--require' || entry === '-r' ? 2 : 0;
+      const arg = args[script];
+      let resolved = null;
+      if (arg && !arg.startsWith('-')) {
+        const candidate = path.resolve(options?.cwd ?? process.cwd(), arg);
+        try {
+          if (fs.statSync(candidate).isFile()) resolved = fs.realpathSync.native(candidate);
+        } catch { /* Non-existent or unreadable script is not a product entry. */ }
+      }
+      const isBirthObserver = !inherited && arg && path.basename(arg) === 'worker-birth.cjs';
+      if (resolved === cli || (resolved && resolved.endsWith('/bin/model-gateway.js') && fs.readFileSync(resolved).equals(cliBytes))) {
+        isCli = true;
+        binaryArgs = args.slice(script + 1);
+        kind = binaryArgs[0] === 'serve-shim' ? 'supervisor' : binaryArgs[0] === 'serve-worker' ? 'worker' : 'cli';
+      } else if (entry === '-e' && args[1] === `require(${JSON.stringify(path.join(plugin, 'lib/request-worker.js'))}).runWorker()`) {
+        kind = 'worker'; binaryArgs = ['serve-worker'];
+      } else if (resolved && resolved.endsWith('/model-gateway/model-gateway.js')) {
+        kind = 'shim'; binaryArgs = args.slice(1);
+      } else if (resolved && resolved.endsWith('/model-gateway/update.js')) {
+        kind = 'shim'; binaryArgs = ['setup', '--preserve-wiring'];
+      } else if (resolved === path.join(plugin, 'hooks/registry-writer.js')) {
+        kind = 'hook'; binaryArgs = ['hook', 'session-start', ...args.slice(1)];
+      } else if (resolved === path.join(plugin, 'hooks/ensure.js')) {
+        kind = 'hook'; binaryArgs = args.slice(1);
+      } else if (!isBirthObserver) {
+        // Known decoys, fake fixtures and unrelated Node scripts stay on Node.
+        return original.apply(this, arguments);
+      }
+
+      const detectedKind = kind ?? 'birth';
       const test = owner();
-      if (!test) return original.apply(this, arguments);
+      if (!test) failClosed(`product launch (${detectedKind}) without test owner`, detectedKind, null);
+
       const matches = inherited ? [inherited.row] : getCallSites(100).flatMap(frame =>
         sites.get(`${path.relative(plugin, frame.scriptName)}:${frame.lineNumber}`) ?? []);
       // V8's async stack also contains callers suspended at await. getCallSites
@@ -91,40 +137,31 @@ module.exports = function install(config, inherited) {
           if (location) matches.push(...(sites.get(`${path.relative(plugin, location[1])}:${location[2]}`) ?? []));
         }
       }
-      if (!matches.length) return original.apply(this, arguments);
+      if (!matches.length) {
+        failClosed(`product launch (${detectedKind}) outside inventoried sites for ${test.path}:${test.line}`, detectedKind, test);
+      }
+
       const owned = matches.filter(r => r.name === test.name && !r.via.startsWith('subtest:'));
       // This generated birth observer itself must stay Node. Its inner spawn
       // is a copied gateway entry, at a source line embedded in a string.
-      if (!inherited && owned.some(r => r.via === 'startStaleWorkerFixture') && args[0] && path.basename(args[0]) === 'worker-birth.cjs') {
+      if (isBirthObserver) {
+        if (!owned.some(r => r.via === 'startStaleWorkerFixture')) {
+          failClosed(`unattributed worker birth observer for ${test.path}:${test.line}`, 'birth', test);
+        }
         const inner = [...sites.values()].flat().find(r => r.name === test.name && r.kind === 'worker' && r.via === 'spawn');
-        if (!inner) throw new Error('missing worker birth launch site');
+        if (!inner) failClosed(`missing worker birth launch site for ${test.path}:${test.line}`, 'birth', test);
         const preload = path.join(config.work, `birth-${process.pid}-${++birthSeq}.cjs`);
         fs.writeFileSync(preload, `require(${JSON.stringify(__filename)})(${JSON.stringify(config)},${JSON.stringify({ owner: test, row: inner })});\n`);
         return original.call(this, command, ['--require', preload, ...args], options);
       }
-      let binaryArgs, kind;
-      const entry = args[0];
-      const script = entry === '--require' || entry === '-r' ? 2 : 0;
-      const arg = args[script];
-      const candidate = arg && !arg.startsWith('-') && (path.isAbsolute(arg) ? arg : `${options?.cwd ?? process.cwd()}/${arg}`);
-      const resolved = candidate && fs.existsSync(candidate) && fs.realpathSync.native(candidate);
-      if (resolved === cli || (resolved && resolved.endsWith('/bin/model-gateway.js') && fs.readFileSync(resolved).equals(cliBytes))) {
-        binaryArgs = args.slice(script + 1);
-        kind = binaryArgs[0] === 'serve-shim' ? 'supervisor' : binaryArgs[0] === 'serve-worker' ? 'worker' : 'cli';
-      } else if (entry === '-e' && args[1] === `require(${JSON.stringify(path.join(plugin, 'lib/request-worker.js'))}).runWorker()`) {
-        kind = 'worker'; binaryArgs = ['serve-worker'];
-      } else if (resolved && resolved.endsWith('/model-gateway/model-gateway.js')) {
-        kind = 'shim'; binaryArgs = args.slice(1);
-      } else if (resolved && resolved.endsWith('/model-gateway/update.js')) {
-        kind = 'shim'; binaryArgs = ['setup', '--preserve-wiring'];
-      } else if (resolved === path.join(plugin, 'hooks/registry-writer.js')) {
-        kind = 'hook'; binaryArgs = ['hook', 'session-start', ...args.slice(1)];
-      } else if (resolved === path.join(plugin, 'hooks/ensure.js')) {
-        kind = 'hook'; binaryArgs = args.slice(1);
-      } else return original.apply(this, arguments);
-      const row = owned.find(r => r.kind === kind) ?? matches.find(r => r.name === '-' && r.kind === kind) ??
-        (resolved && resolved.endsWith('/bin/model-gateway.js') && matches.find(r => r.site.startsWith('test/support.js:') && r.kind === 'helper'));
-      if (!row) return original.apply(this, arguments);
+
+      const allowSupportHelper = test.path.startsWith('test/conformance/');
+      const row = owned.find(r => r.kind === kind) ??
+        matches.find(r => r.name === '-' && r.kind === kind) ??
+        (isCli && allowSupportHelper && matches.find(r => r.site.startsWith('test/support.js:') && r.kind === 'helper'));
+      if (!row) {
+        failClosed(`product launch (${kind}) has no matching inventory row for ${test.path}:${test.line} ${test.name}`, kind, test);
+      }
 
       const witnessPid = config.witness ? witness(command, args, binaryArgs, options) : null;
       const child = dispatch(original, target, command, args, binaryArgs, options);

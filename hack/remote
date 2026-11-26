@@ -176,8 +176,132 @@ negative_control() (
     restore_attestation "$failed"
 )
 
+venue_stop_verify_scope() {
+    local unit=$1
+    python3 -I - "$unit" <<'PY'
+import os, subprocess, sys, time
+from pathlib import Path
+
+unit = sys.argv[1]
+uid = os.getuid()
+env = dict(os.environ, XDG_RUNTIME_DIR=f"/run/user/{uid}")
+env.pop("DBUS_SESSION_BUS_ADDRESS", None)
+
+def run_sc(args):
+    try:
+        return subprocess.run(["systemctl", "--user", *args], env=env, capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+def cg_dir():
+    res = run_sc(["show", "-p", "ControlGroup", "--value", unit])
+    if res is None or res.returncode != 0:
+        return None
+    cg = res.stdout.strip() or f"/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/{unit}"
+    return Path("/sys/fs/cgroup") / cg.lstrip("/")
+
+def state():
+    res = run_sc(["show", "-p", "ActiveState", "--value", unit])
+    return None if (res is None or res.returncode != 0) else res.stdout.strip()
+
+def pids(cg):
+    try:
+        return [int(x) for x in (cg / "cgroup.procs").read_text().splitlines() if x.strip()]
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return None
+
+def wait_clear(cg, limit):
+    deadline = time.monotonic() + limit
+    while True:
+        p, s = pids(cg), state()
+        if p == [] and s in ("inactive", "failed"):
+            if s == "failed":
+                run_sc(["reset-failed", unit])
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+cg = cg_dir()
+if cg is None:
+    sys.exit(1)
+cur, st = pids(cg), state()
+if cur is None or st is None:
+    sys.exit(1)
+if cur or st not in ("inactive", "failed"):
+    if cur:
+        run_sc(["kill", "-s", "SIGTERM", "--kill-who=all", unit])
+    if not wait_clear(cg, 3.0):
+        try:
+            (cg / "cgroup.kill").write_text("1\n")
+        except OSError:
+            pass
+        run_sc(["kill", "-s", "SIGKILL", "--kill-who=all", unit])
+        run_sc(["stop", unit])
+        if not wait_clear(cg, 5.0):
+            sys.exit(1)
+elif st == "failed":
+    run_sc(["reset-failed", unit])
+sys.exit(0 if pids(cg) == [] and state() == "inactive" else 1)
+PY
+}
+
+venue_scope_state() {
+    local file=$1
+    python3 -I - "$file" <<'PY'
+import os, subprocess, sys
+from pathlib import Path
+
+uid = os.getuid()
+env = dict(os.environ, XDG_RUNTIME_DIR=f"/run/user/{uid}")
+env.pop("DBUS_SESSION_BUS_ADDRESS", None)
+parts = []
+for raw in Path(sys.argv[1]).read_text().splitlines():
+    if "=" not in raw:
+        continue
+    role, unit = raw.split("=", 1)
+    try:
+        cg_res = subprocess.run(["systemctl", "--user", "show", "-p", "ControlGroup", "--value", unit], env=env, capture_output=True, text=True, timeout=5, check=False)
+        st_res = subprocess.run(["systemctl", "--user", "show", "-p", "ActiveState", "--value", unit], env=env, capture_output=True, text=True, timeout=5, check=False)
+        st = st_res.stdout.strip() if st_res.returncode == 0 else "unknown"
+        cg_val = (cg_res.stdout.strip() if cg_res.returncode == 0 else "") or f"/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/{unit}"
+        procs = Path("/sys/fs/cgroup") / cg_val.lstrip("/") / "cgroup.procs"
+        try:
+            live = [int(x) for x in procs.read_text().splitlines() if x.strip()]
+        except FileNotFoundError:
+            live = []
+        parts.append(f"{role}={unit} state={st} pids={live}")
+    except (OSError, subprocess.TimeoutExpired):
+        parts.append(f"{role}={unit} state=unreadable")
+print("; ".join(parts) or "unverified prior scope")
+PY
+}
+
+cleanup_scopes() {
+    local rc=$1 base=$2 line unit
+    if [[ -f $base/active-scope ]]; then
+        while IFS= read -r line; do
+            if [[ $line == job=* ]]; then
+                unit=${line#job=}
+                if ! venue_stop_verify_scope "$unit"; then
+                    printf 'unverified job scope termination: %s\n' "$unit" >| "$base/unavailable"
+                    printf 'remote: could not verify termination of %s; venue marked unavailable\n' "$unit" >&2
+                    rc=1
+                fi
+            fi
+        done < "$base/active-scope"
+        if [[ ! -e $base/unavailable ]]; then
+            rm -f -- "$base/active-scope"
+        fi
+    fi
+    return "$rc"
+}
+
 cleanup_run() {
-    local rc=$1 path=$2 runs=$3
+    local rc=$1 path=$2 runs=$3 base=$4
+    cleanup_scopes "$rc" "$base" || rc=$?
     cd "$runs"
     if [[ $rc == 0 ]]; then rm -rf -- "$path"; else printf 'failed run retained: %s\n' "$path" >&2; fi
     python3 -I -c 'import pathlib,shutil; paths=sorted(pathlib.Path.cwd().glob("run.*"),key=lambda p:p.stat().st_mtime_ns,reverse=True); [shutil.rmtree(p) for p in paths[5:]]'
@@ -213,7 +337,17 @@ remote_main() {
             printf 'attestation: absent or invalid; state and ports not checked\n'
         fi
         if [[ -d $base && ! -L $base && -O $base && $(stat -c %a "$base") == 700 ]]; then
-            if flock -ns "$base" true; then printf 'lock: free\n'; else printf 'lock: held (%s)\n' "$(<"$base/holder")"; fi
+            if [[ -e $base/unavailable ]]; then
+                printf 'venue: unavailable (%s)\n' "$(tr '\n' ' ' < "$base/unavailable")"
+            elif flock -ns "$base" true; then
+                if [[ -f $base/active-scope ]]; then
+                    printf 'venue: unavailable (%s)\n' "$(venue_scope_state "$base/active-scope")"
+                else
+                    printf 'lock: free\n'
+                fi
+            else
+                printf 'lock: held (%s)\n' "$(<"$base/holder")"
+            fi
             if [[ -x $go/bin/go ]]; then printf 'Go: %s\n' "$gover"; else printf 'Go: absent\n'; fi
             if [[ -x $node/bin/node ]]; then printf 'Node: %s\n' "$nodever"; else printf 'Node: absent\n'; fi
         else printf 'venue toolchains and lock: unavailable\n'; fi
@@ -235,6 +369,36 @@ remote_main() {
     flock -nx 9 || fail 'venue locked by another operation'
     [[ $base -ef /proc/self/fd/9 ]] || fail 'venue directory replaced'
     printf 'pid=%s command=%s\n' "$$" "$op" >| "$base/holder"
+    if [[ $op == provision || $op == deprovision ]]; then
+        if [[ -f $base/active-scope ]]; then
+            local scope_line scope_unit
+            while IFS= read -r scope_line; do
+                scope_unit=${scope_line#*=}
+                [[ -n $scope_unit ]] || continue
+                venue_stop_verify_scope "$scope_unit" || fail "cannot verify termination of prior scope $scope_unit; venue remains unavailable"
+            done < "$base/active-scope"
+            rm -f -- "$base/active-scope"
+        fi
+        if [[ -e $base/unavailable ]]; then
+            venue_state_clear "$home"; venue_ports_clear
+            rm -f -- "$base/unavailable"
+            printf 'recovered unavailable venue state after verifying empty scopes\n'
+        fi
+    else
+        if [[ -e $base/unavailable ]]; then
+            fail "venue marked unavailable ($(tr '\n' ' ' < "$base/unavailable")); run provision to verify and recover"
+        fi
+        if [[ -f $base/active-scope ]]; then
+            fail "venue has unverified prior scope ($(venue_scope_state "$base/active-scope")); run provision to verify and recover"
+        fi
+        if [[ -n ${CONFORMANCE_OUTER_UNIT:-} ]]; then
+            printf 'outer=%s\n' "$CONFORMANCE_OUTER_UNIT" >| "$base/active-scope"
+            export CONFORMANCE_SCOPE_FILE=$base/active-scope
+            export CONFORMANCE_UNAVAILABLE_FILE=$base/unavailable
+            # shellcheck disable=SC2064
+            trap "cleanup_scopes \"\$?\" '$base'" EXIT
+        fi
+    fi
     if [[ $op == deprovision ]]; then
         rm -f -- "$marker" "$saved"
         chmod -R u+w "$base"; rm -rf -- "$base"; return
@@ -259,7 +423,7 @@ remote_main() {
     run=$(mktemp -d "$base/runs/run.XXXXXXXX")
     # Capture these local paths before remote_main returns and loses its scope.
     # shellcheck disable=SC2064
-    trap "cleanup_run \"\$?\" '$run' '$base/runs'" EXIT
+    trap "cleanup_run \"\$?\" '$run' '$base/runs' '$base'" EXIT
     mkdir "$run/tree"; cd "$run/tree"
     tar -xf - --no-same-owner
     ./hack/venue-check
@@ -267,6 +431,8 @@ remote_main() {
 }
 
 op=${1:-}; [[ $# == 0 ]] || shift
+conf_timeout=200
+conf_max=200
 case $op in
     provision|deprovision|status) [[ $# == 0 ]] || fail "unexpected arguments for $op" ;;
     negative-control)
@@ -279,9 +445,14 @@ case $op in
              for arg in "${@:2}"; do
                  if [[ $arg == TARGET=binary:* && ${arg#TARGET=binary:} =~ (^|/)\.\.(/|$) ]]; then fail 'binary target contains a parent component'; fi
                  [[ $arg == CLASS=conformance || $arg =~ ^MODE=(suite|self-test|probes)$ || $arg =~ ^TARGET=(identity|binary:/[a-zA-Z0-9_./-]+)$ ||
-                    $arg =~ ^TIMEOUT_SECONDS=[1-9][0-9]{0,2}$ || $arg =~ ^SITE=test/[a-zA-Z0-9_-]+\.test\.js:[1-9][0-9]*$ ||
+                    $arg =~ ^TIMEOUT_SECONDS=[1-9][0-9]{0,3}$ || $arg =~ ^MAX_TIMEOUT_SECONDS=[1-9][0-9]{0,3}$ ||
+                    $arg =~ ^SITE=test/[a-zA-Z0-9_-]+\.test\.js:[1-9][0-9]*$ ||
                     $arg =~ ^PHASE=phase-[0-9]+$ || $arg =~ ^PACKAGE=[a-zA-Z0-9_./-]+$ || $arg =~ ^GATE=(task|phase)$ ]] || fail 'invalid conformance selector'
+                 if [[ $arg == TIMEOUT_SECONDS=* ]]; then conf_timeout=${arg#TIMEOUT_SECONDS=}; fi
+                 if [[ $arg == MAX_TIMEOUT_SECONDS=* ]]; then conf_max=${arg#MAX_TIMEOUT_SECONDS=}; fi
              done
+             (( conf_max <= 1800 )) || fail 'MAX_TIMEOUT_SECONDS must be between 1 and 1800'
+             (( conf_timeout <= conf_max )) || fail "TIMEOUT_SECONDS must be between 1 and $conf_max"
          else
              for target do [[ $target =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || fail 'invalid make target'; done
          fi ;;
@@ -296,11 +467,17 @@ reject_local "${host##*@}" "$expanded"
 root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 gover=go1.27.4
 # Send only the functions and validated arguments; stdin remains the tree archive.
-program=$(declare -f venue_refuse venue_home venue_file_kind venue_state_clear venue_ports_clear venue_attest venue_require fail fetch tool_version_ok install_tools negative_control restore_attestation cleanup_run remote_main)
+program=$(declare -f venue_refuse venue_home venue_file_kind venue_state_clear venue_ports_clear venue_attest venue_require fail fetch tool_version_ok install_tools negative_control restore_attestation venue_stop_verify_scope venue_scope_state cleanup_scopes cleanup_run remote_main)
 program=$'set -euo pipefail\n'"$program"$'\nremote_main "$@"'
 # A single-line encoding survives SSH command relays that split multiline arguments.
 encoded=$(printf '%s' "$program" | base64 | tr -d '\n')
-cmd="env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin GITHUB_ACTIONS=\"\${GITHUB_ACTIONS:-}\" /bin/bash -c \"\$(printf %s $encoded | base64 -d)\" remote"
+if [[ $op == run && $1 == conformance ]]; then
+    outer_unit="mgw-remote-$$-$(date +%s).scope"
+    outer_limit=$((conf_timeout + 90))
+    cmd="XDG_RUNTIME_DIR=\"/run/user/\$(id -u)\" systemd-run --user --scope --unit=$outer_unit -p RuntimeMaxSec=$outer_limit -p TimeoutStopSec=5 -p KillMode=control-group -p CollectMode=inactive-or-failed --quiet -- env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin GITHUB_ACTIONS=\"\${GITHUB_ACTIONS:-}\" CONFORMANCE_OUTER_UNIT=$outer_unit CONFORMANCE_REQUIRE_SCOPE=1 /bin/bash -c \"\$(printf %s $encoded | base64 -d)\" remote"
+else
+    cmd="env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin GITHUB_ACTIONS=\"\${GITHUB_ACTIONS:-}\" /bin/bash -c \"\$(printf %s $encoded | base64 -d)\" remote"
+fi
 for arg in "$op" "$(hostname -s)" "$gover" v24.11.1 "$@"; do
     [[ $arg =~ ^[a-zA-Z0-9_=.:/-]+$ ]] || fail 'invalid remote argument'
     cmd+=" $arg"

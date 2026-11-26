@@ -7,6 +7,14 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
+const PROBE_FILE = 'test/conformance/probes/launch.test.js';
+const REQUIRED_PROBES = [
+  { name: 'launch probe: stdout listener, health pid and fixture IPC shutdown', kind: 'supervisor' },
+  { name: 'launch probe: standalone worker accepts fixture drain', kind: 'worker' },
+  { name: 'launch probe: standalone worker exits when fixture IPC disconnects', kind: 'worker' },
+  { name: 'launch probe: copied proxy is real Node and fixture NODE_OPTIONS survives', kind: 'worker' },
+];
+
 function tsv(file) {
   const [header, ...lines] = fs.readFileSync(file, 'utf8').trimEnd().split('\n');
   const columns = header.split('\t');
@@ -27,7 +35,8 @@ function createLog(request, plugin) {
 }
 
 const key = r => JSON.stringify([r.path, Number(r.line), Number(r.column), r.name]);
-const validLaunch = (r, target, build) => r.target === target && r.build === build && Number.isSafeInteger(r.pid) && r.pid > 0;
+const validLaunch = (r, target, build) =>
+  !r.unattributed && r.target === target && r.build === build && Number.isSafeInteger(r.pid) && r.pid > 0;
 
 // Only an inventory edge to this exact nested registration may also credit its parent.
 function parentCredits(sites, census) {
@@ -41,4 +50,184 @@ function parentCredits(sites, census) {
   return r => result.get(JSON.stringify([key(r), r.site, r.kind]));
 }
 
-module.exports = { createLog, key, parentCredits, tsv, validLaunch };
+function evaluateSuite({
+  target, build, full, probes, selected, baseline, sites, launches, events,
+  expectedFiles, runnerStatus, runnerError = null, normalizeFile = f => f, binaryUnchanged = true,
+}) {
+  const errors = [];
+  let failed = runnerStatus !== 0;
+  const error = message => { failed = true; errors.push(message); };
+  if (runnerError) error(runnerError);
+
+  const parent = parentCredits(sites, baseline);
+  const validLaunches = [];
+  const credited = new Set();
+  for (const r of launches) {
+    if (r.unattributed) {
+      error(`unattributed or unredirected product launch: ${r.reason ?? 'unknown'}`);
+      continue;
+    }
+    if (!validLaunch(r, target, build)) {
+      error(`invalid launch at ${r.site}`);
+      continue;
+    }
+    validLaunches.push(r);
+    credited.add(key(r));
+    if (parent(r)) credited.add(key(parent(r)));
+  }
+
+  const observed = new Map();
+  const observedProbes = new Map();
+  const probeIds = new Set();
+  const observedByFile = new Map();
+  const ends = new Map();
+  const stacks = new Map();
+  const expectedFileSet = new Set(expectedFiles);
+  const bump = (file, status) => {
+    if (!observedByFile.has(file)) observedByFile.set(file, { pass: 0, fail: 0, skip: 0, todo: 0 });
+    observedByFile.get(file)[status]++;
+  };
+
+  try {
+    for (const event of events) {
+      if (event.type === 'baseline:environment') continue;
+      if (['test:abort', 'test:aborted', 'test:cancelled'].includes(event.type) ||
+          ['cancelledByParent', 'testAborted', 'testTimeoutFailure'].includes(event.failureType)) {
+        error(`aborted test: ${event.name}`);
+      }
+      const file = event.file == null ? null : normalizeFile(event.file);
+      if (event.type === 'test:summary') {
+        if (!event.counts || event.counts.cancelled || !event.success) {
+          error(`unsuccessful test summary: ${file ?? 'suite'}`);
+        }
+        if (file !== null && !expectedFileSet.has(file)) {
+          error(`unknown test summary: ${file}`);
+        } else if (ends.has(file)) {
+          error(`duplicate test summary: ${file ?? 'suite'}`);
+        } else {
+          ends.set(file, event);
+        }
+        continue;
+      }
+      if (!['test:start', 'test:pass', 'test:fail'].includes(event.type)) continue;
+      if (file === null || !expectedFileSet.has(file)) {
+        error(`unknown event file: ${file}`);
+        continue;
+      }
+      if (ends.has(file)) error(`event after file summary: ${file}`);
+      if (!stacks.has(file)) stacks.set(file, []);
+      const stack = stacks.get(file);
+      if (event.type === 'test:start') {
+        assert.equal(stack.length, event.nesting, `broken parent chain: ${file}:${event.line}`);
+        stack.push(event);
+        continue;
+      }
+      assert.equal(stack.length, event.nesting + 1, `unmatched terminal event: ${file}:${event.line}`);
+      const start = stack.pop();
+      assert.equal(key(start), key(event), `mismatched terminal event: ${file}:${event.line}`);
+      const name = [...stack.map(s => s.name), event.name].join(' > ');
+      const id = key({ ...event, path: file, name });
+      if (observed.has(id)) error(`duplicate result ${id}`);
+      const status = Object.hasOwn(event, 'skip') ? 'skip' : Object.hasOwn(event, 'todo') ? 'todo' :
+        event.type === 'test:pass' ? 'pass' : 'fail';
+      observed.set(id, status);
+      bump(file, status);
+      if (file === PROBE_FILE) {
+        probeIds.add(id);
+        if (observedProbes.has(name)) error(`duplicate probe name: ${name}`);
+        observedProbes.set(name, { id, status });
+      }
+    }
+    if ([...stacks.values()].some(s => s.length)) error('unfinished tests in event stream');
+  } catch (err) {
+    error(`reporter stream: ${err.message}`);
+  }
+
+  for (const expectedFile of [...expectedFileSet, null]) {
+    if (!ends.has(expectedFile)) error(`missing test summary: ${expectedFile ?? 'suite'}`);
+  }
+  const totals = { pass: 0, fail: 0, skip: 0, todo: 0 };
+  for (const c of observedByFile.values()) {
+    totals.pass += c.pass;
+    totals.fail += c.fail;
+    totals.skip += c.skip;
+    totals.todo += c.todo;
+  }
+  for (const [file, summary] of ends) {
+    const c = file === null ? totals : (observedByFile.get(file) ?? { pass: 0, fail: 0, skip: 0, todo: 0 });
+    const total = c.pass + c.fail + c.skip + c.todo;
+    const sc = summary.counts;
+    if (!sc || sc.tests !== total || sc.passed !== c.pass || sc.failed !== c.fail ||
+        sc.skipped !== c.skip || sc.todo !== c.todo || sc.cancelled !== 0) {
+      error(`summary count mismatch for ${file ?? 'suite'}: runner=${JSON.stringify(sc)} observed=${JSON.stringify({ tests: total, ...c })}`);
+    }
+    if (Boolean(summary.success) !== (c.fail === 0)) {
+      error(`summary success mismatch for ${file ?? 'suite'}`);
+    }
+  }
+  if (ends.has(null) && (runnerStatus === 0) !== Boolean(ends.get(null).success)) {
+    error('suite exit status disagrees with runner summary');
+  }
+
+  const statuses = new Map(baseline.map(r => [key(r), r.status]));
+  const selectedKeys = new Set(selected.map(key));
+  if (full && (statuses.size !== selected.length || statuses.size !== selectedKeys.size ||
+      [...statuses.keys()].some(id => !selectedKeys.has(id)))) {
+    error('baseline/classification keys differ');
+  }
+
+  for (const r of selected) {
+    const id = key(r);
+    const expected = full ? statuses.get(id) : 'pass';
+    if (observed.get(id) !== expected) error(`${id}: expected ${expected}, got ${observed.get(id) ?? 'missing'}`);
+    if (observed.get(id) !== 'pass') continue;
+    const obligations = sites.filter(s => s.path === r.path && s.case === r.name && s.kind !== 'helper');
+    if (r.class !== 'conformance' && !obligations.length) continue;
+    if (!obligations.length) {
+      if (!credited.has(id)) error(`no attributed launch: ${id}`);
+      continue;
+    }
+    for (const s of obligations) {
+      const launchSite = `${s.path}:${s.line}`;
+      if (s.via.startsWith('subtest: ')) {
+        const childName = `${s.case} > ${s.via.slice(9)}`;
+        const matched = validLaunches.some(l => l.path === s.path && l.name === childName && l.kind === s.kind &&
+          (l.site === launchSite || l.callers?.includes(launchSite)) && parent(l) && key(parent(l)) === id);
+        if (!matched) error(`missing attributed nested launch at ${launchSite} (${s.kind}) for ${id}`);
+      } else {
+        const matched = validLaunches.some(l => key(l) === id && l.kind === s.kind &&
+          (l.site === launchSite || l.callers?.includes(launchSite)));
+        if (!matched) error(`missing attributed launch at ${launchSite} (${s.kind}) for ${id}`);
+      }
+    }
+  }
+
+  if (probes) {
+    const requiredNames = new Set(REQUIRED_PROBES.map(p => p.name));
+    for (const { name, kind } of REQUIRED_PROBES) {
+      const probe = observedProbes.get(name);
+      if (!probe) {
+        error(`missing required probe: ${name}`);
+      } else if (probe.status !== 'pass' || !validLaunches.some(l => key(l) === probe.id && l.kind === kind)) {
+        error(`unproven probe: ${probe.id}`);
+      }
+    }
+    for (const [name, probe] of observedProbes) {
+      if (!requiredNames.has(name)) error(`unexpected probe registration: ${probe.id}`);
+    }
+  }
+
+  for (const [id] of observed) {
+    if (selectedKeys.has(id)) continue;
+    if (probes && probeIds.has(id)) continue;
+    error(`unexpected registration: ${id}`);
+  }
+
+  if (!binaryUnchanged) error('target binary changed during the run');
+
+  const counts = Object.fromEntries(['pass', 'fail', 'skip', 'todo'].map(s =>
+    [s, [...observed.values()].filter(v => v === s).length]));
+  return { failed, errors, counts, observed, validLaunches };
+}
+
+module.exports = { PROBE_FILE, REQUIRED_PROBES, createLog, evaluateSuite, key, parentCredits, tsv, validLaunch };

@@ -1,0 +1,242 @@
+#!/usr/bin/env bash
+# Copyright 2026 The claude-code-model-gateway Authors.
+# SPDX-License-Identifier: Apache-2.0
+set -euo pipefail
+root=${1:-$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)}
+"$root/hack/venue-check"
+
+if [[ $(uname -s) != Linux ]]; then
+    printf '# conformance containment check: skipped non-Linux scope controls\n'
+    exit 0
+fi
+
+stage=$(mktemp -d "${root%/*}/containment-check.XXXXXX")
+# Invoked by the EXIT trap.
+# shellcheck disable=SC2329
+cleanup() {
+    rm -rf -- "$stage"
+}
+trap cleanup EXIT
+
+make_mirror() {
+    local dst=$1
+    mkdir -p "$dst/hack"
+    cp "$root/hack/conformance" "$dst/hack/conformance"
+    cp "$root/hack/conformance-supervise" "$dst/hack/conformance-supervise"
+    ln -s "$root/hack/venue-check" "$dst/hack/venue-check"
+    chmod +x "$dst/hack/conformance"
+}
+
+fail() {
+    printf 'conformance containment check FAILED: %s\n' "$*" >&2
+    exit 1
+}
+
+assert_pid_dead() {
+    local pid=$1 label=$2
+    if kill -0 "$pid" 2>/dev/null; then
+        fail "$label: pid $pid is still alive"
+    fi
+}
+
+# Control 1: Timeout ceiling validation (default 200s, raisable via MAX_TIMEOUT_SECONDS up to 1800s).
+m0=$stage/m0
+make_mirror "$m0"
+cat > "$m0/hack/conformance-job" <<'JOB'
+#!/usr/bin/env bash
+exit 0
+JOB
+chmod +x "$m0/hack/conformance-job"
+
+rc=0
+TIMEOUT_SECONDS=201 CONFORMANCE_SKIP_CONTAINMENT_CHECK=1 CONFORMANCE_REQUIRE_SCOPE=1 \
+    CONFORMANCE_SCOPE_FILE='' CONFORMANCE_UNAVAILABLE_FILE='' \
+    "$m0/hack/conformance" >/dev/null 2>"$stage/m0-default.err" || rc=$?
+[[ $rc != 0 ]] || fail 'TIMEOUT_SECONDS=201 succeeded without raising MAX_TIMEOUT_SECONDS'
+grep -q 'TIMEOUT_SECONDS must be between 1 and 200' "$stage/m0-default.err" || fail 'missing 200s ceiling diagnostic'
+
+rc=0
+MAX_TIMEOUT_SECONDS=1801 TIMEOUT_SECONDS=250 CONFORMANCE_SKIP_CONTAINMENT_CHECK=1 CONFORMANCE_REQUIRE_SCOPE=1 \
+    CONFORMANCE_SCOPE_FILE='' CONFORMANCE_UNAVAILABLE_FILE='' \
+    "$m0/hack/conformance" >/dev/null 2>"$stage/m0-max.err" || rc=$?
+[[ $rc != 0 ]] || fail 'MAX_TIMEOUT_SECONDS=1801 succeeded above hard bound'
+
+MAX_TIMEOUT_SECONDS=300 TIMEOUT_SECONDS=250 CONFORMANCE_SKIP_CONTAINMENT_CHECK=1 CONFORMANCE_REQUIRE_SCOPE=1 \
+    CONFORMANCE_SCOPE_FILE='' CONFORMANCE_UNAVAILABLE_FILE='' \
+    "$m0/hack/conformance" >/dev/null 2>"$stage/m0-raised.err" || fail 'raised MAX_TIMEOUT_SECONDS=300 TIMEOUT_SECONDS=250 failed'
+printf '# containment control 1: timeout default 200s and MAX_TIMEOUT_SECONDS override verified\n'
+
+# Control 2: Detached ppid=1 SIGTERM-ignoring survivor outlives an exit-0 job.
+m1=$stage/m1
+make_mirror "$m1"
+cat > "$m1/hack/conformance-job" <<JOB
+#!/usr/bin/env bash
+set -euo pipefail
+python3 -I - "$stage/survivor.pid" "$stage/survivor.ppid" <<'PY'
+import os, subprocess, sys, time
+child = subprocess.Popen(
+    [
+        "python3",
+        "-I",
+        "-c",
+        (
+            "import os, signal, subprocess, sys, time; "
+            "c = subprocess.Popen(['python3', '-I', '-c', "
+            "'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'], "
+            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, "
+            "start_new_session=True); "
+            "print(c.pid, flush=True)"
+        ),
+    ],
+    stdout=subprocess.PIPE,
+    text=True,
+)
+pid = int(child.communicate()[0].strip())
+time.sleep(0.2)
+with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+    ppid = int(fh.read().rsplit(")", 1)[1].split()[1])
+open(sys.argv[1], "w", encoding="utf-8").write(str(pid))
+open(sys.argv[2], "w", encoding="utf-8").write(str(ppid))
+PY
+exit 0
+JOB
+chmod +x "$m1/hack/conformance-job"
+
+rc=0
+CONFORMANCE_SKIP_CONTAINMENT_CHECK=1 CONFORMANCE_REQUIRE_SCOPE=1 \
+    CONFORMANCE_SCOPE_FILE="$stage/m1.scope" CONFORMANCE_UNAVAILABLE_FILE="$stage/m1.unavail" \
+    TIMEOUT_SECONDS=30 "$m1/hack/conformance" >"$stage/m1.out" 2>"$stage/m1.err" || rc=$?
+[[ $rc != 0 ]] || fail 'detached survivor exited 0 instead of failing'
+survivor_pid=$(<"$stage/survivor.pid")
+survivor_ppid=$(<"$stage/survivor.ppid")
+[[ $survivor_ppid == 1 ]] || fail "detached survivor ppid was $survivor_ppid, expected 1 (no subreaper)"
+assert_pid_dead "$survivor_pid" 'detached survivor control'
+grep -q 'detached survivor(s) in job scope' "$stage/m1.err" || fail 'missing detached survivor diagnostic'
+[[ ! -e $stage/m1.unavail ]] || fail 'verified detached survivor cleanup unexpectedly marked unavailable'
+printf '# containment control 2: detached ppid=1 survivor (pid=%s) failed run and was verified dead\n' "$survivor_pid"
+
+# Control 3: Inner supervisor killed abruptly with SIGKILL while job + detached child live.
+m2=$stage/m2
+make_mirror "$m2"
+cat > "$m2/hack/conformance-job" <<JOB
+#!/usr/bin/env bash
+set -euo pipefail
+python3 -I - "$stage/kill-detached.pid" "$stage/kill-ready" <<'PY'
+import signal, subprocess, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+c = subprocess.Popen(
+    ["python3", "-I", "-c", "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    start_new_session=True,
+)
+open(sys.argv[1], "w", encoding="utf-8").write(str(c.pid))
+open(sys.argv[2], "w", encoding="utf-8").write("ready\n")
+time.sleep(60)
+PY
+JOB
+chmod +x "$m2/hack/conformance-job"
+
+CONFORMANCE_SKIP_CONTAINMENT_CHECK=1 CONFORMANCE_REQUIRE_SCOPE=1 \
+    CONFORMANCE_SCOPE_FILE="$stage/m2.scope" CONFORMANCE_UNAVAILABLE_FILE="$stage/m2.unavail" \
+    TIMEOUT_SECONDS=45 "$m2/hack/conformance" >"$stage/m2.out" 2>"$stage/m2.err" &
+outer_pid=$!
+
+deadline=$((SECONDS + 15))
+while [[ ! -f $stage/kill-ready ]]; do
+    if (( SECONDS >= deadline )); then
+        kill -9 "$outer_pid" 2>/dev/null || :
+        fail 'SIGKILL control job never reached ready state'
+    fi
+    sleep 0.05
+done
+
+sup_pid=$(python3 -I - "$outer_pid" <<'PY'
+import os, sys
+from pathlib import Path
+parent = int(sys.argv[1])
+for entry in Path("/proc").glob("[0-9]*"):
+    try:
+        stat = (entry / "stat").read_bytes().rsplit(b")", 1)[1].split()
+        if int(stat[1]) != parent:
+            continue
+        cmd = (entry / "cmdline").read_bytes()
+        if b"conformance-supervise" in cmd:
+            print(entry.name)
+            sys.exit(0)
+    except OSError:
+        continue
+sys.exit(1)
+PY
+) || fail 'could not locate inner conformance-supervise pid'
+
+kill -9 "$sup_pid"
+rc=0
+wait "$outer_pid" || rc=$?
+[[ $rc != 0 ]] || fail 'abrupt SIGKILL of supervisor exited 0'
+kill_detached_pid=$(<"$stage/kill-detached.pid")
+assert_pid_dead "$kill_detached_pid" 'SIGKILL supervisor detached child'
+grep -q 'stopped and verified empty job scope' "$stage/m2.out" || fail 'missing outer scope-stop verification line after SIGKILL'
+[[ ! -e $stage/m2.unavail ]] || fail 'verified SIGKILL cleanup unexpectedly marked unavailable'
+printf '# containment control 3: abrupt SIGKILL of supervisor (pid=%s) stopped detached child (pid=%s) and verified empty scope\n' "$sup_pid" "$kill_detached_pid"
+
+# Control 4: Unverifiable scope termination marks venue unavailable.
+m3=$stage/m3
+make_mirror "$m3"
+cat > "$m3/hack/conformance-job" <<'JOB'
+#!/usr/bin/env bash
+exit 0
+JOB
+chmod +x "$m3/hack/conformance-job"
+cat > "$m3/hack/conformance-supervise" <<'SUP'
+import sys
+if len(sys.argv) == 3 and sys.argv[1] == "--stop-scope":
+    sys.exit("simulated unverified termination")
+sys.exit(1)
+SUP
+
+rc=0
+CONFORMANCE_SKIP_CONTAINMENT_CHECK=1 CONFORMANCE_REQUIRE_SCOPE=1 \
+    CONFORMANCE_SCOPE_FILE="$stage/m3.scope" CONFORMANCE_UNAVAILABLE_FILE="$stage/m3.unavail" \
+    TIMEOUT_SECONDS=15 "$m3/hack/conformance" >"$stage/m3.out" 2>"$stage/m3.err" || rc=$?
+[[ $rc != 0 ]] || fail 'unverified scope termination exited 0'
+[[ -f $stage/m3.unavail ]] || fail 'unverified scope termination did not write unavailable marker'
+grep -q 'unverified job scope termination:' "$stage/m3.unavail" || fail 'unexpected unavailable marker contents'
+printf '# containment control 4: unverified scope termination marked venue unavailable\n'
+
+# Control 5: Outer OS-owned scope deadline kills a stalled lock owner and bound job scope
+# independently of a suspended inner supervisor, leaving the active-scope marker behind.
+outer_unit="mgw-ctrl-outer-$$.scope"
+inner_unit="mgw-ctrl-inner-$$.scope"
+cat > "$stage/outer-script.sh" <<'OUTER'
+#!/usr/bin/env bash
+set -euo pipefail
+outer=$1 inner=$2 scope_file=$3 pid_file=$4
+printf 'outer=%s\njob=%s\n' "$outer" "$inner" >| "$scope_file"
+XDG_RUNTIME_DIR="/run/user/$EUID" systemd-run --user --scope --unit="$inner" \
+    -p "BindsTo=$outer" -p RuntimeMaxSec=60 -p TimeoutStopSec=2 -p KillMode=control-group -p CollectMode=inactive-or-failed \
+    --quiet -- python3 -I - "$pid_file" <<'PY' &
+import signal, subprocess, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+c = subprocess.Popen(
+    ["python3", "-I", "-c", "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"],
+    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+)
+open(sys.argv[1], "w", encoding="utf-8").write(str(c.pid))
+time.sleep(60)
+PY
+sleep 60
+OUTER
+chmod +x "$stage/outer-script.sh"
+rc=0
+XDG_RUNTIME_DIR="/run/user/$EUID" systemd-run --user --scope --unit="$outer_unit" \
+    -p RuntimeMaxSec=3 -p TimeoutStopSec=2 -p KillMode=control-group -p CollectMode=inactive-or-failed \
+    --quiet -- "$stage/outer-script.sh" "$outer_unit" "$inner_unit" "$stage/m4.scope" "$stage/m4.pid" >"$stage/m4.out" 2>"$stage/m4.err" || rc=$?
+[[ $rc != 0 ]] || fail 'outer scope RuntimeMaxSec exited 0'
+[[ -f $stage/m4.scope ]] || fail 'stalled outer owner failed to leave active-scope marker'
+python3 -I "$root/hack/conformance-supervise" --stop-scope "$inner_unit" >/dev/null || fail 'inner bound scope failed stop verification'
+python3 -I "$root/hack/conformance-supervise" --stop-scope "$outer_unit" >/dev/null || fail 'outer scope failed stop verification'
+outer_detached_pid=$(<"$stage/m4.pid")
+assert_pid_dead "$outer_detached_pid" 'outer deadline detached child'
+printf '# containment control 5: outer OS deadline stopped stalled owner + bound scope (detached pid=%s) and retained active-scope marker\n' "$outer_detached_pid"
