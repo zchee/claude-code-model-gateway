@@ -68,6 +68,13 @@ func (b *eofChunkBody) Close() error {
 	return nil
 }
 
+// remaining reports how many scripted chunks no read has delivered yet.
+func (b *eofChunkBody) remaining() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.chunks)
+}
+
 // heldRead is one scripted result of a heldBody read.
 type heldRead struct {
 	data []byte

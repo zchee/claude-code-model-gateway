@@ -166,14 +166,31 @@ func TestRelayHeadGatedOnClientDeparture(t *testing.T) {
 				// own; a passthrough holds the provider by back-pressure until the service ends.
 				synctest.Wait()
 				var out handlerOutcome
-				select {
-				case out = <-done:
-				default:
-					if tt.drains {
+				if tt.drains {
+					select {
+					case out = <-done:
+					default:
 						t.Errorf("%s did not return after draining the tail for a departed client", tt.relay)
+						cancel()
+						out = <-done
 					}
-					cancel()
-					out = <-done
+					// The first read delivers the start frame and the second the rest of the stream
+					// with its clean end, so two reads and no chunk left mean the tail was consumed
+					// to its end.
+					if reads, left := src.reads.Load(), src.remaining(); reads != 2 || left != 0 {
+						t.Errorf("upstream reads = %d with %d chunks left, want 2 reads and the tail consumed to its end", reads, left)
+					}
+				} else {
+					select {
+					case out = <-done:
+						t.Errorf("%s returned (%+v, %v) before the service ended, want it to wait with the provider held by back-pressure", tt.relay, out.res, out.err)
+					default:
+						if reads, closes := src.reads.Load(), src.closes.Load(); reads != 0 || closes != 0 {
+							t.Errorf("before the service ended: upstream reads = %d, body closes = %d, want no read and no close", reads, closes)
+						}
+						cancel()
+						out = <-done
+					}
 				}
 
 				if out.err != nil {
