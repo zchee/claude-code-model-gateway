@@ -1,63 +1,175 @@
-# Package map: what is ported from where
+# Package map
 
-This page lists each part of the Node gateway and the Go package that replaces it, with the phase that delivers
-it. The mapping is the one in section 3.2 of `model-gateway-go-port.md`; that plan and its phase table remain the
-authority. The status column is a snapshot taken on 2026-11-27 and is updated at each phase gate.
+This page shows how the Go port is organized: what each package does, which Node file it replaces, and how far it
+is. Read it top to bottom once; after that, use the index at the end to go from a Node file to its Go packages.
 
-Source paths are relative to the pinned source tree. Go packages are relative to `internal/`.
+The plan (`model-gateway-go-port.md`, section 3.2 and the phase table) is the authority for the mapping and the
+phases. The status marks here are a snapshot taken on 2026-11-27 and are updated at each phase gate.
 
-## Phases
+Go packages are relative to `internal/`. Node paths are relative to the pinned source tree.
 
-| Phase | Content | Status on 2026-11-27 |
-|---|---|---|
-| 0 | Foundations: test isolation, process identity, test inventory | Landed on `main` |
-| 1 | Pure logic packages | Landed on `main` |
-| 2 | Walking skeleton, launch adapter, worker | In progress |
-| 3 | Supervisor and process layer | Not started |
-| 4 | CLI and settings | Not started |
-| 5 | Packaging, migration, shadow mode | Not started |
-| 6 | Rehearsal, shadow soak, cutover | Not started |
+## The gateway in one picture
 
-## Source to Go package
+Claude Code talks to one local address. Behind it, a long-lived supervisor accepts connections and hands each request
+to a worker process, which decides where the request goes and relays the answer.
 
-"Done" means the production code is on `main`. "Partly" means the pure logic is on `main` and the rest belongs to
-the later phase named in the row. "In review" means the code exists on a unit branch and has not passed its
-independent review yet.
+```mermaid
+flowchart LR
+    CC[Claude Code] --> SUP[supervisor<br/>public listener]
+    SUP --> W[worker<br/>local endpoints]
+    W --> R{route<br/>classify the model}
+    R -->|Anthropic model| UP[worker/upstream]
+    R -->|proxy model| PR[worker/proxyreq] --> UP
+    R -->|Grok model| G[grok] --> UP
+    UP --> A[(Anthropic)]
+    UP --> P[(local proxy:<br/>Codex and others)]
+    UP --> X[(Grok)]
+    UP --> REPLY{reply<br/>buffered or stream?}
+    REPLY -->|buffered| CC
+    REPLY -->|stream| SSE[worker/sse relay] --> CC
+```
 
-| Source (Node) | Go package | Phase | Status on 2026-11-27 |
+Three things watch every request without changing where it goes: the context sentry (`worker/sentry`) refuses a
+request that would overflow the model's window, the compaction guard (`worker/compactguard`) retries a compaction
+that came back incomplete, and the observers (`usage`, `telemetry`) record counts and route decisions, never
+message content.
+
+## Status marks
+
+| Mark | Meaning |
+|---|---|
+| ✅ | Production code is on `main` |
+| 🔶 | Code exists on a branch and is in independent review, or is partly on `main` (the note says which part) |
+| 🔜 | Not started; the phase column says when |
+
+Phases: 0 foundations, 1 pure logic, 2 worker, 3 supervisor and process layer, 4 command line and settings,
+5 packaging, migration and shadow mode, 6 rehearsal and cutover. Phases 0 and 1 are on `main`; phase 2 is in progress.
+
+## 1. The request path (worker)
+
+What happens to one inference request, in the order it happens.
+
+| Package | What it does | Replaces | Phase | Status |
+|---|---|---|---|---|
+| `worker` | Serves the local endpoints and runs a request through the steps below | `lib/request-worker.js` (server part) | 2 | 🔶 in review |
+| `worker/route` | Classifies the requested model: Anthropic, proxy, Grok, or refused | `lib/request-worker.js` | 1 | ✅ |
+| `worker/dispatch` | Recognizes route markers in a conversation and remembers a session's route | `lib/request-worker.js` | 1 | ✅ |
+| `worker/sentry` | Tracks context usage per session and refuses a request that cannot fit | `lib/request-worker.js` | 1 | ✅ |
+| `worker/proxyreq` | Builds the request for a proxy model and answers local refusals | `lib/request-worker.js` | 2 | 🔶 reviewed; follow-up tests pending |
+| `grok` | Translates between Anthropic messages and Grok's wire format, and keeps the Grok credential fresh | `lib/grok-backend.js` | 1, 2 | 🔶 translation ✅; request branch in review |
+| `toolschema` | Adapts tool schemas to what each upstream accepts | `lib/tool-schema-compat.js` | 1 | ✅ |
+| `worker/upstream` | Filters headers and sends the request to Anthropic, the proxy or Grok | `lib/request-worker.js` | 2 | 🔶 reviewed; TLS error text in review |
+| `worker/reply` | Handles a buffered answer: errors, retries, overflow, rejections | `lib/request-worker.js` | 2 | 🔶 in review |
+| `worker/sse`, `sse` | Relays a streamed answer to the client; `sse` splits the event stream | `lib/request-worker.js` | 1, 2 | 🔶 splitter ✅; relays in review |
+| `worker/compactguard` | Buffers a compaction stream and retries it when it is incomplete | `lib/request-worker.js` | 2 | 🔶 in review |
+| `worker/modelcache` | Keeps the model list current and serves `/v1/models` | `lib/request-worker.js` | 2 | 🔶 in review |
+| `worker/outcome` | Carries the facts of one request (route, status) between the steps | `lib/request-worker.js` | 2 | 🔶 in review |
+| `worker/compose` | Wires all of the above into one worker | new | 2 | 🔜 after the unit reviews |
+
+## 2. Processes: supervisor, worker lifecycle, ownership
+
+Who listens, who starts and stops whom, and how the gateway knows a process is its own.
+
+| Package | What it does | Replaces | Phase | Status |
+|---|---|---|---|---|
+| `supervisor`, `supervisor/relay`, `supervisor/workerproc` | Owns the public listener, starts and replaces workers, relays requests to them | `lib/commands.js` (supervisor part) | 2, 3 | 🔶 skeleton in review; the rest is phase 3 |
+| `cli/serveshim`, `cli/serveworker` | The two long-running commands: supervisor and worker | `lib/commands.js` | 2 | 🔶 in review |
+| `procinfo` | Reads process and listener facts from the operating system | `lib/process-supervision.js` | 0 | ✅ |
+| `ownership`, `supervisor/proxyrecovery`, `launch` | Decide which processes belong to the gateway, recover the proxy, start detached processes | `lib/process-supervision.js`, `lib/windows-detached.js` | 3 | 🔜 |
+| `shimstate` | Records the supervisor's own state on disk | `lib/shim-state.js` | 3 | 🔜 |
+| `lifecycle` | Serializes start, stop and repair, and records what happened | `lib/lifecycle-lock.js`, `lib/lifecycle-diagnostics.js` | 1 | ✅ |
+| `controlauth` | Authorizes local start and stop requests | `lib/control-auth.js` | 1 | ✅ |
+
+## 3. Models, catalogs and policy
+
+Which models exist, which one a picker alias means, and what limits apply.
+
+| Package | What it does | Replaces | Phase | Status |
+|---|---|---|---|---|
+| `policy` | Resolves model identities, context windows and compaction limits | `lib/runtime.js`, `lib/context-window.js` | 1 | ✅ |
+| `pins` | Chooses the model behind each picker alias | `lib/pins.js`, `lib/previous-picker-rows.js` | 1, 4 | 🔶 logic ✅; live probe in phase 4 |
+| `anthropiccatalog` | Stores snapshots of Anthropic's model catalog and merges picker rows | `lib/anthropic-catalog.js` | 1 | ✅ |
+| `proxymodels` | Reads the model listing the proxy serves | `lib/proxy-models.js` | 1 | ✅ |
+| `localprov`, `proxyconfig` | Read local providers (LM Studio, llama.cpp) and the proxy's configuration | `lib/lmstudio.js`, `lib/local-llama.js`, `lib/proxy-config.js` | 1, 2 | 🔶 parsers ✅; live probes in review |
+| `catalog` | Builds the catalog document other tools consume | `lib/commands.js` | 1 | ✅ |
+| `pickerguard` | Guards the model picker against stale rows | `lib/picker-guard.js` | 4 | 🔜 |
+
+## 4. Settings, installation and files
+
+How the gateway writes itself into Claude Code's settings and keeps its own files safe.
+
+| Package | What it does | Replaces | Phase | Status |
+|---|---|---|---|---|
+| `wiring` | Adds and removes the gateway's entries in Claude settings and project registrations | `lib/settings-wiring.js` | 1, 4 | 🔶 logic ✅; commands in phase 4 |
+| `readiness` | Decides whether recovery applies to the effective settings | `lib/readiness-hooks.js`, `lib/recovery-policy.js`, `lib/readiness-gate.js` | 1, 4 | 🔶 logic ✅; commands in phase 4 |
+| `paths`, `config` | Resolve every path and environment variable in one place | `lib/runtime.js` | 0, 1 | ✅ |
+| `install` | Reads the installed-plugin registries and compares versions | `lib/runtime.js` | 1 | ✅ |
+| `atomicfile` | Replaces state and settings files atomically and appends journal records | `lib/atomic-file.js` | 0 | ✅ |
+| `jsonx` | Edits the gateway's own keys without rewriting the rest of a JSON file | new | 0 | ✅ |
+| `selfinstall` | Installs the binary at its stable path and writes the launchers | `hooks/registry-writer.js` | 4, 5 | 🔜 |
+| `release` | Downloads and verifies a release | `lib/github-release.js`, `lib/release-verification.js` | 4 | 🔜 |
+
+## 5. Observability and upstream state
+
+| Package | What it does | Replaces | Phase | Status |
+|---|---|---|---|---|
+| `usage` | Builds and emits counts-only usage records | `lib/usage-observability.js` | 1, 2 | 🔶 records ✅; capture and emitter in review |
+| `telemetry` | Records route decisions as spans and a local log, without message content | `lib/request-worker.js` | 2 | 🔶 in review |
+| `upstreamstate` | Remembers that Codex refused dispatch, with evidence and expiry | `lib/codex-upstream-state.js` | 1 | ✅ |
+
+## 6. Command line
+
+| Package | What it does | Replaces | Phase | Status |
+|---|---|---|---|---|
+| `cli`, `cli/argscan` | Register the commands and read arguments the way the Node CLI does | `lib/commands.js` | 0 | ✅ |
+| `cli/version`, `cli/completions` | `version` and shell completions | `lib/commands.js` | 0 | ✅ |
+| `cli/<command>`, `doctor`, `status` | One package per remaining command (`setup`, `ensure`, `env`, `pin`, `stop`, ...) | `lib/commands.js` | 3, 4 | 🔜 |
+
+## 7. Moving from the Node version
+
+| Package | What it does | Replaces | Phase | Status |
+|---|---|---|---|---|
+| `migrate` | Switches a home from the Node gateway to the Go one, with a journal and a rollback | new | 5 | 🔜 |
+| `shadow` | Runs a second, isolated instance beside the live one for a soak, and reports on it | new | 5 | 🔜 |
+| `plugin/`, `.claude-plugin/marketplace.json` | The Claude Code plugin and its marketplace entry (not Go) | the Node plugin | 5 | 🔜 |
+
+Not ported: `lib/remote-control.js`. The Go version never writes the hosts file. It only detects, read-only, the hosts
+block the Node version manages, in `doctor` and in the migration check.
+
+## 8. Test support
+
+| Package | What it does | Phase | Status |
 |---|---|---|---|
-| `lib/runtime.js` (paths, environment, policy, install) | `paths`, `config`, `policy`, `install` | 0, 1 | Done |
-| `lib/context-window.js` | `policy` | 1 | Done |
-| `lib/proxy-models.js` | `proxymodels` | 1 | Done |
-| `lib/lmstudio.js`, `lib/local-llama.js`, `lib/proxy-config.js` | `localprov`, `proxyconfig` | 1, 2 | Partly: parsers done; live probes in review with the model cache |
-| `lib/pins.js`, `lib/anthropic-catalog.js`, `lib/previous-picker-rows.js` | `pins`, `anthropiccatalog` | 1, 4 | Partly: logic done; the probe is phase 4 |
-| `lib/tool-schema-compat.js` | `toolschema` | 1 | Done |
-| `lib/codex-upstream-state.js`, `lib/control-auth.js` | `upstreamstate`, `controlauth` | 1 | Done |
-| `lib/lifecycle-lock.js`, `lib/lifecycle-diagnostics.js` | `lifecycle` | 1 | Done |
-| `lib/atomic-file.js` | `atomicfile` | 0 | Done |
-| `lib/settings-wiring.js`, `lib/readiness-hooks.js`, `lib/recovery-policy.js`, `lib/readiness-gate.js` | `wiring`, `readiness` | 1, 4 | Partly: logic done; the rest is phase 4 |
-| `lib/grok-backend.js` | `grok` | 1, 2 | Partly: translation done; the request branch is in review |
-| `lib/usage-observability.js` | `usage` | 1, 2 | Partly: records done; capture and emitter in review |
-| `lib/request-worker.js`: routing, context sentry, dispatch | `worker/route`, `worker/sentry`, `worker/dispatch`, `sse` (frame scanner) | 1 | Done |
-| `lib/request-worker.js`: server; `lib/commands.js`: `serve-shim`, `serve-worker` | `worker`, `cli/serveshim`, `cli/serveworker`, `supervisor` (skeleton) | 2 | In review |
-| `lib/request-worker.js`: upstream requests | `worker/upstream` | 2 | Reviewed; a follow-up on TLS error text is in review |
-| `lib/request-worker.js`: buffered replies | `worker/reply` | 2 | In review |
-| `lib/request-worker.js`: stream relays | `worker/sse` | 2 | In review |
-| `lib/request-worker.js`: compaction guard | `worker/compactguard` | 2 | In review |
-| `lib/request-worker.js`: proxy request assembly | `worker/proxyreq` | 2 | Reviewed; follow-up tests pending |
-| `lib/request-worker.js`: model cache and `/v1/models` | `worker/modelcache` | 2 | In review |
-| `lib/request-worker.js`: route telemetry and the request-route log | `telemetry` | 2 | In review |
-| `lib/request-worker.js`: route and terminal response facts | `worker/outcome` | 2 | In review |
-| Worker assembly (new) | `worker/compose` | 2 | Not started: follows the unit reviews |
-| `lib/commands.js`: supervisor | `supervisor`, `supervisor/relay`, `supervisor/workerproc` | 3 | Not started |
-| `lib/process-supervision.js` | `procinfo`, `ownership`, `supervisor/proxyrecovery`, `launch` | 0, 3 | Partly: `procinfo` done |
-| `lib/shim-state.js` | `shimstate` | 3 | Not started |
-| `lib/windows-detached.js` | `launch` (Windows stub) | 3 | Not started |
-| `lib/picker-guard.js` | `pickerguard` | 4 | Not started |
-| `lib/github-release.js`, `lib/release-verification.js` | `release` | 4 | Not started |
-| rest of `lib/commands.js` (one command each) | `cli`, `cli/<command>`, `catalog`, `doctor`, `status` | 0, 3, 4 | Partly: registration, argument scan and `catalog` done |
-| `hooks/registry-writer.js` | `selfinstall` | 4, 5 | Not started |
-| `lib/remote-control.js` | Not ported. Only a read-only check for the hosts block that the Node version manages remains, in `doctor` and in the migration check | 4, 5 | Not started |
-| New | `jsonx`, `venue`, `gatewaytest` | 0 | Done |
-| New | `migrate`, `shadow` | 5 | Not started |
-| New, not Go | `plugin/`, `.claude-plugin/marketplace.json`, `test/conformance/` | 2, 5 | Partly: conformance tests and the hosted evidence export exist; the plugin is phase 5 |
+| `venue` | Refuses to run a test binary on a machine that runs a real gateway | 0 | ✅ |
+| `gatewaytest` | Gives tests an isolated home, environment and child processes | 0 | ✅ |
+| `jsdate` | Parses the dates the Node code parsed with `Date.parse`, independent of the time zone | 1 | ✅ |
+| `test/conformance/` | Runs the same cases against the Node gateway and the Go binary (not a Go package) | 2 | 🔶 cases and hosted evidence export exist; the binary proof is the phase 2 gate |
+
+## Index: from a Node file to its Go packages
+
+| Node file | Go packages | Section |
+|---|---|---|
+| `lib/request-worker.js` | `worker` and everything under it, `sse`, `telemetry` | 1, 5 |
+| `lib/commands.js` | `cli` and everything under it, `supervisor`, `catalog`, `doctor`, `status` | 2, 3, 6 |
+| `lib/process-supervision.js` | `procinfo`, `ownership`, `supervisor/proxyrecovery`, `launch` | 2 |
+| `lib/runtime.js` | `paths`, `config`, `policy`, `install` | 3, 4 |
+| `lib/usage-observability.js` | `usage` | 5 |
+| `lib/settings-wiring.js` | `wiring` | 4 |
+| `lib/pins.js`, `lib/previous-picker-rows.js` | `pins` | 3 |
+| `lib/grok-backend.js` | `grok` | 1 |
+| `lib/tool-schema-compat.js` | `toolschema` | 1 |
+| `lib/remote-control.js` | not ported | 7 |
+| `lib/anthropic-catalog.js` | `anthropiccatalog` | 3 |
+| `lib/proxy-models.js`, `lib/proxy-config.js` | `proxymodels`, `proxyconfig` | 3 |
+| `lib/lmstudio.js`, `lib/local-llama.js` | `localprov` | 3 |
+| `lib/picker-guard.js` | `pickerguard` | 3 |
+| `lib/context-window.js` | `policy` | 3 |
+| `lib/lifecycle-lock.js`, `lib/lifecycle-diagnostics.js` | `lifecycle` | 2 |
+| `lib/codex-upstream-state.js` | `upstreamstate` | 5 |
+| `lib/control-auth.js` | `controlauth` | 2 |
+| `lib/shim-state.js` | `shimstate` | 2 |
+| `lib/windows-detached.js` | `launch` | 2 |
+| `lib/readiness-hooks.js`, `lib/recovery-policy.js`, `lib/readiness-gate.js` | `readiness` | 4 |
+| `lib/atomic-file.js` | `atomicfile` | 4 |
+| `lib/github-release.js`, `lib/release-verification.js` | `release` | 4 |
+| `hooks/registry-writer.js` | `selfinstall` | 4 |
