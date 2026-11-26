@@ -57,13 +57,17 @@ type Version struct {
 
 // ParseVersion parses a canonical pin, treating an omitted minor as zero.
 func ParseVersion(id string) (Version, bool) {
+	if !utf8.ValidString(id) {
+		return Version{}, false
+	}
 	rest, ok := strings.CutPrefix(strings.TrimSuffix(id, "[1m]"), "claude-")
 	family, fields, hasMajor := strings.Cut(rest, "-")
 	if !ok || !hasMajor {
 		return Version{}, false
 	}
 	major, minor, hasMinor := strings.Cut(fields, "-")
-	if strings.ContainsRune(minor, '-') {
+	// Longer decimal integers stringify in exponential notation, so none round-trip.
+	if len(major) > 21 || len(minor) > 21 || strings.ContainsRune(minor, '-') {
 		return Version{}, false
 	}
 	if !hasMinor {
@@ -87,6 +91,8 @@ func numberText(n float64) string {
 }
 
 // Compare returns the sign of the version difference, or false for unrelated or invalid IDs.
+// Unicode lowercasing uses bounded context: for long families or runs of combining
+// marks after a capital sigma, spellings JavaScript equates may compare as unrelated.
 func Compare(first, second string) (float64, bool) {
 	a, ok := ParseVersion(first)
 	b, valid := ParseVersion(second)
@@ -213,6 +219,8 @@ func (a alias) accepts(pin string) bool {
 // The caller retains detection metadata such as the last probe timestamp.
 func (in Inputs) FollowCatalog() (Cache, bool) {
 	c := in.Cache
+	c.Detected = maps.Clone(c.Detected)
+	c.DetectedFor = maps.Clone(c.DetectedFor)
 	c.CatalogPins = make(map[string]string, 3)
 	c.Retired = make(map[string][]string, 3)
 	effective := in.Effective()

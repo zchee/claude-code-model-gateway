@@ -18,6 +18,7 @@ package anthropiccatalog
 import (
 	"cmp"
 	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"errors"
 	"math"
 	"os"
@@ -26,6 +27,7 @@ import (
 	"strings"
 	"time"
 	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/zchee/claude-code-model-gateway/internal/atomicfile"
 	"github.com/zchee/claude-code-model-gateway/internal/config"
@@ -159,7 +161,7 @@ func Read(path string) Snapshot {
 func WriteSuccess(path string, rows jsontext.Value, at time.Time) error {
 	v, err := jsonx.DecodeWire(rows)
 	if err != nil {
-		return err
+		return errors.New("invalid catalog data")
 	}
 	v, err = validRows(v)
 	if err != nil {
@@ -169,12 +171,10 @@ func WriteSuccess(path string, rows jsontext.Value, at time.Time) error {
 }
 
 // WriteFailure records the failed attempt against the snapshot that triggered the refresh.
+// The caller must supply only classified, payload-free text in message.
 func WriteFailure(path string, snapshot Snapshot, message string, at time.Time) error {
 	obj, err := jsonx.DecodeWire(snapshot.Object)
-	if err != nil {
-		return err
-	}
-	if obj.Kind != '{' {
+	if err != nil || obj.Kind != '{' {
 		return errors.New("invalid catalog snapshot")
 	}
 	obj.Members = append(obj.Members, member("error", text(message)), member("attemptedAt", number(float64(at.UnixMilli()))))
@@ -197,7 +197,7 @@ func write(path string, obj jsonx.WireValue) error {
 
 // WithCached puts the advertised cached rows before models, which lose on an ID collision.
 func WithCached(models, cachedRows jsontext.Value, resolver policy.Resolver) jsontext.Value {
-	return merge(models, cachedRows, func(row jsonx.WireValue) (jsonx.WireValue, string, bool) {
+	return merge(models, cachedRows, "id", func(row jsonx.WireValue) (jsonx.WireValue, string, bool) {
 		id, ok := idString(field(row, "id"))
 		if !ok {
 			return jsonx.WireValue{}, "", false
@@ -211,7 +211,7 @@ func WithCached(models, cachedRows jsontext.Value, resolver policy.Resolver) jso
 // WithPrevious prepends relabelled older server rows, replacing any models with those IDs.
 // Server rows are the entries of Claude Code's additionalModelOptionsCache array.
 func WithPrevious(models, serverRows jsontext.Value, currentPins map[string]string) jsontext.Value {
-	return merge(models, serverRows, func(row jsonx.WireValue) (jsonx.WireValue, string, bool) {
+	return merge(models, serverRows, "value", func(row jsonx.WireValue) (jsonx.WireValue, string, bool) {
 		id, ok := idString(field(row, "value"))
 		if !ok {
 			return jsonx.WireValue{}, "", false
@@ -227,9 +227,46 @@ func WithPrevious(models, serverRows jsontext.Value, currentPins map[string]stri
 	})
 }
 
-func merge(models, preferred jsontext.Value, advertise func(jsonx.WireValue) (jsonx.WireValue, string, bool)) jsontext.Value {
-	first, _ := jsonx.DecodeWire(preferred)
-	rest, _ := jsonx.DecodeWire(models)
+// Wire decoding preserves escaped surrogates but replaces invalid UTF-8. When the
+// document contains invalid bytes, check the winning identifier token before decoding.
+func decodeRows(raw jsontext.Value, key string) jsonx.WireValue {
+	if utf8.Valid(raw) {
+		v, _ := jsonx.DecodeWire(raw)
+		return v
+	}
+	opts := json.JoinOptions(jsontext.AllowDuplicateNames(true), jsontext.AllowInvalidUTF8(true))
+	var entries []jsontext.Value
+	if err := json.Unmarshal(raw, &entries, opts); err != nil {
+		return jsonx.WireValue{}
+	}
+	rows := jsonx.WireValue{Kind: '[', Elements: make([]jsonx.WireValue, 0, len(entries))}
+	for _, entry := range entries {
+		if entry.Kind() == '{' && !utf8.Valid(entry) {
+			var fields struct {
+				ID    jsontext.Value `json:"id"`
+				Value jsontext.Value `json:"value"`
+			}
+			if err := json.Unmarshal(entry, &fields, opts); err != nil {
+				continue
+			}
+			id := fields.ID
+			if key == "value" {
+				id = fields.Value
+			}
+			if id.Kind() == '"' && !utf8.Valid(id) {
+				continue
+			}
+		}
+		if row, err := jsonx.DecodeWire(entry); err == nil {
+			rows.Elements = append(rows.Elements, row)
+		}
+	}
+	return rows
+}
+
+func merge(models, preferred jsontext.Value, preferredKey string, advertise func(jsonx.WireValue) (jsonx.WireValue, string, bool)) jsontext.Value {
+	first := decodeRows(preferred, preferredKey)
+	rest := decodeRows(models, "id")
 	result := jsonx.WireValue{Kind: '[', Elements: make([]jsonx.WireValue, 0, len(first.Elements)+len(rest.Elements))}
 	ids := make(map[string]bool, len(first.Elements))
 	for _, row := range first.Elements {
