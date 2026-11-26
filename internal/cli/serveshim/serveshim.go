@@ -55,7 +55,8 @@ type Options struct {
 // on Stdout and starts the worker with the report and liveness pipes. SIGTERM, SIGINT and, under the test guard,
 // the fixture channel's shutdown message stop it in order: the stop is recorded, the worker is disconnected and
 // awaited, then the listener closes (lib/commands.js:2547-2575,2895-2905). Run returns nil after an orderly stop and an
-// error when the supervisor stops with exit status 1.
+// error when the supervisor stops with exit status 1. It prints only non-fatal diagnostics on Stderr; the caller
+// reports the returned error.
 func Run(ctx context.Context, opts Options) error {
 	env := newEnvironment(opts.Environment)
 	stdout, stderr := writerOr(opts.Stdout), writerOr(opts.Stderr)
@@ -114,8 +115,7 @@ func Run(ctx context.Context, opts Options) error {
 
 	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(publicPort)))
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "model-gateway: shim supervisor cannot bind 127.0.0.1:%d: %v\n", publicPort, err)
-		return err
+		return fmt.Errorf("model-gateway: shim supervisor cannot bind 127.0.0.1:%d: %w", publicPort, err)
 	}
 	defer func() { _ = listener.Close() }()
 	bound := listener.Addr().(*net.TCPAddr).Port
@@ -129,8 +129,7 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	if err := s.publishSelf(ctx, bound); err != nil {
 		// A supervisor that cannot publish its own record does not serve untracked.
-		_, _ = fmt.Fprintf(stderr, "model-gateway: shim supervisor could not publish its pid record: %v\n", err)
-		return err
+		return fmt.Errorf("model-gateway: shim supervisor could not publish its pid record: %w", err)
 	}
 
 	serveCtx, stopServe := context.WithCancel(context.WithoutCancel(ctx))
@@ -165,8 +164,14 @@ func Run(ctx context.Context, opts Options) error {
 		stopErr = err
 	}
 	s.wait()
+	// A failure still pending here was not the reason to stop, so Run does not return it; it is printed once so that
+	// it is not lost. The chosen stop path alone decides the exit status and the records.
+	select {
+	case err := <-s.fatal:
+		s.warnFatal(err)
+	default:
+	}
 	if stopErr != nil {
-		_, _ = fmt.Fprintln(stderr, stopErr)
 		return stopErr
 	}
 	exitCode = 0

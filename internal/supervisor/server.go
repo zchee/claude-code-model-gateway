@@ -61,8 +61,8 @@ const (
 	// lingerTimeout bounds the wait for the client to close its end of a connection that is being closed, so that
 	// unread request bytes do not turn the close into a reset that destroys the response.
 	lingerTimeout = 500 * time.Millisecond
-	// closingWriteTimeout bounds a refusal and the final flush before a linger, so that a client that never reads
-	// cannot hold the connection open.
+	// closingWriteTimeout bounds a refusal, an interim 100 Continue and the final flush before a linger, so that a
+	// client that never reads cannot hold the connection open.
 	closingWriteTimeout = 5 * time.Second
 )
 
@@ -420,6 +420,9 @@ func (c *conn) writeContinue() error {
 	if c.answered {
 		return nil
 	}
+	// The response that follows is written without a deadline, so this one is cleared again.
+	_ = c.rwc.SetWriteDeadline(time.Now().Add(closingWriteTimeout))
+	defer func() { _ = c.rwc.SetWriteDeadline(time.Time{}) }()
 	if _, err := c.bw.WriteString("HTTP/1.1 100 Continue\r\n\r\n"); err != nil {
 		return err
 	}
@@ -677,9 +680,10 @@ func (b *requestBody) read(p []byte) (int, error) {
 	return n, err
 }
 
-// readTrailer reads the trailer section under the same byte budget and time limit as a request head.
+// readTrailer reads the trailer section under the same byte budget and time limit as a request head. A section the
+// stream cut off, even inside a line, is an early end of the body rather than a malformed trailer.
 func (b *requestBody) readTrailer() error {
-	b.c.budget.remain = maxHeadBytes
+	b.c.budget.remain, b.c.budget.ended = maxHeadBytes, false
 	_ = b.c.rwc.SetReadDeadline(time.Now().Add(headTimeout))
 	defer func() {
 		b.c.budget.remain = -1
@@ -687,7 +691,7 @@ func (b *requestBody) readTrailer() error {
 	}()
 	trailer, err := textproto.NewReader(b.c.br).ReadMIMEHeader()
 	if err != nil {
-		if errors.Is(err, io.EOF) {
+		if errors.Is(err, io.EOF) || b.c.budget.ended {
 			return io.ErrUnexpectedEOF
 		}
 		return err

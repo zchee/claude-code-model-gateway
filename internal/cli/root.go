@@ -18,7 +18,6 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -26,7 +25,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"sync"
 
 	"github.com/spf13/cobra"
 
@@ -75,6 +73,9 @@ func run(argv []string, stdin io.Reader, stdout, stderr io.Writer, lookup func(s
 }
 
 func runProcess(argv []string, stdin io.Reader, stdout, stderr io.Writer, p Process, commands []sourceCommand) int {
+	if p.Lookup == nil {
+		p.Lookup = func(string) (string, bool) { return "", false }
+	}
 	lookup, home := p.Lookup, p.Home
 	name := commandName(argv)
 	root := newRoot(name, commands, p)
@@ -275,12 +276,11 @@ func handled(cmd *cobra.Command, err error) error {
 // serveShim runs the supervisor in the foreground (lib/commands.js:3039). Its worker is this executable. Without an
 // executable lookup the supervisor gets an empty path, which it refuses only after resolving its state directory.
 func serveShim(call invocation) error {
-	stderr := &stderrTail{w: call.streams.Error}
 	var executable string
 	if call.executable != nil {
 		path, err := call.executable()
 		if err != nil {
-			return stderr.report(fmt.Errorf("could not locate the worker executable: %w", err))
+			return reportFatal(call.streams.Error, fmt.Errorf("could not locate the worker executable: %w", err))
 		}
 		executable = path
 	}
@@ -288,58 +288,31 @@ func serveShim(call invocation) error {
 	if call.environ != nil {
 		environ = call.environ()
 	}
-	return stderr.report(serveshim.Run(context.Background(), serveshim.Options{
+	return reportFatal(call.streams.Error, serveshim.Run(context.Background(), serveshim.Options{
 		Environment: environ, Home: call.home, Executable: executable,
-		Version: version.String(), Stdout: call.streams.Output, Stderr: stderr,
+		Version: version.String(), Stdout: call.streams.Output, Stderr: call.streams.Error,
 	}))
 }
 
 // serveWorker runs the request worker in the foreground (lib/commands.js:3040).
 func serveWorker(call invocation) error {
-	stderr := &stderrTail{w: call.streams.Error}
-	return stderr.report(serveworker.Run(context.Background(), serveworker.Options{
+	return reportFatal(call.streams.Error, serveworker.Run(context.Background(), serveworker.Options{
 		Lookup: call.lookup, Home: call.home, Cwd: call.cwd,
-		Version: version.String(), Stdout: call.streams.Output, Stderr: stderr,
+		Version: version.String(), Stdout: call.streams.Output, Stderr: call.streams.Error,
 	}))
 }
 
-// maxStderrTail bounds the end of a serve command's stderr kept to recognize an error the command printed itself.
-const maxStderrTail = 64 << 10
-
-// stderrTail passes a serve command's diagnostics through and keeps their end. The commands print some failures
-// themselves before returning them, so a returned error whose text is already there is not printed again.
-type stderrTail struct {
-	w    io.Writer
-	mu   sync.Mutex
-	tail []byte
-}
-
-func (s *stderrTail) Write(p []byte) (int, error) {
-	s.mu.Lock()
-	s.tail = append(s.tail, p...)
-	if over := len(s.tail) - maxStderrTail; over > 0 {
-		s.tail = s.tail[over:]
-	}
-	s.mu.Unlock()
-	return s.w.Write(p)
-}
-
-// report writes err as one line with one "model-gateway: " prefix unless the command already printed it, and returns
-// errReported so that the exit status is set without a second copy. A nil err stays nil.
-func (s *stderrTail) report(err error) error {
+// reportFatal writes the error a serve command returned as one line with one "model-gateway: " prefix, and returns
+// errReported so that the exit status is set without a second copy. The serve commands print only non-fatal
+// diagnostics themselves. A nil err stays nil.
+func reportFatal(stderr io.Writer, err error) error {
 	if err == nil {
 		return nil
 	}
-	message := err.Error()
-	s.mu.Lock()
-	printed := bytes.Contains(s.tail, []byte(message))
-	s.mu.Unlock()
-	if !printed {
-		line := strings.ReplaceAll(strings.TrimRight(message, "\n"), "\n", "; ")
-		if !strings.HasPrefix(line, installedName+": ") {
-			line = installedName + ": " + line
-		}
-		_, _ = fmt.Fprintln(s.w, line)
+	line := strings.ReplaceAll(strings.TrimRight(err.Error(), "\n"), "\n", "; ")
+	if !strings.HasPrefix(line, installedName+": ") {
+		line = installedName + ": " + line
 	}
+	_, _ = fmt.Fprintln(stderr, line)
 	return errReported
 }

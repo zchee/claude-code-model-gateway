@@ -99,11 +99,24 @@ func (s *shim) logf(format string, args ...any) {
 	_, _ = fmt.Fprintf(s.stderr, format, args...)
 }
 
+// fail hands a fatal error to Run, which holds one. A failure that arrives while another one is pending is not the
+// one Run returns, so it is printed here as a warning instead of being lost.
 func (s *shim) fail(err error) {
 	select {
 	case s.fatal <- err:
 	default:
+		s.warnFatal(err)
 	}
+}
+
+// warnFatal prints a fatal error that Run does not return as one line with one "model-gateway: " prefix. The error
+// Run returns is printed by its caller only.
+func (s *shim) warnFatal(err error) {
+	line := strings.ReplaceAll(strings.TrimRight(err.Error(), "\n"), "\n", "; ")
+	if !strings.HasPrefix(line, "model-gateway: ") {
+		line = "model-gateway: " + line
+	}
+	s.logf("%s\n", line)
 }
 
 // publishSelf writes the supervisor's own pid record before it reports ready.
@@ -172,8 +185,7 @@ func (s *shim) startWorker() {
 	}
 	w, err := s.spawn()
 	if err != nil {
-		s.logf("model-gateway: could not start the shim worker: %v\n", err)
-		s.fail(err)
+		s.fail(fmt.Errorf("model-gateway: could not start the shim worker: %w", err))
 		return
 	}
 	s.current = w
@@ -237,11 +249,12 @@ func (s *shim) readReport(w *workerProc) {
 		return
 	}
 	if err := s.publish(w, port, true); err != nil {
-		s.logf("model-gateway: could not publish the worker pid record: %v\n", err)
-		if s.isCurrent(w) {
-			// A worker the supervisor cannot track is not served, as the supervisor does not serve untracked itself.
-			s.fail(fmt.Errorf("model-gateway: the shim worker could not be tracked: %w", err))
+		if !s.isCurrent(w) {
+			s.logf("model-gateway: could not publish the worker pid record: %v\n", err)
+			return
 		}
+		// A worker the supervisor cannot track is not served, as the supervisor does not serve untracked itself.
+		s.fail(fmt.Errorf("model-gateway: the shim worker could not be tracked: %w", err))
 	}
 }
 
