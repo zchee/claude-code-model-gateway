@@ -31,7 +31,8 @@ type Route struct {
 	Provider string `json:"provider"`
 }
 
-// ParseListing parses the data member of a proxy listing in discovery order.
+// ParseListing parses the raw data member of a proxy listing in discovery order.
+// It skips rows whose IDs contain invalid UTF-8 or unpaired UTF-16 surrogates.
 func ParseListing(rows jsontext.Value) []Route {
 	var entries []jsontext.Value
 	if err := json.Unmarshal(rows, &entries, jsontext.AllowDuplicateNames(true), jsontext.AllowInvalidUTF8(true)); err != nil {
@@ -40,6 +41,7 @@ func ParseListing(rows jsontext.Value) []Route {
 	routes := make([]Route, 0, len(entries))
 	seen := make(map[string]struct{}, len(entries))
 	for _, entry := range entries {
+		// Keep the raw fields so a malformed string cannot become a different ID.
 		var row struct {
 			ID          jsontext.Value `json:"id"`
 			DisplayName jsontext.Value `json:"display_name"`
@@ -48,7 +50,7 @@ func ParseListing(rows jsontext.Value) []Route {
 			continue
 		}
 		var id string
-		if err := json.Unmarshal(row.ID, &id, jsontext.AllowInvalidUTF8(true)); err != nil || id == "" {
+		if err := json.Unmarshal(row.ID, &id); err != nil || id == "" {
 			continue
 		}
 		switch id {
@@ -61,9 +63,10 @@ func ParseListing(rows jsontext.Value) []Route {
 		if _, duplicate := seen[id]; duplicate {
 			continue
 		}
-		var displayName string
-		_ = json.Unmarshal(row.DisplayName, &displayName, jsontext.AllowInvalidUTF8(true))
-		provider := listedProvider(id, displayName)
+		var displayName, provider string
+		if err := json.Unmarshal(row.DisplayName, &displayName); err == nil {
+			provider = listedProvider(id, displayName)
+		}
 		if provider == "" {
 			if !strings.HasPrefix(id, "gpt-") {
 				continue
@@ -98,7 +101,7 @@ func listedProvider(id, displayName string) string {
 	return provider
 }
 
-// ModelsFileRoutes reads Codex routes from a legacy JSON array of model IDs.
+// ModelsFileRoutes reads Codex routes with well-formed Unicode IDs from a raw legacy JSON array.
 func ModelsFileRoutes(value jsontext.Value) []Route {
 	var entries []jsontext.Value
 	if err := json.Unmarshal(value, &entries, jsontext.AllowDuplicateNames(true), jsontext.AllowInvalidUTF8(true)); err != nil {
@@ -108,7 +111,7 @@ func ModelsFileRoutes(value jsontext.Value) []Route {
 	seen := make(map[string]struct{}, len(entries))
 	for _, entry := range entries {
 		var id string
-		if err := json.Unmarshal(entry, &id, jsontext.AllowInvalidUTF8(true)); err != nil || !strings.HasPrefix(id, "gpt-") {
+		if err := json.Unmarshal(entry, &id); err != nil || !strings.HasPrefix(id, "gpt-") {
 			continue
 		}
 		if _, duplicate := seen[id]; !duplicate {
