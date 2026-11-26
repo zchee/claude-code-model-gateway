@@ -84,10 +84,13 @@ func TestUncleanRelativeDispatchPathRefused(t *testing.T) {
 			}
 			h, err := proxyreq.New(proxyreq.Options{StartupDir: dir, DispatchPath: tc.path, Now: func() time.Time { return time.UnixMilli(1234) }})
 			if err == nil {
-				t.Errorf("New accepted the unclean relative dispatch path %q (handler %v)", tc.path, h != nil)
+				t.Errorf("New accepted the unclean relative dispatch path %q", tc.path)
 			} else if len(tc.path) > 2 && strings.Contains(err.Error(), tc.path) {
 				// "." and ".." can occur in any sentence, so only a longer spelling shows an echoed path.
 				t.Errorf("refusal echoes the dispatch path %q: %v", tc.path, err)
+			}
+			if h != nil {
+				t.Errorf("New returned a non-nil handler on refusal of %q", tc.path)
 			}
 			for _, c := range candidates {
 				got, err := os.ReadFile(filepath.Join(dir, c))
@@ -130,10 +133,17 @@ func TestCleanRelativeDispatchPathSelection(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			dir := stateTree(t)
+			decoys := []string{"routes.json", "state/routes.json", "real/routes.json", "real/sub/routes.json"}
+			seeded := make(map[string]string, len(decoys))
 			// A decoy route in every other candidate file shows a wrong selection as a wrong model.
-			for _, decoy := range []string{"routes.json", "state/routes.json", "real/routes.json", "real/sub/routes.json"} {
+			for _, decoy := range decoys {
 				if decoy != tc.selected {
 					brief(t, stateHandler(t, dir, filepath.Join(dir, decoy)), "gpt-decoy")
+					raw, err := os.ReadFile(filepath.Join(dir, decoy))
+					if err != nil {
+						t.Fatal(err)
+					}
+					seeded[decoy] = string(raw)
 				}
 			}
 			brief(t, stateHandler(t, dir, filepath.Join(dir, tc.selected)), "gpt-selected")
@@ -150,10 +160,20 @@ func TestCleanRelativeDispatchPathSelection(t *testing.T) {
 			if diff := gocmp.Diff(want, followUp(t, stateHandler(t, dir, filepath.Join(dir, tc.selected)))); diff != "" {
 				t.Errorf("binding through %q not persisted to %s (-want +got): %s", tc.path, tc.selected, diff)
 			}
-			if tc.selected != "routes.json" {
-				decoy := turnOutcome{Via: "dispatch-cached", Model: "gpt-decoy", Ticket: "<none>"}
-				if diff := gocmp.Diff(decoy, followUp(t, stateHandler(t, dir, filepath.Join(dir, "routes.json")))); diff != "" {
-					t.Errorf("binding through %q changed the startup directory's routes.json (-want +got): %s", tc.path, diff)
+			for _, decoy := range decoys {
+				if decoy == tc.selected {
+					continue
+				}
+				got, err := os.ReadFile(filepath.Join(dir, decoy))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if diff := gocmp.Diff(seeded[decoy], string(got)); diff != "" {
+					t.Errorf("binding through %q changed %s (-want +got): %s", tc.path, decoy, diff)
+				}
+				wantDecoy := turnOutcome{Via: "dispatch-cached", Model: "gpt-decoy", Ticket: "<none>"}
+				if diff := gocmp.Diff(wantDecoy, followUp(t, stateHandler(t, dir, filepath.Join(dir, decoy)))); diff != "" {
+					t.Errorf("binding through %q changed route in %s (-want +got): %s", tc.path, decoy, diff)
 				}
 			}
 		})

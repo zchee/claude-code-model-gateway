@@ -37,14 +37,14 @@ func TestRequestedEffortUnits(t *testing.T) {
 		effort, wantBody, wantEffort string
 	}{
 		"success: ordinary effort":            {`"high"`, `"high"`, "high"},
-		"success: paired surrogates":          {`"😀"`, "\"\U0001F600\"", "\U0001F600"},
+		"success: paired surrogates":          {`"\ud83d\ude00"`, "\"\U0001F600\"", "\U0001F600"},
 		"success: unpaired high surrogate":    {`"\ud800"`, `"\ud800"`, "�"},
 		"success: unpaired low surrogate":     {`"x\udc00y"`, `"x\udc00y"`, "x�y"},
 		"success: literal replacement stays":  {`"�"`, "\"�\"", "�"},
 		"success: reversed surrogate pair":    {`"\ude00\ud83d"`, `"\ude00\ud83d"`, "��"},
 		"success: surrogate before a letter":  {`"\ud83dz"`, `"\ud83dz"`, "�z"},
 		"success: surrogate at the very end":  {`"low\udbff"`, `"low\udbff"`, "low�"},
-		"success: escaped ASCII is unescaped": {`"high"`, `"high"`, "high"},
+		"success: escaped ASCII is unescaped": {`"\u0068\u0069\u0067\u0068"`, `"high"`, "high"},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
