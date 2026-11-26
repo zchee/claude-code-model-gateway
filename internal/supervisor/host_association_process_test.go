@@ -547,6 +547,36 @@ func TestHostAssociationPerRequest(t *testing.T) {
 			pipelined: true,
 			halfClose: true,
 		},
+		// A trailer section ends with an empty line. A section the peer's half-close cut off before that line was never
+		// finished, even when every field line it holds is complete, malformed or not.
+		"error: peer closes after the last chunk, before the trailer section": {
+			requests: []wireRequest{
+				{head: "POST /trailer HTTP/1.1\r\nHost: {own}\r\nX-Probe: {probe}\r\nTransfer-Encoding: chunked\r\n\r\n", body: "2\r\n{}\r\n0\r\n", want: abandoned},
+			},
+			pipelined: true,
+			halfClose: true,
+		},
+		"error: peer closes after a complete trailer field line, before the end of the section": {
+			requests: []wireRequest{
+				{head: "POST /trailer HTTP/1.1\r\nHost: {own}\r\nX-Probe: {probe}\r\nTransfer-Encoding: chunked\r\n\r\n", body: "2\r\n{}\r\n0\r\nX-Trailer: done\r\n", want: abandoned},
+			},
+			pipelined: true,
+			halfClose: true,
+		},
+		"error: peer closes after a complete trailer line without a colon, before the end of the section": {
+			requests: []wireRequest{
+				{head: "POST /trailer HTTP/1.1\r\nHost: {own}\r\nX-Probe: {probe}\r\nTransfer-Encoding: chunked\r\n\r\n", body: "2\r\n{}\r\n0\r\nX-Tr\r\n", want: abandoned},
+			},
+			pipelined: true,
+			halfClose: true,
+		},
+		"error: peer closes after a complete trailer field name with a space before the colon, before the end of the section": {
+			requests: []wireRequest{
+				{head: "POST /trailer HTTP/1.1\r\nHost: {own}\r\nX-Probe: {probe}\r\nTransfer-Encoding: chunked\r\n\r\n", body: "2\r\n{}\r\n0\r\nX-Trailer : done\r\n", want: abandoned},
+			},
+			pipelined: true,
+			halfClose: true,
+		},
 		// The same trailer lines, finished: the client completed the request, so its malformed trailer is refused.
 		"error: complete trailer line without a colon": {
 			requests: []wireRequest{

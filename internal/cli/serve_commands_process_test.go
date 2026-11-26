@@ -26,8 +26,8 @@ import (
 
 // TestServeShimReportsABindFailureOnce runs serve-shim to a failure it meets only after its state directory, control
 // token, executable and port checks: its public port is held by the test's own loopback listener, so the bind fails.
-// The failure reaches stderr once, as one line with one "model-gateway: " prefix, the exit status is 1, and nothing
-// reaches stdout.
+// The failure reaches stderr once, as one line with one "model-gateway: " prefix that says the supervisor could not
+// bind the held address, not only the bare system error; the exit status is 1, and nothing reaches stdout.
 func TestServeShimReportsABindFailureOnce(t *testing.T) {
 	tests := map[string]struct {
 		settings func(heldPort string) map[string]string
@@ -55,7 +55,7 @@ func TestServeShimReportsABindFailureOnce(t *testing.T) {
 			if diff := gocmp.Diff("", stdout); diff != "" {
 				t.Errorf("stdout mismatch (-want +got):\n%s", diff)
 			}
-			checkReportedOnce(t, stderr, "127.0.0.1:"+port)
+			checkReportedOnce(t, stderr, "cannot bind 127.0.0.1:"+port)
 		})
 	}
 }
