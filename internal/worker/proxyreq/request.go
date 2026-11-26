@@ -22,10 +22,12 @@ import (
 	"maps"
 	"math"
 	"net/http"
+	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf16"
 
@@ -64,6 +66,9 @@ type Result struct {
 
 // Handler owns one worker's dispatch cache and shared request settings.
 type Handler struct {
+	// routesMu makes each request's dispatch decision (its explicit binding, or its own lookup, parent lookup
+	// and inherited write) one step, so concurrent turns of a session end as some serial order would leave them.
+	routesMu      sync.Mutex
 	routes        *dispatch.Cache
 	windows       policy.Windows
 	sentryEnabled bool
@@ -78,17 +83,30 @@ func New(options Options) (*Handler, error) {
 		// The dispatch cache keeps the directory it first opens; a path relative to the process working
 		// directory would make that directory depend on where the worker happened to start.
 		if !filepath.IsAbs(options.StartupDir) {
-			return nil, fmt.Errorf("proxyreq: relative dispatch path %q needs an absolute startup directory", path)
+			return nil, errors.New("proxyreq: a relative dispatch state path needs an absolute startup directory")
 		}
-		path = filepath.Join(options.StartupDir, path)
+		// Lexical cleaning would let a symlink followed by ".." name a different file than the kernel opens
+		// for the same spelling, so only a spelling that needs no cleaning is anchored, by concatenation.
+		if !cleanRelative(path) {
+			return nil, errors.New("proxyreq: a relative dispatch state path must not have a volume, an empty, \".\" or \"..\" component, or a trailing separator")
+		}
+		separator := string(filepath.Separator)
+		if os.IsPathSeparator(options.StartupDir[len(options.StartupDir)-1]) {
+			separator = ""
+		}
+		path = options.StartupDir + separator + path
 	}
 	now := options.Now
 	if now == nil {
 		now = time.Now
 	}
 	lookup := options.Lookup
-	// The configured maximum is a positive integer; the clamp only keeps the conversion defined.
-	maxSessions := int(min(config.DispatchMax.Get(lookup), math.MaxInt32))
+	// The configured maximum is a positive integer. Saturate only where it exceeds the native int: the float
+	// nearest math.MaxInt on 64-bit builds is 2^63, which an int conversion cannot represent.
+	maxSessions := math.MaxInt
+	if limit := config.DispatchMax.Get(lookup); limit < float64(math.MaxInt) {
+		maxSessions = int(limit)
+	}
 	return &Handler{
 		routes:        dispatch.NewCache(path, config.DispatchTTL.Get(lookup), maxSessions, now),
 		windows:       maps.Clone(options.Windows),
@@ -158,11 +176,8 @@ func (h *Handler) Prepare(w http.ResponseWriter, r *http.Request, snapshot route
 	if dispatched {
 		id = requestIdentity(r.Header, payload)
 		var marked *dispatch.Route
-		if messages := memberValue(payload, "messages"); messages.Kind == '[' {
-			if raw, err := jsonx.EncodeWire(messages); err == nil {
-				marked, markers = dispatch.FromMessages(raw)
-			}
-		}
+		marked, markers = dispatch.FromWireMessages(memberValue(payload, "messages"))
+		h.routesMu.Lock()
 		switch {
 		case markers == 1 && marked != nil:
 			chosen = &dispatch.CachedRoute{Route: *marked}
@@ -176,6 +191,7 @@ func (h *Handler) Prepare(w http.ResponseWriter, r *http.Request, snapshot route
 				inheritedID, via = id.parentAgentID, "dispatch-inherited"
 			}
 		}
+		h.routesMu.Unlock()
 		if chosen == nil {
 			res.Route.Via = "dispatch"
 			res.Audit = id.audit(outcome.Audit{Backend: provider, Model: new(advertised), Via: "dispatch-unbound", MarkersLength: new(markers)})
@@ -348,7 +364,11 @@ func metadataSession(payload jsonx.WireValue) string {
 }
 
 // safeUnits applies safeID to UTF-16 units; a safe ID is ASCII, so any other unit rejects it.
+// The length limit is checked first so an overlong candidate is not copied.
 func safeUnits(text []uint16) string {
+	if len(text) < 1 || len(text) > 128 {
+		return ""
+	}
 	b := make([]byte, len(text))
 	for i, u := range text {
 		if u >= 0x80 {
@@ -372,6 +392,25 @@ func safeID(s string) string {
 		}
 	}
 	return s
+}
+
+// cleanRelative reports whether a relative path has no volume and only components other than "", "." and
+// "..", so it needs no lexical cleaning; a leading or trailing separator makes an empty component.
+func cleanRelative(path string) bool {
+	if filepath.VolumeName(path) != "" {
+		return false
+	}
+	start := 0
+	for i := range len(path) + 1 {
+		if i < len(path) && !os.IsPathSeparator(path[i]) {
+			continue
+		}
+		if c := path[start:i]; c == "" || c == "." || c == ".." {
+			return false
+		}
+		start = i + 1
+	}
+	return true
 }
 
 // headerValue joins repeated values as Node joins a repeated custom header; it is empty when absent.

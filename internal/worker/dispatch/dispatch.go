@@ -56,7 +56,16 @@ type Route struct {
 // FromMessages returns the sole user-authored route, or nil, and the number of qualifying markers.
 func FromMessages(messages jsontext.Value) (*Route, int) {
 	root, err := jsonx.DecodeWire(messages)
-	if err != nil || root.Kind != '[' {
+	if err != nil {
+		return nil, 0
+	}
+	return FromWireMessages(root)
+}
+
+// FromWireMessages is FromMessages over an already decoded messages value; anything but an array has no
+// markers. The returned route shares no memory with messages.
+func FromWireMessages(messages jsonx.WireValue) (*Route, int) {
+	if messages.Kind != '[' {
 		return nil, 0
 	}
 	var route *Route
@@ -80,7 +89,7 @@ func FromMessages(messages jsontext.Value) (*Route, int) {
 			text = text[match[1]:]
 		}
 	}
-	for _, message := range root.Elements {
+	for _, message := range messages.Elements {
 		if string(utf16.Decode(property(message, "role").Text)) != "user" {
 			continue
 		}
