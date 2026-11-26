@@ -187,41 +187,15 @@ func TestProviderAuthState(t *testing.T) {
 			t.Errorf("last status call mismatch (-want +got):\n%s", diff)
 		}
 	})
-
-	t.Run("proxy_config_dir", func(t *testing.T) {
-		tests := map[string]struct {
-			env      map[string]string
-			platform string
-			home     string
-			want     string
-		}{
-			"success: explicit CCP_CONFIG_DIR": {
-				env: map[string]string{"CCP_CONFIG_DIR": "/custom"}, platform: "linux", home: "/h", want: "/custom",
-			},
-			"success: darwin default": {
-				env: map[string]string{}, platform: "darwin", home: "/h", want: filepath.Join("/h", ".config", "claude-code-proxy"),
-			},
-			"success: linux XDG_CONFIG_HOME": {
-				env: map[string]string{"XDG_CONFIG_HOME": "/x"}, platform: "linux", home: "/h", want: filepath.Join("/x", "claude-code-proxy"),
-			},
-		}
-		for name, tt := range tests {
-			t.Run(name, func(t *testing.T) {
-				got := readiness.ProxyConfigDir(lookupMap(tt.env), tt.platform, tt.home)
-				if got != tt.want {
-					t.Errorf("ProxyConfigDir = %q, want %q", got, tt.want)
-				}
-			})
-		}
-	})
 }
 
 func TestProxyProviderReadiness(t *testing.T) {
 	dir := t.TempDir()
+	commandPath := filepath.Join(dir, "my gateway", "bin", "model-gateway")
 	msgOpts := readiness.ProviderMessageOptions{
 		ConfigDir:   dir,
 		ProxyBinary: filepath.Join(dir, "claude-code-proxy"),
-		CommandPath: filepath.Join(dir, "model-gateway.js"),
+		CommandPath: commandPath,
 	}
 	healthy := readiness.SharedChecks{ProxyBinary: true, ProxyModels: true, ShimRunning: true, ServingVersionMatches: true}
 
@@ -239,7 +213,7 @@ func TestProxyProviderReadiness(t *testing.T) {
 			"error: binary missing wins over sign-in": {
 				checks: readiness.SharedChecks{ProxyBinary: false, ProxyModels: true, ShimRunning: true, ServingVersionMatches: true},
 				auth:   "ready", state: "binary-missing",
-				message: regexp.MustCompile(`claude-code-proxy is missing`),
+				message: regexp.MustCompile(`^` + regexp.QuoteMeta("claude-code-proxy is missing. Run `\""+commandPath+"\" setup`.") + `$`),
 			},
 			"error: proxy down": {
 				checks: readiness.SharedChecks{ProxyBinary: true, ProxyModels: false, ShimRunning: true, ServingVersionMatches: true},
@@ -302,7 +276,7 @@ func TestVertexReadiness(t *testing.T) {
 	msgOpts := readiness.ProviderMessageOptions{
 		ConfigDir:   dir,
 		ProxyBinary: filepath.Join(dir, "claude-code-proxy"),
-		CommandPath: filepath.Join(dir, "model-gateway.js"),
+		CommandPath: filepath.Join(dir, "my gateway", "bin", "model-gateway"),
 	}
 	healthy := readiness.SharedChecks{ProxyBinary: true, ProxyModels: true, ShimRunning: true, ServingVersionMatches: true}
 

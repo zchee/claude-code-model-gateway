@@ -49,19 +49,20 @@ func ProbeProxyAndAuth(ctx context.Context, probe ProxyAuthProbe) ProxyAuthResul
 
 // SharedCheck deduplicates concurrent proxy and auth checks and serves the latest result immediately.
 // When no check has completed or the latest result is at least FreshnessTTL old, Latest starts at most
-// one background check.
+// one background check bound to the worker-lifetime context supplied to NewSharedCheck.
 type SharedCheck struct{}
 
-// NewSharedCheck creates a single-flight check using run and clock. A nil clock defaults to time.Now.
-func NewSharedCheck(run func(context.Context) ProxyAuthResult, clock func() time.Time) *SharedCheck {
-	_, _ = run, clock
+// NewSharedCheck creates a single-flight check using workerCtx, run, and clock.
+// Background checks inherit workerCtx (or context.Background when nil) so an immediate /healthz response
+// does not cancel an in-flight probe, while worker shutdown cancels it cleanly. A nil clock defaults to time.Now.
+func NewSharedCheck(workerCtx context.Context, run func(context.Context) ProxyAuthResult, clock func() time.Time) *SharedCheck {
+	_, _, _ = workerCtx, run, clock
 	return &SharedCheck{}
 }
 
 // Latest returns the most recently completed check immediately, or nil before the first check finishes.
-// If the result is absent or stale, it starts at most one background check bound to ctx.
-func (c *SharedCheck) Latest(ctx context.Context) *ProxyAuthResult {
-	_ = ctx
+// If the result is absent or stale, it starts at most one background check under the worker context.
+func (c *SharedCheck) Latest() *ProxyAuthResult {
 	return nil
 }
 

@@ -28,7 +28,8 @@ import (
 const DefaultProbeTimeout = 1500 * time.Millisecond
 
 // ProbeOptions configures live HTTP probes against local model servers.
-// Zero values use DefaultProbeTimeout and a loopback-safe client that does not follow redirects.
+// Zero values use DefaultProbeTimeout and a client that follows HTTP 3xx redirects
+// while retaining the Authorization header only on the same origin.
 type ProbeOptions struct {
 	Client  *http.Client
 	Timeout time.Duration

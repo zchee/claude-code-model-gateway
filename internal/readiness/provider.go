@@ -42,12 +42,6 @@ func ProviderAuthState(ctx context.Context, provider string, opts ProviderAuthOp
 	return ""
 }
 
-// ProxyConfigDir resolves the claude-code-proxy configuration directory for the given platform and home.
-func ProxyConfigDir(lookup config.LookupEnv, platform, home string) string {
-	_, _, _ = lookup, platform, home
-	return ""
-}
-
 // SharedChecks holds the gateway checks shared by every proxy provider.
 type SharedChecks struct {
 	ProxyBinary           bool

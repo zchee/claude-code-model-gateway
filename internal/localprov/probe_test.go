@@ -24,6 +24,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,12 +36,16 @@ import (
 
 	"github.com/zchee/claude-code-model-gateway/internal/config"
 	"github.com/zchee/claude-code-model-gateway/internal/localprov"
+	"github.com/zchee/claude-code-model-gateway/internal/policy"
 	"github.com/zchee/claude-code-model-gateway/internal/proxyconfig"
 	"github.com/zchee/claude-code-model-gateway/internal/proxymodels"
 	"github.com/zchee/claude-code-model-gateway/internal/readiness"
 )
 
-const studioTestSecret = "lmstudio-test-token-never-printed"
+const (
+	studioTestSecret     = "lmstudio-test-token-never-printed"
+	studioRedirectSecret = "lmstudio-redirect-marker-49a7"
+)
 
 func mapLookup(values map[string]string) config.LookupEnv {
 	return func(key string) (string, bool) {
@@ -51,7 +56,8 @@ func mapLookup(values map[string]string) config.LookupEnv {
 
 type seenRequest struct {
 	URL           string
-	Authorization string
+	HasAuthHeader bool
+	AuthValues    []string
 }
 
 type fakeStudioServer struct {
@@ -106,8 +112,13 @@ func startFakeStudio(t *testing.T, models func() []map[string]any, status int, r
 	t.Helper()
 	fake := &fakeStudioServer{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authValues, hasAuth := r.Header["Authorization"]
 		fake.mu.Lock()
-		fake.seen = append(fake.seen, seenRequest{URL: r.URL.RequestURI(), Authorization: r.Header.Get("Authorization")})
+		fake.seen = append(fake.seen, seenRequest{
+			URL:           r.URL.RequestURI(),
+			HasAuthHeader: hasAuth,
+			AuthValues:    slices.Clone(authValues),
+		})
 		fake.mu.Unlock()
 		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/models" {
 			w.WriteHeader(http.StatusNotFound)
@@ -139,7 +150,9 @@ func startFakeStudio(t *testing.T, models func() []map[string]any, status int, r
 	return fake
 }
 
-func closedLoopbackPort(t *testing.T) uint16 {
+// reserveLoopbackPort binds an ephemeral port while other servers remain open so the OS guarantees
+// a distinct port; the returned release function closes the listener right before an outage probe.
+func reserveLoopbackPort(t *testing.T) (uint16, func()) {
 	t.Helper()
 	var lc net.ListenConfig
 	ln, err := lc.Listen(t.Context(), "tcp4", "127.0.0.1:0")
@@ -147,9 +160,22 @@ func closedLoopbackPort(t *testing.T) uint16 {
 		t.Fatalf("listen ephemeral port: %v", err)
 	}
 	port := uint16(ln.Addr().(*net.TCPAddr).Port)
-	if err := ln.Close(); err != nil {
-		t.Fatalf("close ephemeral port: %v", err)
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			if err := ln.Close(); err != nil {
+				t.Errorf("close ephemeral port %d: %v", port, err)
+			}
+		})
 	}
+	t.Cleanup(release)
+	return port, release
+}
+
+func closedLoopbackPort(t *testing.T) uint16 {
+	t.Helper()
+	port, release := reserveLoopbackPort(t)
+	release()
 	return port
 }
 
@@ -287,26 +313,26 @@ func TestProbeStudio(t *testing.T) {
 				t.Fatalf("%s: marshal state: %v", name, err)
 			}
 			if tokenPattern.Match(raw) {
-				t.Errorf("%s: token leaked into state: %s", name, raw)
+				t.Errorf("%s: token marker leaked into serialized StudioState", name)
 			}
 		}
 	})
 
 	t.Run("open_requests", func(t *testing.T) {
-		want := []seenRequest{{URL: "/api/v1/models", Authorization: ""}}
+		want := []seenRequest{{URL: "/api/v1/models", HasAuthHeader: false, AuthValues: nil}}
 		if diff := gocmp.Diff(want, open.requests()); diff != "" {
 			t.Errorf("open server requests mismatch (-want +got):\n%s", diff)
 		}
 	})
 
 	t.Run("locked_requests", func(t *testing.T) {
-		got := make([]string, 0, len(locked.requests()))
-		for _, req := range locked.requests() {
-			got = append(got, req.Authorization)
+		want := []seenRequest{
+			{URL: "/api/v1/models", HasAuthHeader: true, AuthValues: []string{"Bearer " + studioTestSecret}},
+			{URL: "/api/v1/models", HasAuthHeader: false, AuthValues: nil},
+			{URL: "/api/v1/models", HasAuthHeader: true, AuthValues: []string{"Bearer wrong-token"}},
 		}
-		want := []string{"Bearer " + studioTestSecret, "", "Bearer wrong-token"}
-		if diff := gocmp.Diff(want, got); diff != "" {
-			t.Errorf("locked server authorizations mismatch (-want +got):\n%s", diff)
+		if diff := gocmp.Diff(want, locked.requests()); diff != "" {
+			t.Errorf("locked server requests mismatch (-want +got):\n%s", diff)
 		}
 	})
 }
@@ -328,6 +354,9 @@ func TestRefreshStudioState(t *testing.T) {
 		_, _ = w.Write(data)
 	}))
 	t.Cleanup(srv.Close)
+
+	// Reserve a second distinct port while srv is still bound so the OS cannot reassign srv's port.
+	movedPort, releaseMovedPort := reserveLoopbackPort(t)
 
 	studioRoutes := []proxymodels.Route{
 		{ID: "lmstudio/qwen3-coder-30b", Provider: "lmstudio"},
@@ -382,11 +411,52 @@ func TestRefreshStudioState(t *testing.T) {
 	if got := windowFor(down, "qwen3-coder-30b"); got != 40960 {
 		t.Errorf("stopped server contextWindow = %d, want preserved 40960", got)
 	}
-	if diff := gocmp.Diff(down, tracker.State()); diff != "" {
+	snap := tracker.State()
+	if snap == nil {
+		t.Fatal("tracker.State() returned nil during outage")
+	}
+	if diff := gocmp.Diff(down, snap); diff != "" {
 		t.Errorf("tracker.State() mismatch (-want +got):\n%s", diff)
 	}
+	// Policy resolution uses the tracked snapshot, and mutating returned copies must not alter tracked state or the resolver.
+	resolver := policy.NewResolver(policy.ResolverInputs{
+		Routes:          proxymodels.NewTable(studioRoutes),
+		LMStudioURL:     snap.BaseURL,
+		LMStudioWindows: snap.Windows(),
+	})
+	if got := resolver.AdvertisedWindow("claude-lmstudio/qwen3-coder-30b"); got != 40960 {
+		t.Errorf("resolver advertised window during outage = %d, want 40960", got)
+	}
+	if len(down.Models) > 0 {
+		down.Models[0].ContextWindow = 999999
+	}
+	if len(snap.Models) > 0 {
+		snap.Models[0].ContextWindow = 111111
+		snap.Models = append(snap.Models, localprov.Model{Key: "injected", Loaded: true, ContextWindow: 50000})
+		windowsCopy := snap.Windows()
+		windowsCopy["qwen3-coder-30b"] = 12345
+	}
+	afterMutation := tracker.State()
+	if afterMutation == nil {
+		t.Fatal("tracker.State() returned nil after copy mutation")
+	}
+	if len(afterMutation.Models) != 1 || windowFor(afterMutation, "qwen3-coder-30b") != 40960 {
+		t.Errorf("tracked state mutated through returned copy: %+v", afterMutation)
+	}
+	if got := resolver.AdvertisedWindow("claude-lmstudio/qwen3-coder-30b"); got != 40960 {
+		t.Errorf("resolver advertised window mutated to %d, want 40960", got)
+	}
+	freshResolver := policy.NewResolver(policy.ResolverInputs{
+		Routes:          proxymodels.NewTable(studioRoutes),
+		LMStudioURL:     afterMutation.BaseURL,
+		LMStudioWindows: afterMutation.Windows(),
+	})
+	if got := freshResolver.AdvertisedWindow("claude-lmstudio/qwen3-coder-30b"); got != 40960 {
+		t.Errorf("fresh resolver advertised window after copy mutation = %d, want 40960", got)
+	}
 
-	movedEnv := mapLookup(map[string]string{"CCP_LMSTUDIO_BASE_URL": "http://127.0.0.1:" + strconv.Itoa(int(closedLoopbackPort(t)))})
+	releaseMovedPort()
+	movedEnv := mapLookup(map[string]string{"CCP_LMSTUDIO_BASE_URL": "http://127.0.0.1:" + strconv.Itoa(int(movedPort))})
 	moved := tracker.Refresh(t.Context(), studioRoutes, movedEnv, emptyDir, localprov.ProbeOptions{})
 	if moved == nil {
 		t.Fatal("moved server refresh returned nil")
@@ -438,7 +508,8 @@ func TestRefreshStudioUnlistedNoContact(t *testing.T) {
 
 func TestStudioReadiness(t *testing.T) {
 	dir := t.TempDir()
-	commandPath := filepath.Join(dir, "model-gateway.js")
+	commandPath := filepath.Join(dir, "my gateway", "bin", "model-gateway")
+	restartSuffix := "restart the gateway: `\"" + commandPath + "\" stop`, then `\"" + commandPath + "\" start`."
 	proxyBin := filepath.Join(dir, "claude-code-proxy")
 	healthy := readiness.SharedChecks{ProxyBinary: true, ProxyModels: true, ShimRunning: true, ServingVersionMatches: true}
 	const base = "http://127.0.0.1:1234"
@@ -491,12 +562,12 @@ func TestStudioReadiness(t *testing.T) {
 		"error: turned off where the check runs": {
 			env:       map[string]string{"CCP_LMSTUDIO_ENABLED": "off"},
 			wantState: "config-invalid",
-			described: regexp.MustCompile(`^NOT CONFIGURED \(claude-code-proxy lists LM Studio models, but the provider is turned off where this check runs.*Use the same CCP_LMSTUDIO_ENABLED where the gateway starts.*model-gateway\.js" stop` + "`" + `, then ` + "`" + `node ".*model-gateway\.js" start` + "`" + `\.\)$`),
+			described: regexp.MustCompile(`^NOT CONFIGURED \(claude-code-proxy lists LM Studio models, but the provider is turned off where this check runs.*Use the same CCP_LMSTUDIO_ENABLED where the gateway starts.*, then ` + regexp.QuoteMeta(restartSuffix) + `\)$`),
 		},
 		"error: an invalid server setting, and the message names it and the reason": {
 			env:       map[string]string{"CCP_LMSTUDIO_BASE_URL": "http://lmstudio.example:1234"},
 			wantState: "config-invalid",
-			described: regexp.MustCompile(`^NOT CONFIGURED \(claude-code-proxy lists LM Studio models, but the LM Studio setting CCP_LMSTUDIO_BASE_URL is invalid where this check runs \(must use https \(plain http only for a loopback host\)\)`),
+			described: regexp.MustCompile(`^NOT CONFIGURED \(claude-code-proxy lists LM Studio models, but the LM Studio setting CCP_LMSTUDIO_BASE_URL is invalid where this check runs \(must use https \(plain http only for a loopback host\)\).*, then ` + regexp.QuoteMeta(restartSuffix) + `\)$`),
 		},
 		"error: not probed in this process": {
 			wantState: "auth-unknown",
@@ -516,13 +587,13 @@ func TestStudioReadiness(t *testing.T) {
 		"error: server requires a token and none is set": {
 			state:     probed(nil, func(s *localprov.StudioState) { s.AuthRequired = true }),
 			wantState: "auth-missing",
-			described: regexp.MustCompile(`^MISSING \(LM Studio at http://127\.0\.0\.1:1234 requires an API token: set CCP_LMSTUDIO_API_KEY \(or LM_API_TOKEN\) where the gateway starts .*, or lmstudio\.apiKey in .*config\.json; the token comes from LM Studio's server settings\. Then restart the gateway: `),
+			described: regexp.MustCompile(`^MISSING \(LM Studio at http://127\.0\.0\.1:1234 requires an API token: set CCP_LMSTUDIO_API_KEY \(or LM_API_TOKEN\) where the gateway starts .*, or lmstudio\.apiKey in .*config\.json; the token comes from LM Studio's server settings\. Then ` + regexp.QuoteMeta(restartSuffix) + `\)$`),
 		},
 		"error: server refuses the token that is set": {
 			env:       map[string]string{"CCP_LMSTUDIO_API_KEY": studioTestSecret},
 			state:     probed(nil, func(s *localprov.StudioState) { s.AuthRequired = true; s.HasAPIKey = true }),
 			wantState: "auth-missing",
-			described: regexp.MustCompile(`^MISSING \(LM Studio at http://127\.0\.0\.1:1234 refused the API token it was sent: check CCP_LMSTUDIO_API_KEY`),
+			described: regexp.MustCompile(`^MISSING \(LM Studio at http://127\.0\.0\.1:1234 refused the API token it was sent: check CCP_LMSTUDIO_API_KEY.*\. Then ` + regexp.QuoteMeta(restartSuffix) + `\)$`),
 		},
 	}
 
@@ -564,9 +635,12 @@ func TestStudioReadiness(t *testing.T) {
 			t.Errorf("%s: DescribeProviderAuth = %q, does not match %s", name, line, c.described)
 		}
 		if strings.Contains(line, studioTestSecret) {
-			t.Errorf("%s: DescribeProviderAuth leaked secret: %q", name, line)
+			t.Errorf("%s: DescribeProviderAuth leaked studio token marker", name)
 		}
 		got := readiness.ProxyProviderReadiness("lmstudio", healthy, func(string) string { return authState }, msgOpts)
+		if strings.Contains(got.Message, studioTestSecret) {
+			t.Errorf("%s: ProxyProviderReadiness.Message leaked studio token marker", name)
+		}
 		if got.Ready != expectReady {
 			t.Errorf("%s: Ready = %v, want %v", name, got.Ready, expectReady)
 		}
@@ -645,6 +719,8 @@ func TestProbeLlama(t *testing.T) {
 
 func TestRefreshLlamaState(t *testing.T) {
 	port, closeSrv := startFakeLlama(t, func() int64 { return 65536 }, http.StatusOK)
+	// Reserve a second distinct port while llama-server is still bound so the OS cannot reassign its port.
+	movedPort, releaseMovedPort := reserveLoopbackPort(t)
 	routes := []proxymodels.Route{{ID: "local/gguf", Provider: "local"}}
 	env := mapLookup(map[string]string{"CCP_LLAMA_PORT": strconv.Itoa(int(port))})
 	var tracker localprov.LlamaTracker
@@ -669,7 +745,8 @@ func TestRefreshLlamaState(t *testing.T) {
 		t.Errorf("stopped server ContextWindow = %d, want preserved 65536", down.ContextWindow)
 	}
 
-	movedEnv := mapLookup(map[string]string{"CCP_LLAMA_PORT": strconv.Itoa(int(closedLoopbackPort(t)))})
+	releaseMovedPort()
+	movedEnv := mapLookup(map[string]string{"CCP_LLAMA_PORT": strconv.Itoa(int(movedPort))})
 	moved := tracker.Refresh(t.Context(), routes, movedEnv, localprov.ProbeOptions{})
 	if moved == nil {
 		t.Fatal("moved port Refresh returned nil")
@@ -689,7 +766,8 @@ func TestRefreshLlamaState(t *testing.T) {
 
 func TestLlamaReadiness(t *testing.T) {
 	dir := t.TempDir()
-	commandPath := filepath.Join(dir, "model-gateway.js")
+	commandPath := filepath.Join(dir, "my gateway", "bin", "model-gateway")
+	restartSuffix := "restart the gateway: `\"" + commandPath + "\" stop`, then `\"" + commandPath + "\" start`."
 	proxyBin := filepath.Join(dir, "claude-code-proxy")
 	healthy := readiness.SharedChecks{ProxyBinary: true, ProxyModels: true, ShimRunning: true, ServingVersionMatches: true}
 
@@ -725,12 +803,12 @@ func TestLlamaReadiness(t *testing.T) {
 		"error: CCP_LLAMA_PORT unset where the gateway runs": {
 			env:       map[string]string{},
 			wantState: "config-invalid",
-			described: regexp.MustCompile(`^NOT CONFIGURED \(claude-code-proxy lists local/gguf, but CCP_LLAMA_PORT is not set where the gateway runs.*model-gateway\.js" stop` + "`" + `, then ` + "`" + `node ".*model-gateway\.js" start` + "`" + `\.\)$`),
+			described: regexp.MustCompile(`^NOT CONFIGURED \(claude-code-proxy lists local/gguf, but CCP_LLAMA_PORT is not set where the gateway runs.*, then ` + regexp.QuoteMeta(restartSuffix) + `\)$`),
 		},
 		"error: CCP_LLAMA_PORT not a port, and the message names the value": {
 			env:       map[string]string{"CCP_LLAMA_PORT": "abc"},
 			wantState: "config-invalid",
-			described: regexp.MustCompile(`^NOT CONFIGURED \(claude-code-proxy lists local/gguf, but CCP_LLAMA_PORT="abc" is not a port where the gateway runs`),
+			described: regexp.MustCompile(`^NOT CONFIGURED \(claude-code-proxy lists local/gguf, but CCP_LLAMA_PORT="abc" is not a port where the gateway runs.*, then ` + regexp.QuoteMeta(restartSuffix) + `\)$`),
 		},
 		"error: not probed in this process": {
 			env:       map[string]string{"CCP_LLAMA_PORT": "8080"},
@@ -813,6 +891,177 @@ func TestLlamaReadiness(t *testing.T) {
 	t.Run("non_ready", func(t *testing.T) {
 		for name, c := range nonReadyCases {
 			runCase(t, name, c, false)
+		}
+	})
+}
+
+func TestProbeRedirects(t *testing.T) {
+	t.Run("success: LM Studio follows same-origin redirect and retains Authorization", func(t *testing.T) {
+		var mu sync.Mutex
+		var seen []seenRequest
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			authValues, hasAuth := r.Header["Authorization"]
+			mu.Lock()
+			seen = append(seen, seenRequest{
+				URL:           r.URL.RequestURI(),
+				HasAuthHeader: hasAuth,
+				AuthValues:    slices.Clone(authValues),
+			})
+			mu.Unlock()
+			if r.URL.Path == "/api/v1/models" {
+				w.Header().Set("Location", "/redirected/models")
+				w.WriteHeader(http.StatusFound)
+				return
+			}
+			if r.URL.Path != "/redirected/models" {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			if r.Header.Get("Authorization") != "Bearer "+studioRedirectSecret {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			data, err := json.Marshal(map[string]any{
+				"models": []map[string]any{studioCatalogModel("qwen3-coder-30b", []studioInstanceSpec{{"qwen3-coder-30b", 65536}}, "llm")},
+			})
+			if err != nil {
+				t.Errorf("marshal redirected models: %v", err)
+				return
+			}
+			_, _ = w.Write(data)
+		}))
+		t.Cleanup(srv.Close)
+
+		env := mapLookup(map[string]string{
+			"CCP_LMSTUDIO_BASE_URL": srv.URL,
+			"CCP_LMSTUDIO_API_KEY":  studioRedirectSecret,
+		})
+		got := localprov.ProbeStudio(t.Context(), env, t.TempDir(), localprov.ProbeOptions{})
+		want := localprov.StudioState{
+			Enabled:   true,
+			BaseURL:   srv.URL,
+			HasAPIKey: true,
+			Reachable: true,
+			Models:    []localprov.Model{{Key: "qwen3-coder-30b", Loaded: true, ContextWindow: 65536}},
+		}
+		if diff := gocmp.Diff(want, got); diff != "" {
+			t.Errorf("same-origin redirect StudioState mismatch (-want +got):\n%s", diff)
+		}
+		mu.Lock()
+		gotSeen := slices.Clone(seen)
+		mu.Unlock()
+		wantSeen := []seenRequest{
+			{URL: "/api/v1/models", HasAuthHeader: true, AuthValues: []string{"Bearer " + studioRedirectSecret}},
+			{URL: "/redirected/models", HasAuthHeader: true, AuthValues: []string{"Bearer " + studioRedirectSecret}},
+		}
+		if diff := gocmp.Diff(wantSeen, gotSeen); diff != "" {
+			t.Errorf("same-origin redirect requests mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("success: LM Studio follows cross-origin redirect and strips Authorization", func(t *testing.T) {
+		var targetMu sync.Mutex
+		var targetSeen []seenRequest
+		var targetSawSecret atomic.Bool
+		target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			authValues, hasAuth := r.Header["Authorization"]
+			for _, vals := range r.Header {
+				for _, v := range vals {
+					if strings.Contains(v, studioRedirectSecret) {
+						targetSawSecret.Store(true)
+					}
+				}
+			}
+			targetMu.Lock()
+			targetSeen = append(targetSeen, seenRequest{
+				URL:           r.URL.RequestURI(),
+				HasAuthHeader: hasAuth,
+				AuthValues:    slices.Clone(authValues),
+			})
+			targetMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			data, err := json.Marshal(map[string]any{
+				"models": []map[string]any{studioCatalogModel("qwen3-coder-30b", []studioInstanceSpec{{"qwen3-coder-30b", 40960}}, "llm")},
+			})
+			if err != nil {
+				t.Errorf("marshal cross-origin models: %v", err)
+				return
+			}
+			_, _ = w.Write(data)
+		}))
+		t.Cleanup(target.Close)
+
+		var originMu sync.Mutex
+		var originSeen []seenRequest
+		origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			authValues, hasAuth := r.Header["Authorization"]
+			originMu.Lock()
+			originSeen = append(originSeen, seenRequest{
+				URL:           r.URL.RequestURI(),
+				HasAuthHeader: hasAuth,
+				AuthValues:    slices.Clone(authValues),
+			})
+			originMu.Unlock()
+			w.Header().Set("Location", target.URL+"/cross/models")
+			w.WriteHeader(http.StatusFound)
+		}))
+		t.Cleanup(origin.Close)
+
+		env := mapLookup(map[string]string{
+			"CCP_LMSTUDIO_BASE_URL": origin.URL,
+			"CCP_LMSTUDIO_API_KEY":  studioRedirectSecret,
+		})
+		got := localprov.ProbeStudio(t.Context(), env, t.TempDir(), localprov.ProbeOptions{})
+		want := localprov.StudioState{
+			Enabled:   true,
+			BaseURL:   origin.URL,
+			HasAPIKey: true,
+			Reachable: true,
+			Models:    []localprov.Model{{Key: "qwen3-coder-30b", Loaded: true, ContextWindow: 40960}},
+		}
+		if diff := gocmp.Diff(want, got); diff != "" {
+			t.Errorf("cross-origin redirect StudioState mismatch (-want +got):\n%s", diff)
+		}
+		if targetSawSecret.Load() {
+			t.Error("cross-origin redirect leaked studio token marker to different-origin target")
+		}
+		originMu.Lock()
+		gotOrigin := slices.Clone(originSeen)
+		originMu.Unlock()
+		if len(gotOrigin) != 1 || !gotOrigin[0].HasAuthHeader {
+			t.Errorf("origin server expected 1 authenticated request, got %d (hasAuth=%v)", len(gotOrigin), len(gotOrigin) > 0 && gotOrigin[0].HasAuthHeader)
+		}
+		targetMu.Lock()
+		gotTarget := slices.Clone(targetSeen)
+		targetMu.Unlock()
+		wantTarget := []seenRequest{{URL: "/cross/models", HasAuthHeader: false, AuthValues: nil}}
+		if diff := gocmp.Diff(wantTarget, gotTarget); diff != "" {
+			t.Errorf("cross-origin target requests mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("success: llama-server probe follows redirect on /props", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/props" {
+				w.Header().Set("Location", "/props-v2")
+				w.WriteHeader(http.StatusFound)
+				return
+			}
+			if r.URL.Path == "/props-v2" {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"default_generation_settings":{"n_ctx":65536}}`))
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		t.Cleanup(srv.Close)
+		port := uint16(srv.Listener.Addr().(*net.TCPAddr).Port)
+
+		got := localprov.ProbeLlama(t.Context(), mapLookup(map[string]string{"CCP_LLAMA_PORT": strconv.Itoa(int(port))}), localprov.ProbeOptions{})
+		want := localprov.LlamaState{Port: port, Configured: true, Reachable: true, ContextWindow: 65536}
+		if diff := gocmp.Diff(want, got); diff != "" {
+			t.Errorf("redirected ProbeLlama mismatch (-want +got):\n%s", diff)
 		}
 	})
 }

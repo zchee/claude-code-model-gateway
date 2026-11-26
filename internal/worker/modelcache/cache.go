@@ -41,8 +41,8 @@ const (
 	ProxyListingTimeout = 2500 * time.Millisecond
 	// AnthropicPageTimeout is the per-page HTTP timeout for fetching the upstream Anthropic catalog.
 	AnthropicPageTimeout = 5 * time.Second
-	// MaxAnthropicPageBytes is the maximum body size permitted for one upstream Anthropic catalog page.
-	MaxAnthropicPageBytes = 2 * 1024 * 1024
+	// MaxAnthropicPageUTF16Units is the maximum decoded UTF-16 code-unit length permitted for one upstream Anthropic catalog page.
+	MaxAnthropicPageUTF16Units = 2 * 1024 * 1024
 	// MaxAnthropicPages is the maximum number of paginated requests allowed per Anthropic catalog fetch.
 	MaxAnthropicPages = 10
 )
@@ -106,7 +106,8 @@ func New(opts Options) (*Cache, error) {
 	return &Cache{}, errNotImplemented
 }
 
-// Start runs the initial refresh and schedules periodic refreshes and exponential retries until ctx is canceled.
+// Start runs the initial refresh and schedules periodic refreshes, exponential retries, and
+// background Anthropic catalog refreshes under ctx until ctx is canceled.
 func (c *Cache) Start(ctx context.Context) {
 	_ = ctx
 }
@@ -137,14 +138,15 @@ func (c *Cache) HealthCatalog() (source string, count int) {
 }
 
 // ModelsResponse builds the GET /v1/models JSON response body using allowed credential headers from incoming.
+// When serving stale cached rows immediately, any background refresh runs under the worker context from Start rather than ctx.
 func (c *Cache) ModelsResponse(ctx context.Context, incoming http.Header) (jsontext.Value, error) {
 	_, _ = ctx, incoming
 	return nil, errNotImplemented
 }
 
-// TriggerAnthropicRefresh initiates a non-blocking Anthropic catalog refresh when stale and credentials are present.
-func (c *Cache) TriggerAnthropicRefresh(ctx context.Context, incoming http.Header) {
-	_, _ = ctx, incoming
+// TriggerAnthropicRefresh initiates a non-blocking Anthropic catalog refresh under the worker context from Start when stale and credentials are present.
+func (c *Cache) TriggerAnthropicRefresh(incoming http.Header) {
+	_ = incoming
 }
 
 // SyncDiscoveryCache writes the gateway discovery cache when the effective base URL is wired and not in shadow mode.
