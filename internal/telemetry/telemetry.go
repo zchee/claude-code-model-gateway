@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/zchee/claude-code-model-gateway/internal/config"
+	"github.com/zchee/claude-code-model-gateway/internal/worker/outcome"
 )
 
 // Options supplies the environment, resolved audit path, diagnostics, clock and entropy.
@@ -46,12 +47,7 @@ func newRecorder(options Options, dialContext func(context.Context, string, stri
 }
 
 // LogEntry holds only the allowed route and dispatch metadata for the local audit file.
-type LogEntry struct {
-	Backend                                                                             string
-	Model                                                                               *string
-	Via, Effort, SessionID, AgentID, ParentAgentID, InheritedFromAgentID, SessionSource string
-	MarkersLength                                                                       *int
-}
+type LogEntry = outcome.Audit
 
 // LogRoute appends one audit entry using the request path and fallback session header.
 func (r *Recorder) LogRoute(request *http.Request, entry LogEntry) {}
@@ -66,26 +62,13 @@ type Span struct{}
 func (r *Recorder) Start(headers http.Header) *Span { return &Span{} }
 
 // Route describes the resolved model and classification at response completion.
-type Route struct {
-	SelectedModel, EffectiveModel, Backend, Effort, Via string
-	Fallback                                            bool
-	Compaction                                          *Compaction
-	Overflow                                            *Overflow
-}
+type Route = outcome.Route
 
 // Compaction contains safe outcome labels and measured token counts; unset counts are omitted.
-type Compaction struct {
-	Outcome, TerminalCode, ErrorCode                                string
-	UpstreamStatus                                                  *int
-	InputTokens, OutputTokens, CacheReadTokens, CacheCreationTokens *float64
-}
+type Compaction = outcome.Compaction
 
 // Overflow holds only the classifier's diagnostic labels and numeric measurements.
-type Overflow struct {
-	Phase, RefusedBy, TokensFrom string
-	RequestBytes                 int64
-	Tokens, LimitTokens          *float64
-}
+type Overflow = outcome.Overflow
 
 // Finish queues the final span once without waiting for the collector's reply.
 // A zero status code denotes the absence of an HTTP response.
