@@ -71,6 +71,8 @@ if [[ ${MODE:-suite} == self-test && $rc == 0 && $interrupted == 0 ]]; then
         publication-failure
         capture-write-failure
         duplicate-metadata
+        subdirectory-root
+        git-config-override
     )
     for name in "${expected_export[@]}"; do
         count=$(grep -Fxc "# export control $name: pass" "$work/export-controls.log" || :)

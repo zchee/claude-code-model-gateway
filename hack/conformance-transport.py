@@ -9,6 +9,7 @@ import shutil
 import socket
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 
@@ -45,15 +46,41 @@ def reject_local(names: list[str]) -> None:
             raise ValueError("refusing local destination")
 
 
+def _clean_git_env(env: Mapping[str, str]) -> dict[str, str]:
+    """Strip inherited GIT_* variables and disable external Git configuration."""
+    cleaned = {
+        k: v
+        for k, v in env.items()
+        if not k.startswith("GIT_") and k not in ("HOME", "XDG_CONFIG_HOME")
+    }
+    cleaned.update(
+        {
+            "LC_ALL": "C",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    return cleaned
+
+
 def check_archive(root: str, commit: str) -> None:
     """Refuse export archives whose tree contains gitlinks or export attributes."""
-    git_env = {
-        k: v
-        for k, v in os.environ.items()
-        if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR")
-    }
+    git_env = _clean_git_env(os.environ)
+    git_base = [
+        "git",
+        "--no-optional-locks",
+        "-c",
+        "core.excludesFile=/dev/null",
+        "-c",
+        "core.attributesFile=/dev/null",
+        "-C",
+        root,
+    ]
     tree_out = subprocess.check_output(
-        ["git", "--no-optional-locks", "-C", root, "ls-tree", "-rtz", commit],
+        [*git_base, "ls-tree", "-rtz", commit],
         env=git_env,
         timeout=30,
     )
@@ -80,10 +107,7 @@ def check_archive(root: str, commit: str) -> None:
     )
     attr_out = subprocess.check_output(
         [
-            "git",
-            "--no-optional-locks",
-            "-C",
-            root,
+            *git_base,
             "check-attr",
             f"--source={commit}",
             "--stdin",

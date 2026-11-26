@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Exercise the export producer and verifier through the real fixture pipeline."""
 
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -12,6 +14,7 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest import TestCase
+from unittest.mock import patch
 
 FIXTURE_FILE = "test/conformance/adapter/dispatch.test.js"
 FIXTURE_CASE = "recording executable receives sync and async fixture launches"
@@ -39,8 +42,12 @@ def _git_env(work: Path) -> dict[str, str]:
     return {
         "PATH": os.environ.get("PATH", ""),
         "HOME": str(work),
+        "LC_ALL": "C",
         "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_TERMINAL_PROMPT": "0",
     }
 
 
@@ -373,14 +380,16 @@ def main(root: Path, work: Path, full: bool) -> None:
         "# dispatch fixture: real producer exported, verified against fixture checkout, and refused against full inventory"
     )
 
-    # Control 1: failed-run (through real hosted_export with a failing binary, plus export_target).
+    # Control 1: failed-run (through real hosted_export with a failing binary and
+    # venue refusal, plus export_target status classification).
     fail_bin = work / "fail-bin"
     fail_bin.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
     fail_bin.chmod(0o700)
     failed_out = work / "failed-export"
     _reset_fixture_modules(fixture_root)
-    assert (
-        owner.hosted_export(
+    failed_err = io.StringIO()
+    with contextlib.redirect_stderr(failed_err):
+        rc_failed = owner.hosted_export(
             fixture_root,
             {
                 **base_hosted_env,
@@ -389,9 +398,36 @@ def main(root: Path, work: Path, full: bool) -> None:
             },
             home=fake_home,
         )
-        == 70
-    )
+    assert rc_failed == 70
+    assert (
+        "conformance export refused: comparison status 1 is not a pass"
+        in failed_err.getvalue()
+    ), failed_err.getvalue()
     assert not failed_out.exists()
+
+    claude_dir = work / "claude-path"
+    claude_dir.mkdir()
+    fake_claude = claude_dir / "claude"
+    fake_claude.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_claude.chmod(0o700)
+    venue_refused_out = work / "venue-refused-export"
+    venue_err = io.StringIO()
+    with contextlib.redirect_stderr(venue_err):
+        rc_venue = owner.hosted_export(
+            fixture_root,
+            {
+                **base_hosted_env,
+                "PATH": f"{claude_dir}:{base_hosted_env['PATH']}",
+                "EXPORT_DIR": str(venue_refused_out),
+            },
+            home=fake_home,
+        )
+    assert rc_venue == 70
+    assert (
+        "conformance export refused: venue refusal status 97 is not a pass"
+        in venue_err.getvalue()
+    ), venue_err.getvalue()
+    assert not venue_refused_out.exists()
 
     # Preflight executable-path consistency: canonical path with space refused before suite.
     space_dir = work / "dir with space"
@@ -415,10 +451,16 @@ def main(root: Path, work: Path, full: bool) -> None:
 
     venue_args = ["conformance", f"TARGET=binary:{standin}", "PHASE=phase-2"]
     assert owner.export_target(venue_args, 0, head) == (standin, "phase-2")
-    with checks.assertRaisesRegex(ValueError, "comparison status 1 is not a pass"):
-        owner.export_target(venue_args, 1, head)
-    with checks.assertRaisesRegex(ValueError, "infrastructure status 70 is not a pass"):
-        owner.export_target(venue_args, 70, head)
+    for status_code, label in [
+        (1, "comparison"),
+        (70, "infrastructure"),
+        (97, "venue refusal"),
+        (124, "timeout"),
+    ]:
+        with checks.assertRaisesRegex(
+            ValueError, f"{label} status {status_code} is not a pass"
+        ):
+            owner.export_target(venue_args, status_code, head)
     for options, revision, reason in [
         (["conformance", "PHASE=phase-2"], head, "source-runtime"),
         (["conformance", f"TARGET=binary:{standin}"], head, "missing gate PHASE"),
@@ -595,52 +637,46 @@ def main(root: Path, work: Path, full: bool) -> None:
     dirty_marker.unlink()
     print("# export control producer-id-mismatch: pass")
 
-    # Control 7: publication-failure leaves nothing under the final name and allows retry.
-    ro_parent = work / "ro-export-parent"
-    ro_parent.mkdir(mode=0o700)
-    pub_target = ro_parent / "published"
-    ro_parent.chmod(0o500)
+    # Control 7: publication-failure triggers a real rename failure inside hosted_export
+    # after the staging directory is created and verified, removes the staging directory,
+    # leaves nothing under the final name, and allows retry into the same path.
+    pub_parent = work / "pub-export-parent"
+    pub_parent.mkdir(mode=0o700)
+    pub_target = pub_parent / "published"
+    orig_publish = owner.publish_export
+    seen_stages: list[Path] = []
+
+    def fail_rename(stage_dir: Path, dest: Path) -> None:
+        seen_stages.append(stage_dir)
+        assert stage_dir.is_dir() and stage_dir.parent == pub_parent
+        assert (stage_dir / "manifest.json").is_file()
+        pub_parent.chmod(0o500)
+        try:
+            orig_publish(stage_dir, dest)
+        finally:
+            pub_parent.chmod(0o700)
+
+    pub_err = io.StringIO()
     try:
         _reset_fixture_modules(fixture_root)
-        rc_pub = owner.hosted_export(
-            fixture_root,
-            {**base_hosted_env, "EXPORT_DIR": str(pub_target)},
-            home=fake_home,
-        )
-        assert rc_pub == 70
-        assert not pub_target.exists() and not pub_target.is_symlink()
-        assert list(ro_parent.iterdir()) == []
+        with (
+            patch.object(owner, "publish_export", fail_rename),
+            contextlib.redirect_stderr(pub_err),
+        ):
+            rc_pub = owner.hosted_export(
+                fixture_root,
+                {**base_hosted_env, "EXPORT_DIR": str(pub_target)},
+                home=fake_home,
+            )
     finally:
-        ro_parent.chmod(0o700)
+        pub_parent.chmod(0o700)
+    assert rc_pub == 70, pub_err.getvalue()
+    assert "conformance export refused:" in pub_err.getvalue(), pub_err.getvalue()
+    assert len(seen_stages) == 1 and not seen_stages[0].exists()
+    assert not pub_target.exists() and not pub_target.is_symlink()
+    assert list(pub_parent.iterdir()) == []
 
-    # Also exercise publish_export directly when the final directory rename fails.
-    direct_stage = ro_parent / ".pending-direct"
-    direct_stage.mkdir()
-    owner.prepare_export(
-        direct_stage,
-        manifest,
-        {
-            "census": "".join(orig_census.splitlines(keepends=True)[1:]),
-            "launches": "".join(orig_launches.splitlines(keepends=True)[1:]),
-        },
-        root=fixture_root,
-        require_git_checkout=True,
-        expected_producer="hosted",
-        expected_run_id=hosted_id,
-        expected_commit=head,
-        expected_phase="phase-2",
-        env=base_hosted_env,
-    )
-    ro_parent.chmod(0o500)
-    try:
-        with checks.assertRaises(OSError):
-            owner.publish_export(direct_stage, pub_target)
-        assert not pub_target.exists() and not pub_target.is_symlink()
-    finally:
-        ro_parent.chmod(0o700)
-        shutil.rmtree(direct_stage, ignore_errors=True)
-
-    # Retry into the exact same final path succeeds once writable.
+    # Retry into the exact same final path succeeds once publish_export is restored.
     _reset_fixture_modules(fixture_root)
     assert (
         owner.hosted_export(
@@ -722,6 +758,113 @@ def main(root: Path, work: Path, full: bool) -> None:
         and "duplicate JSON member name" in res_dup_manifest.stderr
     ), res_dup_manifest
     print("# export control duplicate-metadata: pass")
+
+    # Control 10: subdirectory-root refuses an ignored subdirectory of a clean checkout
+    # even when it contains matching inventory files.
+    spoof_root = fixture_root / ".cache/spoof-root"
+    shutil.copytree(fixture_root / "test", spoof_root / "test")
+    try:
+        res_subdir = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(fixture_root / "hack/conformance-owner.py"),
+                "verify",
+                str(spoof_root),
+                str(bundle),
+            ],
+            capture_output=True,
+            text=True,
+            env=clean_env,
+            check=False,
+        )
+        assert (
+            res_subdir.returncode == 70
+            and "not the Git repository top level" in res_subdir.stderr
+        ), res_subdir
+        with checks.assertRaisesRegex(ValueError, "not the Git repository top level"):
+            owner.resolve_hosted_identity(spoof_root, base_hosted_env, home=fake_home)
+    finally:
+        shutil.rmtree(spoof_root, ignore_errors=True)
+    print("# export control subdirectory-root: pass")
+
+    # Control 11: git-config-override refuses an untracked file even when inherited
+    # Git config or XDG excludes attempt to hide it, and ignores external attributes.
+    hide_all = work / "hide-all.ignore"
+    hide_all.write_text("*\n", encoding="utf-8")
+    fake_gitconfig = work / "fake.gitconfig"
+    fake_gitconfig.write_text(
+        f"[core]\n\texcludesFile = {hide_all}\n", encoding="utf-8"
+    )
+    xdg_dir = work / "xdg-config"
+    (xdg_dir / "git").mkdir(parents=True)
+    (xdg_dir / "git/ignore").write_text("*\n", encoding="utf-8")
+    hide_attrs = work / "hide-attrs"
+    hide_attrs.write_text("* export-ignore\n", encoding="utf-8")
+
+    overrides = [
+        {
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.excludesFile",
+            "GIT_CONFIG_VALUE_0": str(hide_all),
+        },
+        {"GIT_CONFIG_GLOBAL": str(fake_gitconfig)},
+        {"GIT_CONFIG_PARAMETERS": f"'core.excludesFile={hide_all}'"},
+        {"XDG_CONFIG_HOME": str(xdg_dir)},
+    ]
+    dirty_marker.write_text("dirty\n", encoding="utf-8")
+    try:
+        for override in overrides:
+            res_override = run_cli_verify(bundle, env={**clean_env, **override})
+            assert (
+                res_override.returncode == 70 and "not clean" in res_override.stderr
+            ), (override, res_override)
+            res_remote_git = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'source "$1" && clean_git "$2" status --porcelain=v1 --untracked-files=all --ignore-submodules=none',
+                    "bash",
+                    str(root / "hack/remote"),
+                    str(fixture_root),
+                ],
+                capture_output=True,
+                text=True,
+                env={**clean_env, **override},
+                check=False,
+            )
+            assert (
+                res_remote_git.returncode == 0
+                and "untracked.txt" in res_remote_git.stdout
+            ), (override, res_remote_git)
+        with checks.assertRaisesRegex(ValueError, "not clean"):
+            owner.resolve_hosted_identity(
+                fixture_root, {**base_hosted_env, **overrides[0]}, home=fake_home
+            )
+    finally:
+        dirty_marker.unlink(missing_ok=True)
+
+    res_attr_override = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            str(root / "hack/conformance-transport.py"),
+            "check-archive",
+            str(fixture_root),
+            head,
+        ],
+        capture_output=True,
+        text=True,
+        env={
+            **clean_env,
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.attributesFile",
+            "GIT_CONFIG_VALUE_0": str(hide_attrs),
+        },
+        check=False,
+    )
+    assert res_attr_override.returncode == 0, res_attr_override
+    print("# export control git-config-override: pass")
 
 
 if __name__ == "__main__":

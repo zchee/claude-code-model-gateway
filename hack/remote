@@ -34,9 +34,16 @@ reject_local() {
     python3 -I "$root/hack/conformance-transport.py" destination "$@"
 }
 
+clean_git() {
+    env -i PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" LC_ALL=C \
+        GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+        GIT_ATTR_NOSYSTEM=1 GIT_NO_REPLACE_OBJECTS=1 GIT_TERMINAL_PROMPT=0 \
+        git --no-optional-locks -c core.excludesFile=/dev/null -c core.attributesFile=/dev/null -C "$1" "${@:2}"
+}
+
 archive_tree() {
     local root=$1
-    (cd "$root" && git ls-files -t --cached --others --exclude-standard -z | perl -0ne '
+    (cd "$root" && clean_git "$root" ls-files -t --cached --others --exclude-standard -z | perl -0ne '
         chomp; my $untracked = s/^\? //; s/^[A-Z] // unless $untracked;
         if ($untracked) {
             if (m{(?:^|/)(?:\.claude|\.cache|\.git|\.omc)(?:/|$)|(?:^|/)\.env[^/]*(?:/|$)|token|credential|secret}i) {
@@ -419,10 +426,6 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
     # Establish the repository root, commit and clean state BEFORE reading any
     # file from the checkout; re-check after producing the archive below.
     root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
-    clean_git() {
-        env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR \
-            git --no-optional-locks -C "$1" "${@:2}"
-    }
     commit=dirty
     if (( has_conformance )); then
         if top=$(clean_git "$root" rev-parse --show-toplevel 2>/dev/null) && [[ $top == "$root" ]]; then
@@ -474,14 +477,19 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
         if [[ $commit != dirty ]]; then
             clean_git "$root" archive --format=tar "$commit" >| "$input" || exit 70
             [[ $(clean_git "$root" get-tar-commit-id < "$input") == "$commit" ]] || exit 70
+            post_top=$(clean_git "$root" rev-parse --show-toplevel 2>/dev/null) || post_top=''
             post_snapshot=$(clean_git "$root" rev-parse --verify 'HEAD^{commit}') || exit 70
             post_changes=$(clean_git "$root" status --porcelain=v1 --untracked-files=all --ignore-submodules=none) || exit 70
-            if [[ $post_snapshot != "$commit" || -n $post_changes ]]; then
+            if [[ $post_top != "$root" || $post_snapshot != "$commit" || -n $post_changes ]]; then
                 printf 'remote: checkout HEAD or clean state changed while archiving; refusing conformance export\n' >&2
                 commit=dirty
+            else
+                printf 'remote: archive=commit commit=%s\n' "$commit" >&2
             fi
         elif ! archive_tree "$root" >| "$input"; then
             printf 'remote: failed to archive checkout\n' >&2; exit 70
+        else
+            printf 'remote: archive=working-tree commit=%s\n' "$commit" >&2
         fi
     fi
     cmd="env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin GITHUB_ACTIONS=\"\${GITHUB_ACTIONS:-}\" /bin/bash -c \"\$(printf %s $encoded | base64 -d)\" remote"

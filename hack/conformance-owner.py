@@ -54,12 +54,32 @@ def loads_strict_object(text: str, label: str) -> dict[str, Any]:
 
 
 def _clean_git_env(env: Mapping[str, str]) -> dict[str, str]:
-    """Strip Git override variables so commands inspect the intended checkout."""
-    return {
+    """Strip inherited GIT_* variables and disable external Git configuration."""
+    cleaned = {
         k: v
         for k, v in env.items()
-        if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR")
+        if not k.startswith("GIT_") and k not in ("HOME", "XDG_CONFIG_HOME")
     }
+    cleaned.update(
+        {
+            "LC_ALL": "C",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    return cleaned
+
+
+def _status_label(status: int) -> str:
+    """Classify a non-zero comparison command status for refusal messages."""
+    return {
+        70: "infrastructure",
+        97: "venue refusal",
+        124: "timeout",
+    }.get(status, "comparison")
 
 
 def _phase_number(phase: str) -> int:
@@ -142,18 +162,31 @@ def check_producer_env(
 def verify_clean_checkout(
     root: Path, expected_commit: str, env: Mapping[str, str]
 ) -> None:
-    """Verify root is a clean Git checkout at expected_commit."""
+    """Verify root is the top level of a clean Git checkout at expected_commit."""
     git_env = _clean_git_env(env)
+    git_base = [
+        "git",
+        "--no-optional-locks",
+        "-c",
+        "core.excludesFile=/dev/null",
+        "-c",
+        "core.attributesFile=/dev/null",
+        "-C",
+        str(root),
+    ]
+    top = subprocess.check_output(
+        [*git_base, "rev-parse", "--show-toplevel"],
+        text=True,
+        env=git_env,
+        timeout=15,
+    ).strip()
+    if Path(top).resolve() != root.resolve():
+        raise ValueError(
+            f"checkout root {root.resolve()} is not the Git repository top level "
+            f"{Path(top).resolve()}"
+        )
     head = subprocess.check_output(
-        [
-            "git",
-            "--no-optional-locks",
-            "-C",
-            str(root),
-            "rev-parse",
-            "--verify",
-            "HEAD^{commit}",
-        ],
+        [*git_base, "rev-parse", "--verify", "HEAD^{commit}"],
         text=True,
         env=git_env,
         timeout=15,
@@ -164,10 +197,7 @@ def verify_clean_checkout(
         )
     dirty = subprocess.check_output(
         [
-            "git",
-            "--no-optional-locks",
-            "-C",
-            str(root),
+            *git_base,
             "status",
             "--porcelain=v1",
             "--untracked-files=all",
@@ -637,7 +667,7 @@ def hosted_export(
             [str(root / "hack/conformance")], env=run_env, check=False
         )
         if proc.returncode != 0:
-            kind = "infrastructure" if proc.returncode == 70 else "comparison"
+            kind = _status_label(proc.returncode)
             print(
                 f"conformance export refused: {kind} status {proc.returncode} is not a pass",
                 file=sys.stderr,
@@ -855,7 +885,7 @@ def inspect_record(path: Path, recover: bool) -> None:
 def export_target(args: list[str], status: int, commit: str) -> tuple[str, str]:
     """Return (binary, phase) only for a passing, clean, gate-phase binary run."""
     if status != 0:
-        kind = "infrastructure" if status == 70 else "comparison"
+        kind = _status_label(status)
         raise ValueError(f"{kind} status {status} is not a pass")
     if [arg for arg in args if "=" not in arg] != ["conformance"]:
         raise ValueError("expected one conformance goal")
