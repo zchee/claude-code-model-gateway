@@ -15,6 +15,7 @@
 package upstream_test
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -229,6 +230,8 @@ func TestTransportNoAutoDecompression(t *testing.T) {
 
 func TestTransportHTTP11Only(t *testing.T) {
 	var protoMajor, protoMinor atomic.Int32
+	var offeredMu sync.Mutex
+	var offeredProtos [][]string
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		protoMajor.Store(int32(r.ProtoMajor))
 		protoMinor.Store(int32(r.ProtoMinor))
@@ -237,6 +240,14 @@ func TestTransportHTTP11Only(t *testing.T) {
 		_, _ = io.WriteString(w, `{"ok":true}`)
 	}))
 	srv.EnableHTTP2 = true
+	srv.TLS = &tls.Config{
+		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+			offeredMu.Lock()
+			offeredProtos = append(offeredProtos, slices.Clone(hello.SupportedProtos))
+			offeredMu.Unlock()
+			return nil, nil
+		},
+	}
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
 
@@ -261,6 +272,20 @@ func TestTransportHTTP11Only(t *testing.T) {
 	}
 	if protoMajor.Load() != 1 || protoMinor.Load() != 1 {
 		t.Fatalf("upstream received HTTP/%d.%d, want HTTP/1.1", protoMajor.Load(), protoMinor.Load())
+	}
+	offeredMu.Lock()
+	gotOffered := slices.Clone(offeredProtos)
+	offeredMu.Unlock()
+	if len(gotOffered) == 0 {
+		t.Fatal("TLS server observed no ClientHello")
+	}
+	for i, protos := range gotOffered {
+		if slices.Contains(protos, "h2") {
+			t.Fatalf("TLS handshake %d offered ALPN h2 (%v) despite HTTP/1.1-only policy", i+1, protos)
+		}
+	}
+	if diff := gocmp.Diff([]string{"h2", "http/1.1"}, tlsCfg.NextProtos); diff != "" {
+		t.Fatalf("NewClient mutated caller TLSConfig.NextProtos (-want +got):\n%s", diff)
 	}
 }
 
@@ -970,6 +995,356 @@ func TestTransportIdleTimeout(t *testing.T) {
 			}
 		})
 	})
+
+	t.Run("success: periodic request body write activity resets the 1 hour idle deadline", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			const (
+				segmentSize = 64 * 1024
+				totalSize   = 3 * segmentSize
+			)
+			payload := make([]byte, totalSize)
+			for i := range payload {
+				payload[i] = byte('a' + (i % 26))
+			}
+
+			readNext := make(chan struct{}, 2)
+			segDone := make(chan error, 3)
+			peerDone := make(chan error, 1)
+			stopPeer := make(chan struct{})
+			stopPeerOnce := sync.OnceFunc(func() { close(stopPeer) })
+
+			var connMu sync.Mutex
+			var serverConns []net.Conn
+			var dialCount atomic.Int32
+			var peerWG sync.WaitGroup
+
+			dialCtx := func(_ context.Context, _, _ string) (net.Conn, error) {
+				if dialCount.Add(1) > 1 {
+					return nil, errors.New("unexpected extra dial during segmented upload")
+				}
+				c1, c2 := net.Pipe()
+				connMu.Lock()
+				serverConns = append(serverConns, c2)
+				connMu.Unlock()
+
+				peerWG.Go(func() {
+					defer func() { _ = c2.Close() }()
+					br := bufio.NewReaderSize(c2, 4096)
+					req, err := http.ReadRequest(br)
+					if err != nil {
+						segDone <- fmt.Errorf("peer ReadRequest: %w", err)
+						return
+					}
+					defer func() { _ = req.Body.Close() }()
+
+					got := make([]byte, totalSize)
+					if _, err := io.ReadFull(req.Body, got[:segmentSize]); err != nil {
+						segDone <- fmt.Errorf("peer segment 1 read: %w", err)
+						return
+					}
+					segDone <- nil
+
+					select {
+					case <-readNext:
+					case <-stopPeer:
+						return
+					}
+					if _, err := io.ReadFull(req.Body, got[segmentSize:2*segmentSize]); err != nil {
+						segDone <- fmt.Errorf("peer segment 2 read: %w", err)
+						return
+					}
+					segDone <- nil
+
+					select {
+					case <-readNext:
+					case <-stopPeer:
+						return
+					}
+					if _, err := io.ReadFull(req.Body, got[2*segmentSize:]); err != nil {
+						peerDone <- fmt.Errorf("peer segment 3 read: %w", err)
+						return
+					}
+					var extra [1]byte
+					if n, err := req.Body.Read(extra[:]); n != 0 || !errors.Is(err, io.EOF) {
+						peerDone <- fmt.Errorf("peer expected EOF after request body, got n=%d err=%w", n, err)
+						return
+					}
+					if !bytes.Equal(payload, got) {
+						peerDone <- errors.New("peer received corrupted segmented request body")
+						return
+					}
+					_, err = io.WriteString(c2, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}")
+					peerDone <- err
+					<-stopPeer
+				})
+				return c1, nil
+			}
+
+			client := upstream.NewClient(upstream.Options{DialContext: dialCtx})
+			type outcome struct {
+				resp *upstream.Response
+				err  error
+			}
+			done := make(chan outcome, 1)
+			var reqWG sync.WaitGroup
+			defer func() {
+				stopPeerOnce()
+				connMu.Lock()
+				for _, c := range serverConns {
+					_ = c.Close()
+				}
+				connMu.Unlock()
+				_ = client.Close()
+				reqWG.Wait()
+				peerWG.Wait()
+				synctest.Wait()
+			}()
+
+			reqWG.Go(func() {
+				resp, err := client.Do(t.Context(), upstream.Request{
+					Target:        upstream.TargetAnthropic,
+					BaseURL:       "http://127.0.0.1:12355",
+					Method:        http.MethodPost,
+					RequestURI:    "/v1/messages",
+					ClientHeaders: http.Header{"Content-Type": {"application/octet-stream"}},
+					Body:          payload,
+				})
+				done <- outcome{resp: resp, err: err}
+			})
+
+			select {
+			case err := <-segDone:
+				if err != nil {
+					t.Fatalf("segment 1 failed: %v", err)
+				}
+			case res := <-done:
+				if res.resp != nil && res.resp.Body != nil {
+					_ = res.resp.Body.Close()
+				}
+				t.Fatalf("Do returned before segment 1 completed: err=%v", res.err)
+			}
+
+			time.Sleep(40 * time.Minute)
+			synctest.Wait()
+			select {
+			case res := <-done:
+				if res.resp != nil && res.resp.Body != nil {
+					_ = res.resp.Body.Close()
+				}
+				t.Fatalf("Do returned after 40m upload pause: err=%v", res.err)
+			default:
+			}
+
+			readNext <- struct{}{}
+			select {
+			case err := <-segDone:
+				if err != nil {
+					t.Fatalf("segment 2 failed: %v", err)
+				}
+			case res := <-done:
+				if res.resp != nil && res.resp.Body != nil {
+					_ = res.resp.Body.Close()
+				}
+				t.Fatalf("Do returned before segment 2 completed: err=%v", res.err)
+			}
+
+			// Total elapsed time reaches 80 minutes (> 1 hour) while each inter-write gap is 40 minutes (< 1 hour).
+			time.Sleep(40 * time.Minute)
+			synctest.Wait()
+			select {
+			case res := <-done:
+				if res.resp != nil && res.resp.Body != nil {
+					_ = res.resp.Body.Close()
+				}
+				t.Fatalf("Do timed out during progressing upload spanning 80m: err=%v", res.err)
+			default:
+			}
+
+			readNext <- struct{}{}
+			res := <-done
+			if res.err != nil {
+				select {
+				case peerErr := <-peerDone:
+					t.Fatalf("Do failed after 80m progressing upload: %v (peer: %v)", res.err, peerErr)
+				default:
+					t.Fatalf("Do failed after 80m progressing upload: %v", res.err)
+				}
+			}
+			defer func() { _ = res.resp.Body.Close() }()
+
+			body, err := io.ReadAll(res.resp.Body)
+			if err != nil {
+				t.Fatalf("reading response body after progressing upload: %v", err)
+			}
+			if peerErr := <-peerDone; peerErr != nil {
+				t.Fatalf("pipe peer error: %v", peerErr)
+			}
+			if diff := gocmp.Diff(http.StatusOK, res.resp.StatusCode); diff != "" {
+				t.Fatalf("status (-want +got):\n%s", diff)
+			}
+			if diff := gocmp.Diff(`{"ok":true}`, string(body)); diff != "" {
+				t.Fatalf("response body (-want +got):\n%s", diff)
+			}
+		})
+	})
+
+	t.Run("error: 1 hour silence when peer stops accepting request body bytes times out", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			const (
+				segmentSize = 64 * 1024
+				totalSize   = 3 * segmentSize
+			)
+			payload := bytes.Repeat([]byte("w"), totalSize)
+
+			readNext := make(chan struct{}, 2)
+			segDone := make(chan error, 3)
+			stopPeer := make(chan struct{})
+			stopPeerOnce := sync.OnceFunc(func() { close(stopPeer) })
+
+			var connMu sync.Mutex
+			var serverConns []net.Conn
+			var dialCount atomic.Int32
+			var peerWG sync.WaitGroup
+
+			dialCtx := func(_ context.Context, _, _ string) (net.Conn, error) {
+				if dialCount.Add(1) > 1 {
+					return nil, errors.New("unexpected extra dial during stalled upload")
+				}
+				c1, c2 := net.Pipe()
+				connMu.Lock()
+				serverConns = append(serverConns, c2)
+				connMu.Unlock()
+
+				peerWG.Go(func() {
+					defer func() { _ = c2.Close() }()
+					br := bufio.NewReaderSize(c2, 4096)
+					req, err := http.ReadRequest(br)
+					if err != nil {
+						segDone <- fmt.Errorf("peer ReadRequest: %w", err)
+						return
+					}
+					defer func() { _ = req.Body.Close() }()
+
+					buf := make([]byte, segmentSize)
+					if _, err := io.ReadFull(req.Body, buf); err != nil {
+						segDone <- fmt.Errorf("peer segment 1 read: %w", err)
+						return
+					}
+					segDone <- nil
+
+					select {
+					case <-readNext:
+					case <-stopPeer:
+						return
+					}
+					if _, err := io.ReadFull(req.Body, buf); err != nil {
+						segDone <- fmt.Errorf("peer segment 2 read: %w", err)
+						return
+					}
+					segDone <- nil
+
+					// Stop accepting the final 64 KiB until teardown so socket write activity stalls.
+					<-stopPeer
+				})
+				return c1, nil
+			}
+
+			client := upstream.NewClient(upstream.Options{DialContext: dialCtx})
+			type outcome struct {
+				resp *upstream.Response
+				err  error
+			}
+			done := make(chan outcome, 1)
+			var reqWG sync.WaitGroup
+			defer func() {
+				stopPeerOnce()
+				connMu.Lock()
+				for _, c := range serverConns {
+					_ = c.Close()
+				}
+				connMu.Unlock()
+				_ = client.Close()
+				reqWG.Wait()
+				peerWG.Wait()
+				synctest.Wait()
+			}()
+
+			reqWG.Go(func() {
+				resp, err := client.Do(t.Context(), upstream.Request{
+					Target:        upstream.TargetAnthropic,
+					BaseURL:       "http://127.0.0.1:12356",
+					Method:        http.MethodPost,
+					RequestURI:    "/v1/messages",
+					ClientHeaders: http.Header{"Content-Type": {"application/octet-stream"}},
+					Body:          payload,
+				})
+				done <- outcome{resp: resp, err: err}
+			})
+
+			select {
+			case err := <-segDone:
+				if err != nil {
+					t.Fatalf("segment 1 failed: %v", err)
+				}
+			case res := <-done:
+				if res.resp != nil && res.resp.Body != nil {
+					_ = res.resp.Body.Close()
+				}
+				t.Fatalf("Do returned before segment 1 completed: err=%v", res.err)
+			}
+
+			// Advance 30 minutes, then accept a second segment so the inactivity deadline must
+			// move to 90m rather than remaining fixed at 60m from request start.
+			time.Sleep(30 * time.Minute)
+			synctest.Wait()
+			select {
+			case res := <-done:
+				if res.resp != nil && res.resp.Body != nil {
+					_ = res.resp.Body.Close()
+				}
+				t.Fatalf("Do returned after 30m upload pause: err=%v", res.err)
+			default:
+			}
+			readNext <- struct{}{}
+			select {
+			case err := <-segDone:
+				if err != nil {
+					t.Fatalf("segment 2 failed: %v", err)
+				}
+			case res := <-done:
+				if res.resp != nil && res.resp.Body != nil {
+					_ = res.resp.Body.Close()
+				}
+				t.Fatalf("Do returned before segment 2 completed: err=%v", res.err)
+			}
+			synctest.Wait()
+
+			time.Sleep(time.Hour - time.Nanosecond)
+			synctest.Wait()
+			select {
+			case res := <-done:
+				if res.resp != nil && res.resp.Body != nil {
+					_ = res.resp.Body.Close()
+				}
+				t.Fatalf("Do timed out before 1 hour of write silence elapsed: err=%v", res.err)
+			default:
+			}
+
+			time.Sleep(time.Nanosecond)
+			synctest.Wait()
+			select {
+			case res := <-done:
+				if res.resp != nil && res.resp.Body != nil {
+					_ = res.resp.Body.Close()
+				}
+				if !errors.Is(res.err, upstream.ErrTimeout) {
+					t.Fatalf("expected ErrTimeout after 1 hour of write silence, got %v", res.err)
+				}
+			default:
+				t.Fatal("Do did not time out once 1 hour of write silence elapsed")
+			}
+		})
+	})
 }
 
 func requireImmediateClose(t *testing.T, client *upstream.Client) {
@@ -1229,6 +1604,186 @@ func TestTransportShutdownBoundsRequest(t *testing.T) {
 			t.Fatalf("closed client sent %d requests, want 0", len(captured()))
 		}
 	})
+
+	t.Run("success: Client.Close releases already idle pooled connection", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			peerEOF := make(chan error, 1)
+			var connMu sync.Mutex
+			var serverConns []net.Conn
+			var dialCount atomic.Int32
+			var peerWG sync.WaitGroup
+
+			dialCtx := func(_ context.Context, _, _ string) (net.Conn, error) {
+				if dialCount.Add(1) > 1 {
+					return nil, errors.New("unexpected extra dial while warming idle connection")
+				}
+				c1, c2 := net.Pipe()
+				connMu.Lock()
+				serverConns = append(serverConns, c2)
+				connMu.Unlock()
+
+				peerWG.Go(func() {
+					defer func() { _ = c2.Close() }()
+					br := bufio.NewReader(c2)
+					req, err := http.ReadRequest(br)
+					if err != nil {
+						peerEOF <- fmt.Errorf("peer ReadRequest: %w", err)
+						return
+					}
+					_, _ = io.Copy(io.Discard, req.Body)
+					_ = req.Body.Close()
+
+					if _, err := io.WriteString(c2, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}"); err != nil {
+						peerEOF <- fmt.Errorf("peer write response: %w", err)
+						return
+					}
+
+					// Block waiting for either another request or peer close on shutdown.
+					var b [1]byte
+					_, err = br.Read(b[:])
+					peerEOF <- err
+				})
+				return c1, nil
+			}
+
+			client := upstream.NewClient(upstream.Options{DialContext: dialCtx})
+			defer func() {
+				_ = client.Close()
+				connMu.Lock()
+				for _, c := range serverConns {
+					_ = c.Close()
+				}
+				connMu.Unlock()
+				peerWG.Wait()
+				synctest.Wait()
+			}()
+
+			resp, err := client.Do(t.Context(), upstream.Request{
+				Target:     upstream.TargetAnthropic,
+				BaseURL:    "http://127.0.0.1:12357",
+				Method:     http.MethodPost,
+				RequestURI: "/v1/messages",
+				Body:       []byte(`{"model":"claude-sonnet-4-6"}`),
+			})
+			if err != nil {
+				t.Fatalf("warmup Do returned error: %v", err)
+			}
+			_, readErr := io.ReadAll(resp.Body)
+			closeErr := resp.Body.Close()
+			if readErr != nil || closeErr != nil {
+				t.Fatalf("draining warmup response body: read=%v close=%v", readErr, closeErr)
+			}
+
+			// Wait until transport has parked the connection in its idle pool and peer is blocked reading.
+			synctest.Wait()
+			if got := dialCount.Load(); got != 1 {
+				t.Fatalf("warmup dialed %d time(s), want 1", got)
+			}
+			select {
+			case err := <-peerEOF:
+				t.Fatalf("connection closed before Client.Close (not kept idle): %v", err)
+			default:
+			}
+
+			beforeClose := time.Now()
+			requireImmediateClose(t, client)
+			if !time.Now().Equal(beforeClose) {
+				t.Fatalf("Client.Close advanced virtual clock by %v", time.Since(beforeClose))
+			}
+
+			// Observe peer EOF before defer releases any fixture connection.
+			select {
+			case err := <-peerEOF:
+				if !errors.Is(err, io.EOF) {
+					t.Fatalf("idle peer read after Client.Close = %v, want io.EOF", err)
+				}
+			default:
+				t.Fatal("Client.Close did not release already idle pooled connection")
+			}
+		})
+	})
+
+	t.Run("error: Client.Close cancels outstanding dial", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			dialEntered := make(chan struct{})
+			dialEnteredOnce := sync.OnceFunc(func() { close(dialEntered) })
+			dialExited := make(chan error, 1)
+			releaseDial := make(chan struct{})
+			releaseDialOnce := sync.OnceFunc(func() { close(releaseDial) })
+			var dialCount atomic.Int32
+
+			dialCtx := func(ctx context.Context, _, _ string) (net.Conn, error) {
+				if dialCount.Add(1) > 1 {
+					return nil, errors.New("unexpected extra dial during shutdown")
+				}
+				dialEnteredOnce()
+				select {
+				case <-ctx.Done():
+					dialExited <- ctx.Err()
+					return nil, ctx.Err()
+				case <-releaseDial:
+					err := errors.New("dial fixture released before shutdown canceled dial context")
+					dialExited <- err
+					return nil, err
+				}
+			}
+
+			client := upstream.NewClient(upstream.Options{DialContext: dialCtx})
+			done := make(chan error, 1)
+			var reqWG sync.WaitGroup
+			defer func() {
+				releaseDialOnce()
+				_ = client.Close()
+				reqWG.Wait()
+				synctest.Wait()
+			}()
+
+			reqWG.Go(func() {
+				resp, err := client.Do(t.Context(), upstream.Request{
+					Target:     upstream.TargetAnthropic,
+					BaseURL:    "http://127.0.0.1:12358",
+					Method:     http.MethodPost,
+					RequestURI: "/v1/messages",
+					Body:       []byte(`{"model":"claude-sonnet-4-6"}`),
+				})
+				if resp != nil && resp.Body != nil {
+					_ = resp.Body.Close()
+				}
+				done <- err
+			})
+
+			select {
+			case <-dialEntered:
+			case err := <-done:
+				t.Fatalf("Do returned before dial started: %v", err)
+			}
+			synctest.Wait()
+
+			beforeClose := time.Now()
+			requireImmediateClose(t, client)
+			if !time.Now().Equal(beforeClose) {
+				t.Fatalf("Client.Close advanced virtual clock by %v", time.Since(beforeClose))
+			}
+
+			// Observe dialer exit and Do failure before defer releases the dial fixture.
+			select {
+			case err := <-dialExited:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("outstanding dial exited with %v, want context.Canceled", err)
+				}
+			default:
+				t.Fatal("Client.Close did not cancel outstanding dial context")
+			}
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("expected error from Do when Client.Close aborted outstanding dial")
+				}
+			default:
+				t.Fatal("Client.Close did not abort Do waiting on outstanding dial")
+			}
+		})
+	})
 }
 
 func TestTransportInvalidRequests(t *testing.T) {
@@ -1483,8 +2038,10 @@ func TestLiveUpstreamHeadersToUpstreamState(t *testing.T) {
 					if len(vals) != 2 {
 						t.Fatalf("RelayHeader %q values = %v, want 2 values", k, vals)
 					}
-					vals[0] = "mutated=1"
 					mutatedCookies = true
+				}
+				for i := range vals {
+					vals[i] = "mutated=1"
 				}
 			}
 			if !mutatedCookies {
@@ -1692,6 +2249,8 @@ func TestNewTransport(t *testing.T) {
 
 		var redirectTargetHits atomic.Int32
 		var protoMajor, protoMinor atomic.Int32
+		var offeredMu sync.Mutex
+		var offeredProtos [][]string
 		srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			protoMajor.Store(int32(r.ProtoMajor))
 			protoMinor.Store(int32(r.ProtoMinor))
@@ -1713,6 +2272,14 @@ func TestNewTransport(t *testing.T) {
 			}
 		}))
 		srv.EnableHTTP2 = true
+		srv.TLS = &tls.Config{
+			GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+				offeredMu.Lock()
+				offeredProtos = append(offeredProtos, slices.Clone(hello.SupportedProtos))
+				offeredMu.Unlock()
+				return nil, nil
+			},
+		}
 		srv.StartTLS()
 		t.Cleanup(srv.Close)
 
@@ -1765,6 +2332,20 @@ func TestNewTransport(t *testing.T) {
 		}
 		if protoMajor.Load() != 1 || protoMinor.Load() != 1 {
 			t.Fatalf("TLS server received HTTP/%d.%d, want HTTP/1.1", protoMajor.Load(), protoMinor.Load())
+		}
+		offeredMu.Lock()
+		gotOffered := slices.Clone(offeredProtos)
+		offeredMu.Unlock()
+		if len(gotOffered) == 0 {
+			t.Fatal("TLS server observed no ClientHello")
+		}
+		for i, protos := range gotOffered {
+			if slices.Contains(protos, "h2") {
+				t.Fatalf("TLS handshake %d offered ALPN h2 (%v) despite HTTP/1.1-only policy", i+1, protos)
+			}
+		}
+		if diff := gocmp.Diff([]string{"h2", "http/1.1"}, tlsCfg.NextProtos); diff != "" {
+			t.Fatalf("NewTransport mutated caller TLSConfig.NextProtos (-want +got):\n%s", diff)
 		}
 	})
 
@@ -2138,6 +2719,126 @@ func TestSendAndContextOwnership(t *testing.T) {
 		mu.Unlock()
 		if diff := gocmp.Diff(2, len(afterSecond)); diff != "" {
 			t.Fatalf("two Send calls must produce two upstream attempts (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("success: Send with bodyless GET on closed pooled connection performs one attempt or one transport retry", func(t *testing.T) {
+		var mu sync.Mutex
+		var warmAddr string
+		var probeAddrs []string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/warmup" {
+				mu.Lock()
+				warmAddr = r.RemoteAddr
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, "warm")
+				return
+			}
+			mu.Lock()
+			probeAddrs = append(probeAddrs, r.RemoteAddr)
+			attempt := len(probeAddrs)
+			mu.Unlock()
+			if attempt == 1 {
+				if hj, ok := w.(http.Hijacker); ok {
+					if conn, _, err := hj.Hijack(); err == nil {
+						_ = conn.Close()
+					}
+				}
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"data":[]}`)
+		}))
+		t.Cleanup(srv.Close)
+
+		client := upstream.NewClient(upstream.Options{})
+		t.Cleanup(func() { _ = client.Close() })
+
+		warm, err := client.Do(t.Context(), upstream.Request{
+			Target:     upstream.TargetAnthropic,
+			BaseURL:    srv.URL,
+			Method:     http.MethodGet,
+			RequestURI: "/warmup",
+		})
+		if err != nil {
+			t.Fatalf("warmup Do failed: %v", err)
+		}
+		_, readErr := io.ReadAll(warm.Body)
+		closeErr := warm.Body.Close()
+		if readErr != nil || closeErr != nil {
+			t.Fatalf("warmup body drain: read=%v close=%v", readErr, closeErr)
+		}
+
+		req := upstream.Request{
+			Target:     upstream.TargetAnthropic,
+			BaseURL:    srv.URL,
+			Method:     http.MethodGet,
+			RequestURI: "/v1/models",
+		}
+		var send upstream.Send = func(ctx context.Context) (*upstream.Response, error) {
+			return client.Do(ctx, req)
+		}
+
+		resp, err := send(t.Context())
+		mu.Lock()
+		gotWarm := warmAddr
+		afterFirst := slices.Clone(probeAddrs)
+		mu.Unlock()
+
+		if gotWarm == "" {
+			t.Fatal("warmup request did not record a remote address")
+		}
+		if err == nil {
+			// Stock pooled net/http.Transport may retry a bodyless idempotent GET once on a fresh connection.
+			body, rErr := io.ReadAll(resp.Body)
+			cErr := resp.Body.Close()
+			if rErr != nil || cErr != nil {
+				t.Fatalf("draining retried GET body: read=%v close=%v", rErr, cErr)
+			}
+			if diff := gocmp.Diff(http.StatusOK, resp.StatusCode); diff != "" {
+				t.Fatalf("retried GET status (-want +got):\n%s", diff)
+			}
+			if diff := gocmp.Diff(`{"data":[]}`, string(body)); diff != "" {
+				t.Fatalf("retried GET body (-want +got):\n%s", diff)
+			}
+			if diff := gocmp.Diff(2, len(afterFirst)); diff != "" {
+				t.Fatalf("bodyless GET retry attempts (-want +got):\n%s", diff)
+			}
+			if diff := gocmp.Diff(gotWarm, afterFirst[0]); diff != "" {
+				t.Fatalf("first bodyless GET attempt did not reuse warmed connection (-warm +probe):\n%s", diff)
+			}
+			if afterFirst[1] == gotWarm {
+				t.Fatalf("bodyless GET retry reused closed connection %q", afterFirst[1])
+			}
+			return
+		}
+
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		if err.Error() == "not implemented" {
+			t.Fatalf("got stub error: %v", err)
+		}
+		if diff := gocmp.Diff(1, len(afterFirst)); diff != "" {
+			t.Fatalf("failed bodyless GET attempt count (-want +got):\n%s", diff)
+		}
+		if diff := gocmp.Diff(gotWarm, afterFirst[0]); diff != "" {
+			t.Fatalf("bodyless GET did not reuse warmed connection (-warm +probe):\n%s", diff)
+		}
+
+		resp2, err := send(t.Context())
+		if err != nil {
+			t.Fatalf("second explicit bodyless GET failed: %v", err)
+		}
+		_, rErr := io.ReadAll(resp2.Body)
+		cErr := resp2.Body.Close()
+		if rErr != nil || cErr != nil {
+			t.Fatalf("draining second bodyless GET body: read=%v close=%v", rErr, cErr)
+		}
+		if diff := gocmp.Diff(http.StatusOK, resp2.StatusCode); diff != "" {
+			t.Fatalf("second bodyless GET status (-want +got):\n%s", diff)
 		}
 	})
 

@@ -361,13 +361,14 @@ func TestResponseHeaders(t *testing.T) {
 			if diff := gocmp.Diff(before, tt.in); diff != "" {
 				t.Fatalf("ResponseHeaders mutated input (-before +after):\n%s", diff)
 			}
-			for k, vals := range got {
-				if strings.EqualFold(k, "Set-Cookie") && len(vals) > 0 {
-					vals[0] = "mutated"
-					if tt.in["Set-Cookie"][0] == "mutated" {
-						t.Fatal("ResponseHeaders aliased input Set-Cookie value slice")
-					}
+			// Mutating returned value slices must not alias any input slice.
+			for _, vals := range got {
+				for i := range vals {
+					vals[i] = "mutated"
 				}
+			}
+			if diff := gocmp.Diff(before, tt.in); diff != "" {
+				t.Fatalf("mutating ResponseHeaders output altered input (-before +after):\n%s", diff)
 			}
 		})
 	}

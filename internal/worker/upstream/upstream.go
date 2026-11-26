@@ -90,9 +90,10 @@ type Response struct {
 	Body io.ReadCloser
 }
 
-// Send executes one outbound upstream attempt for an immutable Request bound once by the
-// worker or branch caller to a Client. Each call performs exactly one outbound attempt
-// and never triggers an automatic replay.
+// Send executes an outbound upstream request for an immutable Request bound once by the
+// worker or branch caller to a Client. Requests carrying a body perform a single outbound
+// attempt with no automatic replay; bodyless idempotent requests on a reused keep-alive
+// connection may be retried by net/http if the connection fails before any response byte.
 type Send func(context.Context) (*Response, error)
 
 // Client executes pooled HTTP/1.1 requests (up to 64 connections per host, 1-hour socket-inactivity
