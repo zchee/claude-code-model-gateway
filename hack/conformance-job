@@ -9,7 +9,16 @@ trap 'exit 70' ERR
 work=$2 tmp=$3
 plugin=$("$root/hack/pinned-source")/plugins/model-gateway
 "$root/hack/baseline-extract" --verify >&2
-clean=(env -i "PATH=$PATH" "HOME=$work/home" "TMPDIR=$tmp" "npm_config_cache=${npm_config_cache:?missing venue npm cache}")
+npm_cache=${npm_config_cache:-}
+if [[ -z $npm_cache ]]; then
+    if [[ ${CONFORMANCE_VENUE_SCOPED:-0} == 1 ]]; then
+        printf 'conformance-job: missing venue npm cache\n' >&2
+        exit 70
+    fi
+    npm_cache=$work/npm-cache
+    mkdir -p "$npm_cache"
+fi
+clean=(env -i "PATH=$PATH" "HOME=$work/home" "TMPDIR=$tmp" "npm_config_cache=$npm_cache")
 "${clean[@]}" npm --prefix "$plugin" ci --ignore-scripts --no-audit --no-fund >&2
 "${clean[@]}" node -e 'if (require(process.argv[1]).version !== "8.20.0") process.exit(1)' "$plugin/node_modules/ajv/package.json"
 case ${MODE:-suite} in
@@ -18,4 +27,4 @@ case ${MODE:-suite} in
     *) printf 'unknown conformance MODE: %s\n' "$MODE" >&2; exit 2 ;;
 esac
 exec "${clean[@]}" node "$root/test/conformance/adapter/run.cjs" "$root" "$plugin" "$work" \
-    "${TARGET:-identity}" "${MODE:-suite}" "${PHASE:-}" "${PACKAGE:-}" "${GATE:-}" "${LAUNCH_LOG:-$work/launches.jsonl}" "${CLASS:-}" "${SITE:-}"
+    "${TARGET:-identity}" "${MODE:-suite}" "${PHASE:-}" "${PACKAGE:-}" "${GATE:-}" "${LAUNCH_LOG:-$work/launches.jsonl}" "${CLASS:-}" "${SITE:-}" "${CONFORMANCE_CAPTURE:-}" "${CONFORMANCE_CANDIDATE:-}"

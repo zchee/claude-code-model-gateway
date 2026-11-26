@@ -3,15 +3,404 @@
 """Own a venue launch from outside its scope; never reap an orphan."""
 
 import errno
+import hashlib
+import json
 import os
+import pwd
 import re
 import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
+from collections import Counter
+from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
+
+# Sorted escaped TSV: registration and depth; registration and credited count.
+# Both profiles come from the reviewed identity run, not the binary under test.
+CASE_PROFILE = "907f889cd952126193724e3da5b219642a29a0437f8573061de76057fcfe227a"
+COUNT_PROFILE = "0b2dad4d4ec33d0201aa1ca6a3de9afe5be4b581587be3d327ffa673f1cddda2"
+SOURCE_PIN = "4a10b3bb214b5ecc779c18fa1ba16ff0943168ec00ed881d358449a147b0ca06"
+CENSUS = "path\tline\tcolumn\tdepth\tname\tstatus\tdetail"
+LAUNCHES = "path\tline\tcolumn\tname\tbinary\tbinary_sha256"
+HOSTED_RUN_ID_RE = re.compile(r"gha-[1-9][0-9]*-[1-9][0-9]*")
+VENUE_UNIT_RE = re.compile(r"mgw-run-[0-9]+-[0-9]+\.scope")
+VENUE_RUN_ID_RE = re.compile(r"venue-mgw-run-[0-9]+-[0-9]+")
+COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+DIGEST_RE = re.compile(r"[0-9a-f]{64}")
+POSITIVE_INT_RE = re.compile(r"[1-9][0-9]*")
+
+
+def profile(rows: list[str]) -> str:
+    """Fingerprint every row, including multiplicity, independent of scheduling."""
+    return hashlib.sha256("".join(s + "\n" for s in sorted(rows)).encode()).hexdigest()
+
+
+def venue_run_id(unit: str) -> str:
+    """Derive the dedicated-venue run identifier from its systemd scope unit."""
+    if not VENUE_UNIT_RE.fullmatch(unit):
+        raise ValueError(f"invalid venue scope unit: {unit}")
+    return f"venue-{unit.removesuffix('.scope')}"
+
+
+def check_producer_run_id(producer: str, run_id: str) -> None:
+    """Require the run identifier shape to match the declared producer."""
+    if producer == "hosted":
+        if not HOSTED_RUN_ID_RE.fullmatch(run_id):
+            raise ValueError("invalid run identity for hosted producer")
+    elif producer == "venue":
+        if not VENUE_RUN_ID_RE.fullmatch(run_id):
+            raise ValueError("invalid run identity for venue producer")
+    else:
+        raise ValueError(f"unknown producer: {producer}")
+
+
+def check_producer_env(
+    producer: str, run_id: str, commit: str, env: Mapping[str, str]
+) -> None:
+    """Refuse a manifest whose identity disagrees with the active producer environment."""
+    if (
+        env.get("GITHUB_ACTIONS") == "true"
+        or env.get("RUNNER_ENVIRONMENT") == "github-hosted"
+    ):
+        if producer != "hosted":
+            raise ValueError("producer does not match hosted environment")
+        gh_run = env.get("GITHUB_RUN_ID", "")
+        gh_attempt = env.get("GITHUB_RUN_ATTEMPT", "")
+        if not (
+            POSITIVE_INT_RE.fullmatch(gh_run) and POSITIVE_INT_RE.fullmatch(gh_attempt)
+        ):
+            raise ValueError("missing hosted run identity in environment")
+        if run_id != f"gha-{gh_run}-{gh_attempt}":
+            raise ValueError("run identity does not match hosted environment")
+        if env.get("GITHUB_SHA", "") != commit:
+            raise ValueError("commit does not match hosted environment")
+    elif env.get("CONFORMANCE_VENUE_UNIT"):
+        if producer != "venue":
+            raise ValueError("producer does not match venue environment")
+        if run_id != venue_run_id(env["CONFORMANCE_VENUE_UNIT"]):
+            raise ValueError("run identity does not match venue scope")
+        venue_commit = env.get("CONFORMANCE_VENUE_COMMIT", "")
+        if venue_commit and commit != venue_commit:
+            raise ValueError("commit does not match venue archive")
+
+
+def resolve_hosted_identity(
+    root: Path, env: Mapping[str, str], home: Path | None = None
+) -> tuple[str, str, str]:
+    """Derive hosted run identity and commit from CI environment, attestation and Git."""
+    if env.get("CONFORMANCE_VENUE_SCOPED") == "1":
+        raise ValueError("hosted export cannot run inside a dedicated venue scope")
+    if (
+        env.get("GITHUB_ACTIONS") != "true"
+        or env.get("RUNNER_ENVIRONMENT") != "github-hosted"
+    ):
+        raise ValueError("hosted export requires a GitHub-hosted runner environment")
+    gh_run = env.get("GITHUB_RUN_ID", "")
+    gh_attempt = env.get("GITHUB_RUN_ATTEMPT", "")
+    sha = env.get("GITHUB_SHA", "")
+    if not (
+        POSITIVE_INT_RE.fullmatch(gh_run)
+        and POSITIVE_INT_RE.fullmatch(gh_attempt)
+        and COMMIT_RE.fullmatch(sha)
+    ):
+        raise ValueError("invalid hosted run identity or GITHUB_SHA")
+    account_home = home if home is not None else Path(pwd.getpwuid(os.getuid()).pw_dir)
+    attest = account_home / ".model-gateway-test-venue"
+    if attest.is_symlink() or not attest.is_file():
+        raise ValueError("hosted venue attestation is missing")
+    lines = attest.read_text(encoding="utf-8").splitlines()
+    if (
+        len(lines) != 1
+        or len(lines[0].split("\t")) != 3
+        or lines[0].split("\t")[2] != "ci"
+    ):
+        raise ValueError("venue attestation is not a hosted ci attestation")
+    git_env = {
+        k: v
+        for k, v in env.items()
+        if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR")
+    }
+    head = subprocess.check_output(
+        ["git", "-C", str(root), "rev-parse", "--verify", "HEAD^{commit}"],
+        text=True,
+        env=git_env,
+        timeout=15,
+    ).strip()
+    if head != sha:
+        raise ValueError(f"checkout HEAD {head} does not match GITHUB_SHA {sha}")
+    dirty = subprocess.check_output(
+        [
+            "git",
+            "--no-optional-locks",
+            "-C",
+            str(root),
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ],
+        text=True,
+        env=git_env,
+        timeout=15,
+    )
+    if dirty:
+        raise ValueError("checkout worktree is not clean")
+    return "hosted", f"gha-{gh_run}-{gh_attempt}", sha
+
+
+def verify_export(
+    directory: Path,
+    manifest_file: str = "manifest.json",
+    *,
+    expected_producer: str | None = None,
+    expected_run_id: str | None = None,
+    expected_commit: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> None:
+    """Check the completed bundle without a checkout, target binary or launch log."""
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("export path is not a regular directory")
+    for filename in (manifest_file, "census.tsv", "launches.tsv"):
+        entry = directory / filename
+        if entry.is_symlink() or not entry.is_file():
+            raise ValueError(f"missing or invalid {filename}")
+    manifest = json.loads((directory / manifest_file).read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise TypeError("manifest must be a JSON object")
+    producer = manifest["producer"]
+    run_id = manifest["run_id"]
+    commit = manifest["commit"]
+    if not (
+        isinstance(producer, str)
+        and isinstance(run_id, str)
+        and isinstance(commit, str)
+    ):
+        raise TypeError("invalid producer, run identity, or commit")
+    check_producer_run_id(producer, run_id)
+    if not COMMIT_RE.fullmatch(commit):
+        raise ValueError("invalid commit")
+    if (
+        type(manifest.get("clean_tree")) is not bool
+        or manifest["clean_tree"] is not True
+    ):
+        raise ValueError("export does not record a clean checkout")
+    if expected_producer is not None and producer != expected_producer:
+        raise ValueError("manifest producer does not match expected producer")
+    if expected_run_id is not None and run_id != expected_run_id:
+        raise ValueError("manifest run identity does not match expected run identity")
+    if expected_commit is not None and commit != expected_commit:
+        raise ValueError("manifest commit does not match expected commit")
+    if env is not None:
+        check_producer_env(producer, run_id, commit, env)
+    meta = {"run_id": run_id, "commit": commit}
+    binary, digest = manifest["binary"], manifest["binary_sha256"]
+    if (
+        not isinstance(binary, str)
+        or not re.fullmatch(r"/(?!/)[A-Za-z0-9_./-]+", binary)
+        or os.path.normpath(binary) != binary
+        or os.path.dirname(binary) == binary
+    ):
+        raise ValueError("invalid binary path")
+    if not isinstance(digest, str) or not DIGEST_RE.fullmatch(digest):
+        raise ValueError("invalid binary digest")
+    if (
+        manifest["test_source_sha256"] != SOURCE_PIN
+        or manifest["selection"] != "all-conformance"
+    ):
+        raise ValueError("unreviewed test source or partial selection")
+    if (
+        manifest["verdict"] != "pass"
+        or type(manifest["status"]) is not int
+        or manifest["status"] != 0
+    ):
+        raise ValueError("not a passing run")
+    start, end = (datetime.fromisoformat(manifest[k]) for k in ("started", "ended"))
+    if start.tzinfo is None or end.tzinfo is None or end < start:
+        raise ValueError("invalid run interval")
+
+    def rows(name: str, columns: str) -> list[list[str]]:
+        data = (directory / name).read_bytes().decode("utf-8")
+        if not data.endswith("\n") or "\r" in data:
+            raise ValueError(f"malformed {name}")
+        header, fields, *lines = data[:-1].split("\n")
+        if json.loads(header) != meta:
+            raise ValueError(f"{name} run identity or commit mismatch")
+        result = [line.split("\t") for line in lines]
+        if fields != columns or any(
+            len(row) != len(columns.split("\t")) for row in result
+        ):
+            raise ValueError(f"malformed {name} columns")
+        return result
+
+    cases: list[str] = []
+    counts: Counter[str] = Counter()
+    for path, line, col, depth, name, status, detail in rows("census.tsv", CENSUS):
+        if status != "pass" or detail != "-":
+            raise ValueError("non-passing census entry")
+        case_key = f"{path}\t{line}\t{col}\t{name}"
+        if case_key in counts:
+            raise ValueError("duplicate census entry")
+        cases.append(f"{path}\t{line}\t{col}\t{depth}\t{name}")
+        counts[case_key] = 0
+    if profile(cases) != CASE_PROFILE:
+        raise ValueError("census does not match full selection")
+    for path, line, col, name, image, sha in rows("launches.tsv", LAUNCHES):
+        case = f"{path}\t{line}\t{col}\t{name}"
+        if case not in counts:
+            raise ValueError("launch outside census")
+        if (image, sha) != (binary, digest):
+            raise ValueError("mixed binary path or digest")
+        counts[case] += 1
+    if profile([f"{case}\t{count}" for case, count in counts.items()]) != COUNT_PROFILE:
+        raise ValueError("unexpected per-case launch count")
+
+
+def prepare_export(
+    directory: Path,
+    manifest: dict[str, object],
+    candidate: dict[str, str],
+    *,
+    expected_producer: str,
+    expected_run_id: str,
+    expected_commit: str,
+    env: Mapping[str, str] | None = None,
+) -> None:
+    """Prepare a verified bundle in an unpublished directory after cleanup."""
+    header = json.dumps({k: manifest[k] for k in ("run_id", "commit")}) + "\n"
+    (directory / "manifest.pending").write_text(
+        json.dumps(manifest) + "\n", encoding="utf-8"
+    )
+    for name in ("census", "launches"):
+        (directory / f"{name}.tsv").write_text(
+            header + candidate[name], encoding="utf-8"
+        )
+    verify_export(
+        directory,
+        "manifest.pending",
+        expected_producer=expected_producer,
+        expected_run_id=expected_run_id,
+        expected_commit=expected_commit,
+        env=env,
+    )
+
+
+def hosted_export(root: Path, env: Mapping[str, str]) -> int:
+    """Run the full binary conformance suite on a hosted runner and write its export."""
+    target = env.get("TARGET", "identity")
+    mode = env.get("MODE", "suite") or "suite"
+    classification = env.get("CLASS", "")
+    args = ["conformance", f"TARGET={target}", f"MODE={mode}"]
+    if classification:
+        args.append(f"CLASS={classification}")
+    for key in ("PHASE", "PACKAGE", "GATE", "SITE"):
+        if env.get(key):
+            args.append(f"{key}={env[key]}")
+    try:
+        producer, run_id, commit = resolve_hosted_identity(root, env)
+        binary = export_target(args, 0, commit)
+        if classification and classification != "conformance":
+            raise ValueError("invalid CLASS selector")
+        binary_path = Path(binary)
+        if (
+            not binary_path.is_file()
+            or not os.access(binary, os.X_OK)
+            or os.path.realpath(binary) != binary
+        ):
+            raise ValueError(f"invalid executable: {binary}")
+        out_raw = env.get("EXPORT_DIR", "")
+        if not out_raw and env.get("RUNNER_TEMP"):
+            out_raw = str(Path(env["RUNNER_TEMP"]) / "conformance-export")
+        if (
+            not out_raw
+            or not os.path.isabs(out_raw)
+            or os.path.normpath(out_raw) != out_raw
+            or os.path.dirname(out_raw) == out_raw
+        ):
+            raise ValueError("EXPORT_DIR must be a clean absolute path")
+        output = Path(out_raw)
+        if output.exists() or output.is_symlink():
+            raise ValueError(f"EXPORT_DIR already exists: {output}")
+        if not output.parent.is_dir() or output.parent.is_symlink():
+            raise ValueError(f"EXPORT_DIR parent is not a directory: {output.parent}")
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+        print(f"conformance export refused: {exc}", file=sys.stderr)
+        return 70
+
+    venue_rc = subprocess.run([str(root / "hack/venue-check")], check=False).returncode
+    if venue_rc != 0:
+        return 97
+
+    started = datetime.now(UTC).isoformat()
+    capture_dir = Path(tempfile.mkdtemp(prefix="mgw-capture-"))
+    candidate_path = capture_dir / "candidate.json"
+    stage: Path | None = None
+    try:
+        run_env = dict(env)
+        run_env["TARGET"] = f"binary:{binary}"
+        run_env["MODE"] = "suite"
+        run_env["CONFORMANCE_CAPTURE"] = binary
+        run_env["CONFORMANCE_CANDIDATE"] = str(candidate_path)
+        proc = subprocess.run(
+            [str(root / "hack/conformance")], env=run_env, check=False
+        )
+        if proc.returncode != 0:
+            print(
+                f"conformance export refused: comparison status {proc.returncode} is not a pass",
+                file=sys.stderr,
+            )
+            return 70
+        post_identity = resolve_hosted_identity(root, env)
+        if post_identity != (producer, run_id, commit):
+            raise ValueError("hosted run identity or checkout changed during run")
+        candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+        if not isinstance(candidate, dict) or candidate.get("binary") != binary:
+            raise ValueError("candidate does not match the requested executable")
+        stage = Path(tempfile.mkdtemp(prefix=".pending-", dir=output.parent))
+        prepare_export(
+            stage,
+            {
+                "producer": producer,
+                "run_id": run_id,
+                "commit": commit,
+                "clean_tree": True,
+                "binary": binary,
+                "binary_sha256": candidate["binary_sha256"],
+                "test_source_sha256": candidate["test_source_sha256"],
+                "selection": "all-conformance",
+                "started": started,
+                "ended": datetime.now(UTC).isoformat(),
+                "verdict": "pass",
+                "status": 0,
+            },
+            candidate,
+            expected_producer=producer,
+            expected_run_id=run_id,
+            expected_commit=commit,
+            env=env,
+        )
+        stage.rename(output)
+        stage = None
+        (output / "manifest.pending").rename(output / "manifest.json")
+        print(f"conformance export: {output}", flush=True)
+        return 0
+    except (
+        OSError,
+        KeyError,
+        ValueError,
+        TypeError,
+        subprocess.SubprocessError,
+    ) as exc:
+        print(f"conformance export refused: {exc}", file=sys.stderr)
+        return 70
+    finally:
+        shutil.rmtree(capture_dir, ignore_errors=True)
+        if stage is not None:
+            shutil.rmtree(stage, ignore_errors=True)
 
 
 def write_atomic(target: Path, content: str) -> None:
@@ -166,10 +555,34 @@ def inspect_record(path: Path, recover: bool) -> None:
     print("; ".join(parts))
 
 
+def export_target(args: list[str], status: int, commit: str) -> str:
+    """Return the image only for a successful, isolated, full binary comparison."""
+    if status != 0:
+        raise ValueError(f"comparison status {status} is not a pass")
+    options = dict(arg.split("=", 1) for arg in args if "=" in arg)
+    target = options.get("TARGET", "identity")
+    if not target.startswith("binary:"):
+        raise ValueError("source-runtime target")
+    if [arg for arg in args if "=" not in arg] != ["conformance"]:
+        raise ValueError("expected one conformance goal")
+    if options.get("MODE", "suite") != "suite" or any(
+        k in options for k in ("PHASE", "PACKAGE", "GATE", "SITE")
+    ):
+        raise ValueError("partial selection")
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("checkout was not a clean commit archive")
+    return target.removeprefix("binary:")
+
+
 def run(path: Path, unit: str, limit: int, args: list[str]) -> int:
     """Release the launcher only after publishing its identity under the flock."""
-    control, work, *payload = args
+    split = args.index("--")
+    control, work, commit, *goals = args[:split]
+    payload = args[split + 1 :]
+    run_id = venue_run_id(unit)
+    started = datetime.now(UTC).isoformat()
     directory = Path(work)
+    candidate_path = directory / "conformance-candidate.json"
     ready = directory / "control.ready"
     port: int | None = None
     if path.read_text() != f"pending={unit}\n":
@@ -187,6 +600,13 @@ def run(path: Path, unit: str, limit: int, args: list[str]) -> int:
         "import os,sys; fd=int(sys.argv[1]); token=os.read(fd,1); os.close(fd); "
         "sys.exit(70) if token!=b'G' else os.execvp(sys.argv[2],sys.argv[2:])"
     )
+    capture = ""
+    if control == "run" and "conformance" in goals:
+        try:
+            capture = export_target(goals, 0, commit)
+        except ValueError:
+            # Diagnostics still run; report the refusal alongside their actual outcome.
+            capture = ""
     cmd = [
         sys.executable,
         "-I",
@@ -209,6 +629,9 @@ def run(path: Path, unit: str, limit: int, args: list[str]) -> int:
         "-u",
         "DBUS_SESSION_BUS_ADDRESS",
         "CONFORMANCE_VENUE_SCOPED=1",
+        f"CONFORMANCE_VENUE_UNIT={unit}",
+        f"CONFORMANCE_CAPTURE={capture}",
+        f"CONFORMANCE_CANDIDATE={candidate_path if capture else ''}",
         *payload,
     ]
     # Keep the launcher in its own session so an outside watchdog killing the
@@ -290,6 +713,24 @@ def run(path: Path, unit: str, limit: int, args: list[str]) -> int:
         status = status or 70
     if status < 0:
         status = 128 - status
+    candidate: dict[str, str] | None = None
+    binary = ""
+    if control == "run" and "conformance" in goals:
+        try:
+            binary = export_target(goals, status, commit)
+        except ValueError as exc:
+            print(f"conformance export refused: {exc}", file=sys.stderr)
+        else:
+            try:
+                candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+                if not isinstance(candidate, dict) or candidate.get("binary") != binary:
+                    raise ValueError(
+                        "candidate does not match the requested executable"
+                    )
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                candidate = None
+                status = 70
+                print(f"conformance export refused (status=70): {exc}", file=sys.stderr)
     try:
         if status == 0:
             shutil.rmtree(directory)
@@ -304,20 +745,83 @@ def run(path: Path, unit: str, limit: int, args: list[str]) -> int:
             shutil.rmtree(old)
     except OSError as exc:
         print(f"remote: could not prune run directories: {exc}", file=sys.stderr)
+    stage: Path | None = None
+    output = path.parent / "exports" / run_id
+    if candidate is not None and status == 0 and not interrupted:
+        try:
+            output.parent.mkdir(mode=0o700, exist_ok=True)
+            stage = Path(tempfile.mkdtemp(prefix=".pending-", dir=output.parent))
+            prepare_export(
+                stage,
+                {
+                    "producer": "venue",
+                    "run_id": run_id,
+                    "commit": commit,
+                    "clean_tree": True,
+                    "binary": binary,
+                    "binary_sha256": candidate["binary_sha256"],
+                    "test_source_sha256": candidate["test_source_sha256"],
+                    "selection": "all-conformance",
+                    "started": started,
+                    "ended": datetime.now(UTC).isoformat(),
+                    "verdict": "pass",
+                    "status": status,
+                },
+                candidate,
+                expected_producer="venue",
+                expected_run_id=run_id,
+                expected_commit=commit,
+                env={
+                    "CONFORMANCE_VENUE_UNIT": unit,
+                    "CONFORMANCE_VENUE_COMMIT": commit,
+                },
+            )
+        except (OSError, KeyError, ValueError, TypeError) as exc:
+            print(f"conformance export refused (status=70): {exc}", file=sys.stderr)
+            status = 70
     if interrupted and status != 124:
         status = 128 + interrupted
+    exported: Path | None = None
+    if stage is not None:
+        if status == 0:
+            try:
+                stage.rename(output)
+                (output / "manifest.pending").rename(output / "manifest.json")
+                exported = output
+            except OSError as exc:
+                print(f"conformance export refused (status=70): {exc}", file=sys.stderr)
+                status = 70
+                shutil.rmtree(stage, ignore_errors=True)
+        else:
+            shutil.rmtree(stage, ignore_errors=True)
     label = {0: "pass", 1: "failure", 2: "usage", 124: "timeout"}.get(
         status, "no-verdict"
     )
     record = f"unit={unit} class={label} status={status}"
     write_atomic(path.with_name("last-outcome"), record + "\n")
     path.unlink()
+    if exported is not None:
+        print(f"remote: conformance export {exported}", flush=True)
     print(f"remote: {record}", flush=True)
     return status
 
 
 def main(args: list[str]) -> int:
     """Dispatch only the operation requested by the outside venue owner."""
+    if args[:1] == ["verify"]:
+        try:
+            if len(args) != 2:
+                raise ValueError("usage: conformance-export verify DIR")
+            verify_export(Path(args[1]), env=os.environ)
+        except (OSError, KeyError, ValueError, TypeError) as exc:
+            print(f"conformance export refused: {exc}", file=sys.stderr)
+            return 70
+        return 0
+    if args[:1] == ["export"]:
+        if len(args) != 2:
+            print("usage: conformance-export run", file=sys.stderr)
+            return 70
+        return hosted_export(Path(args[1]), os.environ)
     os.environ["XDG_RUNTIME_DIR"] = f"/run/user/{os.getuid()}"
     os.environ.pop("DBUS_SESSION_BUS_ADDRESS", None)
     command, file, *rest = args

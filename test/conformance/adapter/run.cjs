@@ -7,8 +7,8 @@ const cp = require('node:child_process');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
-const [root, plugin, work, target, mode, phase, pkg, gate, requestedLog, classification, site] = process.argv.slice(2);
-const { PROBE_FILE, REQUIRED_PROBES, checkPinnedLaunchForms, createLog, evaluateSuite, tsv, validLaunch } = require('./evidence.cjs');
+const [root, plugin, work, target, mode, phase, pkg, gate, requestedLog, classification, site, capture, candidateFile] = process.argv.slice(2);
+const { PROBE_FILE, REQUIRED_PROBES, checkPinnedLaunchForms, createLog, evaluateSuite, parentCredits, tsv, validLaunch } = require('./evidence.cjs');
 const data = path.join(root, 'test/conformance');
 const inventory = file => tsv(path.join(data, file));
 const ndjson = file => fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line));
@@ -48,7 +48,7 @@ if (probes) {
   pattern.push(...REQUIRED_PROBES.map(p => escapeRE(p.name)));
 }
 // Verify the pinned test tree uses only inventoried launch forms and matches the reviewed pin.
-checkPinnedLaunchForms(plugin);
+const sourceDigest = checkPinnedLaunchForms(plugin);
 const manifest = require(path.join(plugin, 'package.json')).scripts.test;
 assert.equal(manifest, 'node --require ./test/isolate-home.js --test --test-concurrency=2 --test-timeout=300000 "test/*.test.js"', 'unexpected pinned test command');
 const eventsFile = path.join(work, 'events.jsonl');
@@ -87,6 +87,33 @@ let failed = verdict.failed;
 function error(message) { failed = true; process.stderr.write(`conformance: ${message}\n`); }
 for (const message of verdict.errors) process.stderr.write(`conformance: ${message}\n`);
 
+const tsvLine = values => values.map(v => String(v).replace(/[\\\t\r\n]/g,
+  c => ({ '\\': '\\\\', '\t': '\\t', '\r': '\\r', '\n': '\\n' })[c])).join('\t') + '\n';
+function launchTable(records, image, digest) {
+  const parent = parentCredits(sites, baseline);
+  let text = 'path\tline\tcolumn\tname\tbinary\tbinary_sha256\n';
+  for (const record of records) {
+    assert(validLaunch(record, image, digest), 'invalid or mixed launch evidence');
+    for (const r of [record, parent(record)].filter(Boolean)) {
+      text += tsvLine([r.path, r.line, r.column, r.name, record.target.slice(7), record.build]);
+    }
+  }
+  return text;
+}
+if (capture && candidateFile && capture === binary && !failed && mode === 'suite' && !identity && !(phase || pkg || gate || site)) {
+  const safeCandidate = createLog(candidateFile, plugin);
+  let census = 'path\tline\tcolumn\tdepth\tname\tstatus\tdetail\n';
+  for (const [id, status] of verdict.observed) {
+    const [file, line, column, name] = JSON.parse(id);
+    census += tsvLine([file, line, column, verdict.depths.get(id), name, status, '-']);
+  }
+  // These are private observations, not evidence. Only the producer has the final verdict.
+  fs.writeFileSync(safeCandidate, JSON.stringify({
+    binary, binary_sha256: config.build, test_source_sha256: sourceDigest, census,
+    launches: launchTable(launches, target, config.build),
+  }), { mode: 0o600 });
+}
+
 if (mode === 'self-test') {
   const alias = path.join(work, 'fixture-alias');
   for (const dir of [process.env.HOME, require('node:os').tmpdir(), plugin]) {
@@ -110,18 +137,39 @@ if (mode === 'self-test') {
     log: path.join(work, 'standin.jsonl'), witness: null, trackActive: false };
   fs.writeFileSync(preload, `require(${JSON.stringify(path.join(__dirname, 'preload.cjs'))})(${JSON.stringify(binaryConfig)});\n`);
   const check = cp.spawnSync(process.execPath, ['--require', './test/isolate-home.js', '--require', preload,
-    '--test', '--test-reporter=tap', path.join(__dirname, 'dispatch.test.js')], { cwd: plugin, encoding: 'utf8' });
+    '--test', '--test-reporter=tap', '--test-reporter-destination=stdout',
+    `--test-reporter=${path.join(root, 'hack/baseline-node-reporter.mjs')}`,
+    `--test-reporter-destination=${path.join(work, 'standin-events.jsonl')}`, path.join(__dirname, 'dispatch.test.js')], { cwd: plugin, encoding: 'utf8' });
   if (check.status !== 0) error(`stand-in dispatch failed:\n${check.stdout}\n${check.stderr}`);
   const records = ndjson(binaryConfig.log);
   if (records.length !== 2 || records.some(r => !validLaunch(r, binaryConfig.target, binaryConfig.build)) ||
       new Set(records.map(r => r.pid)).size !== 2) error('missing independent sync/async binary launches');
   for (const r of records) process.stdout.write(`# stand-in ${JSON.stringify(r)}\n`);
-  const metadata = { run_id: 'standin-self-test', commit: '0'.repeat(40) };
-  const exported = cp.execFileSync(process.execPath, [path.join(root, 'hack/conformance-launches'), binaryConfig.log, metadata.run_id, metadata.commit], { encoding: 'utf8' });
-  assert.deepEqual(exported.trimEnd().split('\n'), [JSON.stringify(metadata), 'path\tline\tcolumn\tname\tbinary\tbinary_sha256',
+  const standinTable = launchTable(records, binaryConfig.target, binaryConfig.build);
+  fs.writeFileSync(path.join(work, 'standin-table'), standinTable);
+  assert.deepEqual(standinTable.trimEnd().split('\n'), ['path\tline\tcolumn\tname\tbinary\tbinary_sha256',
     ...records.map(r => [r.path, r.line, r.column, r.name, config.witness, binaryConfig.build].join('\t'))]);
-  process.stdout.write(`# stand-in TSV: ${records.length} measured launches, matching metadata and rows\n`);
+  process.stdout.write(`# stand-in TSV: ${records.length} measured launches; dispatch fixture only\n`);
 
+  if (full) {
+    const key = require('./evidence.cjs').key;
+    const counts = new Map(classes.filter(r => r.class === 'conformance').map(r => [key(r), 0]));
+    const parent = parentCredits(sites, baseline);
+    for (const launch of launches) {
+      for (const r of [launch, parent(launch)].filter(Boolean)) {
+        const id = key(r);
+        if (counts.has(id)) counts.set(id, counts.get(id) + 1);
+      }
+    }
+    const cases = [], credits = [];
+    for (const [id, n] of counts) {
+      const [f, l, c, name] = JSON.parse(id);
+      cases.push(tsvLine([f, l, c, verdict.depths.get(id), name]));
+      credits.push(tsvLine([f, l, c, name, n]));
+    }
+    const fingerprint = rows => crypto.createHash('sha256').update(rows.sort().join('')).digest('hex');
+    fs.writeFileSync(path.join(work, 'identity-profile.json'), JSON.stringify([fingerprint(cases), fingerprint(credits)]));
+  }
   const requiredControls = [
     'control: unattributed, alternate-node, and extra-option product launches fail closed while decoys stay on Node',
     'control: real product launch falling back to Node inside a passing case fails the run',

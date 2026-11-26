@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Copyright 2026 The claude-code-model-gateway Authors.
+# SPDX-License-Identifier: Apache-2.0
+set -eu
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
+case ${1:-} in
+    verify)
+        [[ $# == 2 ]] || { printf 'usage: conformance-export verify DIR\n' >&2; exit 70; }
+        exec python3 -I "$root/hack/conformance-owner.py" verify "$2"
+        ;;
+    run)
+        [[ $# == 1 ]] || { printf 'usage: conformance-export run\n' >&2; exit 70; }
+        exec python3 -I "$root/hack/conformance-owner.py" export "$root"
+        ;;
+    *)
+        printf 'usage: conformance-export {run|verify DIR}\n' >&2
+        exit 70
+        ;;
+esac

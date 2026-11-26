@@ -199,7 +199,7 @@ restore_attestation() {
 }
 
 remote_main() {
-    local op=$1 localname=$2 gover=$3 nodever=$4 scope_limit=$5; shift 5
+    local op=$1 localname=$2 gover=$3 nodever=$4 scope_limit=$5 commit=$6; shift 6
     local home base=/tmp/model-gateway-venue run unit=''
     [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]] || fail 'expected a remote Linux/amd64 venue'
     [[ $(hostname -s) != "$localname" ]] || fail 'refusing same host name as caller'
@@ -345,7 +345,7 @@ PAYLOAD
         } >| "$run/payload.sh"
         printf 'pending=%s\n' "$unit" >| "$base/active-scope"
         printf 'remote: reserved %s\n' "$unit" >&2
-        exec python3 -I -c "$owner_source" run "$base/active-scope" "$unit" "$scope_limit" "$op" "$run" /bin/bash "$run/payload.sh" "$base" "$run" "$gover" "$nodever" "$op" "$@"
+        exec python3 -I -c "$owner_source" run "$base/active-scope" "$unit" "$scope_limit" "$op" "$run" "$commit" "$@" -- /bin/bash "$run/payload.sh" "$base" "$run" "$gover" "$nodever" "$op" "$@"
     fi
     # negative-control runs outside the run scope under its own timeout and attestation trap.
     # shellcheck disable=SC2064
@@ -444,7 +444,13 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
     # A single-line encoding survives SSH command relays that split multiline arguments.
     encoded=$(printf '%s' "$program" | base64 | tr -d '\n')
     cmd="env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin GITHUB_ACTIONS=\"\${GITHUB_ACTIONS:-}\" /bin/bash -c \"\$(printf %s $encoded | base64 -d)\" remote"
-    for arg in "$op" "$(hostname -s)" "$gover" v24.11.1 "$scope_limit" "$@"; do
+    commit=dirty
+    if (( has_conformance )); then
+        snapshot=$(git -C "$root" rev-parse --verify 'HEAD^{commit}') || exit 70
+        changes=$(git -C "$root" status --porcelain=v1 --untracked-files=all --ignore-submodules=none) || exit 70
+        if [[ -z $changes ]]; then commit=$snapshot; fi
+    fi
+    for arg in "$op" "$(hostname -s)" "$gover" v24.11.1 "$scope_limit" "$commit" "$@"; do
         [[ $arg =~ ^[a-zA-Z0-9_=.:/-]+$ ]] || usage_fail 'invalid remote argument'
         cmd+=" $arg"
     done
@@ -460,7 +466,10 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
             printf 'remote: failed to create checkout archive\n' >&2; exit 70
         fi
         trap 'rm -f -- "$input"' EXIT
-        if ! archive_tree "$root" >| "$input"; then
+        if [[ $commit != dirty ]]; then
+            git -C "$root" archive --format=tar "$commit" >| "$input" || exit 70
+            [[ $(git get-tar-commit-id < "$input") == "$commit" ]] || exit 70
+        elif ! archive_tree "$root" >| "$input"; then
             printf 'remote: failed to archive checkout\n' >&2; exit 70
         fi
     fi

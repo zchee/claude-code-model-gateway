@@ -45,13 +45,26 @@ cleanup() {
     exit "$rc"
 }
 trap cleanup EXIT
-tmp=$(mktemp -d "${root%/*}/t.XXXXXX")
+if [[ ${CONFORMANCE_VENUE_SCOPED:-0} == 1 ]]; then
+    tmp=$(mktemp -d "${root%/*}/t.XXXXXX")
+else
+    tmp_base=${TMPDIR:-/tmp}
+    if (( ${#tmp_base} > 30 )); then tmp_base=/tmp; fi
+    tmp=$(mktemp -d "$tmp_base/mgw.XXXXXX")
+fi
 mkdir "$work/home"
 rc=0
 python3 -I "$root/hack/conformance-supervise" "$work" "$limit" \
     bash "$root/hack/conformance-job" "$root" "$work" "$tmp" 9<&- || rc=$?
 if [[ -f $work/job.log ]]; then cat -- "$work/job.log" || { (( rc )) || rc=70; }; fi
 if [[ ${MODE:-suite} == self-test && $rc == 0 && $interrupted == 0 ]]; then
+    selection=full; if [[ -n ${SITE:-} ]]; then selection=site; fi
+    python3 -I "$root/test/conformance/adapter/export_controls.py" "$root" "$work" "$selection" >| "$work/export-controls.log" 9<&- || rc=$?
+    cat "$work/export-controls.log" || { (( rc )) || rc=70; }
+    for name in failed-run missing-launch changed-commit missing-case mixed-digest producer-id-mismatch; do
+        count=$(grep -Fxc "# export control $name: pass" "$work/export-controls.log" || :)
+        [[ $count == 1 ]] || { printf 'unverified export control: %s\n' "$name" >&2; (( rc )) || rc=1; }
+    done
     "$root/hack/conformance-containment-check" "$root" "$work" >| "$work/controls.log" 9<&- || rc=$?
     cat "$work/controls.log" || { (( rc )) || rc=70; }
     for name in selector-refusal timeout-ceiling private-status in-group-timeout; do

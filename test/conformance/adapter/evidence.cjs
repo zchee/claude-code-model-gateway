@@ -52,8 +52,10 @@ function checkPinnedLaunchForms(plugin) {
   }
   assert.equal(violations.length, 0,
     `out-of-scope launch forms in pinned test sources: ${violations.join('; ')}`);
-  assert.equal(sourceDigest.digest('hex'), PINNED_TEST_DIGEST,
+  const digest = sourceDigest.digest('hex');
+  assert.equal(digest, PINNED_TEST_DIGEST,
     'pinned test sources changed: review launch forms and execution counts');
+  return digest;
 }
 
 const PROBE_FILE = 'test/conformance/probes/launch.test.js';
@@ -127,6 +129,7 @@ function evaluateSuite({
   }
 
   const observed = new Map();
+  const depths = new Map();
   const observedProbes = new Map();
   const probeIds = new Set();
   const observedByFile = new Map();
@@ -185,6 +188,7 @@ function evaluateSuite({
       const status = Object.hasOwn(event, 'skip') ? 'skip' : Object.hasOwn(event, 'todo') ? 'todo' :
         event.type === 'test:pass' ? 'pass' : 'fail';
       observed.set(id, status);
+      depths.set(id, event.nesting);
       bump(file, status);
       if (file === PROBE_FILE) {
         probeIds.add(id);
@@ -280,7 +284,7 @@ function evaluateSuite({
 
   const counts = Object.fromEntries(['pass', 'fail', 'skip', 'todo'].map(s =>
     [s, [...observed.values()].filter(v => v === s).length]));
-  return { failed, errors, counts, observed, validLaunches };
+  return { failed, errors, counts, observed, depths, validLaunches };
 }
 
 module.exports = { PROBE_FILE, REQUIRED_PROBES, checkPinnedLaunchForms, createLog, evaluateSuite, key, parentCredits, tsv, validLaunch };

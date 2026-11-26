@@ -56,6 +56,8 @@ paths resolve from the caller's directory. Supply each file its gate requires:
 | `--census PATH` | The source suite run against Go; TSV columns `path`, `line`, `column`, `depth`, `name`, `status`, `detail`. Each conformance case assigned to the phase must pass, even if its individual pairs are due later. |
 | `--launches PATH` | TSV with `path`, `line`, `column`, `name`, `binary`, `binary_sha256`. Each row attributes one launch to the exact case key. The absolute binary path and lowercase SHA-256 must be identical throughout the run. |
 
+For `--census` and `--launches`, use both files from one [conformance export](../../test/conformance/adapter/README.md#evidence-output) accepted by `hack/conformance-export verify DIR`: either from the same hosted `gha-<run>-<attempt>` workflow run as the Go test JSON, or from a dedicated venue run together with Go test JSON acquired under that same venue run ID. Never mix identifiers across producers.
+
 After the metadata line, TSVs use a header and literal tabs with the same
 field escaping as the baseline. Each results gate requires its pending matrix
 and mapped tests plus every replacement scheduled for that phase in the plan's
