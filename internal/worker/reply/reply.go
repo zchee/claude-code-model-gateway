@@ -44,8 +44,8 @@ type UsageCapture interface {
 // is respected.
 // NewMessageID supplies the complete ID for a synthesized message.
 // Diagnostics receives fixed operator lines that carry no request or response content; nil
-// discards them. Each line is one Write call, so a writer shared between requests must be safe
-// for concurrent use.
+// discards them. Each line is written with exactly one Write call, and the writer must be safe for
+// concurrent use by every user of the same underlying sink.
 type Request struct {
 	Provider, AdvertisedModel, BackendModel, Session, CommandPath, Origin string
 	Body                                                                  []byte
@@ -70,15 +70,19 @@ type Result struct {
 // Handle calls forward for each attempt, closes buffered bodies and writes one client response.
 // The ctx argument is the client context: no attempt starts once ctx is done (neither the first
 // attempt nor any retry, including with a zero retry delay), and an attempt in flight is never
-// cancelled by it because Handle passes context.WithoutCancel(ctx) to forward. When Handle stops
-// because the client context is done, it writes nothing to w, closes any buffered body it holds,
-// and returns Stream nil, a nil error, Contacted as it happened, Status zero, and Cancelled false.
-// The client context is checked again when a send returns and after every buffered read, before
-// any reply is written and before the sentry or the upstream state is updated, so a client that
-// left while the upstream was answering gets the same result; a read in progress finishes first.
-// A response that arrives for a departed client is closed, a stream included. Otherwise it returns
-// an untouched open response for the stream relay, or an error wrapping http.ErrAbortHandler when
-// the client connection must abort.
+// cancelled by it because Handle passes context.WithoutCancel(ctx) to forward.
+//
+// What the upstream sent is recorded whether or not the client is still there: the Codex
+// rejection state and its diagnostic line, the overflow latch and ceiling learning, and the usage
+// and sentry observations of a complete JSON body. Only a reply that is delivered counts as an
+// ordinary completed turn for the sentry. The client context is checked again immediately before
+// the first byte of a client response, after every such callback and after any rewriting; once it
+// is done Handle writes nothing to w and, for a buffered body, reads and closes it and returns a
+// nil error, Stream nil, Contacted as it happened, Status zero, and Cancelled false.
+//
+// A response that belongs to the stream relay is returned untouched and open whatever the client
+// context says; the relay, which learns of the departure itself, owns its body. Otherwise Handle
+// returns an error wrapping http.ErrAbortHandler when the client connection must abort.
 func Handle(ctx context.Context, w http.ResponseWriter, req Request, forward upstream.Send) (Result, error) {
 	retries, delay := defaultRetries, defaultRetryDelay
 	// A negative setting falls back to the default, as the source's configuration does.
@@ -99,14 +103,11 @@ func Handle(ctx context.Context, w http.ResponseWriter, req Request, forward ups
 		}
 		res, err := forward(context.WithoutCancel(ctx))
 		facts.Contacted = true
-		if err != nil || ctx.Err() != nil {
+		if err != nil {
 			if res != nil && res.Body != nil {
 				_ = res.Body.Close()
 			}
-			if ctx.Err() != nil {
-				return Result{Result: facts}, nil
-			}
-			return transportFailure(w, req, err, facts)
+			return transportFailure(ctx, w, req, err, facts)
 		}
 		t := &turn{ctx: ctx, w: w, req: req, res: res, result: facts}
 		out, retry, err := t.respond(attempt, retries)
@@ -153,10 +154,11 @@ func WriteSentry(w http.ResponseWriter, original []byte, provider string, cross 
 // WriteEngineOverflow normalizes an upstream refusal using the prepared request and source HTTP status.
 // It always returns Contacted true because the refusal came from the upstream.
 func WriteEngineOverflow(w http.ResponseWriter, req Request, status int, counts sentry.Counts) (outcome.Result, error) {
-	o, err := engineOverflow(w, req, status, counts)
+	o, body, err := engineOverflow(req, status, counts)
 	if err != nil {
 		return outcome.Result{Contacted: true}, err
 	}
+	writeOverflow(w, body, &status)
 	return outcome.Result{Route: outcome.Route{Overflow: o}, Status: http.StatusRequestEntityTooLarge, Contacted: true}, nil
 }
 

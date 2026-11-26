@@ -49,17 +49,19 @@ const (
 	emptyCompletionLine = "model-gateway: Codex completed a turn with no output (claude-code-proxy empty_codex_completion); answered an empty end_turn instead of a retryable 503\n"
 )
 
-// diagnose writes one fixed line to w in a single Write call; a nil w discards it.
+// diagnose writes one fixed line to w with exactly one Write call; a nil w discards it. The
+// writer, not this package, keeps lines from concurrent requests apart.
 func diagnose(w io.Writer, line string) {
 	if w != nil {
-		_, _ = io.WriteString(w, line)
+		_, _ = w.Write([]byte(line))
 	}
 }
 
-// noteCodexRejection records an attributed OpenAI rejection so readiness reports the block.
-// The evidence names only headers, never their values. Header names are sorted because the
-// parsed header map does not keep their arrival order. A failed state write does not change
-// the client's reply; it is reported on the diagnostics writer instead of the rejection line.
+// noteCodexRejection records an attributed OpenAI rejection so readiness reports the block, also
+// when the client has already left. The evidence names only headers, never their values. Header
+// names are sorted because the parsed header map does not keep their arrival order. A failed
+// state write does not change the client's reply; it is reported on the diagnostics writer
+// instead of the rejection line.
 func noteCodexRejection(req Request, status int, headers http.Header, body []byte) {
 	store := req.Upstream
 	if store == nil || !HasOpenAIRejectionEvidence(status, headers, body) {

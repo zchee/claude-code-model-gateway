@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/outcome"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/sentry"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/upstream"
@@ -34,8 +35,8 @@ const lmStudioProvider = "lmstudio"
 // errAborted reports that the client connection must be dropped without a clean reply.
 var errAborted = fmt.Errorf("reply: upstream response failed after it could no longer be answered cleanly: %w", http.ErrAbortHandler)
 
-// errDeparted reports that the client left while an upstream response was being received; Handle
-// turns it into a result with nothing written.
+// errDeparted reports that the client left before its reply was written; Handle turns it into a
+// result with nothing written.
 var errDeparted = errors.New("reply: client left before the upstream response was answered")
 
 const earlyEnd = `{"type":"error","error":{"type":"api_error","message":"model-gateway shim: upstream response ended early"}}`
@@ -56,19 +57,22 @@ type turn struct {
 	result outcome.Result
 }
 
-// readBody buffers the whole upstream body and closes it. With note, every read is counted as
-// response bytes as it arrives, so a failed read still accounts for what was received. The read
-// is not interrupted when the client leaves; errDeparted reports, once it has finished, that the
-// client is gone and nothing more may be answered or updated for it.
-func (t *turn) readBody(note bool) ([]byte, error) {
-	body, err := t.readAll(note)
-	if t.ctx.Err() != nil {
-		return nil, errDeparted
+// gone reports that the client has left. It is checked immediately before the first byte of a
+// client response, after every callback and rewrite, so nothing is written to a departed client.
+func (t *turn) gone() bool { return t.ctx.Err() != nil }
+
+// abort drops the client connection after a buffered body broke, unless the client already left.
+func (t *turn) abort() error {
+	if t.gone() {
+		return errDeparted
 	}
-	return body, err
+	return errAborted
 }
 
-func (t *turn) readAll(note bool) ([]byte, error) {
+// readBody buffers the whole upstream body and closes it. With note, every read is counted as
+// response bytes as it arrives, so a failed read still accounts for what was received. The read
+// is not interrupted when the client leaves: what the upstream sent is recorded either way.
+func (t *turn) readBody(note bool) ([]byte, error) {
 	defer func() { _ = t.res.Body.Close() }()
 	var body []byte
 	buf := make([]byte, 32<<10)
@@ -105,8 +109,12 @@ func compactionFailure(status int) *outcome.Compaction {
 	return &outcome.Compaction{Outcome: "upstream_error", ErrorCode: "upstream_http_error", UpstreamStatus: &status}
 }
 
-// writeRelay answers with the upstream's relay headers, an optional content type and the length of body.
-func (t *turn) writeRelay(status int, body []byte, contentType string) {
+// writeRelay answers with the upstream's relay headers, an optional content type and the length of
+// body, or reports errDeparted without touching the client response.
+func (t *turn) writeRelay(status int, body []byte, contentType string) error {
+	if t.gone() {
+		return errDeparted
+	}
 	h := t.w.Header()
 	maps.Copy(h, t.res.RelayHeader)
 	if contentType != "" {
@@ -114,8 +122,18 @@ func (t *turn) writeRelay(status int, body []byte, contentType string) {
 	}
 	h.Set("Content-Length", strconv.Itoa(len(body)))
 	t.w.WriteHeader(status)
-	// A client that has gone away cannot be answered; the facts stand either way.
+	// A client that leaves during the write cannot be answered; the facts stand either way.
 	_, _ = t.w.Write(body)
+	return nil
+}
+
+// writeEarlyEnd answers a buffered body that broke before its end, unless the client has left.
+func (t *turn) writeEarlyEnd() error {
+	if t.gone() {
+		return errDeparted
+	}
+	writeJSON(t.w, http.StatusBadGateway, []byte(earlyEnd))
+	return nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, body []byte) {
@@ -124,26 +142,37 @@ func writeJSON(w http.ResponseWriter, status int, body []byte) {
 	_, _ = w.Write(body)
 }
 
-// transportFailure answers an attempt that produced no response.
-func transportFailure(w http.ResponseWriter, req Request, cause error, result outcome.Result) (Result, error) {
+// transportFailure answers an attempt that produced no response. The client context is checked
+// after the capture callback, immediately before the reply or the abort; a departed client gets
+// neither and the result carries only the facts it was given.
+func transportFailure(ctx context.Context, w http.ResponseWriter, req Request, cause error, facts outcome.Result) (Result, error) {
+	result := facts
 	if req.Compaction {
 		req.Usage.SetResponseComplete(false)
 		result.Route.Compaction = compactionFailure(http.StatusBadGateway)
 	}
 	result.Status, result.StatusOverride = http.StatusBadGateway, "upstream_error"
+	var body []byte
+	if !req.HeadWritten {
+		var err error
+		body, err = errorDocument("api_error", units("model-gateway shim: upstream "+req.Origin+" failed: "+cause.Error()))
+		if err != nil {
+			return Result{Result: result}, err
+		}
+	}
+	if ctx.Err() != nil {
+		return Result{Result: facts}, nil
+	}
 	if req.HeadWritten {
 		return Result{Result: result}, errAborted
-	}
-	body, err := errorDocument("api_error", units("model-gateway shim: upstream "+req.Origin+" failed: "+cause.Error()))
-	if err != nil {
-		return Result{Result: result}, err
 	}
 	writeJSON(w, http.StatusBadGateway, body)
 	return Result{Result: result}, nil
 }
 
 // respond handles one upstream response. retry reports a rejected WebSocket upgrade that the
-// caller may send again; its body is already closed and nothing has been written.
+// caller may send again; its body is already closed and nothing has been written. errDeparted
+// reports that the response was recorded but the client had left before anything was written.
 func (t *turn) respond(attempt, retries int) (out Result, retry bool, err error) {
 	status := t.res.StatusCode
 	successful := status >= 200 && status < 300
@@ -170,7 +199,8 @@ func (t *turn) respond(attempt, retries int) (out Result, retry bool, err error)
 		case advertised && successful && !stream:
 			err = t.successJSON()
 		default:
-			// Streams, redirects and native Anthropic replies belong to the relay, unread and open.
+			// Streams, redirects and native Anthropic replies belong to the relay, unread and open,
+			// also for a client that has left: the relay learns of the departure and owns the body.
 			return Result{Result: t.result, Stream: t.res}, false, nil
 		}
 	}
@@ -178,14 +208,12 @@ func (t *turn) respond(attempt, retries int) (out Result, retry bool, err error)
 }
 
 // committed reports a failed compaction retry inside the stream whose status line was already
-// sent: one in-band error event, never a second header.
+// sent: one in-band error event, never a second header. The facts are recorded from whatever was
+// read, also when the read broke.
 func (t *turn) committed() error {
 	status := t.res.StatusCode
 	t.req.Usage.SetResponse(status, t.res.Header)
 	body, err := t.readBody(true)
-	if errors.Is(err, errDeparted) {
-		return err
-	}
 	if err != nil {
 		t.fail(status, err)
 	} else {
@@ -208,20 +236,21 @@ func (t *turn) committed() error {
 	if err != nil {
 		return err
 	}
+	if t.gone() {
+		return errDeparted
+	}
 	_, _ = t.w.Write(frame)
 	return nil
 }
 
-// forbidden handles a proxy 403: a rejected WebSocket upgrade is retried, any other 403 is answered once.
+// forbidden handles a proxy 403: a rejected WebSocket upgrade is retried, any other 403 is answered
+// once. A rejection is recorded only from a body that was read to its end.
 func (t *turn) forbidden(attempt, retries int) (Result, bool, error) {
 	status := t.res.StatusCode
 	body, err := t.readBody(true)
-	if errors.Is(err, errDeparted) {
-		return Result{}, false, err
-	}
 	if err != nil {
 		t.fail(status, err)
-		return Result{Result: t.result}, false, errAborted
+		return Result{Result: t.result}, false, t.abort()
 	}
 	if !isUpgradeRejection(status, body) {
 		codex := t.req.Provider == "codex"
@@ -241,25 +270,20 @@ func (t *turn) forbidden(attempt, retries int) (Result, bool, error) {
 	}
 	t.req.Usage.SetResponse(http.StatusServiceUnavailable, t.res.RelayHeader)
 	t.result.Status, t.result.StatusOverride = http.StatusServiceUnavailable, "upstream_error"
-	t.writeRelay(http.StatusServiceUnavailable, exhausted, "")
-	return Result{Result: t.result}, false, nil
+	return Result{Result: t.result}, false, t.writeRelay(http.StatusServiceUnavailable, exhausted, "")
 }
 
-// genuineOverflow answers a proxy's own 413 with the gateway's diagnostics appended.
+// genuineOverflow answers a proxy's own 413 with the gateway's diagnostics appended. The ceiling
+// is learned from a body read to its end, before the client is checked.
 func (t *turn) genuineOverflow() error {
 	body, err := t.readBody(true)
-	if errors.Is(err, errDeparted) {
-		return err
-	}
 	if err != nil {
 		t.fail(http.StatusRequestEntityTooLarge, err)
-		writeJSON(t.w, http.StatusBadGateway, []byte(earlyEnd))
-		return nil
+		return t.writeEarlyEnd()
 	}
 	normalized, overflow := normalizeGenuine(body, t.req)
 	t.result.Status, t.result.Route.Overflow = http.StatusRequestEntityTooLarge, overflow
-	t.writeRelay(http.StatusRequestEntityTooLarge, rewriteCodexJSON(normalized, t.req.AdvertisedModel, false, t.req.BackendModel), "")
-	return nil
+	return t.writeRelay(http.StatusRequestEntityTooLarge, rewriteCodexJSON(normalized, t.req.AdvertisedModel, false, t.req.BackendModel), "")
 }
 
 // proxyFailure handles a proxy error other than 413, in the source's order: the empty Codex
@@ -267,13 +291,9 @@ func (t *turn) genuineOverflow() error {
 func (t *turn) proxyFailure() error {
 	status := t.res.StatusCode
 	raw, err := t.readBody(true)
-	if errors.Is(err, errDeparted) {
-		return err
-	}
 	if err != nil {
 		t.fail(status, err)
-		writeJSON(t.w, http.StatusBadGateway, []byte(earlyEnd))
-		return nil
+		return t.writeEarlyEnd()
 	}
 	body := rewriteCodexJSON(raw, t.req.AdvertisedModel, false, t.req.BackendModel)
 	codex := t.req.Provider == "codex"
@@ -282,7 +302,14 @@ func (t *turn) proxyFailure() error {
 		if err != nil {
 			return err
 		}
+		// The line reports an empty reply that is sent, so a departed client gets none.
+		if t.gone() {
+			return errDeparted
+		}
 		diagnose(t.req.Diagnostics, emptyCompletionLine)
+		if t.gone() {
+			return errDeparted
+		}
 		t.result.Status = http.StatusOK
 		t.w.Header().Set("Content-Type", contentType)
 		t.w.Header().Set("Content-Length", strconv.Itoa(len(answer)))
@@ -294,11 +321,15 @@ func (t *turn) proxyFailure() error {
 		noteCodexRejection(t.req, status, t.res.Header, body)
 	}
 	if counts, ok := sentry.ParseOverflow(status, body); ok {
-		overflow, err := engineOverflow(t.w, t.req, status, counts)
+		overflow, answer, err := engineOverflow(t.req, status, counts)
 		if err != nil {
 			return err
 		}
+		if t.gone() {
+			return errDeparted
+		}
 		t.result.Status, t.result.Route.Overflow = http.StatusRequestEntityTooLarge, overflow
+		writeOverflow(t.w, answer, &status)
 		return nil
 	}
 	t.result.Status = status
@@ -314,12 +345,10 @@ func (t *turn) answerFailure(status int, detail, body []byte) error {
 			if err != nil {
 				return err
 			}
-			t.writeRelay(status, doc, "application/json")
-			return nil
+			return t.writeRelay(status, doc, "application/json")
 		}
 	}
-	t.writeRelay(status, body, "")
-	return nil
+	return t.writeRelay(status, body, "")
 }
 
 // passFailure relays a proxy error the earlier branches left alone (a 413 with the sentry off)
@@ -327,29 +356,24 @@ func (t *turn) answerFailure(status int, detail, body []byte) error {
 func (t *turn) passFailure() error {
 	status := t.res.StatusCode
 	body, err := t.readBody(true)
-	if errors.Is(err, errDeparted) {
-		return err
-	}
 	if err != nil {
 		t.fail(status, err)
-		return errAborted
+		return t.abort()
 	}
 	t.result.Status = status
-	t.writeRelay(status, rewriteCodexJSON(body, t.req.AdvertisedModel, false, t.req.BackendModel), "")
-	return nil
+	return t.writeRelay(status, rewriteCodexJSON(body, t.req.AdvertisedModel, false, t.req.BackendModel), "")
 }
 
 // successJSON delivers a successful proxy JSON reply. LM Studio's usage is corrected before
-// usage capture and the sentry read it, and before the model rewrite and plan-tool filter.
+// usage capture and the sentry read it, and before the model rewrite and plan-tool filter. Both
+// observe the body whether or not the client is still there, but a reply that will not be
+// delivered is no ordinary completed turn, so it cannot rearm a fired refusal.
 func (t *turn) successJSON() error {
 	status := t.res.StatusCode
 	body, err := t.readBody(false)
-	if errors.Is(err, errDeparted) {
-		return err
-	}
 	if err != nil {
 		t.fail(status, err)
-		return errAborted
+		return t.abort()
 	}
 	if t.req.Provider == lmStudioProvider {
 		body = exclusiveLMStudioJSON(body)
@@ -357,12 +381,25 @@ func (t *turn) successJSON() error {
 	t.req.Usage.ObserveJSON(body)
 	completed := completedJSON(body)
 	if completed && t.req.Sentry != nil {
-		t.req.Sentry.ObserveJSON(t.req.Session, t.req.Target, t.req.Body, body)
+		if t.gone() {
+			observeUndelivered(t.req, body)
+		} else {
+			t.req.Sentry.ObserveJSON(t.req.Session, t.req.Target, t.req.Body, body)
+		}
 	}
 	t.result.Status = status
 	if !completed {
 		t.result.StatusOverride = "upstream_error"
 	}
-	t.writeRelay(status, rewriteCodexJSON(body, t.req.AdvertisedModel, t.req.FilterPlanTools, t.req.BackendModel), "")
-	return nil
+	return t.writeRelay(status, rewriteCodexJSON(body, t.req.AdvertisedModel, t.req.FilterPlanTools, t.req.BackendModel), "")
+}
+
+// observeUndelivered records the usage of a complete JSON reply that no client receives, without
+// marking it an ordinary completed turn.
+func observeUndelivered(req Request, body []byte) {
+	v, err := jsonx.DecodeWire(body)
+	if err != nil {
+		return
+	}
+	req.Sentry.ObserveWire(req.Session, req.Target, object(field("type", wireString("message_delta")), field("usage", member(v, "usage"))), false)
 }

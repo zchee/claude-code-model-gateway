@@ -131,9 +131,10 @@ func normalizeGenuine(body []byte, req Request) ([]byte, *outcome.Overflow) {
 	return out, o
 }
 
-// engineOverflow writes the normalized refusal for an engine or legacy context error. An engine's
-// own limit suppresses ceiling learning; its own token count replaces the previous turn's usage.
-func engineOverflow(w http.ResponseWriter, req Request, status int, counts sentry.Counts) (*outcome.Overflow, error) {
+// engineOverflow latches the refusal and builds the normalized body for an engine or legacy context
+// error; the caller writes it. An engine's own limit suppresses ceiling learning; its own token
+// count replaces the previous turn's usage.
+func engineOverflow(req Request, status int, counts sentry.Counts) (*outcome.Overflow, []byte, error) {
 	var usage float64
 	if req.SentryEnabled && req.Sentry != nil {
 		usage = req.Sentry.Overflow(req.Session, req.Target, counts.Limit == nil || *counts.Limit == 0)
@@ -158,8 +159,7 @@ func engineOverflow(w http.ResponseWriter, req Request, status int, counts sentr
 	o := overflowDetails(req.Body, "upstream", tokens, from, limit)
 	body, err := overflowBody("Input exceeds the model context window; compact and retry."+numbers, o)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	writeOverflow(w, body, &status)
-	return o, nil
+	return o, body, nil
 }
