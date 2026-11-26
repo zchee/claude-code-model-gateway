@@ -43,11 +43,14 @@ func OpenDir(path string) (*Dir, error) {
 //
 // The walk starts at the root or, for relative paths, the current directory.
 // An empty path is invalid. Trailing slashes are accepted, and . and .. are
-// resolved in place, including after a symlink. Each directory must be readable.
-// Existing symlinks to directories are followed; the walk is not confined to
-// any root. Each component is resolved relative to the last directory opened,
-// not by looking up the preceding path again. A later rename or symlink change
-// cannot redirect operations on the returned Dir. The caller must close it.
+// resolved in place. Linux and Darwin need search, not read, permission on
+// ancestors; the final directory is opened for reading as in [OpenDir].
+// A component that resolves to a directory on its first lookup may be a
+// symlink. After a missing component, only a real directory is accepted at
+// that name. The walk is not confined to any root. Each lookup starts from
+// the last directory opened. The returned Dir holds the directory actually
+// opened, not necessarily the inode this call created; no subsequent rename
+// or symlink change redirects its operations. The caller must close it.
 func OpenDirCreate(path string, perm fs.FileMode) (*Dir, error) {
 	return openDirCreate(path, perm, nil)
 }
@@ -60,25 +63,39 @@ func openDirCreate(path string, perm fs.FileMode, afterOpen func(string)) (*Dir,
 	if strings.HasPrefix(path, "/") {
 		start = "/"
 	}
-	fd, err := openDirectoryAt(unix.AT_FDCWD, start, false, 0)
+	remaining := strings.Trim(path, "/")
+	flags := traversalFlags
+	if remaining == "" { // The starting directory is also the final directory.
+		flags = directoryFlags
+	}
+	fd, err := openDirectoryAtFlags(unix.AT_FDCWD, start, false, 0, flags)
 	if err != nil {
 		return nil, err
 	}
-	for component := range strings.SplitSeq(path, "/") {
-		if component == "" {
-			continue
+	defer func() {
+		if fd >= 0 {
+			_ = unix.Close(fd)
 		}
-		next, err := openDirectoryAt(fd, component, true, perm)
-		_ = unix.Close(fd)
+	}()
+	for remaining != "" {
+		component, rest, _ := strings.Cut(remaining, "/")
+		remaining = strings.TrimLeft(rest, "/")
+		if remaining == "" {
+			flags = directoryFlags
+		}
+		next, err := openDirectoryAtFlags(fd, component, true, perm, flags)
 		if err != nil {
 			return nil, err
 		}
+		_ = unix.Close(fd)
 		fd = next
 		if afterOpen != nil {
 			afterOpen(component)
 		}
 	}
-	return &Dir{root: directory{os.NewFile(uintptr(fd), path)}}, nil
+	d := &Dir{root: directory{os.NewFile(uintptr(fd), path)}}
+	fd = -1 // Ownership transferred to d.
+	return d, nil
 }
 
 // ReadFile reads a regular file named by one component. It does not follow

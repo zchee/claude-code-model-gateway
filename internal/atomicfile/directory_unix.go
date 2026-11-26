@@ -198,7 +198,11 @@ const directoryFlags = unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NONBLOCK | unix.O
 // openDirectoryAt leaves the spelling of existing components to the kernel: a symlink
 // followed by .. is not equivalent to removing both from the path string.
 func openDirectoryAt(at int, path string, create bool, perm fs.FileMode) (int, error) {
-	fd, err := retryEINTR(func() (int, error) { return unix.Openat(at, path, directoryFlags, 0) })
+	return openDirectoryAtFlags(at, path, create, perm, directoryFlags)
+}
+
+func openDirectoryAtFlags(at int, path string, create bool, perm fs.FileMode, flags int) (int, error) {
+	fd, err := retryEINTR(func() (int, error) { return unix.Openat(at, path, flags, 0) })
 	if err == nil {
 		return fd, nil
 	}
@@ -220,13 +224,18 @@ func openDirectoryAt(at int, path string, create bool, perm fs.FileMode) (int, e
 		}
 		defer func() { _ = unix.Close(ancestor) }()
 	}
+	var mkdirErr error
 	if leaf != "." && leaf != ".." {
-		_, err := retryEINTR(func() (int, error) { return 0, unix.Mkdirat(ancestor, leaf, uint32(perm.Perm())) })
-		if err != nil && !errors.Is(err, fs.ErrExist) {
-			return -1, &os.PathError{Op: "mkdir", Path: path, Err: err}
-		}
+		_, mkdirErr = retryEINTR(func() (int, error) { return 0, unix.Mkdirat(ancestor, leaf, uint32(perm.Perm())) })
 	}
-	fd, err = retryEINTR(func() (int, error) { return unix.Openat(ancestor, leaf, directoryFlags|unix.O_NOFOLLOW, 0) })
+	return openAfterMkdir(ancestor, leaf, path, flags, mkdirErr)
+}
+
+func openAfterMkdir(ancestor int, leaf, path string, flags int, mkdirErr error) (int, error) {
+	if mkdirErr != nil && !errors.Is(mkdirErr, fs.ErrExist) {
+		return -1, &os.PathError{Op: "mkdir", Path: path, Err: mkdirErr}
+	}
+	fd, err := retryEINTR(func() (int, error) { return unix.Openat(ancestor, leaf, flags|unix.O_NOFOLLOW, 0) })
 	if err != nil {
 		return -1, &os.PathError{Op: "open directory", Path: path, Err: err}
 	}
