@@ -301,8 +301,14 @@ module.exports = function install(config, inherited) {
       const { kind, binaryArgs, isCli, isBirthObserver } = detected;
       if (!test) failClosed(`product launch (${kind}) without test owner`, kind, null);
 
+      const sitePath = file => {
+        if (typeof file !== 'string') return '';
+        if (file.startsWith(plugin + '/')) return path.relative(plugin, file);
+        if (file.startsWith(root + '/')) return path.relative(root, file);
+        return path.relative(plugin, file);
+      };
       const matches = inherited ? [inherited.row] : getCallSites(100).flatMap(frame =>
-        sites.get(`${path.relative(plugin, frame.scriptName)}:${frame.lineNumber}`) ?? []);
+        sites.get(`${sitePath(frame.scriptName)}:${frame.lineNumber}`) ?? []);
       // V8's async stack also contains callers suspended at await. getCallSites
       // alone stops at the helper that resumed after allocating a fixture port.
       if (!inherited) {
@@ -312,7 +318,7 @@ module.exports = function install(config, inherited) {
         finally { Error.stackTraceLimit = limit; }
         for (const line of stack.split('\n')) {
           const location = /(?:\(|\s)(\/.*):(\d+):\d+\)?$/.exec(line);
-          if (location) matches.push(...(sites.get(`${path.relative(plugin, location[1])}:${location[2]}`) ?? []));
+          if (location) matches.push(...(sites.get(`${sitePath(location[1])}:${location[2]}`) ?? []));
         }
       }
       if (!matches.length) {

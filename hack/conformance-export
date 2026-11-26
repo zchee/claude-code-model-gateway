@@ -6,7 +6,7 @@ root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
 case ${1:-} in
     verify)
         [[ $# == 2 ]] || { printf 'usage: conformance-export verify DIR\n' >&2; exit 70; }
-        exec python3 -I "$root/hack/conformance-owner.py" verify "$2"
+        exec python3 -I "$root/hack/conformance-owner.py" verify "$root" "$2"
         ;;
     run)
         [[ $# == 1 ]] || { printf 'usage: conformance-export run\n' >&2; exit 70; }

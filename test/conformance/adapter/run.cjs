@@ -8,7 +8,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const [root, plugin, work, target, mode, phase, pkg, gate, requestedLog, classification, site, capture, candidateFile] = process.argv.slice(2);
-const { PROBE_FILE, REQUIRED_PROBES, checkPinnedLaunchForms, createLog, evaluateSuite, parentCredits, tsv, validLaunch } = require('./evidence.cjs');
+const { PROBE_FILE, REQUIRED_PROBES, checkPinnedLaunchForms, createLog, evaluateSuite, parentCredits, tsv, validLaunch, writeCandidate } = require('./evidence.cjs');
 const data = path.join(root, 'test/conformance');
 const inventory = file => tsv(path.join(data, file));
 const ndjson = file => fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line));
@@ -35,13 +35,23 @@ assert(!site || (identity && !probes && !(phase || pkg || gate || classification
 const full = !probes && identity && !(site || phase || pkg || gate || classification);
 assert(mode !== 'self-test' || full || site, 'self-test requires identity');
 const signalCase = 'supervisor records an orderly signal before it exits';
+const parsePhase = value => {
+  const match = /^phase-([0-9]+)$/.exec(value);
+  assert(match, `invalid phase: ${value}`);
+  return Number(match[1]);
+};
+const targetPhase = phase ? parsePhase(phase) : null;
+if (phase) {
+  const knownPhases = new Set(classes.map(r => r.phase).filter(Boolean));
+  assert(knownPhases.has(phase), `unknown phase: ${phase}`);
+}
 const selected = classes.filter(r => site ? `${r.path}:${r.line}` === site : probes ? r.name === signalCase :
-  full || (r.class === 'conformance' && (!phase || r.phase === phase) && (!pkg || r.package === pkg) && (!gate || r.gate === gate)));
+  full || (r.class === 'conformance' && (targetPhase === null || parsePhase(r.phase) <= targetPhase) && (!pkg || r.package === pkg) && (!gate || r.gate === gate)));
 assert(selected.length, 'empty conformance selection');
 const escapeRE = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-const files = [...new Set(selected.map(r => r.path))];
+const expectedFiles = [...new Set(selected.map(r => r.path))];
+const files = expectedFiles.map(p => p.startsWith('test/conformance/') ? path.join(root, p) : p);
 const pattern = selected.map(r => escapeRE(r.name.replaceAll(' > ', ' ')));
-const expectedFiles = [...files];
 if (probes) {
   files.push(path.join(data, 'probes/launch.test.js'));
   expectedFiles.push(PROBE_FILE);
@@ -100,18 +110,28 @@ function launchTable(records, image, digest) {
   }
   return text;
 }
-if (capture && candidateFile && capture === binary && !failed && mode === 'suite' && !identity && !(phase || pkg || gate || site)) {
-  const safeCandidate = createLog(candidateFile, plugin);
-  let census = 'path\tline\tcolumn\tdepth\tname\tstatus\tdetail\n';
-  for (const [id, status] of verdict.observed) {
-    const [file, line, column, name] = JSON.parse(id);
-    census += tsvLine([file, line, column, verdict.depths.get(id), name, status, '-']);
+let captureFailed = false;
+if (capture && candidateFile && capture === binary && !failed && mode === 'suite' && !identity && phase && !(pkg || gate || site)) {
+  try {
+    let census = 'path\tline\tcolumn\tdepth\tname\tstatus\tdetail\n';
+    for (const [id, status] of verdict.observed) {
+      const [file, line, column, name] = JSON.parse(id);
+      census += tsvLine([file, line, column, verdict.depths.get(id), name, status, '-']);
+    }
+    // These are private observations, not evidence. Only the producer has the final verdict.
+    const payload = JSON.stringify({
+      phase,
+      binary,
+      binary_sha256: config.build,
+      test_source_sha256: sourceDigest,
+      census,
+      launches: launchTable(launches, target, config.build),
+    });
+    writeCandidate(candidateFile, plugin, payload);
+  } catch (err) {
+    captureFailed = true;
+    process.stderr.write(`conformance: candidate capture failed: ${err.message}\n`);
   }
-  // These are private observations, not evidence. Only the producer has the final verdict.
-  fs.writeFileSync(safeCandidate, JSON.stringify({
-    binary, binary_sha256: config.build, test_source_sha256: sourceDigest, census,
-    launches: launchTable(launches, target, config.build),
-  }), { mode: 0o600 });
 }
 
 if (mode === 'self-test') {
@@ -153,6 +173,9 @@ if (mode === 'self-test') {
 
   if (full) {
     const key = require('./evidence.cjs').key;
+    const escapeField = value => String(value).replace(/[\\\t\r\n]/g,
+      c => ({ '\\': '\\\\', '\t': '\\t', '\r': '\\r', '\n': '\\n' })[c]);
+    const tsvKey = (f, l, c, name) => [f, l, c, name].map(escapeField).join('\t');
     const counts = new Map(classes.filter(r => r.class === 'conformance').map(r => [key(r), 0]));
     const parent = parentCredits(sites, baseline);
     for (const launch of launches) {
@@ -161,14 +184,19 @@ if (mode === 'self-test') {
         if (counts.has(id)) counts.set(id, counts.get(id) + 1);
       }
     }
-    const cases = [], credits = [];
+    const observedCases = {};
+    const observedCounts = {};
     for (const [id, n] of counts) {
       const [f, l, c, name] = JSON.parse(id);
-      cases.push(tsvLine([f, l, c, verdict.depths.get(id), name]));
-      credits.push(tsvLine([f, l, c, name, n]));
+      const k = tsvKey(f, l, c, name);
+      observedCases[k] = String(verdict.depths.get(id));
+      observedCounts[k] = n;
     }
-    const fingerprint = rows => crypto.createHash('sha256').update(rows.sort().join('')).digest('hex');
-    fs.writeFileSync(path.join(work, 'identity-profile.json'), JSON.stringify([fingerprint(cases), fingerprint(credits)]));
+    fs.writeFileSync(path.join(work, 'identity-observations.json'), JSON.stringify({
+      cases: observedCases,
+      counts: observedCounts,
+      source_digest: sourceDigest,
+    }));
   }
   const requiredControls = [
     'control: unattributed, alternate-node, and extra-option product launches fail closed while decoys stay on Node',
@@ -227,4 +255,4 @@ if (mode === 'self-test') {
   }
 }
 process.stdout.write(`# conformance ${JSON.stringify({ target, mode, selected: selected.length, counts: verdict.counts, launches: launches.length, ok: !failed })}\n`);
-process.exitCode = failed ? 1 : 0;
+process.exitCode = failed ? 1 : captureFailed ? 70 : 0;

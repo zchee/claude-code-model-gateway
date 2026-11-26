@@ -11,8 +11,13 @@ for arg do
     esac
 done
 usage() { printf 'conformance: %s\n' "$1" >&2; exit 2; }
-[[ $target == identity || $target == binary:/* ]] || usage 'invalid target'
+if [[ $target != identity ]]; then
+    if ! [[ $target =~ ^binary:/[A-Za-z0-9_./-]+$ ]] || [[ $target == *//* || $target == */ || ${target#binary:} =~ (^|/)\.\.?(/|$) ]]; then
+        usage 'invalid target'
+    fi
+fi
 [[ ! $class || $class == conformance ]] || usage 'invalid class'
+[[ ! $phase || $phase =~ ^phase-[0-9]+$ ]] || usage 'invalid phase'
 filters=$class$phase$package$gate
 case $mode in
     suite) ;;
@@ -21,8 +26,14 @@ case $mode in
     *) usage 'invalid mode' ;;
 esac
 [[ ! $site || ( $target == identity && ! $filters ) ]] || usage 'SITE is an identity diagnostic, not a conformance gate'
+if [[ -n $phase ]]; then
+    if ! LC_ALL=C awk -F '\t' -v p="$phase" 'NR > 1 && $6 == p { found=1; exit } END { exit !found }' "$file"; then
+        usage "unknown phase: $phase"
+    fi
+fi
 if [[ $site || $filters || $target != identity ]]; then
     if ! LC_ALL=C awk -F '\t' -v s="$site" -v p="$phase" -v k="$package" -v g="$gate" '
-        NR > 1 && (s ? $1 ":" $2 == s : $5 == "conformance" && (!p || $6 == p) && (!k || $7 == k) && (!g || $8 == g)) { found=1; exit }
+        function pnum(v) { sub(/^phase-/, "", v); return v + 0 }
+        NR > 1 && (s ? $1 ":" $2 == s : $5 == "conformance" && (!p || pnum($6) <= pnum(p)) && (!k || $7 == k) && (!g || $8 == g)) { found=1; exit }
         END { exit !found }' "$file"; then usage 'empty conformance selection'; fi
 fi

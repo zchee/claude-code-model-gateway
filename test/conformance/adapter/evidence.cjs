@@ -73,16 +73,36 @@ function tsv(file) {
     [columns[i], value.replace(/\\([\\tnr])/g, (_, c) => ({ '\\': '\\', t: '\t', n: '\n', r: '\r' })[c])])));
 }
 
-function createLog(request, plugin) {
+function safeOutputPath(request, plugin, label) {
   assert(path.isAbsolute(request) && path.normalize(request) === request && !request.endsWith('/'),
-    'LAUNCH_LOG must be an absolute clean file path');
-  const log = path.join(fs.realpathSync(path.dirname(request)), path.basename(request));
+    `${label} must be an absolute clean file path`);
+  const target = path.join(fs.realpathSync(path.dirname(request)), path.basename(request));
   for (const dir of [process.env.HOME, os.tmpdir(), plugin].map(p => fs.realpathSync(p))) {
-    const relative = path.relative(dir, log);
-    assert(relative === '..' || relative.startsWith(`..${path.sep}`), 'LAUNCH_LOG is inside a fixture or source directory');
+    const relative = path.relative(dir, target);
+    assert(relative === '..' || relative.startsWith(`..${path.sep}`), `${label} is inside a fixture or source directory`);
   }
+  return target;
+}
+
+function createLog(request, plugin) {
+  const log = safeOutputPath(request, plugin, 'LAUNCH_LOG');
   fs.closeSync(fs.openSync(log, 'wx', 0o600));
   return log;
+}
+
+function writeCandidate(request, plugin, payload) {
+  const target = safeOutputPath(request, plugin, 'CONFORMANCE_CANDIDATE');
+  const fd = fs.openSync(target, 'wx', 0o600);
+  try {
+    fs.writeFileSync(fd, payload, 'utf8');
+    fs.fsyncSync(fd);
+  } catch (err) {
+    try { fs.unlinkSync(target); } catch { /* Best-effort cleanup of partial file. */ }
+    throw err;
+  } finally {
+    fs.closeSync(fd);
+  }
+  return target;
 }
 
 const key = r => JSON.stringify([r.path, Number(r.line), Number(r.column), r.name]);
@@ -287,4 +307,4 @@ function evaluateSuite({
   return { failed, errors, counts, observed, depths, validLaunches };
 }
 
-module.exports = { PROBE_FILE, REQUIRED_PROBES, checkPinnedLaunchForms, createLog, evaluateSuite, key, parentCredits, tsv, validLaunch };
+module.exports = { PROBE_FILE, REQUIRED_PROBES, checkPinnedLaunchForms, createLog, evaluateSuite, key, parentCredits, tsv, validLaunch, writeCandidate };

@@ -4,6 +4,7 @@
 
 import ipaddress
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -44,11 +45,81 @@ def reject_local(names: list[str]) -> None:
             raise ValueError("refusing local destination")
 
 
+def check_archive(root: str, commit: str) -> None:
+    """Refuse export archives whose tree contains gitlinks or export attributes."""
+    git_env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR")
+    }
+    tree_out = subprocess.check_output(
+        ["git", "--no-optional-locks", "-C", root, "ls-tree", "-rtz", commit],
+        env=git_env,
+        timeout=30,
+    )
+    paths: list[str] = []
+    for raw in tree_out.split(b"\0"):
+        if not raw:
+            continue
+        meta_b, path_b = raw.split(b"\t", 1)
+        mode, obj_type, _ = meta_b.decode("ascii").split(" ", 2)
+        rel = path_b.decode("utf-8", errors="surrogateescape")
+        if mode == "160000" or obj_type == "commit":
+            print(
+                f"remote: commit {commit} contains gitlink {rel}; refusing conformance export",
+                file=sys.stderr,
+            )
+            sys.exit(3)
+        paths.append(rel)
+        if obj_type == "tree":
+            paths.append(f"{rel}/")
+    if not paths:
+        return
+    stdin_bytes = (
+        b"\0".join(p.encode("utf-8", errors="surrogateescape") for p in paths) + b"\0"
+    )
+    attr_out = subprocess.check_output(
+        [
+            "git",
+            "--no-optional-locks",
+            "-C",
+            root,
+            "check-attr",
+            f"--source={commit}",
+            "--stdin",
+            "-z",
+            "export-ignore",
+            "export-subst",
+        ],
+        input=stdin_bytes,
+        env=git_env,
+        timeout=30,
+    )
+    tokens = attr_out.split(b"\0")
+    if tokens and tokens[-1] == b"":
+        tokens.pop()
+    if len(tokens) % 3 != 0:
+        raise ValueError("malformed git check-attr output")
+    for idx in range(0, len(tokens), 3):
+        rel = tokens[idx].decode("utf-8", errors="surrogateescape")
+        attr = tokens[idx + 1].decode("ascii")
+        value = tokens[idx + 2].decode("utf-8", errors="surrogateescape")
+        if value not in ("unspecified", "unset"):
+            print(
+                f"remote: commit {commit} has {attr}={value} on {rel}; refusing conformance export",
+                file=sys.stderr,
+            )
+            sys.exit(3)
+
+
 def main(args: list[str]) -> None:
-    """Check the destination, verify an archive pin, or prune negative-control runs."""
-    if not args or len(args) != {"destination": 3, "checksum": 3, "prune": 1}.get(
-        args[0]
-    ):
+    """Check the destination, archive safety, archive pin, or prune runs."""
+    if not args or len(args) != {
+        "destination": 3,
+        "checksum": 3,
+        "prune": 1,
+        "check-archive": 3,
+    }.get(args[0]):
         print("remote: invalid transport operation or arguments", file=sys.stderr)
         sys.exit(2)
     op, *values = args
@@ -58,6 +129,8 @@ def main(args: list[str]) -> None:
         except (ValueError, socket.gaierror) as exc:
             print(f"remote: {exc}", file=sys.stderr)
             sys.exit(2)
+    elif op == "check-archive":
+        check_archive(values[0], values[1])
     elif op == "checksum":
         with Path(values[0]).open() as f:
             versions = json.load(f)

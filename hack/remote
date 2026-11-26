@@ -387,8 +387,8 @@ remote_parse_args() {
             for arg do
                 if [[ $arg == *=* ]]; then
                     (( has_conformance )) || usage_fail 'invalid make target'
-                    if [[ $arg == TARGET=binary:* && ${arg#TARGET=binary:} =~ (^|/)\.\.(/|$) ]]; then
-                        usage_fail 'binary target contains a parent component'
+                    if [[ $arg == TARGET=binary:* && ( ${arg#TARGET=binary:} == *//* || ${arg#TARGET=binary:} == */ || ${arg#TARGET=binary:} =~ (^|/)\.\.?(/|$) ) ]]; then
+                        usage_fail 'binary target must be a clean absolute path'
                     fi
                     [[ $arg == CLASS=conformance || $arg =~ ^MODE=(suite|self-test|probes)$ || $arg =~ ^TARGET=(identity|binary:/[a-zA-Z0-9_./-]+)$ ||
                        $arg =~ ^TIMEOUT_SECONDS=[1-9][0-9]{0,3}$ || $arg =~ ^MAX_TIMEOUT_SECONDS=[1-9][0-9]{0,3}$ ||
@@ -416,7 +416,21 @@ remote_parse_args() {
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
     remote_parse_args "$@"
+    # Establish the repository root, commit and clean state BEFORE reading any
+    # file from the checkout; re-check after producing the archive below.
     root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
+    clean_git() {
+        env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR \
+            git --no-optional-locks -C "$1" "${@:2}"
+    }
+    commit=dirty
+    if (( has_conformance )); then
+        if top=$(clean_git "$root" rev-parse --show-toplevel 2>/dev/null) && [[ $top == "$root" ]]; then
+            snapshot=$(clean_git "$root" rev-parse --verify 'HEAD^{commit}') || exit 70
+            changes=$(clean_git "$root" status --porcelain=v1 --untracked-files=all --ignore-submodules=none) || exit 70
+            if [[ -z $changes ]]; then commit=$snapshot; fi
+        fi
+    fi
     if [[ $op == run ]]; then
         for goal in "${@:2}"; do
             if [[ $goal != *=* ]]; then
@@ -433,7 +447,6 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
     expanded=$(ssh -G "${sshopts[@]}" "$host" | awk '$1 == "hostname" {print $2}')
     [[ -n $expanded ]] || usage_fail 'could not resolve SSH configuration'
     reject_local "${host##*@}" "$expanded"
-    root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
     gover=go1.27.4
     # Send only the functions and validated arguments; stdin remains the tree archive.
     program=$(declare -f venue_refuse venue_home venue_file_kind venue_state_clear venue_ports_clear venue_attest venue_require fail usage_fail conformance_failure fetch tool_version_ok install_tools negative_control restore_attestation venue_owner venue_scope_state venue_recover_scopes prune_runs cleanup_neg_control remote_main)
@@ -443,13 +456,35 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
     program=$'set -euo pipefail\n'"$owner_assignment"$'\n'"$program"$'\nremote_main "$@"'
     # A single-line encoding survives SSH command relays that split multiline arguments.
     encoded=$(printf '%s' "$program" | base64 | tr -d '\n')
-    cmd="env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin GITHUB_ACTIONS=\"\${GITHUB_ACTIONS:-}\" /bin/bash -c \"\$(printf %s $encoded | base64 -d)\" remote"
-    commit=dirty
-    if (( has_conformance )); then
-        snapshot=$(git -C "$root" rev-parse --verify 'HEAD^{commit}') || exit 70
-        changes=$(git -C "$root" status --porcelain=v1 --untracked-files=all --ignore-submodules=none) || exit 70
-        if [[ -z $changes ]]; then commit=$snapshot; fi
+    if [[ $commit != dirty ]]; then
+        attr_rc=0
+        python3 -I "$root/hack/conformance-transport.py" check-archive "$root" "$commit" || attr_rc=$?
+        if [[ $attr_rc == 3 ]]; then
+            commit=dirty
+        elif [[ $attr_rc != 0 ]]; then
+            exit 70
+        fi
     fi
+    input=/dev/null
+    if [[ $op == run || $op == check-cancellation || $op == check-owner-deadline || $op == negative-control ]]; then
+        if ! input=$(mktemp "${TMPDIR:-/tmp}/venue-tree.XXXXXXXX"); then
+            printf 'remote: failed to create checkout archive\n' >&2; exit 70
+        fi
+        trap 'rm -f -- "$input"' EXIT
+        if [[ $commit != dirty ]]; then
+            clean_git "$root" archive --format=tar "$commit" >| "$input" || exit 70
+            [[ $(clean_git "$root" get-tar-commit-id < "$input") == "$commit" ]] || exit 70
+            post_snapshot=$(clean_git "$root" rev-parse --verify 'HEAD^{commit}') || exit 70
+            post_changes=$(clean_git "$root" status --porcelain=v1 --untracked-files=all --ignore-submodules=none) || exit 70
+            if [[ $post_snapshot != "$commit" || -n $post_changes ]]; then
+                printf 'remote: checkout HEAD or clean state changed while archiving; refusing conformance export\n' >&2
+                commit=dirty
+            fi
+        elif ! archive_tree "$root" >| "$input"; then
+            printf 'remote: failed to archive checkout\n' >&2; exit 70
+        fi
+    fi
+    cmd="env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin GITHUB_ACTIONS=\"\${GITHUB_ACTIONS:-}\" /bin/bash -c \"\$(printf %s $encoded | base64 -d)\" remote"
     for arg in "$op" "$(hostname -s)" "$gover" v24.11.1 "$scope_limit" "$commit" "$@"; do
         [[ $arg =~ ^[a-zA-Z0-9_=.:/-]+$ ]] || usage_fail 'invalid remote argument'
         cmd+=" $arg"
@@ -460,19 +495,6 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
         check-owner-deadline) cmd="timeout --signal=KILL 10s $cmd" ;;
         provision|deprovision) cmd="timeout --signal=KILL 600s $cmd" ;;
     esac
-    input=/dev/null
-    if [[ $op == run || $op == check-cancellation || $op == check-owner-deadline || $op == negative-control ]]; then
-        if ! input=$(mktemp "${TMPDIR:-/tmp}/venue-tree.XXXXXXXX"); then
-            printf 'remote: failed to create checkout archive\n' >&2; exit 70
-        fi
-        trap 'rm -f -- "$input"' EXIT
-        if [[ $commit != dirty ]]; then
-            git -C "$root" archive --format=tar "$commit" >| "$input" || exit 70
-            [[ $(git get-tar-commit-id < "$input") == "$commit" ]] || exit 70
-        elif ! archive_tree "$root" >| "$input"; then
-            printf 'remote: failed to archive checkout\n' >&2; exit 70
-        fi
-    fi
     # cmd contains the encoded script and only validated positional arguments.
     rc=0
     if [[ $op == negative-control ]]; then

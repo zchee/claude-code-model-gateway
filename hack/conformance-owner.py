@@ -19,12 +19,8 @@ from collections import Counter
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
-# Sorted escaped TSV: registration and depth; registration and credited count.
-# Both profiles come from the reviewed identity run, not the binary under test.
-CASE_PROFILE = "907f889cd952126193724e3da5b219642a29a0437f8573061de76057fcfe227a"
-COUNT_PROFILE = "0b2dad4d4ec33d0201aa1ca6a3de9afe5be4b581587be3d327ffa673f1cddda2"
-SOURCE_PIN = "4a10b3bb214b5ecc779c18fa1ba16ff0943168ec00ed881d358449a147b0ca06"
 CENSUS = "path\tline\tcolumn\tdepth\tname\tstatus\tdetail"
 LAUNCHES = "path\tline\tcolumn\tname\tbinary\tbinary_sha256"
 HOSTED_RUN_ID_RE = re.compile(r"gha-[1-9][0-9]*-[1-9][0-9]*")
@@ -33,11 +29,65 @@ VENUE_RUN_ID_RE = re.compile(r"venue-mgw-run-[0-9]+-[0-9]+")
 COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 DIGEST_RE = re.compile(r"[0-9a-f]{64}")
 POSITIVE_INT_RE = re.compile(r"[1-9][0-9]*")
+PHASE_RE = re.compile(r"phase-([0-9]+)")
+BINARY_PATH_RE = re.compile(r"/(?!/)[A-Za-z0-9_./-]+")
+PINNED_DIGEST_RE = re.compile(r"const PINNED_TEST_DIGEST = '([0-9a-f]{64})';")
+EXPORT_FILES = frozenset({"manifest.json", "census.tsv", "launches.tsv"})
 
 
-def profile(rows: list[str]) -> str:
-    """Fingerprint every row, including multiplicity, independent of scheduling."""
-    return hashlib.sha256("".join(s + "\n" for s in sorted(rows)).encode()).hexdigest()
+def _no_duplicate_object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Build a dict from JSON object pairs, refusing duplicate member names."""
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON member name: {key}")
+        result[key] = value
+    return result
+
+
+def loads_strict_object(text: str, label: str) -> dict[str, Any]:
+    """Decode a JSON object while rejecting duplicate member names at any depth."""
+    parsed: Any = json.loads(text, object_pairs_hook=_no_duplicate_object_pairs)
+    if not isinstance(parsed, dict):
+        raise TypeError(f"{label} must be a JSON object")
+    return parsed
+
+
+def _clean_git_env(env: Mapping[str, str]) -> dict[str, str]:
+    """Strip Git override variables so commands inspect the intended checkout."""
+    return {
+        k: v
+        for k, v in env.items()
+        if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR")
+    }
+
+
+def _phase_number(phase: str) -> int:
+    """Parse phase-N and return N, raising ValueError otherwise."""
+    match = PHASE_RE.fullmatch(phase)
+    if match is None:
+        raise ValueError(f"invalid gate phase: {phase!r}")
+    return int(match.group(1))
+
+
+def validate_binary_path(binary: object, *, require_executable: bool = False) -> str:
+    """Enforce the single canonical executable-path rule at preflight and verify."""
+    if (
+        not isinstance(binary, str)
+        or not BINARY_PATH_RE.fullmatch(binary)
+        or os.path.normpath(binary) != binary
+        or os.path.dirname(binary) == binary
+    ):
+        raise ValueError(f"invalid binary path: {binary!r}")
+    if require_executable:
+        binary_path = Path(binary)
+        if (
+            not binary_path.is_file()
+            or not os.access(binary, os.X_OK)
+            or os.path.realpath(binary) != binary
+        ):
+            raise ValueError(f"invalid executable: {binary}")
+    return binary
 
 
 def venue_run_id(unit: str) -> str:
@@ -89,6 +139,48 @@ def check_producer_env(
             raise ValueError("commit does not match venue archive")
 
 
+def verify_clean_checkout(
+    root: Path, expected_commit: str, env: Mapping[str, str]
+) -> None:
+    """Verify root is a clean Git checkout at expected_commit."""
+    git_env = _clean_git_env(env)
+    head = subprocess.check_output(
+        [
+            "git",
+            "--no-optional-locks",
+            "-C",
+            str(root),
+            "rev-parse",
+            "--verify",
+            "HEAD^{commit}",
+        ],
+        text=True,
+        env=git_env,
+        timeout=15,
+    ).strip()
+    if head != expected_commit:
+        raise ValueError(
+            f"checkout HEAD {head} does not match expected commit {expected_commit}"
+        )
+    dirty = subprocess.check_output(
+        [
+            "git",
+            "--no-optional-locks",
+            "-C",
+            str(root),
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ],
+        text=True,
+        env=git_env,
+        timeout=15,
+    )
+    if dirty:
+        raise ValueError("checkout worktree is not clean")
+
+
 def resolve_hosted_identity(
     root: Path, env: Mapping[str, str], home: Path | None = None
 ) -> tuple[str, str, str]:
@@ -120,70 +212,201 @@ def resolve_hosted_identity(
         or lines[0].split("\t")[2] != "ci"
     ):
         raise ValueError("venue attestation is not a hosted ci attestation")
-    git_env = {
-        k: v
-        for k, v in env.items()
-        if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR")
-    }
-    head = subprocess.check_output(
-        ["git", "-C", str(root), "rev-parse", "--verify", "HEAD^{commit}"],
-        text=True,
-        env=git_env,
-        timeout=15,
-    ).strip()
-    if head != sha:
-        raise ValueError(f"checkout HEAD {head} does not match GITHUB_SHA {sha}")
-    dirty = subprocess.check_output(
-        [
-            "git",
-            "--no-optional-locks",
-            "-C",
-            str(root),
-            "status",
-            "--porcelain=v1",
-            "--untracked-files=all",
-            "--ignore-submodules=none",
-        ],
-        text=True,
-        env=git_env,
-        timeout=15,
-    )
-    if dirty:
-        raise ValueError("checkout worktree is not clean")
+    try:
+        verify_clean_checkout(root, sha, env)
+    except ValueError as exc:
+        if "expected commit" in str(exc):
+            raise ValueError(
+                f"checkout HEAD does not match GITHUB_SHA {sha}: {exc}"
+            ) from exc
+        raise
     return "hosted", f"gha-{gh_run}-{gh_attempt}", sha
+
+
+def _read_raw_tsv(path: Path, required: tuple[str, ...]) -> list[dict[str, str]]:
+    """Read an escaped TSV inventory file without altering escape sequences."""
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"missing inventory file: {path}")
+    raw = path.read_bytes().decode("utf-8")
+    if not raw.endswith("\n") or "\r" in raw:
+        raise ValueError(f"malformed inventory TSV: {path}")
+    lines = raw[:-1].split("\n")
+    header = lines[0].split("\t")
+    if any(col not in header for col in required):
+        raise ValueError(f"missing required columns in {path}")
+    rows: list[dict[str, str]] = []
+    for line in lines[1:]:
+        if not line:
+            continue
+        fields = line.split("\t")
+        if len(fields) != len(header):
+            raise ValueError(f"malformed row in {path}")
+        rows.append(dict(zip(header, fields, strict=True)))
+    return rows
+
+
+def derive_phase_expectations(
+    root: Path, phase: str
+) -> tuple[dict[str, str], dict[str, int], str]:
+    """Derive expected cases, depths, launch counts and source digest from tree inventory."""
+    target_num = _phase_number(phase)
+    evidence_path = root / "test/conformance/adapter/evidence.cjs"
+    if evidence_path.is_symlink() or not evidence_path.is_file():
+        raise ValueError(f"missing {evidence_path}")
+    digest_match = PINNED_DIGEST_RE.search(evidence_path.read_text(encoding="utf-8"))
+    if digest_match is None:
+        raise ValueError(
+            "missing PINNED_TEST_DIGEST in test/conformance/adapter/evidence.cjs"
+        )
+    source_pin = digest_match.group(1)
+
+    baseline_run_path = root / "test/conformance/baseline/run.json"
+    baseline_census_path = root / "test/conformance/baseline/census.tsv"
+    if baseline_run_path.is_symlink() or not baseline_run_path.is_file():
+        raise ValueError("missing test/conformance/baseline/run.json")
+    baseline_meta = loads_strict_object(
+        baseline_run_path.read_text(encoding="utf-8"),
+        "test/conformance/baseline/run.json",
+    )
+    expected_census_sha = baseline_meta.get("census_sha256")
+    if not isinstance(expected_census_sha, str) or not DIGEST_RE.fullmatch(
+        expected_census_sha
+    ):
+        raise ValueError("invalid census_sha256 in test/conformance/baseline/run.json")
+    if baseline_census_path.is_symlink() or not baseline_census_path.is_file():
+        raise ValueError("missing test/conformance/baseline/census.tsv")
+    actual_census_sha = hashlib.sha256(baseline_census_path.read_bytes()).hexdigest()
+    if actual_census_sha != expected_census_sha:
+        raise ValueError(
+            f"test/conformance/baseline/census.tsv SHA-256 mismatch: "
+            f"expected {expected_census_sha} from test/conformance/baseline/run.json, "
+            f"observed {actual_census_sha}"
+        )
+
+    baseline_rows = _read_raw_tsv(
+        baseline_census_path, ("path", "line", "column", "depth", "name")
+    )
+    baseline_depths: dict[str, str] = {}
+    for row in baseline_rows:
+        key = f"{row['path']}\t{row['line']}\t{row['column']}\t{row['name']}"
+        baseline_depths[key] = row["depth"]
+
+    class_rows = _read_raw_tsv(
+        root / "test/conformance/classification.tsv",
+        ("path", "line", "column", "name", "class", "phase"),
+    )
+    known_phases = sorted({row["phase"] for row in class_rows if row["phase"]})
+    if phase not in known_phases:
+        raise ValueError(
+            f"unknown gate phase {phase!r}: expected one of {known_phases} "
+            f"from test/conformance/classification.tsv"
+        )
+
+    site_rows = _read_raw_tsv(
+        root / "test/conformance/launch-sites.tsv",
+        ("path", "line", "kind", "via", "case", "argv"),
+    )
+    repeated_rows = _read_raw_tsv(
+        root / "test/conformance/adapter/repeated-sites.tsv", ("site", "count")
+    )
+    repeated = {row["site"]: int(row["count"]) for row in repeated_rows}
+
+    sites_by_case: dict[tuple[str, str], list[dict[str, str]]] = {}
+    for s in site_rows:
+        if s["kind"] == "helper":
+            continue
+        sites_by_case.setdefault((s["path"], s["case"]), []).append(s)
+
+    expected_cases: dict[str, str] = {}
+    expected_counts: dict[str, int] = {}
+    for row in class_rows:
+        if row["class"] != "conformance":
+            continue
+        if _phase_number(row["phase"]) > target_num:
+            continue
+        case_key = f"{row['path']}\t{row['line']}\t{row['column']}\t{row['name']}"
+        if case_key not in baseline_depths:
+            raise ValueError(
+                f"conformance case {case_key} from test/conformance/classification.tsv "
+                f"is missing from test/conformance/baseline/census.tsv"
+            )
+        expected_cases[case_key] = baseline_depths[case_key]
+        obs = sites_by_case.get((row["path"], row["name"]), [])
+        case_line = int(row["line"])
+        # When an inner helper row above the test shares (kind, argv) with the
+        # case body's wrapper call row, both rows describe the same launch.
+        in_body = {
+            (s["kind"], s["argv"])
+            for s in obs
+            if int(s["line"]) >= case_line and not s["via"].startswith("subtest: ")
+        }
+        effective = [
+            s
+            for s in obs
+            if not (
+                int(s["line"]) < case_line
+                and not s["via"].startswith("subtest: ")
+                and (s["kind"], s["argv"]) in in_body
+            )
+        ]
+        total = sum(repeated.get(f"{s['path']}:{s['line']}", 1) for s in effective)
+        if total < 1:
+            raise ValueError(
+                f"conformance case {case_key} has 0 expected launches in "
+                f"test/conformance/launch-sites.tsv"
+            )
+        expected_counts[case_key] = total
+
+    if not expected_cases:
+        raise ValueError(
+            f"gate phase {phase!r} has no conformance cases in "
+            f"test/conformance/classification.tsv (expected at least 1, observed 0)"
+        )
+    return expected_cases, expected_counts, source_pin
 
 
 def verify_export(
     directory: Path,
-    manifest_file: str = "manifest.json",
     *,
+    root: Path,
+    require_git_checkout: bool = True,
     expected_producer: str | None = None,
     expected_run_id: str | None = None,
     expected_commit: str | None = None,
+    expected_phase: str | None = None,
     env: Mapping[str, str] | None = None,
 ) -> None:
-    """Check the completed bundle without a checkout, target binary or launch log."""
+    """Verify a bundle against the inventory of the checkout at manifest.commit."""
     if directory.is_symlink() or not directory.is_dir():
         raise ValueError("export path is not a regular directory")
-    for filename in (manifest_file, "census.tsv", "launches.tsv"):
+    entries = {entry.name for entry in directory.iterdir()}
+    if entries != EXPORT_FILES:
+        raise ValueError(
+            f"export directory entries mismatch: expected {sorted(EXPORT_FILES)}, "
+            f"observed {sorted(entries)}"
+        )
+    for filename in EXPORT_FILES:
         entry = directory / filename
         if entry.is_symlink() or not entry.is_file():
             raise ValueError(f"missing or invalid {filename}")
-    manifest = json.loads((directory / manifest_file).read_text(encoding="utf-8"))
-    if not isinstance(manifest, dict):
-        raise TypeError("manifest must be a JSON object")
+    manifest = loads_strict_object(
+        (directory / "manifest.json").read_text(encoding="utf-8"), "manifest.json"
+    )
     producer = manifest["producer"]
     run_id = manifest["run_id"]
     commit = manifest["commit"]
+    phase = manifest["phase"]
     if not (
         isinstance(producer, str)
         and isinstance(run_id, str)
         and isinstance(commit, str)
+        and isinstance(phase, str)
     ):
-        raise TypeError("invalid producer, run identity, or commit")
+        raise TypeError("invalid producer, run identity, commit, or phase")
     check_producer_run_id(producer, run_id)
     if not COMMIT_RE.fullmatch(commit):
         raise ValueError("invalid commit")
+    _phase_number(phase)
     if (
         type(manifest.get("clean_tree")) is not bool
         or manifest["clean_tree"] is not True
@@ -195,24 +418,33 @@ def verify_export(
         raise ValueError("manifest run identity does not match expected run identity")
     if expected_commit is not None and commit != expected_commit:
         raise ValueError("manifest commit does not match expected commit")
+    if expected_phase is not None and phase != expected_phase:
+        raise ValueError(
+            f"manifest phase mismatch: expected {expected_phase}, observed {phase}"
+        )
     if env is not None:
         check_producer_env(producer, run_id, commit, env)
+    if require_git_checkout:
+        verify_clean_checkout(root, commit, env if env is not None else os.environ)
+    expected_cases, expected_counts, source_pin = derive_phase_expectations(root, phase)
+
     meta = {"run_id": run_id, "commit": commit}
-    binary, digest = manifest["binary"], manifest["binary_sha256"]
-    if (
-        not isinstance(binary, str)
-        or not re.fullmatch(r"/(?!/)[A-Za-z0-9_./-]+", binary)
-        or os.path.normpath(binary) != binary
-        or os.path.dirname(binary) == binary
-    ):
-        raise ValueError("invalid binary path")
+    binary = validate_binary_path(manifest["binary"])
+    digest = manifest["binary_sha256"]
     if not isinstance(digest, str) or not DIGEST_RE.fullmatch(digest):
         raise ValueError("invalid binary digest")
-    if (
-        manifest["test_source_sha256"] != SOURCE_PIN
-        or manifest["selection"] != "all-conformance"
-    ):
-        raise ValueError("unreviewed test source or partial selection")
+    observed_source_sha = manifest["test_source_sha256"]
+    if observed_source_sha != source_pin:
+        raise ValueError(
+            f"test_source_sha256 mismatch: expected {source_pin} from "
+            f"test/conformance/adapter/evidence.cjs, observed {observed_source_sha!r}"
+        )
+    expected_selection = f"conformance<={phase}"
+    if manifest["selection"] != expected_selection:
+        raise ValueError(
+            f"selection mismatch: expected {expected_selection!r}, "
+            f"observed {manifest['selection']!r}"
+        )
     if (
         manifest["verdict"] != "pass"
         or type(manifest["status"]) is not int
@@ -228,7 +460,7 @@ def verify_export(
         if not data.endswith("\n") or "\r" in data:
             raise ValueError(f"malformed {name}")
         header, fields, *lines = data[:-1].split("\n")
-        if json.loads(header) != meta:
+        if loads_strict_object(header, f"{name} metadata") != meta:
             raise ValueError(f"{name} run identity or commit mismatch")
         result = [line.split("\t") for line in lines]
         if fields != columns or any(
@@ -237,81 +469,139 @@ def verify_export(
             raise ValueError(f"malformed {name} columns")
         return result
 
-    cases: list[str] = []
+    observed_cases: dict[str, str] = {}
     counts: Counter[str] = Counter()
     for path, line, col, depth, name, status, detail in rows("census.tsv", CENSUS):
         if status != "pass" or detail != "-":
             raise ValueError("non-passing census entry")
         case_key = f"{path}\t{line}\t{col}\t{name}"
-        if case_key in counts:
+        if case_key in observed_cases:
             raise ValueError("duplicate census entry")
-        cases.append(f"{path}\t{line}\t{col}\t{depth}\t{name}")
+        observed_cases[case_key] = depth
         counts[case_key] = 0
-    if profile(cases) != CASE_PROFILE:
-        raise ValueError("census does not match full selection")
+
+    missing_cases = sorted(set(expected_cases) - set(observed_cases))
+    if missing_cases:
+        raise ValueError(
+            f"census.tsv missing {len(missing_cases)} case(s) for {phase} from "
+            f"test/conformance/classification.tsv (expected {len(expected_cases)}, "
+            f"observed {len(observed_cases)}; first missing: {missing_cases[0]})"
+        )
+    extra_cases = sorted(set(observed_cases) - set(expected_cases))
+    if extra_cases:
+        raise ValueError(
+            f"census.tsv has {len(extra_cases)} unexpected case(s) for {phase} from "
+            f"test/conformance/classification.tsv (expected {len(expected_cases)}, "
+            f"observed {len(observed_cases)}; first unexpected: {extra_cases[0]})"
+        )
+    for case_key, exp_depth in sorted(expected_cases.items()):
+        obs_depth = observed_cases[case_key]
+        if obs_depth != exp_depth:
+            raise ValueError(
+                f"census.tsv depth mismatch for {case_key}: expected {exp_depth} "
+                f"from test/conformance/baseline/census.tsv, observed {obs_depth}"
+            )
+
     for path, line, col, name, image, sha in rows("launches.tsv", LAUNCHES):
         case = f"{path}\t{line}\t{col}\t{name}"
         if case not in counts:
-            raise ValueError("launch outside census")
+            raise ValueError(f"launch outside census: {case}")
         if (image, sha) != (binary, digest):
             raise ValueError("mixed binary path or digest")
         counts[case] += 1
-    if profile([f"{case}\t{count}" for case, count in counts.items()]) != COUNT_PROFILE:
-        raise ValueError("unexpected per-case launch count")
+    for case_key, exp_count in sorted(expected_counts.items()):
+        obs_count = counts[case_key]
+        if obs_count != exp_count:
+            raise ValueError(
+                f"launches.tsv per-case launch count mismatch for {case_key}: "
+                f"expected {exp_count} from test/conformance/launch-sites.tsv and "
+                f"test/conformance/adapter/repeated-sites.tsv, observed {obs_count}"
+            )
+
+
+def _write_fsync(target: Path, content: str) -> None:
+    """Write content to a new file and flush it to storage."""
+    with target.open("w", encoding="utf-8") as fh:
+        fh.write(content)
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def _fsync_dir(directory: Path) -> None:
+    """Fsync a directory descriptor so entry updates reach storage."""
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def prepare_export(
     directory: Path,
     manifest: dict[str, object],
-    candidate: dict[str, str],
+    candidate: Mapping[str, Any],
     *,
+    root: Path,
+    require_git_checkout: bool,
     expected_producer: str,
     expected_run_id: str,
     expected_commit: str,
+    expected_phase: str,
     env: Mapping[str, str] | None = None,
 ) -> None:
-    """Prepare a verified bundle in an unpublished directory after cleanup."""
+    """Stage the final filenames in an unpublished directory and verify them there."""
     header = json.dumps({k: manifest[k] for k in ("run_id", "commit")}) + "\n"
-    (directory / "manifest.pending").write_text(
-        json.dumps(manifest) + "\n", encoding="utf-8"
-    )
+    _write_fsync(directory / "manifest.json", json.dumps(manifest) + "\n")
     for name in ("census", "launches"):
-        (directory / f"{name}.tsv").write_text(
-            header + candidate[name], encoding="utf-8"
-        )
+        value = candidate[name]
+        if not isinstance(value, str):
+            raise TypeError(f"candidate {name} must be a string")
+        _write_fsync(directory / f"{name}.tsv", header + value)
+    _fsync_dir(directory)
     verify_export(
         directory,
-        "manifest.pending",
+        root=root,
+        require_git_checkout=require_git_checkout,
         expected_producer=expected_producer,
         expected_run_id=expected_run_id,
         expected_commit=expected_commit,
+        expected_phase=expected_phase,
         env=env,
     )
 
 
-def hosted_export(root: Path, env: Mapping[str, str]) -> int:
-    """Run the full binary conformance suite on a hosted runner and write its export."""
-    target = env.get("TARGET", "identity")
-    mode = env.get("MODE", "suite") or "suite"
-    classification = env.get("CLASS", "")
-    args = ["conformance", f"TARGET={target}", f"MODE={mode}"]
-    if classification:
-        args.append(f"CLASS={classification}")
-    for key in ("PHASE", "PACKAGE", "GATE", "SITE"):
-        if env.get(key):
-            args.append(f"{key}={env[key]}")
+def publish_export(stage: Path, output: Path) -> None:
+    """Publish a verified staged directory with one same-filesystem rename."""
+    if output.exists() or output.is_symlink():
+        raise FileExistsError(f"export destination already exists: {output}")
+    stage.rename(output)
     try:
-        producer, run_id, commit = resolve_hosted_identity(root, env)
-        binary = export_target(args, 0, commit)
-        if classification and classification != "conformance":
-            raise ValueError("invalid CLASS selector")
-        binary_path = Path(binary)
-        if (
-            not binary_path.is_file()
-            or not os.access(binary, os.X_OK)
-            or os.path.realpath(binary) != binary
-        ):
-            raise ValueError(f"invalid executable: {binary}")
+        _fsync_dir(output.parent)
+    except OSError:
+        # The directory rename already committed; do not misreport publication as failed.
+        pass
+
+
+def hosted_export(
+    root: Path, env: Mapping[str, str], *, home: Path | None = None
+) -> int:
+    """Run the gate-phase binary conformance suite on a hosted runner and export it."""
+    capture_dir: Path | None = None
+    stage: Path | None = None
+    try:
+        target = env.get("TARGET", "identity")
+        mode = env.get("MODE", "suite") or "suite"
+        classification = env.get("CLASS", "")
+        args = ["conformance", f"TARGET={target}", f"MODE={mode}"]
+        if classification:
+            args.append(f"CLASS={classification}")
+        for key in ("PHASE", "PACKAGE", "GATE", "SITE"):
+            if env.get(key):
+                args.append(f"{key}={env[key]}")
+        producer, run_id, commit = resolve_hosted_identity(root, env, home=home)
+        binary, phase = export_target(args, 0, commit)
+        validate_binary_path(binary, require_executable=True)
+        derive_phase_expectations(root, phase)
         out_raw = env.get("EXPORT_DIR", "")
         if not out_raw and env.get("RUNNER_TEMP"):
             out_raw = str(Path(env["RUNNER_TEMP"]) / "conformance-export")
@@ -327,39 +617,42 @@ def hosted_export(root: Path, env: Mapping[str, str]) -> int:
             raise ValueError(f"EXPORT_DIR already exists: {output}")
         if not output.parent.is_dir() or output.parent.is_symlink():
             raise ValueError(f"EXPORT_DIR parent is not a directory: {output.parent}")
-    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
-        print(f"conformance export refused: {exc}", file=sys.stderr)
-        return 70
 
-    venue_rc = subprocess.run([str(root / "hack/venue-check")], check=False).returncode
-    if venue_rc != 0:
-        return 97
+        venue_rc = subprocess.run(
+            [str(root / "hack/venue-check")], check=False
+        ).returncode
+        if venue_rc != 0:
+            return 97
 
-    started = datetime.now(UTC).isoformat()
-    capture_dir = Path(tempfile.mkdtemp(prefix="mgw-capture-"))
-    candidate_path = capture_dir / "candidate.json"
-    stage: Path | None = None
-    try:
+        started = datetime.now(UTC).isoformat()
+        capture_dir = Path(tempfile.mkdtemp(prefix="mgw-capture-"))
+        candidate_path = capture_dir / "candidate.json"
         run_env = dict(env)
         run_env["TARGET"] = f"binary:{binary}"
         run_env["MODE"] = "suite"
+        run_env["PHASE"] = phase
         run_env["CONFORMANCE_CAPTURE"] = binary
         run_env["CONFORMANCE_CANDIDATE"] = str(candidate_path)
         proc = subprocess.run(
             [str(root / "hack/conformance")], env=run_env, check=False
         )
         if proc.returncode != 0:
+            kind = "infrastructure" if proc.returncode == 70 else "comparison"
             print(
-                f"conformance export refused: comparison status {proc.returncode} is not a pass",
+                f"conformance export refused: {kind} status {proc.returncode} is not a pass",
                 file=sys.stderr,
             )
             return 70
-        post_identity = resolve_hosted_identity(root, env)
+        post_identity = resolve_hosted_identity(root, env, home=home)
         if post_identity != (producer, run_id, commit):
             raise ValueError("hosted run identity or checkout changed during run")
-        candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
-        if not isinstance(candidate, dict) or candidate.get("binary") != binary:
-            raise ValueError("candidate does not match the requested executable")
+        candidate = loads_strict_object(
+            candidate_path.read_text(encoding="utf-8"), "candidate"
+        )
+        if candidate.get("binary") != binary or candidate.get("phase") != phase:
+            raise ValueError(
+                "candidate does not match the requested executable or phase"
+            )
         stage = Path(tempfile.mkdtemp(prefix=".pending-", dir=output.parent))
         prepare_export(
             stage,
@@ -368,24 +661,27 @@ def hosted_export(root: Path, env: Mapping[str, str]) -> int:
                 "run_id": run_id,
                 "commit": commit,
                 "clean_tree": True,
+                "phase": phase,
                 "binary": binary,
                 "binary_sha256": candidate["binary_sha256"],
                 "test_source_sha256": candidate["test_source_sha256"],
-                "selection": "all-conformance",
+                "selection": f"conformance<={phase}",
                 "started": started,
                 "ended": datetime.now(UTC).isoformat(),
                 "verdict": "pass",
                 "status": 0,
             },
             candidate,
+            root=root,
+            require_git_checkout=True,
             expected_producer=producer,
             expected_run_id=run_id,
             expected_commit=commit,
+            expected_phase=phase,
             env=env,
         )
-        stage.rename(output)
+        publish_export(stage, output)
         stage = None
-        (output / "manifest.pending").rename(output / "manifest.json")
         print(f"conformance export: {output}", flush=True)
         return 0
     except (
@@ -398,7 +694,8 @@ def hosted_export(root: Path, env: Mapping[str, str]) -> int:
         print(f"conformance export refused: {exc}", file=sys.stderr)
         return 70
     finally:
-        shutil.rmtree(capture_dir, ignore_errors=True)
+        if capture_dir is not None:
+            shutil.rmtree(capture_dir, ignore_errors=True)
         if stage is not None:
             shutil.rmtree(stage, ignore_errors=True)
 
@@ -555,23 +852,31 @@ def inspect_record(path: Path, recover: bool) -> None:
     print("; ".join(parts))
 
 
-def export_target(args: list[str], status: int, commit: str) -> str:
-    """Return the image only for a successful, isolated, full binary comparison."""
+def export_target(args: list[str], status: int, commit: str) -> tuple[str, str]:
+    """Return (binary, phase) only for a passing, clean, gate-phase binary run."""
     if status != 0:
-        raise ValueError(f"comparison status {status} is not a pass")
+        kind = "infrastructure" if status == 70 else "comparison"
+        raise ValueError(f"{kind} status {status} is not a pass")
+    if [arg for arg in args if "=" not in arg] != ["conformance"]:
+        raise ValueError("expected one conformance goal")
     options = dict(arg.split("=", 1) for arg in args if "=" in arg)
+    if options.get("CLASS", "") not in ("", "conformance"):
+        raise ValueError("invalid CLASS selector")
+    if options.get("MODE", "suite") != "suite" or any(
+        k in options for k in ("PACKAGE", "GATE", "SITE")
+    ):
+        raise ValueError("partial selection")
+    phase = options.get("PHASE", "")
+    if not phase:
+        raise ValueError("missing gate PHASE selector")
+    _phase_number(phase)
     target = options.get("TARGET", "identity")
     if not target.startswith("binary:"):
         raise ValueError("source-runtime target")
-    if [arg for arg in args if "=" not in arg] != ["conformance"]:
-        raise ValueError("expected one conformance goal")
-    if options.get("MODE", "suite") != "suite" or any(
-        k in options for k in ("PHASE", "PACKAGE", "GATE", "SITE")
-    ):
-        raise ValueError("partial selection")
-    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+    binary = validate_binary_path(target.removeprefix("binary:"))
+    if not COMMIT_RE.fullmatch(commit):
         raise ValueError("checkout was not a clean commit archive")
-    return target.removeprefix("binary:")
+    return binary, phase
 
 
 def run(path: Path, unit: str, limit: int, args: list[str]) -> int:
@@ -603,7 +908,7 @@ def run(path: Path, unit: str, limit: int, args: list[str]) -> int:
     capture = ""
     if control == "run" and "conformance" in goals:
         try:
-            capture = export_target(goals, 0, commit)
+            capture, _ = export_target(goals, 0, commit)
         except ValueError:
             # Diagnostics still run; report the refusal alongside their actual outcome.
             capture = ""
@@ -694,6 +999,7 @@ def run(path: Path, unit: str, limit: int, args: list[str]) -> int:
             else:
                 raise RuntimeError(f"control port {port} was free before scope drain")
         print(f"remote: launcher exited; port {port} still bound; members={leftover}")
+    # Step 1: verified drain before staging or publishing any export.
     drain(unit)
     if port is not None:
         with socket.socket() as probe:
@@ -713,93 +1019,156 @@ def run(path: Path, unit: str, limit: int, args: list[str]) -> int:
         status = status or 70
     if status < 0:
         status = 128 - status
-    candidate: dict[str, str] | None = None
+
+    candidate: dict[str, Any] | None = None
     binary = ""
+    phase = ""
     if control == "run" and "conformance" in goals:
         try:
-            binary = export_target(goals, status, commit)
+            binary, phase = export_target(goals, status, commit)
         except ValueError as exc:
             print(f"conformance export refused: {exc}", file=sys.stderr)
         else:
             try:
-                candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
-                if not isinstance(candidate, dict) or candidate.get("binary") != binary:
+                candidate = loads_strict_object(
+                    candidate_path.read_text(encoding="utf-8"), "candidate"
+                )
+                if candidate.get("binary") != binary or candidate.get("phase") != phase:
                     raise ValueError(
-                        "candidate does not match the requested executable"
+                        "candidate does not match the requested executable or phase"
                     )
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 candidate = None
                 status = 70
                 print(f"conformance export refused (status=70): {exc}", file=sys.stderr)
-    try:
-        if status == 0:
-            shutil.rmtree(directory)
-        else:
-            print(f"failed run retained: {directory}", file=sys.stderr)
-        runs = sorted(
-            directory.parent.glob("run.*"),
-            key=lambda p: p.stat().st_mtime_ns,
-            reverse=True,
-        )
-        for old in runs[5:]:
-            shutil.rmtree(old)
-    except OSError as exc:
-        print(f"remote: could not prune run directories: {exc}", file=sys.stderr)
+
     stage: Path | None = None
     output = path.parent / "exports" / run_id
-    if candidate is not None and status == 0 and not interrupted:
-        try:
-            output.parent.mkdir(mode=0o700, exist_ok=True)
-            stage = Path(tempfile.mkdtemp(prefix=".pending-", dir=output.parent))
-            prepare_export(
-                stage,
-                {
-                    "producer": "venue",
-                    "run_id": run_id,
-                    "commit": commit,
-                    "clean_tree": True,
-                    "binary": binary,
-                    "binary_sha256": candidate["binary_sha256"],
-                    "test_source_sha256": candidate["test_source_sha256"],
-                    "selection": "all-conformance",
-                    "started": started,
-                    "ended": datetime.now(UTC).isoformat(),
-                    "verdict": "pass",
-                    "status": status,
-                },
-                candidate,
-                expected_producer="venue",
-                expected_run_id=run_id,
-                expected_commit=commit,
-                env={
-                    "CONFORMANCE_VENUE_UNIT": unit,
-                    "CONFORMANCE_VENUE_COMMIT": commit,
-                },
-            )
-        except (OSError, KeyError, ValueError, TypeError) as exc:
-            print(f"conformance export refused (status=70): {exc}", file=sys.stderr)
-            status = 70
-    if interrupted and status != 124:
-        status = 128 + interrupted
     exported: Path | None = None
-    if stage is not None:
-        if status == 0:
+    try:
+        # Step 2: stage and verify the export against the extracted commit archive.
+        if candidate is not None and status == 0 and not interrupted:
             try:
-                stage.rename(output)
-                (output / "manifest.pending").rename(output / "manifest.json")
-                exported = output
-            except OSError as exc:
+                output.parent.mkdir(mode=0o700, exist_ok=True)
+                if output.exists() or output.is_symlink():
+                    raise FileExistsError(
+                        f"export destination already exists: {output}"
+                    )
+                stage = Path(tempfile.mkdtemp(prefix=".pending-", dir=output.parent))
+                prepare_export(
+                    stage,
+                    {
+                        "producer": "venue",
+                        "run_id": run_id,
+                        "commit": commit,
+                        "clean_tree": True,
+                        "phase": phase,
+                        "binary": binary,
+                        "binary_sha256": candidate["binary_sha256"],
+                        "test_source_sha256": candidate["test_source_sha256"],
+                        "selection": f"conformance<={phase}",
+                        "started": started,
+                        "ended": datetime.now(UTC).isoformat(),
+                        "verdict": "pass",
+                        "status": status,
+                    },
+                    candidate,
+                    root=directory / "tree",
+                    require_git_checkout=False,
+                    expected_producer="venue",
+                    expected_run_id=run_id,
+                    expected_commit=commit,
+                    expected_phase=phase,
+                    env={
+                        "CONFORMANCE_VENUE_UNIT": unit,
+                        "CONFORMANCE_VENUE_COMMIT": commit,
+                    },
+                )
+            except (OSError, KeyError, ValueError, TypeError) as exc:
                 print(f"conformance export refused (status=70): {exc}", file=sys.stderr)
                 status = 70
-                shutil.rmtree(stage, ignore_errors=True)
-        else:
+                if stage is not None:
+                    shutil.rmtree(stage, ignore_errors=True)
+                    stage = None
+
+        # Best-effort pruning of the run workspace now that staging is complete.
+        try:
+            if status == 0:
+                shutil.rmtree(directory)
+            else:
+                print(f"failed run retained: {directory}", file=sys.stderr)
+            runs = sorted(
+                directory.parent.glob("run.*"),
+                key=lambda p: p.stat().st_mtime_ns,
+                reverse=True,
+            )
+            for old in runs[5:]:
+                shutil.rmtree(old)
+        except OSError as exc:
+            print(f"remote: could not prune run directories: {exc}", file=sys.stderr)
+
+        if interrupted and status != 124:
+            status = 128 + interrupted
+        if stage is not None and status != 0:
             shutil.rmtree(stage, ignore_errors=True)
-    label = {0: "pass", 1: "failure", 2: "usage", 124: "timeout"}.get(
-        status, "no-verdict"
-    )
-    record = f"unit={unit} class={label} status={status}"
-    write_atomic(path.with_name("last-outcome"), record + "\n")
-    path.unlink()
+            stage = None
+
+        def outcome_record(code: int) -> str:
+            label = {0: "pass", 1: "failure", 2: "usage", 124: "timeout"}.get(
+                code, "no-verdict"
+            )
+            return f"unit={unit} class={label} status={code}"
+
+        # Step 3: write the typed outcome BEFORE the single rename commit point.
+        # Failure here raises before rename and leaves no export.
+        record = outcome_record(status)
+        write_atomic(path.with_name("last-outcome"), record + "\n")
+
+        # Step 4 (single commit point): publish the verified export with one rename.
+        if stage is not None:
+            if interrupted:
+                shutil.rmtree(stage, ignore_errors=True)
+                stage = None
+                status = 128 + interrupted
+                record = outcome_record(status)
+                write_atomic(path.with_name("last-outcome"), record + "\n")
+            else:
+                pending = stage
+                try:
+                    publish_export(pending, output)
+                    stage = None
+                    exported = output
+                except OSError as exc:
+                    print(
+                        f"conformance export refused (status=70): {exc}",
+                        file=sys.stderr,
+                    )
+                    shutil.rmtree(pending, ignore_errors=True)
+                    stage = None
+                    status = 70
+                    record = outcome_record(status)
+                    write_atomic(path.with_name("last-outcome"), record + "\n")
+    finally:
+        if stage is not None:
+            shutil.rmtree(stage, ignore_errors=True)
+
+    # Step 5: release the reservation. If this fails after the commit point, the
+    # export is valid (the run passed and was drained) and the next run is refused
+    # until explicit recovery.
+    try:
+        path.unlink()
+    except OSError as exc:
+        if exported is not None:
+            print(f"remote: conformance export {exported}", flush=True)
+            print(
+                f"remote: cannot release reservation {path}: {exc}; reservation retained; "
+                f"export {exported} is valid (run passed and drained), and the next run "
+                f"is refused until recovery",
+                file=sys.stderr,
+            )
+            return 97
+        raise
+
     if exported is not None:
         print(f"remote: conformance export {exported}", flush=True)
     print(f"remote: {record}", flush=True)
@@ -810,10 +1179,21 @@ def main(args: list[str]) -> int:
     """Dispatch only the operation requested by the outside venue owner."""
     if args[:1] == ["verify"]:
         try:
-            if len(args) != 2:
+            if len(args) == 3:
+                verify_root, target_dir = Path(args[1]), Path(args[2])
+            elif len(args) == 2:
+                verify_root = Path(__file__).resolve().parent.parent
+                target_dir = Path(args[1])
+            else:
                 raise ValueError("usage: conformance-export verify DIR")
-            verify_export(Path(args[1]), env=os.environ)
-        except (OSError, KeyError, ValueError, TypeError) as exc:
+            verify_export(target_dir, root=verify_root, env=os.environ)
+        except (
+            OSError,
+            KeyError,
+            ValueError,
+            TypeError,
+            subprocess.SubprocessError,
+        ) as exc:
             print(f"conformance export refused: {exc}", file=sys.stderr)
             return 70
         return 0
