@@ -183,9 +183,16 @@ func (b *Branch) Prepare(w http.ResponseWriter, r *http.Request, req Request) (o
 // An upstream response body that stops at the upstream inactivity timeout before any client header
 // was written is answered with HTTP 502, error type "api_error", message
 // "model-gateway: Grok upstream failed: Grok upstream timeout", and StatusOverride
-// "upstream_error". Any other break of the body before the client headers, and every break after
-// them, aborts the client response: Handle returns the outcome facts alongside an error wrapping
+// "upstream_error". This holds for an event stream too when its headers were not yet written
+// because the client had already gone; the outcome is then the same and nothing is written. Any
+// other break of the body before the client headers, and every break after them, aborts the
+// client response: Handle returns the outcome facts alongside an error wrapping
 // http.ErrAbortHandler.
+//
+// Handle asks the auth store for the access token on a context without r.Context()'s
+// cancellation, so a stalled token issuer is bounded only by the store's two 30-second request
+// deadlines (discovery and exchange), and those hold only with an auth transport that honours
+// request cancellation.
 //
 // After r.Context() is canceled, Handle writes nothing more to w but continues consuming
 // the upstream stream; the configured Client governs its lifetime. outcome.Result.Cancelled
@@ -292,6 +299,7 @@ type handling struct {
 	res    outcome.Result
 
 	gone          bool
+	headersSent   bool // the event stream's status and headers were written to the client
 	compaction    bool
 	compactionSet bool
 }
@@ -390,11 +398,10 @@ func (h *handling) json(resp *upstream.Response) (outcome.Result, error) {
 		writeJSON(h.client, h.w, http.StatusBadGateway, errorBody("api_error", units(untranslatableResponse)))
 		return h.res, nil
 	}
-	// The sentry sees only a reply the client will receive: one that was translated and encoded.
-	if u := get(response, "usage"); truthy(u) {
-		if converted, err := usage(u); err == nil {
-			h.observeSentry(messageDelta(converted), isString(get(response, "status"), "completed") && !h.isCompaction())
-		}
+	// The sentry observes only a reply that was translated and encoded; the translation already
+	// converted the usage, so it is taken from there.
+	if truthy(get(response, "usage")) {
+		h.observeSentry(messageDelta(get(translated, "usage")), isString(get(response, "status"), "completed") && !h.isCompaction())
 	}
 	if h.req.Usage != nil {
 		h.req.Usage.ObserveJSON(out)
@@ -419,6 +426,7 @@ func (h *handling) stream(resp *upstream.Response) (outcome.Result, error) {
 	} else {
 		h.relayHeader(resp).Set("Content-Type", "text/event-stream")
 		h.w.WriteHeader(resp.StatusCode)
+		h.headersSent = true
 		h.flush()
 	}
 	translator := NewStream(h.req.AdvertisedModel, h.branch.now)
@@ -469,7 +477,11 @@ func (h *handling) stream(resp *upstream.Response) (outcome.Result, error) {
 			break
 		}
 		if err != nil {
-			// The translator's end-of-stream frames belong to an orderly end only.
+			// The translator's end-of-stream frames belong to an orderly end only. A client that
+			// left before the headers were written is answered as the buffered paths answer.
+			if !h.headersSent {
+				return h.brokeBeforeHeaders(err)
+			}
 			return h.broke(err)
 		}
 	}

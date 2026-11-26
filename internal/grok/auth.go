@@ -177,7 +177,8 @@ type AuthOptions struct {
 	File string
 	// Transport performs OIDC discovery and OAuth token refresh requests.
 	// Callers must supply a non-nil Transport isolated from the inference client's lifetime;
-	// nil is rejected with an error and http.DefaultTransport is never used.
+	// nil is rejected with an error and http.DefaultTransport is never used. Each request ends
+	// after 30 seconds only when Transport honours the request's context.
 	Transport http.RoundTripper
 	// Now returns the current time for expiry checks and refreshed expiry timestamps.
 	// If nil, time.Now is used.
@@ -206,11 +207,11 @@ type AuthStore struct {
 type flight struct {
 	done   chan struct{} // closed after the result fields are set
 	cancel context.CancelFunc
-	forced bool // started by an explicit Refresh: it exchanges even when the token is fresh
 
 	// Guarded by AuthStore.mu.
 	waiters   int
-	abandoned bool // every waiter left and the flight's context was ended
+	abandoned bool // every waiter left before the exchange was sent, and the flight's context was ended
+	committed bool // the exchange was handed to the transport; the flight no longer follows its waiters
 
 	// Written before done is closed and read only after it.
 	token     string
@@ -240,10 +241,16 @@ func (s *AuthStore) nowMillis() float64 { return float64(s.now().UnixMilli()) }
 // when the stored token is expired, unparseable, or within the refresh skew window.
 // In shadow mode it uses a stored token until its real expiry (even inside the refresh skew
 // window), refuses expired or unverifiable tokens with ErrAuthCannotRefresh, and never
-// refreshes or writes the auth file. When a refresh is needed and ctx has already ended, it
-// returns ctx's error without starting or joining one; a caller that stops waiting does not
-// fail the others.
+// refreshes or writes the auth file.
+//
+// When ctx has already ended, AccessToken returns ctx's error before it reads the auth file, so
+// before it would return a fresh stored token and before any shadow-mode refusal; it starts and
+// joins no refresh. ctx is checked again under the store's lock before the caller enrolls in a
+// refresh. A caller that stops waiting gets ctx's error at once and does not fail the others.
 func (s *AuthStore) AccessToken(ctx context.Context) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	current, err := readAuth(s.file)
 	if err != nil {
 		return "", err
@@ -275,8 +282,14 @@ func keyOf(a *authFile) string {
 // atomically with mode 0600, and deduplicates concurrent refreshes. The key it returns always comes
 // from an exchange: when it joins a refresh in flight that found the stored token fresh and
 // exchanged nothing, it runs one exchange of its own afterwards.
-// In shadow mode it returns ErrAuthCannotRefresh before reading the auth file or starting a refresh.
+// When ctx has already ended, Refresh returns ctx's error before anything else, the shadow-mode
+// refusal included, and ctx is checked again under the store's lock before the caller enrolls in
+// a refresh. In shadow mode it returns ErrAuthCannotRefresh before reading the auth file or
+// starting a refresh.
 func (s *AuthStore) Refresh(ctx context.Context) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if s.shadow {
 		return "", ErrAuthCannotRefresh
 	}
@@ -284,16 +297,19 @@ func (s *AuthStore) Refresh(ctx context.Context) (string, error) {
 }
 
 // shared waits for the refresh in flight, starting one when there is none. A caller whose ctx has
-// already ended starts and joins nothing. Each caller stops waiting when its own ctx ends; the
-// refresh keeps running for the others, and its own context ends when the last waiter has left.
-// A caller arriving at such an abandoned refresh waits for it to stop, then starts a new one.
-// A forced caller accepts only a key that an exchange produced.
+// ended, checked under s.mu, starts and joins nothing. Each caller stops waiting when its own ctx
+// ends; the refresh keeps running for the others. When the last waiter leaves before the exchange
+// was sent, the refresh's own context ends; once the exchange was sent, the refresh reads the reply
+// and stores the new credential although nobody waits for it, because the issuer may already have
+// rotated the refresh token. A caller arriving at an abandoned refresh waits for it to stop, then
+// starts a new one. A forced caller accepts only a key that an exchange produced.
 func (s *AuthStore) shared(ctx context.Context, forced bool) (string, error) {
 	for {
+		s.mu.Lock()
 		if err := ctx.Err(); err != nil {
+			s.mu.Unlock()
 			return "", err
 		}
-		s.mu.Lock()
 		f := s.flight
 		if f != nil && f.abandoned {
 			s.mu.Unlock()
@@ -322,7 +338,7 @@ func (s *AuthStore) shared(ctx context.Context, forced bool) (string, error) {
 			return f.token, nil
 		case <-ctx.Done():
 			s.mu.Lock()
-			if f.waiters--; f.waiters == 0 {
+			if f.waiters--; f.waiters == 0 && !f.committed {
 				f.abandoned = true
 				f.cancel()
 			}
@@ -336,15 +352,14 @@ func (s *AuthStore) shared(ctx context.Context, forced bool) (string, error) {
 // cancellation, so the first caller leaving does not fail the others. s.mu must be held.
 func (s *AuthStore) start(ctx context.Context, forced bool) *flight {
 	work, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	f := &flight{done: make(chan struct{}), cancel: cancel, forced: forced, waiters: 1}
+	f := &flight{done: make(chan struct{}), cancel: cancel, waiters: 1}
 	s.flight = f
 	go func() {
-		token, exchanged, err := s.run(work, forced)
+		token, exchanged, err := s.run(work, f, forced)
 		s.mu.Lock()
 		f.token, f.exchanged, f.err = token, exchanged, err
-		if s.flight == f {
-			s.flight = nil
-		}
+		// A flight stays in s.flight until it ends, so no other flight can have replaced it.
+		s.flight = nil
 		s.mu.Unlock()
 		cancel()
 		close(f.done)
@@ -355,7 +370,7 @@ func (s *AuthStore) start(ctx context.Context, forced bool) *flight {
 // run is the work of one flight. The file is read inside the flight: a refresh that finished
 // while a caller read the file has already rotated the refresh token, so an unforced flight
 // exchanges only when the token it finds is still expiring.
-func (s *AuthStore) run(ctx context.Context, forced bool) (token string, exchanged bool, err error) {
+func (s *AuthStore) run(ctx context.Context, f *flight, forced bool) (token string, exchanged bool, err error) {
 	current, err := readAuth(s.file)
 	if err != nil {
 		return "", false, err
@@ -363,15 +378,25 @@ func (s *AuthStore) run(ctx context.Context, forced bool) (token string, exchang
 	if !forced && !s.expiresSoon(expiresAtMillis(get(current.value(), "expires_at"))) {
 		return keyOf(current), false, nil
 	}
-	token, err = s.refresh(ctx, current)
+	token, err = s.refresh(ctx, f, current)
 	return token, err == nil, err
 }
 
-// refresh follows refreshGrokAuth (lib/grok-backend.js:83-113).
-func (s *AuthStore) refresh(ctx context.Context, current *authFile) (string, error) {
-	if s.shadow {
-		return "", ErrAuthCannotRefresh
+// commit marks f as past the point where its waiters can end it: from here on the exchange runs
+// to its end under its own deadline. It reports false when every waiter had already left.
+func (s *AuthStore) commit(f *flight) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if f.abandoned {
+		return false
 	}
+	f.committed = true
+	return true
+}
+
+// refresh follows refreshGrokAuth (lib/grok-backend.js:83-113). Discovery follows the flight's
+// context; the exchange does not, so a refresh token the issuer rotated is always stored.
+func (s *AuthStore) refresh(ctx context.Context, f *flight, current *authFile) (string, error) {
 	entry := current.value()
 	refreshToken, ok := nonEmptyString(get(entry, "refresh_token"))
 	if !ok {
@@ -386,7 +411,10 @@ func (s *AuthStore) refresh(ctx context.Context, current *authFile) (string, err
 		return "", ErrAuthRefreshFailed
 	}
 	form := formEncode([][2]string{{"grant_type", "refresh_token"}, {"refresh_token", refreshToken}, {"client_id", clientID}})
-	status, body, err := s.requestJSON(ctx, http.MethodPost, endpoint, form)
+	if !s.commit(f) {
+		return "", ErrAuthRefreshFailed
+	}
+	status, body, err := s.requestJSON(context.WithoutCancel(ctx), http.MethodPost, endpoint, form)
 	if err != nil || status < 200 || status >= 300 {
 		return "", ErrAuthRefreshFailed
 	}
@@ -440,7 +468,8 @@ func (s *AuthStore) tokenEndpoint(ctx context.Context, entry jsonx.WireValue) (s
 // requestJSON follows the source's requestJson (lib/grok-backend.js:393-408): it sends no headers
 // besides the form content type, and a body that is not JSON reads as null. Unlike the source, the
 // request and its body read end after authRequestTimeout (errAuthRequestEnded), and a body above
-// maxAuthBody is refused (errAuthBodyTooLarge).
+// maxAuthBody is refused (errAuthBodyTooLarge) whether or not the read also failed. The deadline
+// holds only with a transport that honours the request's context.
 func (s *AuthStore) requestJSON(ctx context.Context, method, target, form string) (int, jsonx.WireValue, error) {
 	ctx, cancel := context.WithTimeout(ctx, authRequestTimeout)
 	defer cancel()
@@ -466,14 +495,15 @@ func (s *AuthStore) requestJSON(ctx context.Context, method, target, form string
 	}
 	defer func() { _ = resp.Body.Close() }()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxAuthBody+1))
+	// A reader may return data and an error together; the bound is decided on the data alone.
+	if len(raw) > maxAuthBody {
+		return 0, jsonx.WireValue{}, errAuthBodyTooLarge
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			return 0, jsonx.WireValue{}, errAuthRequestEnded
 		}
 		return 0, jsonx.WireValue{}, err
-	}
-	if len(raw) > maxAuthBody {
-		return 0, jsonx.WireValue{}, errAuthBodyTooLarge
 	}
 	parsed, err := jsonx.DecodeWire(raw)
 	if err != nil {
