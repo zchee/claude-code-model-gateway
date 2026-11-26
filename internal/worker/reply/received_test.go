@@ -310,13 +310,19 @@ func (h *heldUpstream) send(body []byte, mode departure, leave func()) upstream.
 	}
 }
 
-// recordingCapture is the real usage capture with a record of SetResponseComplete calls. When
-// leaveAt names one of its methods, that method ends the client context with leave after the
-// real capture has run.
+// recordingCapture is the real usage capture with a record of every call the reply makes on it:
+// each status passed to SetResponse, each body passed to ObserveJSON, the response bytes counted
+// the way the capture counts them (NoteResponseBytes plus the length of each observed body), and
+// each SetResponseComplete value. A repeated call shows up as a second entry or a larger total,
+// which the capture's own snapshot cannot show. When leaveAt names one of its methods, that
+// method ends the client context with leave after the real capture has run.
 type recordingCapture struct {
 	*usage.Capture
 	leaveAt  string
 	leave    func()
+	statuses []int
+	observed []string
+	bytes    int64
 	complete []bool
 }
 
@@ -328,16 +334,20 @@ func (c *recordingCapture) called(method string) {
 
 func (c *recordingCapture) SetResponse(status int, headers http.Header) {
 	c.Capture.SetResponse(status, headers)
+	c.statuses = append(c.statuses, status)
 	c.called("SetResponse")
 }
 
 func (c *recordingCapture) NoteResponseBytes(n int64) {
 	c.Capture.NoteResponseBytes(n)
+	c.bytes += n
 	c.called("NoteResponseBytes")
 }
 
 func (c *recordingCapture) ObserveJSON(body []byte) {
 	c.Capture.ObserveJSON(body)
+	c.observed = append(c.observed, string(body))
+	c.bytes += int64(len(body))
 	c.called("ObserveJSON")
 }
 
@@ -347,13 +357,17 @@ func (c *recordingCapture) SetResponseComplete(complete bool) {
 	c.called("SetResponseComplete")
 }
 
-// receivedFacts are the effects of one reply that record what the upstream sent.
+// receivedFacts are the effects of one reply that record what the upstream sent. Statuses,
+// Observed and Bytes are the totals of the calls on the usage capture.
 type receivedFacts struct {
 	Blocked  *upstreamstate.Blocked
 	Lines    string
 	Attempts int32
 	Sentry   any
 	Usage    map[string]any
+	Statuses []int
+	Observed []string
+	Bytes    int64
 }
 
 // overflowProbe reports, after a refusal, whether the refused session's latch holds against a
@@ -365,8 +379,8 @@ type overflowProbe struct {
 }
 
 // completionProbe reports, after a successful reply on a latched session, whether the session
-// crosses its trigger again (the reply rearmed the latch as a delivered completion) and the usage
-// the reply recorded for it.
+// crosses its trigger again (the reply's complete JSON body rearmed the latch) and the usage the
+// reply recorded for it.
 type completionProbe struct {
 	Rearmed bool
 	Usage   float64
@@ -409,11 +423,12 @@ func probeCompletion(s *sentry.State) any {
 
 // TestDepartedClientRecordsReceivedFacts checks that what the upstream sent is recorded whether or
 // not the client is still there: the Codex rejection's upstream state and its diagnostic line, the
-// overflow latch and the learned trigger, and the sentry's and the usage capture's observation of
-// a complete JSON body. Each scenario runs for a client that stays, one that leaves when the send
-// returns, and one that leaves while the body is being read; the departed runs write nothing to
-// the client and record the same facts as the run that stays, except what only a delivered reply
-// does: no retry, no rearming as a delivered completion, no line for an empty reply never sent.
+// overflow latch and the learned trigger, the sentry's observation of a complete JSON body with
+// its rearming, and every call on the usage capture (statuses, observed bodies, response bytes).
+// Each scenario runs for a client that stays, one that leaves when the send returns, and one that
+// leaves while the body is being read; the departed runs write nothing to the client and record
+// the same facts as the run that stays, except what needs the client: no retry, and no line for
+// an empty reply never sent.
 func TestDepartedClientRecordsReceivedFacts(t *testing.T) {
 	openAI := http.Header{"Content-Type": {"application/json"}, "X-Openai-Request-Id": {"req-1"}, "Retry-After": {"30"}}
 	const (
@@ -427,6 +442,7 @@ func TestDepartedClientRecordsReceivedFacts(t *testing.T) {
 		empty      = `{"message":"Codex completed without producing output"}`
 	)
 	latchedAndLearned := overflowProbe{Latched: true, Learned: 2400}
+	size := func(body string) int64 { return int64(len(body)) }
 	tests := map[string]struct {
 		provider    string
 		headWritten bool
@@ -445,75 +461,84 @@ func TestDepartedClientRecordsReceivedFacts(t *testing.T) {
 	}{
 		"error: attributed Codex forbidden": {
 			provider: "codex", up: heldReply{http.StatusForbidden, openAI, refused},
-			want:      receivedFacts{Blocked: &upstreamstate.Blocked{StatusCode: http.StatusForbidden}, Attempts: 1},
+			want:      receivedFacts{Blocked: &upstreamstate.Blocked{StatusCode: http.StatusForbidden}, Attempts: 1, Statuses: []int{http.StatusForbidden}, Bytes: size(refused)},
 			wantLines: 1, wantCode: http.StatusForbidden,
 		},
 		"error: attributed Codex unauthorized": {
 			provider: "codex", up: heldReply{http.StatusUnauthorized, openAI, refused},
-			want:      receivedFacts{Blocked: &upstreamstate.Blocked{StatusCode: http.StatusUnauthorized}, Attempts: 1},
+			want:      receivedFacts{Blocked: &upstreamstate.Blocked{StatusCode: http.StatusUnauthorized}, Attempts: 1, Statuses: []int{http.StatusUnauthorized}, Bytes: size(refused)},
 			wantLines: 1, wantCode: http.StatusUnauthorized,
 		},
 		"error: attributed Codex rate limit": {
 			provider: "codex", up: heldReply{http.StatusTooManyRequests, openAI, refused},
-			want:      receivedFacts{Blocked: &upstreamstate.Blocked{StatusCode: http.StatusTooManyRequests, ExpiresAtMs: new(float64(1_030_000))}, Attempts: 1},
+			want:      receivedFacts{Blocked: &upstreamstate.Blocked{StatusCode: http.StatusTooManyRequests, ExpiresAtMs: new(float64(1_030_000))}, Attempts: 1, Statuses: []int{http.StatusTooManyRequests}, Bytes: size(refused)},
 			wantLines: 1, wantCode: http.StatusTooManyRequests,
 		},
 		"error: attributed Codex rate limit in a committed compaction": {
 			provider: "codex", headWritten: true, up: heldReply{http.StatusTooManyRequests, openAI, refused},
-			want:      receivedFacts{Blocked: &upstreamstate.Blocked{StatusCode: http.StatusTooManyRequests, ExpiresAtMs: new(float64(1_030_000))}, Attempts: 1},
+			want:      receivedFacts{Blocked: &upstreamstate.Blocked{StatusCode: http.StatusTooManyRequests, ExpiresAtMs: new(float64(1_030_000))}, Attempts: 1, Statuses: []int{http.StatusTooManyRequests}, Bytes: size(refused)},
 			wantLines: 1,
 		},
 		"error: attributed Codex forbidden with unwritable state": {
 			provider: "codex", unwritable: true, up: heldReply{http.StatusForbidden, openAI, refused},
-			want:      receivedFacts{Attempts: 1},
+			want:      receivedFacts{Attempts: 1, Statuses: []int{http.StatusForbidden}, Bytes: size(refused)},
 			wantLines: 1, wantCode: http.StatusForbidden,
 		},
+		// The ordinary 403 branch retries a recognized upgrade rejection and never records it as
+		// an upstream block; the committed branch below has no retry and records it like any
+		// other attributed rejection.
 		"error: attributed upgrade rejection is no block": {
 			provider: "codex", up: heldReply{http.StatusForbidden, openAI, upgrade},
-			want:      receivedFacts{Attempts: 3},
+			want:      receivedFacts{Attempts: 3, Statuses: []int{http.StatusServiceUnavailable}, Bytes: 3 * size(upgrade)},
 			wantLines: 0, wantCode: http.StatusServiceUnavailable,
-			departed: func(f *receivedFacts) { f.Attempts = 1 },
+			departed: func(f *receivedFacts) { f.Attempts, f.Statuses, f.Bytes = 1, nil, size(upgrade) },
+		},
+		"error: attributed upgrade rejection in a committed compaction is a block": {
+			provider: "codex", headWritten: true, up: heldReply{http.StatusForbidden, openAI, upgrade},
+			want:      receivedFacts{Blocked: &upstreamstate.Blocked{StatusCode: http.StatusForbidden}, Attempts: 1, Statuses: []int{http.StatusForbidden}, Bytes: size(upgrade)},
+			wantLines: 1,
 		},
 		"error: genuine overflow with counts": {
 			provider: "local", sentryOn: true, up: heldReply{http.StatusRequestEntityTooLarge, http.Header{"Content-Type": {"application/json"}}, genuine},
 			prime: primeOverflow, probe: probeOverflow,
-			want:     receivedFacts{Attempts: 1, Sentry: latchedAndLearned},
+			want:     receivedFacts{Attempts: 1, Sentry: latchedAndLearned, Statuses: []int{http.StatusRequestEntityTooLarge}, Bytes: size(genuine)},
 			wantCode: http.StatusRequestEntityTooLarge,
 		},
 		"error: engine overflow with its own limit": {
 			provider: "local", sentryOn: true, up: heldReply{http.StatusBadRequest, http.Header{"Content-Type": {"application/json"}}, engineOwn},
 			prime: primeOverflow, probe: probeOverflow,
-			want:     receivedFacts{Attempts: 1, Sentry: overflowProbe{Latched: true}},
+			want:     receivedFacts{Attempts: 1, Sentry: overflowProbe{Latched: true}, Statuses: []int{http.StatusBadRequest}, Bytes: size(engineOwn)},
 			wantCode: http.StatusRequestEntityTooLarge,
 		},
 		"error: engine overflow without its limit": {
 			provider: "local", sentryOn: true, up: heldReply{http.StatusInternalServerError, http.Header{"Content-Type": {"application/json"}}, engineBare},
 			prime: primeOverflow, probe: probeOverflow,
-			want:     receivedFacts{Attempts: 1, Sentry: latchedAndLearned},
+			want:     receivedFacts{Attempts: 1, Sentry: latchedAndLearned, Statuses: []int{http.StatusInternalServerError}, Bytes: size(engineBare)},
 			wantCode: http.StatusRequestEntityTooLarge,
 		},
 		"error: legacy overflow": {
 			provider: "local", sentryOn: true, up: heldReply{http.StatusBadGateway, http.Header{"Content-Type": {"application/json"}}, legacy},
 			prime: primeOverflow, probe: probeOverflow,
-			want:     receivedFacts{Attempts: 1, Sentry: latchedAndLearned},
+			want:     receivedFacts{Attempts: 1, Sentry: latchedAndLearned, Statuses: []int{http.StatusBadGateway}, Bytes: size(legacy)},
 			wantCode: http.StatusRequestEntityTooLarge,
 		},
 		"error: genuine overflow in a committed compaction": {
 			provider: "local", sentryOn: true, headWritten: true, up: heldReply{http.StatusRequestEntityTooLarge, http.Header{"Content-Type": {"application/json"}}, genuine},
 			prime: primeOverflow, probe: probeOverflow,
-			want: receivedFacts{Attempts: 1, Sentry: latchedAndLearned},
+			want: receivedFacts{Attempts: 1, Sentry: latchedAndLearned, Statuses: []int{http.StatusRequestEntityTooLarge}, Bytes: size(genuine)},
 		},
+		// The sentry observes the complete body once, with its rearming, whether or not the
+		// client is still there to receive the reply.
 		"success: completed JSON is observed": {
 			provider: "codex", sentryOn: true, up: heldReply{http.StatusOK, http.Header{"Content-Type": {"application/json"}}, completed},
 			prime: primeCompletion, probe: probeCompletion,
-			want:      receivedFacts{Attempts: 1, Sentry: completionProbe{Rearmed: true, Usage: 2950}},
+			want:      receivedFacts{Attempts: 1, Sentry: completionProbe{Rearmed: true, Usage: 2950}, Statuses: []int{http.StatusOK}, Observed: []string{completed}, Bytes: size(completed)},
 			wantCode:  http.StatusOK,
 			wantUsage: map[string]any{"input_tokens": float64(2950), "output_tokens": float64(4)},
-			departed:  func(f *receivedFacts) { f.Sentry = completionProbe{Rearmed: false, Usage: 2950} },
 		},
 		"success: empty Codex completion": {
 			provider: "codex", up: heldReply{http.StatusServiceUnavailable, http.Header{"Content-Type": {"application/json"}}, empty},
-			want:      receivedFacts{Attempts: 1},
+			want:      receivedFacts{Attempts: 1, Statuses: []int{http.StatusServiceUnavailable}, Bytes: size(empty)},
 			wantLines: 1, wantCode: http.StatusOK,
 			departed: func(f *receivedFacts) { f.Lines = "" },
 		},
@@ -566,7 +591,10 @@ func TestDepartedClientRecordsReceivedFacts(t *testing.T) {
 				if result.Stream != nil {
 					_ = result.Stream.Body.Close()
 				}
-				facts := receivedFacts{Blocked: store.ReadBlocked(), Lines: sink.String(), Attempts: held.attempts.Load(), Usage: capture.Snapshot()}
+				facts := receivedFacts{
+					Blocked: store.ReadBlocked(), Lines: sink.String(), Attempts: held.attempts.Load(), Usage: capture.Snapshot(),
+					Statuses: capture.statuses, Observed: capture.observed, Bytes: capture.bytes,
+				}
 				if tc.probe != nil {
 					facts.Sentry = tc.probe(state)
 				}
@@ -600,6 +628,9 @@ func TestDepartedClientRecordsReceivedFacts(t *testing.T) {
 			}
 			equal(t, tc.want.Attempts, live.facts.Attempts)
 			equal(t, tc.want.Sentry, live.facts.Sentry)
+			equal(t, tc.want.Statuses, live.facts.Statuses)
+			equal(t, tc.want.Observed, live.facts.Observed)
+			equal(t, tc.want.Bytes, live.facts.Bytes)
 			equal(t, tc.wantLines, strings.Count(live.facts.Lines, "\n"))
 			if tc.wantLines == 1 {
 				checkOneLine(t, live.facts.Lines)
@@ -645,9 +676,10 @@ func (w *leavingWriter) Write(p []byte) (int, error) {
 }
 
 // TestCallbackEndsClientContext checks that a client which leaves while a callback of the reply
-// runs (the diagnostics writer, the upstream state store's clock, or a usage capture
-// observation) gets no client write: the context is checked after every callback and immediately
-// before the first byte of the response.
+// runs (the diagnostics writer, the upstream state store's clock, a usage capture observation, or
+// the message ID source) gets no client write: the context is checked after every callback and
+// immediately before the first byte of the response. A client that leaves before an empty reply is
+// written also gets no empty-completion line, because that line follows the written reply.
 func TestCallbackEndsClientContext(t *testing.T) {
 	openAI := http.Header{"Content-Type": {"application/json"}, "X-Openai-Request-Id": {"req-1"}}
 	const (
@@ -658,8 +690,8 @@ func TestCallbackEndsClientContext(t *testing.T) {
 		failed    = `{"error":{"type":"api_error","message":"upstream failed"}}`
 	)
 	tests := map[string]struct {
-		// leaveIn names the callback that ends the client context: "diagnostics", "clock", or
-		// a method of the usage capture.
+		// leaveIn names the callback that ends the client context: "diagnostics", "clock",
+		// "message id", or a method of the usage capture.
 		leaveIn     string
 		unwritable  bool
 		headWritten bool
@@ -670,7 +702,7 @@ func TestCallbackEndsClientContext(t *testing.T) {
 	}{
 		"error: diagnostics writer during the rejection line":         {leaveIn: "diagnostics", status: http.StatusForbidden, header: openAI, body: refused},
 		"error: diagnostics writer during the state failure line":     {leaveIn: "diagnostics", unwritable: true, status: http.StatusUnauthorized, header: openAI, body: refused},
-		"error: diagnostics writer during the empty completion line":  {leaveIn: "diagnostics", status: http.StatusServiceUnavailable, body: empty},
+		"error: message id source before the empty completion reply":  {leaveIn: "message id", status: http.StatusServiceUnavailable, body: empty},
 		"error: diagnostics writer during a committed rejection line": {leaveIn: "diagnostics", headWritten: true, status: http.StatusTooManyRequests, header: openAI, body: refused},
 		"error: state clock during the rate limit write":              {leaveIn: "clock", status: http.StatusTooManyRequests, header: openAI, body: refused},
 		"error: state clock during a committed rejection write":       {leaveIn: "clock", headWritten: true, status: http.StatusForbidden, header: openAI, body: refused},
@@ -708,6 +740,14 @@ func TestCallbackEndsClientContext(t *testing.T) {
 				Provider: "codex", AdvertisedModel: "shown", BackendModel: "engine", Body: []byte(`{"messages":[]}`),
 				Compaction: tc.headWritten, HeadWritten: tc.headWritten, Upstream: store, Retries: tc.retries, Usage: capture,
 			}
+			var idCalls atomic.Int32
+			if tc.leaveIn == "message id" {
+				req.NewMessageID = func() string {
+					idCalls.Add(1)
+					cancel()
+					return "msg_departed"
+				}
+			}
 			req = withDiagnostics(req, sink)
 			fixture := newProxy(t, func(w http.ResponseWriter, _ *http.Request) {
 				maps.Copy(w.Header(), tc.header)
@@ -727,6 +767,10 @@ func TestCallbackEndsClientContext(t *testing.T) {
 			}
 			if tc.leaveIn == "clock" && clockCalls.Load() == 0 {
 				t.Fatal("the upstream state was never written")
+			}
+			if tc.leaveIn == "message id" {
+				equal(t, int32(1), idCalls.Load())
+				equal(t, []string(nil), sink.lines)
 			}
 			checkNothingWritten(t, w, pre, result, err)
 		})

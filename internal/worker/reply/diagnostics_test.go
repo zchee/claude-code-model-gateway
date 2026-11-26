@@ -24,7 +24,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -273,7 +272,8 @@ func TestNilDiagnosticsDiscards(t *testing.T) {
 // TestRejectionLineAcrossShapes checks that every attributed OpenAI rejection writes the same
 // single line whatever its status and its evidence (headers of different names, or the body
 // alone), and that a rejection whose upstream state cannot be written writes exactly one other
-// line instead, the same whatever made the write fail.
+// line instead, the same whatever made the write fail. Each case compares its line with reference
+// lines the parent test writes first, so any single case can be run on its own.
 func TestRejectionLineAcrossShapes(t *testing.T) {
 	const (
 		plain  = `{"error":{"message":"request refused"}}`
@@ -290,6 +290,41 @@ func TestRejectionLineAcrossShapes(t *testing.T) {
 	others := http.Header{"X-Openai-Organization": {"org"}, "X-Openai-Version": {"2"}}
 	// A Retry-After this far ahead puts the rate limit's expiry outside the supported dates.
 	farFuture := http.Header{"X-Openai-Request-Id": {"req-1"}, "Retry-After": {"9000000000000000"}}
+	// reject answers one attributed rejection with its upstream state in a directory of kind dir,
+	// and returns the diagnostic output and whether the state was recorded.
+	reject := func(t *testing.T, status int, header http.Header, body string, dir stateDir) (string, bool) {
+		t.Helper()
+		path := t.TempDir()
+		switch dir {
+		case belowFile:
+			blocker := filepath.Join(path, "state-is-a-file")
+			if err := os.WriteFile(blocker, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			path = filepath.Join(blocker, "codex")
+		case relative:
+			path = filepath.Join("relative", "state")
+		}
+		store := &upstreamstate.Store{Dir: path, Now: func() time.Time { return time.Unix(1000, 0) }}
+		req := reply.Request{Provider: "codex", AdvertisedModel: "shown", BackendModel: "engine", Body: []byte(`{}`), Upstream: store}
+		got := diagnose(t, req, status, header, body)
+		equal(t, status, got.code)
+		checkOneLine(t, got.lines)
+		return got.lines, store.ReadBlocked() != nil
+	}
+
+	success, recorded := reject(t, http.StatusForbidden, requestID, plain, writable)
+	if !recorded {
+		t.Fatal("reference rejection with writable state recorded no upstream state")
+	}
+	failure, recorded := reject(t, http.StatusForbidden, requestID, plain, belowFile)
+	if recorded {
+		t.Fatal("reference rejection with state below a file recorded upstream state")
+	}
+	if success == failure {
+		t.Fatalf("a failed state write reports the success line %q", success)
+	}
+
 	tests := map[string]struct {
 		status int
 		header http.Header
@@ -311,47 +346,20 @@ func TestRejectionLineAcrossShapes(t *testing.T) {
 		"error: rate limit with an expiry out of date range":  {status: http.StatusTooManyRequests, header: farFuture, body: plain, failed: true},
 		"error: unauthorized with a relative state directory": {status: http.StatusUnauthorized, body: inBody, dir: relative, failed: true},
 	}
-	written := map[bool]map[string]string{false: {}, true: {}}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			dir := t.TempDir()
-			switch tc.dir {
-			case belowFile:
-				blocker := filepath.Join(dir, "state-is-a-file")
-				if err := os.WriteFile(blocker, nil, 0o600); err != nil {
-					t.Fatal(err)
-				}
-				dir = filepath.Join(blocker, "codex")
-			case relative:
-				dir = filepath.Join("relative", "state")
-			}
-			store := &upstreamstate.Store{Dir: dir, Now: func() time.Time { return time.Unix(1000, 0) }}
-			req := reply.Request{Provider: "codex", AdvertisedModel: "shown", BackendModel: "engine", Body: []byte(`{}`), Upstream: store}
-			got := diagnose(t, req, tc.status, tc.header, tc.body)
-			equal(t, tc.status, got.code)
-			checkOneLine(t, got.lines)
-			if recorded := store.ReadBlocked() != nil; recorded == tc.failed {
+			lines, recorded := reject(t, tc.status, tc.header, tc.body, tc.dir)
+			if recorded == tc.failed {
 				t.Errorf("upstream state recorded = %v, want %v", recorded, !tc.failed)
 			}
-			written[tc.failed][name] = got.lines
-		})
-	}
-	same := func(kind string, lines map[string]string) string {
-		if len(lines) == 0 {
-			t.Fatalf("no %s line was collected", kind)
-		}
-		names := slices.Sorted(maps.Keys(lines))
-		reference := lines[names[0]]
-		for _, name := range names[1:] {
-			if lines[name] != reference {
-				t.Errorf("%s line differs across rejections:\n%s: %q\n%s: %q", kind, names[0], reference, name, lines[name])
+			want, kind := success, "rejection"
+			if tc.failed {
+				want, kind = failure, "state failure"
 			}
-		}
-		return reference
-	}
-	success, failure := same("rejection", written[false]), same("state failure", written[true])
-	if success == failure {
-		t.Errorf("a failed state write reports the success line %q", success)
+			if lines != want {
+				t.Errorf("%s line differs from the reference:\n got: %q\nwant: %q", kind, lines, want)
+			}
+		})
 	}
 }
 
