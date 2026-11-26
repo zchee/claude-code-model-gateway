@@ -18,6 +18,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"slices"
 	"unicode/utf16"
 
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
@@ -55,7 +56,7 @@ var defaultModels = [...]Model{
 
 // DefaultModels returns a fresh slice of the built-in Grok backend models in declaration order.
 func DefaultModels() []Model {
-	return append([]Model(nil), defaultModels[:]...)
+	return slices.Clone(defaultModels[:])
 }
 
 func defaultModel(id string) (Model, bool) {

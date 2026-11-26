@@ -180,11 +180,17 @@ func (b *Branch) Prepare(w http.ResponseWriter, r *http.Request, req Request) (o
 // locally with HTTP 502, error type "api_error", fixed message
 // "model-gateway: Grok response could not be translated.", and StatusOverride "upstream_error".
 //
+// An upstream response body that stops at the upstream inactivity timeout before any client header
+// was written is answered with HTTP 502, error type "api_error", message
+// "model-gateway: Grok upstream failed: Grok upstream timeout", and StatusOverride
+// "upstream_error". Any other break of the body before the client headers, and every break after
+// them, aborts the client response: Handle returns the outcome facts alongside an error wrapping
+// http.ErrAbortHandler.
+//
 // After r.Context() is canceled, Handle writes nothing more to w but continues consuming
 // the upstream stream; the configured Client governs its lifetime. outcome.Result.Cancelled
-// is always false here and is decided by the worker root. If the upstream breaks after response
-// headers are committed, Handle returns the terminal outcome facts alongside http.ErrAbortHandler
-// rather than panicking.
+// is always false here and is decided by the worker root. Handle never panics with
+// http.ErrAbortHandler itself.
 func (b *Branch) Handle(w http.ResponseWriter, r *http.Request, req Request) (outcome.Result, error) {
 	payload, decodeErr := jsonx.DecodeWire(req.RawBody)
 	if decodeErr != nil {
@@ -206,12 +212,15 @@ func (b *Branch) Handle(w http.ResponseWriter, r *http.Request, req Request) (ou
 
 	// The source translates after reading the token and has no answer when translation throws
 	// (the rejection of its async forwardGrok is unhandled); the port refuses the request locally.
+	// An undecodable body is refused without translating it.
 	var body []byte
-	translated, err := TranslateRequest(payload, req.BackendModel)
-	if err == nil && decodeErr == nil {
-		body, err = jsonx.EncodeWire(translated)
+	if err = decodeErr; err == nil {
+		var translated jsonx.WireValue
+		if translated, err = TranslateRequest(payload, req.BackendModel); err == nil {
+			body, err = jsonx.EncodeWire(translated)
+		}
 	}
-	if decodeErr != nil || err != nil {
+	if err != nil {
 		res.Status, res.StatusOverride = http.StatusBadRequest, "invalid_request"
 		writeJSON(client, w, http.StatusBadRequest, errorBody("invalid_request_error", units(untranslatableRequest)))
 		return res, nil
@@ -287,6 +296,18 @@ type handling struct {
 	compactionSet bool
 }
 
+// brokeBeforeHeaders handles an upstream body that failed before any client header was written:
+// the inactivity timeout gets the source's upstream-timeout 502 (lib/request-worker.js:2350-2357),
+// any other failure aborts as broke does.
+func (h *handling) brokeBeforeHeaders(err error) (outcome.Result, error) {
+	if !errors.Is(err, upstream.ErrTimeout) {
+		return h.broke(err)
+	}
+	h.res.Status, h.res.StatusOverride = http.StatusBadGateway, "upstream_error"
+	writeJSON(h.client, h.w, http.StatusBadGateway, errorBody("api_error", units(upstreamFailedPrefix+upstreamFailedTimeout)))
+	return h.res, nil
+}
+
 // broke reports the facts of an upstream body that failed before its end, with the error the
 // worker root turns into an aborted client response.
 func (h *handling) broke(err error) (outcome.Result, error) {
@@ -300,7 +321,7 @@ func (h *handling) broke(err error) (outcome.Result, error) {
 // outdated answers the backend's refusal of the client version (lib/request-worker.js:2272-2281).
 func (h *handling) outdated(resp *upstream.Response) (outcome.Result, error) {
 	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
-		return h.broke(err)
+		return h.brokeBeforeHeaders(err)
 	}
 	writeJSON(h.client, h.w, resp.StatusCode, errorBody("api_error", units(outdatedVersionMessage)))
 	return h.res, nil
@@ -310,7 +331,7 @@ func (h *handling) outdated(resp *upstream.Response) (outcome.Result, error) {
 func (h *handling) failed(resp *upstream.Response) (outcome.Result, error) {
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return h.broke(err)
+		return h.brokeBeforeHeaders(err)
 	}
 	detail := units("Grok upstream returned " + strconv.Itoa(resp.StatusCode))
 	if parsed, err := jsonx.DecodeWire(raw); err == nil {
@@ -352,18 +373,12 @@ func (h *handling) json(resp *upstream.Response) (outcome.Result, error) {
 			break
 		}
 		if err != nil {
-			return h.broke(err)
+			return h.brokeBeforeHeaders(err)
 		}
 	}
 	response, err := jsonx.DecodeWire(raw)
 	if err != nil {
 		response = null()
-	}
-	if u := get(response, "usage"); truthy(u) {
-		// The source's conversion throws where translation below fails too, before it records.
-		if converted, err := usage(u); err == nil {
-			h.observeSentry(messageDelta(converted), isString(get(response, "status"), "completed") && !h.isCompaction())
-		}
 	}
 	translated, err := TranslateResponseChecked(response, h.req.AdvertisedModel, h.branch.now)
 	var out []byte
@@ -374,6 +389,12 @@ func (h *handling) json(resp *upstream.Response) (outcome.Result, error) {
 		h.res.Status, h.res.StatusOverride = http.StatusBadGateway, "upstream_error"
 		writeJSON(h.client, h.w, http.StatusBadGateway, errorBody("api_error", units(untranslatableResponse)))
 		return h.res, nil
+	}
+	// The sentry sees only a reply the client will receive: one that was translated and encoded.
+	if u := get(response, "usage"); truthy(u) {
+		if converted, err := usage(u); err == nil {
+			h.observeSentry(messageDelta(converted), isString(get(response, "status"), "completed") && !h.isCompaction())
+		}
 	}
 	if h.req.Usage != nil {
 		h.req.Usage.ObserveJSON(out)
