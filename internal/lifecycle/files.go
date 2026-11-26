@@ -20,8 +20,10 @@ import (
 	json "encoding/json/v2"
 	"errors"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"syscall"
 	"time"
@@ -34,7 +36,7 @@ import (
 type Files struct {
 	StateDir string
 	Now      func() time.Time
-	// AppendFile appends one complete journal record. Nil uses atomicfile.AppendFile.
+	// AppendFile overrides the single append to the open logs directory.
 	AppendFile func(path string, data []byte, mode fs.FileMode) error
 }
 
@@ -115,13 +117,17 @@ func (f Files) Resume() error {
 
 type failure struct {
 	PID        *int    `json:"supervisorPid"`
-	Generation *string `json:"generation,omitzero"`
+	Generation any     `json:"generation,omitzero"`
 	Message    *string `json:"message"`
 }
 
 // WriteStartupFailure records a supervisor failure, omitting an unspecified generation.
 func (f Files) WriteStartupFailure(pid int, generation *string, message string) error {
-	return f.write(failureFile, failure{&pid, generation, &message}, 0o666)
+	v := failure{PID: &pid, Message: &message}
+	if generation != nil {
+		v.Generation = *generation
+	}
+	return f.write(failureFile, v, 0o666)
 }
 
 // StartupFailure returns the matching supervisor's message; an empty generation matches any.
@@ -136,10 +142,25 @@ func (f Files) StartupFailure(pid int, generation string) (string, bool) {
 	defer func() { _ = dir.Close() }()
 	data, err := dir.ReadFile(failureFile)
 	var v failure
-	if err != nil || !decodeRecord(data, &v) || v.PID == nil || *v.PID != pid || v.Message == nil || generation != "" && (v.Generation == nil || *v.Generation != generation) {
+	if err != nil || !decodeRecord(data, &v) || v.PID == nil || *v.PID != pid || v.Message == nil || generation != "" && v.Generation != generation {
 		return "", false
 	}
 	return *v.Message, true
+}
+
+// truthyChild applies the JavaScript test before JSON.stringify converts infinities to null.
+func truthyChild(value any) bool {
+	v := reflect.ValueOf(value)
+	switch v.Kind() {
+	case reflect.Invalid:
+		return false
+	case reflect.Float32, reflect.Float64:
+		return v.Float() != 0 && !math.IsNaN(v.Float())
+	case reflect.Bool, reflect.String, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr, reflect.Pointer:
+		return !v.IsZero()
+	default:
+		return true
+	}
 }
 
 func (f Files) record(event string, fields map[string]any) ([]byte, error) {
@@ -150,29 +171,21 @@ func (f Files) record(event string, fields map[string]any) ([]byte, error) {
 		}
 		return nil
 	}
-	var child jsontext.Value
-	if v := fields["child"]; v != nil {
-		b, err := compactRecord(v)
-		if err != nil {
-			return nil, err
-		}
-		switch string(b) {
-		case "null", "false", `""`, "0":
-		default:
-			child = b
-		}
+	var child any
+	if v := fields["child"]; truthyChild(v) {
+		child = v
 	}
 	return compactRecord(struct {
-		At        string         `json:"at"`
-		Event     string         `json:"event"`
-		Component *any           `json:"component,omitzero"`
-		PID       *any           `json:"pid,omitzero"`
-		StartedAt any            `json:"startedAt,omitzero"`
-		Outcome   any            `json:"outcome,omitzero"`
-		ErrorType any            `json:"errorType,omitzero"`
-		Signal    *any           `json:"signal,omitzero"`
-		ExitCode  *any           `json:"exitCode,omitzero"`
-		Child     jsontext.Value `json:"child,omitzero"`
+		At        string `json:"at"`
+		Event     string `json:"event"`
+		Component *any   `json:"component,omitzero"`
+		PID       *any   `json:"pid,omitzero"`
+		StartedAt any    `json:"startedAt,omitzero"`
+		Outcome   any    `json:"outcome,omitzero"`
+		ErrorType any    `json:"errorType,omitzero"`
+		Signal    *any   `json:"signal,omitzero"`
+		ExitCode  *any   `json:"exitCode,omitzero"`
+		Child     any    `json:"child,omitzero"`
 	}{f.timestamp(), event, field("component"), field("pid"), fields["startedAt"], fields["outcome"], fields["errorType"], field("signal"), field("exitCode"), child})
 }
 
@@ -205,11 +218,12 @@ func (f Files) Record(event string, fields map[string]any) {
 	if err != nil {
 		return
 	}
-	appendFile := f.AppendFile
-	if appendFile == nil {
-		appendFile = atomicfile.AppendFile
+	data = append(data, '\n')
+	if f.AppendFile != nil {
+		_ = f.AppendFile(filepath.Join(logs, journal), data, 0o666)
+		return
 	}
-	_ = appendFile(filepath.Join(logs, journal), append(data, '\n'), 0o666)
+	_ = dir.AppendFile(journal, data, 0o666)
 }
 
 // Records returns parseable lifecycle records in file order.

@@ -21,4 +21,5 @@ import (
 	"errors"
 )
 
-func (l Lock) acquire(context.Context, string) (func(), error) { return nil, errors.ErrUnsupported }
+// Acquire returns an unsupported-operation error without inspecting any process.
+func (l Lock) Acquire(context.Context) (func(), error) { return nil, errors.ErrUnsupported }

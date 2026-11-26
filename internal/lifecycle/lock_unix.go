@@ -19,7 +19,6 @@ package lifecycle
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -29,6 +28,8 @@ import (
 	"uuid"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/zchee/claude-code-model-gateway/internal/procinfo"
 )
 
 const lockName = "lifecycle.lock"
@@ -81,7 +82,18 @@ func (l Lock) reap(ctx context.Context, parent *os.File) {
 	}
 }
 
-func (l Lock) acquire(ctx context.Context, birth string) (release func(), err error) {
+// Acquire atomically installs a prepared directory and returns a token-specific release.
+func (l Lock) Acquire(ctx context.Context) (release func(), err error) {
+	if l.Processes == nil {
+		l.Processes = nativeProcesses{procinfo.New(nil)}
+	}
+	state, birth := l.Processes.Lookup(ctx, l.PID)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if state != Alive || birth == "" {
+		return nil, errors.New("could not establish lifecycle lock process identity; run doctor")
+	}
 	if !validStateDir(l.StateDir) {
 		return nil, fs.ErrInvalid
 	}
@@ -110,6 +122,8 @@ func (l Lock) acquire(ctx context.Context, birth string) (release func(), err er
 			_ = parent.Close()
 		}
 	}()
+	// Like the legacy protocol, rename assumes other writers in the state directory
+	// leave this candidate name bound to our directory until installation.
 	candidate := lockName + ".candidate-" + uuid.NewV4().String()
 	fd := int(parent.Fd())
 	if err := unix.Mkdirat(fd, candidate, 0o700); err != nil {
@@ -160,7 +174,7 @@ func (l Lock) acquire(ctx context.Context, birth string) (release func(), err er
 		}
 		l.reap(ctx, parent)
 		if !now().Before(deadline) {
-			return nil, fmt.Errorf("gateway lifecycle is busy or ownership is unknown (%s); retry recover or run doctor", filepath.Join(l.StateDir, lockName))
+			return nil, l.busy()
 		}
 		const interval = 50 * time.Millisecond
 		if l.Wait != nil {

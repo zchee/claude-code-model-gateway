@@ -21,8 +21,11 @@ package lifecycle
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
-	"sync/atomic"
+	"math"
+	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/zchee/claude-code-model-gateway/internal/procinfo"
@@ -56,16 +59,23 @@ type Owner struct {
 
 // Stale reports whether a local owner's process is absent or its PID was reused.
 func Stale(ctx context.Context, owner *Owner, host string, processes ProcessSource) bool {
-	if owner == nil || owner.Host != host || owner.PID <= 0 || owner.StartedAt == nil {
+	if processes == nil || owner == nil || owner.Host != host || owner.PID <= 0 || owner.PID > math.MaxInt32 || owner.StartedAt == nil {
 		return false
 	}
 	state, birth := processes.Lookup(ctx, owner.PID)
-	return state == Absent || state == Alive && birth != "" && birth != *owner.StartedAt
+	return staleBirth(*owner.StartedAt, state, birth)
+}
+
+func staleBirth(recorded string, state ProcessState, birth string) bool {
+	return state == Absent || state == Alive && birth != "" && birth != recorded
 }
 
 type nativeProcesses struct{ probe procinfo.Probe }
 
 func (p nativeProcesses) Lookup(ctx context.Context, pid int) (ProcessState, string) {
+	if pid <= 0 || pid > math.MaxInt32 {
+		return Unknown, ""
+	}
 	birth, err := p.probe.Birth(ctx, pid)
 	switch {
 	case err == nil:
@@ -90,38 +100,53 @@ type Lock struct {
 	NewToken  func() string
 }
 
-// Acquire atomically installs a prepared directory and returns a token-specific release.
-func (l Lock) Acquire(ctx context.Context) (func(), error) {
-	if l.Processes == nil {
-		l.Processes = nativeProcesses{procinfo.New(nil)}
-	}
-	state, birth := l.Processes.Lookup(ctx, l.PID)
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if state != Alive || birth == "" {
-		return nil, errors.New("could not establish lifecycle lock process identity; run doctor")
-	}
-	return l.acquire(ctx, birth)
+type ownershipKey struct{}
+
+type lease struct {
+	stateDir string
+	host     string
+	pid      int
+	mu       sync.Mutex
+	closed   bool
+	nested   sync.WaitGroup
 }
 
-type ownershipKey struct{ stateDir string }
+func (l Lock) busy() error {
+	return fmt.Errorf("gateway lifecycle is busy or ownership is unknown (%s); retry recover or run doctor", filepath.Join(l.StateDir, "lifecycle.lock"))
+}
 
-// With runs operation under the lock, permitting reentry only during its active context.
+// With runs operation under the lock. The inherited context admits nested callbacks
+// for this state directory and owner only until the outer callback returns. Later
+// calls are refused, and release waits for every admitted callback to finish.
+// A nested callback must not wait for the outer With to return.
 func (l Lock) With(ctx context.Context, operation func(context.Context) error) error {
-	key := ownershipKey{l.StateDir}
-	if active, ok := ctx.Value(key).(*atomic.Bool); ok && active.Load() {
+	if held, ok := ctx.Value(ownershipKey{}).(*lease); ok {
+		if held.stateDir != l.StateDir || held.pid != l.PID || held.host != l.Host {
+			return errors.New("lifecycle context belongs to a different lock owner or state directory")
+		}
+		held.mu.Lock()
+		if held.closed {
+			held.mu.Unlock()
+			return l.busy()
+		}
+		held.nested.Add(1)
+		held.mu.Unlock()
+		defer held.nested.Done()
 		return operation(ctx)
 	}
 	release, err := l.Acquire(ctx)
 	if err != nil {
 		return err
 	}
-	defer release()
-	var active atomic.Bool
-	active.Store(true)
-	defer active.Store(false)
-	return operation(context.WithValue(ctx, key, &active))
+	held := &lease{stateDir: l.StateDir, pid: l.PID, host: l.Host}
+	defer func() {
+		held.mu.Lock()
+		held.closed = true
+		held.mu.Unlock()
+		held.nested.Wait()
+		release()
+	}()
+	return operation(context.WithValue(ctx, ownershipKey{}, held))
 }
 
 func clock(now func() time.Time) func() time.Time {
