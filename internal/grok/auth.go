@@ -29,6 +29,7 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/catalog"
 	"github.com/zchee/claude-code-model-gateway/internal/jsdate"
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
+	"github.com/zchee/claude-code-model-gateway/internal/worker/upstream"
 )
 
 // DefaultRefreshSkew is the lead time before token expiry at which a refresh is triggered.
@@ -379,7 +380,9 @@ func (s *AuthStore) wait(ctx context.Context, f *flight) (string, bool, error) {
 	}
 }
 
-// waitIdle returns once no flight is in progress, waiting for each one it finds to end.
+// waitIdle returns once no flight is in progress, waiting for each one it finds to end. A flight
+// leaves s.flight only after its context was cancelled and done was closed, both under s.mu, so
+// when waitIdle returns every flight it could see has finished its cleanup.
 func (s *AuthStore) waitIdle() {
 	for {
 		s.mu.Lock()
@@ -401,12 +404,14 @@ func (s *AuthStore) start(ctx context.Context, forced bool) *flight {
 	go func() {
 		token, exchanged, err := s.run(work, f, forced)
 		s.mu.Lock()
+		defer s.mu.Unlock()
 		f.token, f.exchanged, f.err = token, exchanged, err
-		// A flight stays in s.flight until it ends, so no other flight can have replaced it.
-		s.flight = nil
-		s.mu.Unlock()
+		// The flight's cleanup comes before the store is published idle, so a waitIdle that finds
+		// no flight has nothing of this one left to wait for.
 		cancel()
 		close(f.done)
+		// A flight stays in s.flight until it ends, so no other flight can have replaced it.
+		s.flight = nil
 	}()
 	return f
 }
@@ -514,7 +519,8 @@ func (s *AuthStore) tokenEndpoint(ctx context.Context, entry jsonx.WireValue) (s
 // besides the form content type, and a body that is not JSON reads as null. Unlike the source, the
 // request and its body read end after authRequestTimeout (errAuthRequestEnded), and a body above
 // maxAuthBody is refused (errAuthBodyTooLarge) whether or not the read also failed. The deadline
-// holds only with a transport that honours the request's context.
+// holds only with a transport that honours the request's context. A response that switched
+// protocols is closed and fails as a request that got no response does.
 //
 // For an exchange, f is the flight it belongs to: the request is built first, then commit decides
 // whether it is sent, as the last step before the transport call. A flight every waiter has left
@@ -539,6 +545,10 @@ func (s *AuthStore) requestJSON(ctx context.Context, f *flight, method, target, 
 		return 0, jsonx.WireValue{}, errAuthRequestEnded
 	}
 	resp, err := s.transport.RoundTrip(req)
+	if err == nil {
+		// A switched connection is refused like a failed request: the deadline would not end its read.
+		err = upstream.RefuseSwitch(resp)
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			return 0, jsonx.WireValue{}, errAuthRequestEnded

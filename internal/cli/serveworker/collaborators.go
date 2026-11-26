@@ -17,6 +17,7 @@ package serveworker
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -73,11 +74,19 @@ const (
 	// statusWaitDelay bounds how long an auth status command's output pipes are drained after its
 	// deadline killed it, so a child that keeps them open cannot outlive the check.
 	statusWaitDelay = time.Second
+	// maxStatusOutput bounds each output stream of an auth status command: Node's execFile default
+	// maxBuffer, which the source's call keeps.
+	maxStatusOutput = 1 << 20
+	// establishTimeout bounds the dial and TLS handshake of a catalog, listing or readiness connection.
+	// No request on those transports waits longer than a catalog page, and with keep-alives off a
+	// connection that arrives after its request gave up serves no other request.
+	establishTimeout = modelcache.AnthropicPageTimeout
 )
 
 // lifetime owns everything of one worker that outlives a single call: the servers and their Serve
-// loops, every request handler, the service context, the background catalog and readiness work, the
-// Grok credential refresh, the upstream client and the exporters. stop is the only place it ends.
+// loops, every request handler, the service context, the background catalog and readiness work and
+// their connections, the Grok credential refresh, the upstream client and the exporters. stop is the
+// only place it ends.
 type lifetime struct {
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -87,6 +96,7 @@ type lifetime struct {
 	grok      *grok.Branch
 	upstream  *upstream.Client
 	auth      *http.Transport
+	dials     *dials
 	usage     *usage.Emitter
 	telemetry *telemetry.Recorder
 
@@ -187,7 +197,8 @@ func (l *lifetime) awaitLive(now <-chan struct{}) {
 //  5. close admission and join every request handler, so none still submits work below;
 //  6. join the Grok credential refresh: a token exchange already sent finishes under its own
 //     deadline and stores its result, a discovery has ended with the service;
-//  7. close the upstream client and the credential transport's idle connections;
+//  7. close the upstream client and the credential transport's idle connections, and end and join
+//     the connection establishment of the catalog and readiness transports;
 //  8. join the readiness check, the model cache, the usage exporter and the trace exporter.
 //
 // A nil stopper stops at once. Nothing of the worker runs after stop returns.
@@ -211,6 +222,7 @@ func (l *lifetime) stop(stop *stopper) {
 		}
 		_ = l.upstream.Close()
 		l.auth.CloseIdleConnections()
+		l.dials.close()
 		if l.readiness != nil {
 			l.readiness.Wait()
 		}
@@ -224,6 +236,81 @@ func (l *lifetime) stop(stop *stopper) {
 			l.telemetry.Wait()
 		}
 	})
+}
+
+// dials owns the transports of the worker's catalog, listing and readiness requests. Their
+// connections are bound to its context, which ends with the service: no dial starts afterwards, a dial
+// or TLS handshake in progress is cancelled and every connection closes, the connection of a response
+// that switched protocols included. net/http carries on a dial after the request that started it
+// ended, so close also waits for every dial and handshake still running; what net/http does with the
+// result once the dial function returned is not part of that wait. Unlike the package transports these
+// replace, establishment is also bounded by establishTimeout.
+type dials struct {
+	ctx     context.Context
+	cancel  context.CancelFunc
+	mu      sync.Mutex
+	closed  bool // no dial starts any more; guarded by mu
+	running sync.WaitGroup
+}
+
+func newDials(parent context.Context) *dials {
+	ctx, cancel := context.WithCancel(parent)
+	return &dials{ctx: ctx, cancel: cancel}
+}
+
+// transport returns a new transport of the upstream policy bound to d. Like the package transports
+// it replaces, it never consults the environment's proxy settings, keeps no idle connection and asks
+// for a gzip body that net/http decodes. It never returns a response that switched protocols.
+func (d *dials) transport() http.RoundTripper {
+	t := upstream.NewLifetimeTransport(upstream.Options{}, d.ctx)
+	t.DisableKeepAlives = true
+	t.DisableCompression = false
+	t.DialContext = d.track(t.DialContext)
+	t.DialTLSContext = d.track(t.DialTLSContext)
+	return refusingSwitch{t}
+}
+
+// refusingSwitch fails a request whose response switched protocols, as the upstream client does,
+// after closing that connection. The readiness check and the local provider probes read a body
+// whatever its status, and no deadline of theirs would end the read of a switched connection.
+type refusingSwitch struct{ *http.Transport }
+
+func (t refusingSwitch) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.Transport.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	if err := upstream.RefuseSwitch(resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// track counts every call of dial until it returns and bounds it by establishTimeout. Once close
+// began, no call starts.
+func (d *dials) track(dial func(ctx context.Context, network, addr string) (net.Conn, error)) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		d.mu.Lock()
+		if d.closed {
+			d.mu.Unlock()
+			return nil, net.ErrClosed
+		}
+		d.running.Add(1)
+		d.mu.Unlock()
+		defer d.running.Done()
+		ctx, cancel := context.WithTimeout(ctx, establishTimeout)
+		defer cancel()
+		return dial(ctx, network, addr)
+	}
+}
+
+// close ends d's context and returns once no dial or handshake of its transports is running.
+func (d *dials) close() {
+	d.cancel()
+	d.mu.Lock()
+	d.closed = true
+	d.mu.Unlock()
+	d.running.Wait()
 }
 
 // drain closes every listener, waits for the live responses (lib/request-worker.js:1235-1258), cancels
@@ -292,7 +379,9 @@ func buildWorker(s workerSetup) (worker.Options, *lifetime, error) {
 	client := upstream.NewClient(upstream.Options{})
 	// Credential discovery and refresh never share the inference client's pool or lifetime.
 	authTransport := upstream.NewTransport(upstream.Options{})
-	life := &lifetime{ctx: serviceCtx, cancel: cancel, upstream: client, auth: authTransport, changed: make(chan struct{}, 1)}
+	// The catalog, listing and readiness requests get transports of their own, bound to the service.
+	owned := newDials(serviceCtx)
+	life := &lifetime{ctx: serviceCtx, cancel: cancel, upstream: client, auth: authTransport, dials: owned, changed: make(chan struct{}, 1)}
 	fail := func(err error) (worker.Options, *lifetime, error) {
 		life.stop(nil)
 		return worker.Options{}, nil, err
@@ -326,7 +415,7 @@ func buildWorker(s workerSetup) (worker.Options, *lifetime, error) {
 		ProxyBaseURL:     proxyBase,
 		AnthropicBaseURL: anthropicBase,
 		DefaultBaseURL:   defaultBase,
-		Client:           &http.Client{},
+		Client:           &http.Client{Transport: owned.transport()},
 		Clock:            now,
 		Routes:           routes,
 		Sentry:           state,
@@ -390,6 +479,7 @@ func buildWorker(s workerSetup) (worker.Options, *lifetime, error) {
 	probe := readiness.ProxyAuthProbe{
 		ProxyBinary:    proxyBinary(s.state),
 		ProxyModelsURL: proxyBase + "/v1/models",
+		Client:         &http.Client{Transport: owned.transport()},
 		RunAuthStatus:  runStatus,
 	}
 	life.readiness = readiness.NewSharedCheck(serviceCtx, func(ctx context.Context) readiness.ProxyAuthResult {
@@ -459,12 +549,45 @@ func proxyBinary(state string) string {
 	return filepath.Join(state, "bin", name)
 }
 
+// errStatusOutput reports an auth status command that printed more than maxStatusOutput bytes on
+// one stream.
+var errStatusOutput = errors.New("model-gateway: auth status output exceeded its limit")
+
 // runStatus runs one auth status command until it exits or ctx ends, and returns what it printed.
+// Each stream holds at most maxStatusOutput bytes, as execFile's default maxBuffer does for the
+// source's call (lib/request-worker.js:49-53). A stream that goes past it stops the command, which is
+// killed and reaped, and the run fails with errStatusOutput and no output.
 func runStatus(ctx context.Context, binary string, args []string) (stdout, stderr []byte, err error) {
+	ctx, stop := context.WithCancel(ctx)
+	defer stop()
 	cmd := exec.CommandContext(ctx, binary, args...)
-	var out, errOut bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &errOut
+	out, errOut := &cappedOutput{overflow: stop}, &cappedOutput{overflow: stop}
+	cmd.Stdout, cmd.Stderr = out, errOut
 	cmd.WaitDelay = statusWaitDelay
 	err = cmd.Run()
-	return out.Bytes(), errOut.Bytes(), err
+	// Run has joined the goroutines that copy the two streams, so their state is settled here.
+	if out.exceeded || errOut.exceeded {
+		return nil, nil, errStatusOutput
+	}
+	return out.buf.Bytes(), errOut.buf.Bytes(), err
+}
+
+// cappedOutput collects one output stream of a command up to maxStatusOutput bytes. The write that
+// would go past the limit stores nothing, calls overflow and fails, which ends the copy of the
+// stream; every later write fails too. Only one goroutine writes to it.
+type cappedOutput struct {
+	buf      bytes.Buffer
+	overflow func()
+	exceeded bool
+}
+
+func (c *cappedOutput) Write(p []byte) (int, error) {
+	if c.exceeded || c.buf.Len()+len(p) > maxStatusOutput {
+		if !c.exceeded {
+			c.exceeded = true
+			c.overflow()
+		}
+		return 0, errStatusOutput
+	}
+	return c.buf.Write(p)
 }

@@ -62,8 +62,9 @@ func readPinOverrides(path string) map[string]string {
 
 // readDetectedPins follows readDetectedPinCache (lib/pins.js:79-93): the CLI version must be a string;
 // each detected pin and each saved catalog pin is normalized for its alias and dropped when it is not
-// a pin of that alias; an alias's detection version defaults to the CLI version. A file that is
-// missing, unparsable or not an object yields an empty cache.
+// a pin of that alias; a saved catalog pin is also dropped when it does not outrank the alias's
+// shipped pin (validatedCatalogPins, lib/pins.js:123-127); an alias's detection version defaults to
+// the CLI version. A file that is missing, unparsable or not an object yields an empty cache.
 func readDetectedPins(path string) pins.Cache {
 	saved, ok := readStateObject(path)
 	if !ok {
@@ -86,10 +87,8 @@ func readDetectedPins(path string) pins.Cache {
 				}
 			}
 		}
-		// The source also drops a catalog pin that does not outrank the shipped pin; such a pin can
-		// never become an effective value, which only ever moves to a strictly newer catalog pin.
 		if value, ok := stringMember(catalog, alias); ok {
-			if pin, ok := pins.NormalizeDetected(alias, value); ok {
+			if pin, ok := pins.NormalizeDetected(alias, value); ok && pins.OutranksShipped(alias, pin) {
 				cache.CatalogPins[alias] = pin
 			}
 		}

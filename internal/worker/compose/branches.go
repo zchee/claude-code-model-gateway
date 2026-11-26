@@ -340,7 +340,9 @@ func (c *composer) send(req upstream.Request) upstream.Send {
 // bounded only by its own short timer, and only a closed connection ends the read that is in
 // flight meanwhile. Once the service context has ended, the transport's cancellation closes the
 // connection and ends that read by itself, so a close made then first waits for the read to return
-// and net/http never starts the drain. A close made while the service runs is not delayed.
+// and net/http never starts the drain. A close made while the service runs is not delayed. Every
+// body wrapped here is one the cancellation ends: the upstream client never hands out the
+// connection of a response that switched protocols, whose reads no cancellation would end.
 type serviceBody struct {
 	io.ReadCloser
 	service context.Context

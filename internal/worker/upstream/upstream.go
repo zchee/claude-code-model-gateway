@@ -177,6 +177,16 @@ func NewTransport(opts Options) *http.Transport {
 	return newTransport(opts, nil)
 }
 
+// NewLifetimeTransport constructs a transport with the policy of NewTransport whose connections are
+// bound to lifetime: once lifetime has ended no dial starts, an outstanding dial or TLS handshake is
+// cancelled, a connection whose dial finishes afterwards is closed at once, and every connection the
+// transport made is closed, the connection of a response that switched protocols included. As with
+// NewTransport, a connect also ends after one hour and a handshake after one hour without socket
+// activity. A nil lifetime binds nothing, as NewTransport does.
+func NewLifetimeTransport(opts Options, lifetime context.Context) *http.Transport {
+	return newTransport(opts, lifetime)
+}
+
 // newTransport builds the shared transport policy. A non-nil lifetime ends outstanding dials and
 // closes every connection of the transport when it is done.
 func newTransport(opts Options, lifetime context.Context) *http.Transport {
@@ -222,7 +232,9 @@ func NewClient(opts Options) *Client {
 // ctx's error or cause; when Close ended it, the closed-client error. Otherwise a failed TLS
 // handshake, and a TLS failure or any other failure after the connection was obtained, are each
 // reported as one fixed error, so no upstream bytes reach the error text; the fixed error of a TLS
-// failure unwraps to the TLS layer's error. A failed dial keeps its own error.
+// failure unwraps to the TLS layer's error. A failed dial keeps its own error. A response that
+// switches protocols (status 101 with the Upgrade and Connection headers net/http honours) is never
+// handed out: its connection is closed and Do reports the fixed response error.
 //
 // ctx's cause is recognised only when its value can be compared. A cause whose value cannot be
 // compared (a struct whose interface field holds a slice, for example) is never matched: Do then
@@ -259,13 +271,18 @@ func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 		GetConn: func(string) { connected.Store(false) },
 		GotConn: func(httptrace.GotConnInfo) { connected.Store(true) },
 	})
-	resp, err := c.transport.RoundTrip(outbound.WithContext(traced)) //nolint:bodyclose // The body is handed to the caller inside Response, which owns closing it.
+	resp, err := c.transport.RoundTrip(outbound.WithContext(traced))
 	if err != nil {
 		// The cause names what ended the request: the caller's context, which passes its own cause
 		// on, or the client's closing. It is read before release ends the context itself.
 		cause := context.Cause(reqCtx)
 		release()
 		return nil, c.exchangeError(ctx, cause, err, connected.Load())
+	}
+
+	if err := RefuseSwitch(resp); err != nil {
+		release()
+		return nil, err
 	}
 
 	relay := ResponseHeaders(resp.Header)
@@ -324,6 +341,23 @@ func (c *Client) exchangeError(ctx context.Context, cause, err error, connected 
 	if isTLSError(err) {
 		return &tlsError{err: err}
 	}
+	return errResponseFailed
+}
+
+// RefuseSwitch closes the connection of a response that switched protocols and returns the fixed
+// error of a failed response, "upstream response failed"; for any other response it returns nil and
+// leaves the body alone. net/http hands over the connection of a switch (status 101 with the Upgrade
+// and Connection headers it honours) as a body that also implements io.Writer, and neither the
+// request's context nor the transport's deadlines end a read of it then. The source registers no
+// upgrade listener on its requests, so Node destroys such a socket and the request fails.
+func RefuseSwitch(resp *http.Response) error {
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		return nil
+	}
+	if _, ok := resp.Body.(io.Writer); !ok {
+		return nil
+	}
+	_ = resp.Body.Close()
 	return errResponseFailed
 }
 

@@ -282,7 +282,8 @@ func (b *Branch) Handle(w http.ResponseWriter, r *http.Request, req Request) (ou
 	}
 }
 
-// Wait blocks until the credential refresh in flight, if any, has ended. A refresh whose token
+// Wait blocks until the credential refresh in flight, if any, has ended and released its own
+// context. A refresh whose token
 // exchange was already sent finishes under its own deadline and stores what the issuer returned; one
 // that has not reached its exchange ends once every caller waiting for it has left, which a caller
 // whose ServiceContext ended has done. The worker calls Wait at shutdown, after its request

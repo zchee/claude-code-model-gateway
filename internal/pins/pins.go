@@ -207,6 +207,19 @@ func (in Inputs) Effective() map[string]Pin {
 	return result
 }
 
+// OutranksShipped reports whether pin may stand in for the shipped pin of the named alias family, as
+// the source's detectedPinOutranksShipped decides (lib/pins.js:119-121): pin is not one of the
+// family's retired shipped pins and does not rank below its shipped pin. An empty pin or an unknown
+// family is never eligible.
+func OutranksShipped(family, pin string) bool {
+	for _, a := range aliases() {
+		if a.name == family {
+			return a.accepts(pin)
+		}
+	}
+	return false
+}
+
 func (a alias) accepts(pin string) bool {
 	if pin == "" || slices.Contains(a.retired, pin) {
 		return false
