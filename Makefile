@@ -113,6 +113,20 @@ test-json:
 test-process-json:
 	@$(require_test_venue) && go test -json -count=1 -tags process ./...
 
+.PHONY: test-race test-process-race test-race-json test-process-race-json
+
+test-race:
+	@$(require_test_venue) && go test -race -count=1 ./...
+
+test-process-race:
+	@$(require_test_venue) && go test -race -count=1 -tags process ./...
+
+test-race-json:
+	@$(require_test_venue) && go test -race -json -count=1 ./...
+
+test-process-race-json:
+	@$(require_test_venue) && go test -race -json -count=1 -tags process ./...
+
 .PHONY: json-goldens toolschema-goldens toolschema-supplement fuzz-settings
 
 json-goldens:
