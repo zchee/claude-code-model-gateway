@@ -16,6 +16,7 @@ package sse_test
 
 import (
 	"bufio"
+	"context"
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,8 +36,10 @@ import (
 
 	"github.com/zchee/claude-code-model-gateway/internal/policy"
 	"github.com/zchee/claude-code-model-gateway/internal/proxymodels"
+	"github.com/zchee/claude-code-model-gateway/internal/worker/outcome"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/sentry"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/sse"
+	"github.com/zchee/claude-code-model-gateway/internal/worker/upstream"
 )
 
 func lmStudioOverflowFrame(promptTokens, contextTokens int) string {
@@ -88,6 +92,12 @@ func TestForwardMalformedUTF8Unchanged(t *testing.T) {
 			},
 			want: []byte(": bad��comment\nevent: msg�\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-gpt-5.6-sol\",\"note\":\"a�b\"}}\r\n\r\n"),
 		},
+		"success: valid rewritten unterminated proxy tail preserves absence of delimiter": {
+			chunks: [][]byte{
+				[]byte("event: message_start\r\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"gpt-5.6-sol\"}}"),
+			},
+			want: []byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-gpt-5.6-sol\"}}"),
+		},
 		"success: Anthropic passthrough preserves ill-formed UTF-8 bytes unchanged": {
 			passthrough: true,
 			chunks: [][]byte{
@@ -107,7 +117,7 @@ func TestForwardMalformedUTF8Unchanged(t *testing.T) {
 
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			upSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Type", "text/event-stream")
 				w.WriteHeader(http.StatusOK)
 				rc := http.NewResponseController(w)
@@ -116,12 +126,12 @@ func TestForwardMalformedUTF8Unchanged(t *testing.T) {
 					_ = rc.Flush()
 				}
 			}))
-			t.Cleanup(upstream.Close)
+			t.Cleanup(upSrv.Close)
 
-			relaySrv, client := startRelayServer(t, upstream.URL, func(w http.ResponseWriter, r *http.Request, up *http.Response) error {
+			h := startRelayServer(t, upSrv.URL, func(serviceCtx context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
 				if tt.passthrough {
-					return sse.RelayPassthrough(r.Context(), w, up, sse.PassthroughOptions{
-						Usage: &recordingUsage{},
+					return sse.RelayPassthrough(serviceCtx, w, up, sse.PassthroughOptions{
+						Usage: &usageSpy{},
 					})
 				}
 				return sse.RelayProxy(r.Context(), w, up, sse.ProxyOptions{
@@ -132,11 +142,11 @@ func TestForwardMalformedUTF8Unchanged(t *testing.T) {
 				})
 			})
 
-			req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, relaySrv.URL+"/v1/messages", nil)
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, h.server.URL+"/v1/messages", nil)
 			if err != nil {
 				t.Fatalf("NewRequestWithContext: %v", err)
 			}
-			resp, err := client.Do(req)
+			resp, err := h.client.Do(req)
 			if err != nil {
 				t.Fatalf("Do: %v", err)
 			}
@@ -149,6 +159,13 @@ func TestForwardMalformedUTF8Unchanged(t *testing.T) {
 			if resp.StatusCode != http.StatusOK {
 				t.Fatalf("status = %d (%q), want 200", resp.StatusCode, string(body))
 			}
+			res, handlerErr := h.waitResult(t)
+			if handlerErr != nil {
+				t.Fatalf("relay returned error %v, want nil", handlerErr)
+			}
+			if res.Status != http.StatusOK {
+				t.Errorf("outcome.Status = %d, want 200", res.Status)
+			}
 			if diff := gocmp.Diff(tt.want, body); diff != "" {
 				t.Errorf("wire body mismatch (-want +got):\n%s", diff)
 			}
@@ -160,77 +177,61 @@ func TestLocalNonStudioNoPeek(t *testing.T) {
 	overflowFrame := lmStudioOverflowFrame(6017, 4096)
 
 	tests := map[string]struct {
-		provider         string
-		advertisedModel  string
-		backendModel     string
-		holdUntilHeaders bool
-		wantStatus       int
-		wantPeekCalls    int64
-		wantOverflow     int
+		provider        string
+		advertisedModel string
+		backendModel    string
+		wantStatus      int
+		wantPeekCalls   int64
+		wantOverflow    int
 	}{
-		"success: kimi route commits headers without peeking and keeps overflow frame in-band": {
-			provider:         "kimi",
-			advertisedModel:  "claude-kimi-k3",
-			backendModel:     "kimi-k3",
-			holdUntilHeaders: true,
-			wantStatus:       http.StatusOK,
-			wantPeekCalls:    0,
-			wantOverflow:     0,
+		"success: kimi route bypasses peek and keeps overflow frame in-band": {
+			provider:        "kimi",
+			advertisedModel: "claude-kimi-k3",
+			backendModel:    "kimi-k3",
+			wantStatus:      http.StatusOK,
+			wantPeekCalls:   0,
+			wantOverflow:    0,
 		},
-		"success: codex route commits headers without peeking and keeps overflow frame in-band": {
-			provider:         "codex",
-			advertisedModel:  "claude-gpt-5.6-sol",
-			backendModel:     "gpt-5.6-sol",
-			holdUntilHeaders: true,
-			wantStatus:       http.StatusOK,
-			wantPeekCalls:    0,
-			wantOverflow:     0,
+		"success: codex route bypasses peek and keeps overflow frame in-band": {
+			provider:        "codex",
+			advertisedModel: "claude-gpt-5.6-sol",
+			backendModel:    "gpt-5.6-sol",
+			wantStatus:      http.StatusOK,
+			wantPeekCalls:   0,
+			wantOverflow:    0,
 		},
-		"success: local llama route commits headers without peeking and keeps overflow frame in-band": {
-			provider:         "local",
-			advertisedModel:  "claude-local/gguf",
-			backendModel:     "local/gguf",
-			holdUntilHeaders: true,
-			wantStatus:       http.StatusOK,
-			wantPeekCalls:    0,
-			wantOverflow:     0,
+		"success: local llama route bypasses peek and keeps overflow frame in-band": {
+			provider:        "local",
+			advertisedModel: "claude-local/gguf",
+			backendModel:    "local/gguf",
+			wantStatus:      http.StatusOK,
+			wantPeekCalls:   0,
+			wantOverflow:    0,
 		},
 		"success: lmstudio control invokes peek once and normalizes initial overflow to 413": {
-			provider:         sse.LMStudioProvider,
-			advertisedModel:  "claude-lmstudio/qwen3-coder-30b",
-			backendModel:     "lmstudio/qwen3-coder-30b",
-			holdUntilHeaders: false,
-			wantStatus:       http.StatusRequestEntityTooLarge,
-			wantPeekCalls:    1,
-			wantOverflow:     1,
+			provider:        sse.LMStudioProvider,
+			advertisedModel: "claude-lmstudio/qwen3-coder-30b",
+			backendModel:    "lmstudio/qwen3-coder-30b",
+			wantStatus:      http.StatusRequestEntityTooLarge,
+			wantPeekCalls:   1,
+			wantOverflow:    1,
 		},
 	}
 
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			headersReceived := make(chan struct{})
-			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			upSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Type", "text/event-stream")
 				w.WriteHeader(http.StatusOK)
-				rc := http.NewResponseController(w)
-				_ = rc.Flush()
-				if tt.holdUntilHeaders {
-					select {
-					case <-headersReceived:
-					case <-r.Context().Done():
-						return
-					}
-				}
 				_, _ = io.WriteString(w, overflowFrame)
-				_ = rc.Flush()
 			}))
-			t.Cleanup(upstream.Close)
+			t.Cleanup(upSrv.Close)
 
 			var peekCalls atomic.Int64
 			var mu sync.Mutex
 			var overflows []recordedOverflow
 
-			relaySrv, client := startRelayServer(t, upstream.URL, func(w http.ResponseWriter, r *http.Request, up *http.Response) error {
+			h := startRelayServer(t, upSrv.URL, func(_ context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
 				return sse.RelayProxy(r.Context(), w, up, sse.ProxyOptions{
 					Provider:          tt.provider,
 					AdvertisedModel:   tt.advertisedModel,
@@ -238,34 +239,38 @@ func TestLocalNonStudioNoPeek(t *testing.T) {
 					HeartbeatInterval: -1,
 					FirstEventWait:    10 * time.Second,
 					OnPeek:            func() { peekCalls.Add(1) },
-					OnOverflow: func(w http.ResponseWriter, counts sentry.Counts, upstreamStatus int) {
+					OnOverflow: func(w http.ResponseWriter, upstreamStatus int, counts sentry.Counts) (outcome.Result, error) {
 						mu.Lock()
 						overflows = append(overflows, recordedOverflow{Counts: counts, UpstreamStatus: upstreamStatus})
 						mu.Unlock()
-						writeNormalized413(w, counts, upstreamStatus)
+						return testEngineOverflowResponder(w, upstreamStatus, counts)
 					},
 				})
 			})
 
-			req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, relaySrv.URL+"/v1/messages", nil)
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, h.server.URL+"/v1/messages", nil)
 			if err != nil {
 				t.Fatalf("NewRequestWithContext: %v", err)
 			}
-			resp, err := client.Do(req)
+			resp, err := h.client.Do(req)
 			if err != nil {
 				t.Fatalf("Do: %v", err)
 			}
 			defer func() { _ = resp.Body.Close() }()
 
-			if tt.holdUntilHeaders {
-				close(headersReceived)
-			}
 			body, err := io.ReadAll(resp.Body)
 			if err != nil {
 				t.Fatalf("ReadAll: %v", err)
 			}
 			if resp.StatusCode != tt.wantStatus {
 				t.Fatalf("status = %d (%q), want %d", resp.StatusCode, string(body), tt.wantStatus)
+			}
+			res, handlerErr := h.waitResult(t)
+			if handlerErr != nil {
+				t.Fatalf("RelayProxy error = %v, want nil", handlerErr)
+			}
+			if res.Status != tt.wantStatus {
+				t.Errorf("outcome.Status = %d, want %d", res.Status, tt.wantStatus)
 			}
 			if got := peekCalls.Load(); got != tt.wantPeekCalls {
 				t.Errorf("peek calls = %d, want %d", got, tt.wantPeekCalls)
@@ -291,6 +296,79 @@ func TestLocalNonStudioNoPeek(t *testing.T) {
 			}
 		})
 	}
+
+	// Verify the non-peek path commits status without flushing headers prematurely before first output.
+	t.Run("success: non-studio route commits status without peeking and flushes only on output", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			pr, pw := io.Pipe()
+			rec := newStreamingRecorder()
+			up := &upstream.Response{
+				StatusCode:  http.StatusOK,
+				Header:      http.Header{"Content-Type": []string{"text/event-stream"}},
+				RelayHeader: http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:        pr,
+			}
+			var peekCalls atomic.Int64
+			done := make(chan handlerOutcome, 1)
+			go func() {
+				res, err := sse.RelayProxy(t.Context(), rec, up, sse.ProxyOptions{
+					Provider:          "codex",
+					AdvertisedModel:   "claude-gpt-5.6-sol",
+					BackendModel:      "gpt-5.6-sol",
+					HeartbeatInterval: -1,
+					OnPeek:            func() { peekCalls.Add(1) },
+				})
+				_ = pr.Close()
+				done <- handlerOutcome{res: res, err: err}
+			}()
+			joined := false
+			defer func() {
+				if !joined {
+					_ = pw.Close()
+					_ = pr.Close()
+					<-done
+				}
+			}()
+
+			synctest.Wait()
+			select {
+			case out := <-done:
+				joined = true
+				t.Fatalf("RelayProxy returned early: res=%+v err=%v", out.res, out.err)
+			default:
+			}
+
+			status, wroteHeader, _, _, flushes := rec.snapshot()
+			if !wroteHeader || status != http.StatusOK {
+				t.Fatalf("before output: wroteHeader=%t status=%d, want true and 200", wroteHeader, status)
+			}
+			if flushes != 0 {
+				t.Errorf("flushes before any body output = %d, want 0 (commit status without premature flush)", flushes)
+			}
+			if got := peekCalls.Load(); got != 0 {
+				t.Errorf("peek calls = %d, want 0", got)
+			}
+
+			if _, err := io.WriteString(pw, overflowFrame); err != nil {
+				t.Fatalf("write overflowFrame: %v", err)
+			}
+			synctest.Wait()
+			_, _, body, _, flushesAfter := rec.snapshot()
+			if flushesAfter < 1 {
+				t.Errorf("flushes after output = %d, want >= 1", flushesAfter)
+			}
+			if diff := gocmp.Diff(overflowFrame, body); diff != "" {
+				t.Errorf("body mismatch (-want +got):\n%s", diff)
+			}
+
+			_ = pw.Close()
+			out := <-done
+			joined = true
+			if out.err != nil {
+				t.Fatalf("RelayProxy returned %v, want nil", out.err)
+			}
+		})
+	})
 }
 
 func TestProxyRelayFlushAndHeaders(t *testing.T) {
@@ -298,103 +376,194 @@ func TestProxyRelayFlushAndHeaders(t *testing.T) {
 	wantFirst := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-gpt-5.6-sol\"}}\n\n"
 	secondFrame := "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 
-	firstFrameSeen := make(chan struct{})
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Request-Id", "req-proxy-1")
-		w.Header().Set("Keep-Alive", "timeout=5")
-		w.Header().Set("Content-Length", "999999")
-		w.WriteHeader(http.StatusOK)
-		rc := http.NewResponseController(w)
-		_, _ = io.WriteString(w, firstFrame)
-		_ = rc.Flush()
-		select {
-		case <-firstFrameSeen:
-		case <-r.Context().Done():
-			return
-		}
-		_, _ = io.WriteString(w, secondFrame)
-		_ = rc.Flush()
-	}))
-	t.Cleanup(upstream.Close)
+	t.Run("success: loopback smoke strips content-length and keep-alive, flushes frames, and reports usage and outcome", func(t *testing.T) {
+		firstFrameSeen := make(chan struct{})
+		var releaseOnce sync.Once
+		releaseSecond := func() { releaseOnce.Do(func() { close(firstFrameSeen) }) }
 
-	usage := &recordingUsage{}
-	telemetry := &recordingTelemetry{}
-	relaySrv, client := startRelayServer(t, upstream.URL, func(w http.ResponseWriter, r *http.Request, up *http.Response) error {
-		return sse.RelayProxy(r.Context(), w, up, sse.ProxyOptions{
-			Provider:          "codex",
-			AdvertisedModel:   "claude-gpt-5.6-sol",
-			BackendModel:      "gpt-5.6-sol",
-			HeartbeatInterval: -1,
-			Usage:             usage,
-			Telemetry:         telemetry,
+		upSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Request-Id", "req-proxy-1")
+			w.Header().Set("Keep-Alive", "timeout=5")
+			w.Header().Set("Content-Length", strconv.Itoa(len(firstFrame)+len(secondFrame)))
+			w.WriteHeader(http.StatusOK)
+			rc := http.NewResponseController(w)
+			_, _ = io.WriteString(w, firstFrame)
+			_ = rc.Flush()
+			select {
+			case <-firstFrameSeen:
+			case <-r.Context().Done():
+				return
+			}
+			_, _ = io.WriteString(w, secondFrame)
+			_ = rc.Flush()
+		}))
+		// LIFO cleanup: release blocked upstream handler before closing upSrv.
+		t.Cleanup(upSrv.Close)
+		t.Cleanup(releaseSecond)
+
+		usage := &usageSpy{}
+		h := startRelayServer(t, upSrv.URL, func(_ context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
+			return sse.RelayProxy(r.Context(), w, up, sse.ProxyOptions{
+				Provider:          "codex",
+				AdvertisedModel:   "claude-gpt-5.6-sol",
+				BackendModel:      "gpt-5.6-sol",
+				HeartbeatInterval: -1,
+				Usage:             usage,
+			})
 		})
+
+		reqCtx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, h.server.URL+"/v1/messages", nil)
+		if err != nil {
+			t.Fatalf("NewRequestWithContext: %v", err)
+		}
+		resp, err := h.client.Do(req)
+		if err != nil {
+			t.Fatalf("Do: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("status = %d (%q), want 200", resp.StatusCode, string(body))
+		}
+		if resp.Header.Get("Cache-Control") != "no-cache" || resp.Header.Get("Request-Id") != "req-proxy-1" {
+			t.Errorf("unexpected preserved headers: %v", resp.Header)
+		}
+		if resp.Header.Get("Content-Length") != "" || resp.Header.Get("Keep-Alive") != "" {
+			t.Errorf("content-length or keep-alive leaked into relayed SSE headers: %v", resp.Header)
+		}
+
+		reader := bufio.NewReader(resp.Body)
+		var first strings.Builder
+		for !strings.HasSuffix(first.String(), "\n\n") {
+			line, readErr := reader.ReadString('\n')
+			if readErr != nil {
+				t.Fatalf("reading first flushed frame: %v (partial=%q)", readErr, first.String())
+			}
+			first.WriteString(line)
+		}
+		if diff := gocmp.Diff(wantFirst, first.String()); diff != "" {
+			t.Errorf("first flushed frame (-want +got):\n%s", diff)
+		}
+		releaseSecond()
+
+		rest, err := io.ReadAll(reader)
+		if err != nil {
+			t.Fatalf("reading remaining stream: %v", err)
+		}
+		if diff := gocmp.Diff(secondFrame, string(rest)); diff != "" {
+			t.Errorf("second frame (-want +got):\n%s", diff)
+		}
+
+		res, handlerErr := h.waitResult(t)
+		if handlerErr != nil {
+			t.Fatalf("RelayProxy error = %v, want nil", handlerErr)
+		}
+		if diff := gocmp.Diff(outcome.Result{Status: http.StatusOK}, res); diff != "" {
+			t.Errorf("outcome.Result (-want +got):\n%s", diff)
+		}
+
+		events, _, totalBytes, overflows := usage.snapshot(t)
+		if totalBytes != int64(len(firstFrame)+len(secondFrame)) {
+			t.Errorf("NoteResponseBytes = %d, want %d", totalBytes, len(firstFrame)+len(secondFrame))
+		}
+		if overflows != 0 {
+			t.Errorf("unexpected usage overflow count %d", overflows)
+		}
+		wantEvents := []string{
+			`{"type":"message_start","message":{"model":"gpt-5.6-sol"}}`,
+			`{"type":"message_stop"}`,
+		}
+		if diff := gocmp.Diff(wantEvents, events); diff != "" {
+			t.Errorf("usage observed events (-want +got):\n%s", diff)
+		}
 	})
 
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, relaySrv.URL+"/v1/messages", nil)
-	if err != nil {
-		t.Fatalf("NewRequestWithContext: %v", err)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		t.Fatalf("Do: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
+	t.Run("success: deterministic pipe proves each completed proxy frame is flushed before next arrives", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			pr, pw := io.Pipe()
+			rec := newStreamingRecorder()
+			up := &upstream.Response{
+				StatusCode:  http.StatusOK,
+				Header:      http.Header{"Content-Type": []string{"text/event-stream"}, "Content-Length": []string{strconv.Itoa(len(firstFrame) + len(secondFrame))}},
+				RelayHeader: http.Header{"Content-Type": []string{"text/event-stream"}, "Content-Length": []string{strconv.Itoa(len(firstFrame) + len(secondFrame))}},
+				Body:        pr,
+			}
+			done := make(chan handlerOutcome, 1)
+			go func() {
+				res, err := sse.RelayProxy(t.Context(), rec, up, sse.ProxyOptions{
+					Provider:          "codex",
+					AdvertisedModel:   "claude-gpt-5.6-sol",
+					BackendModel:      "gpt-5.6-sol",
+					HeartbeatInterval: -1,
+				})
+				_ = pr.Close()
+				done <- handlerOutcome{res: res, err: err}
+			}()
+			joined := false
+			defer func() {
+				if !joined {
+					_ = pw.Close()
+					_ = pr.Close()
+					<-done
+				}
+			}()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("status = %d (%q), want 200", resp.StatusCode, string(body))
-	}
-	if resp.Header.Get("Cache-Control") != "no-cache" || resp.Header.Get("Request-Id") != "req-proxy-1" {
-		t.Errorf("unexpected preserved headers: %v", resp.Header)
-	}
-	if resp.Header.Get("Content-Length") != "" || resp.Header.Get("Keep-Alive") != "" {
-		t.Errorf("content-length or keep-alive leaked into relayed SSE headers: %v", resp.Header)
-	}
+			synctest.Wait()
+			select {
+			case out := <-done:
+				joined = true
+				t.Fatalf("RelayProxy returned early: res=%+v err=%v", out.res, out.err)
+			default:
+			}
 
-	reader := bufio.NewReader(resp.Body)
-	var first strings.Builder
-	for !strings.HasSuffix(first.String(), "\n\n") {
-		line, readErr := reader.ReadString('\n')
-		if readErr != nil {
-			t.Fatalf("reading first flushed frame: %v (partial=%q)", readErr, first.String())
-		}
-		first.WriteString(line)
-	}
-	if diff := gocmp.Diff(wantFirst, first.String()); diff != "" {
-		t.Errorf("first flushed frame (-want +got):\n%s", diff)
-	}
-	close(firstFrameSeen)
+			if _, err := io.WriteString(pw, firstFrame); err != nil {
+				t.Fatalf("write firstFrame: %v", err)
+			}
+			synctest.Wait()
+			_, _, body1, _, flushes1 := rec.snapshot()
+			if diff := gocmp.Diff(wantFirst, body1); diff != "" {
+				t.Fatalf("first frame not written before second (-want +got):\n%s", diff)
+			}
+			if flushes1 < 1 {
+				t.Fatalf("flushes after first frame = %d, want >= 1", flushes1)
+			}
+			if got := rec.Header().Get("Content-Length"); got != "" {
+				t.Errorf("Content-Length leaked to writer header: %q", got)
+			}
 
-	rest, err := io.ReadAll(reader)
-	if err != nil {
-		t.Fatalf("reading remaining stream: %v", err)
-	}
-	if diff := gocmp.Diff(secondFrame, string(rest)); diff != "" {
-		t.Errorf("second frame (-want +got):\n%s", diff)
-	}
-	events, _, totalBytes, overflows := usage.snapshot()
-	if totalBytes != len(firstFrame)+len(secondFrame) {
-		t.Errorf("NoteResponseBytes = %d, want %d", totalBytes, len(firstFrame)+len(secondFrame))
-	}
-	if overflows != 0 {
-		t.Errorf("unexpected usage overflow count %d", overflows)
-	}
-	wantEvents := []string{
-		`{"type":"message_start","message":{"model":"gpt-5.6-sol"}}`,
-		`{"type":"message_stop"}`,
-	}
-	if diff := gocmp.Diff(wantEvents, events); diff != "" {
-		t.Errorf("usage observed events (-want +got):\n%s", diff)
-	}
-	wantTelemetry := []recordedTelemetryCall{{Status: http.StatusOK, Override: ""}}
-	if diff := gocmp.Diff(wantTelemetry, telemetry.snapshot()); diff != "" {
-		t.Errorf("telemetry calls (-want +got):\n%s", diff)
-	}
+			if _, err := io.WriteString(pw, secondFrame); err != nil {
+				t.Fatalf("write secondFrame: %v", err)
+			}
+			synctest.Wait()
+			_, _, body2, _, flushes2 := rec.snapshot()
+			if diff := gocmp.Diff(wantFirst+secondFrame, body2); diff != "" {
+				t.Fatalf("second frame not written (-want +got):\n%s", diff)
+			}
+			if flushes2 <= flushes1 {
+				t.Fatalf("flushes did not advance on second frame: before=%d after=%d", flushes1, flushes2)
+			}
+
+			_ = pw.Close()
+			out := <-done
+			joined = true
+			if out.err != nil {
+				t.Fatalf("RelayProxy error = %v, want nil", out.err)
+			}
+			if diff := gocmp.Diff(outcome.Result{Status: http.StatusOK}, out.res); diff != "" {
+				t.Errorf("outcome.Result (-want +got):\n%s", diff)
+			}
+		})
+	})
 }
 
 func TestProxyRelayCompletionAndMessageStop(t *testing.T) {
+	const literalMessageStop = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+
 	finishedWithoutStop := strings.Join([]string{
 		"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"gpt-5.6-sol\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
 		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
@@ -407,55 +576,57 @@ func TestProxyRelayCompletionAndMessageStop(t *testing.T) {
 		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
 		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hand-back report\"}}\n\n",
 	}, "")
-	explicitStop := finishedWithoutStop + sse.SynthesizedMessageStop
+	explicitStop := finishedWithoutStop + literalMessageStop
 
 	tests := map[string]struct {
 		stream           string
+		wantEndWithStop  bool
 		wantMessageStops int
-		wantTelemetry    recordedTelemetryCall
+		wantOutcome      outcome.Result
 	}{
-		"success: finished turn without message_stop synthesizes terminal event": {
+		"success: finished turn without message_stop synthesizes terminal event at EOF": {
 			stream:           finishedWithoutStop,
+			wantEndWithStop:  true,
 			wantMessageStops: 1,
-			wantTelemetry:    recordedTelemetryCall{Status: http.StatusOK, Override: ""},
+			wantOutcome:      outcome.Result{Status: http.StatusOK},
 		},
 		"error: cut-off turn without stop reason and open block does not synthesize message_stop": {
 			stream:           cutOffTurn,
+			wantEndWithStop:  false,
 			wantMessageStops: 0,
-			wantTelemetry:    recordedTelemetryCall{Status: http.StatusOK, Override: "upstream_error"},
+			wantOutcome:      outcome.Result{Status: http.StatusOK, StatusOverride: "upstream_error"},
 		},
 		"success: explicit message_stop is not duplicated": {
 			stream:           explicitStop,
+			wantEndWithStop:  true,
 			wantMessageStops: 1,
-			wantTelemetry:    recordedTelemetryCall{Status: http.StatusOK, Override: ""},
+			wantOutcome:      outcome.Result{Status: http.StatusOK},
 		},
 	}
 
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			upSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Type", "text/event-stream")
 				w.WriteHeader(http.StatusOK)
 				_, _ = io.WriteString(w, tt.stream)
 			}))
-			t.Cleanup(upstream.Close)
+			t.Cleanup(upSrv.Close)
 
-			telemetry := &recordingTelemetry{}
-			relaySrv, client := startRelayServer(t, upstream.URL, func(w http.ResponseWriter, r *http.Request, up *http.Response) error {
+			h := startRelayServer(t, upSrv.URL, func(_ context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
 				return sse.RelayProxy(r.Context(), w, up, sse.ProxyOptions{
 					Provider:          "codex",
 					AdvertisedModel:   "claude-gpt-5.6-sol",
 					BackendModel:      "gpt-5.6-sol",
 					HeartbeatInterval: -1,
-					Telemetry:         telemetry,
 				})
 			})
 
-			req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, relaySrv.URL+"/v1/messages", nil)
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, h.server.URL+"/v1/messages", nil)
 			if err != nil {
 				t.Fatalf("NewRequestWithContext: %v", err)
 			}
-			resp, err := client.Do(req)
+			resp, err := h.client.Do(req)
 			if err != nil {
 				t.Fatalf("Do: %v", err)
 			}
@@ -468,18 +639,34 @@ func TestProxyRelayCompletionAndMessageStop(t *testing.T) {
 			if resp.StatusCode != http.StatusOK {
 				t.Fatalf("status = %d (%q), want 200", resp.StatusCode, string(body))
 			}
-			gotStops := strings.Count(string(body), sse.SynthesizedMessageStop)
-			if gotStops != tt.wantMessageStops {
-				t.Errorf("message_stop count = %d, want %d; body=%q", gotStops, tt.wantMessageStops, string(body))
+			bodyStr := string(body)
+			if !strings.Contains(bodyStr, "hand-back report") {
+				t.Errorf("preceding answer text missing from body: %q", bodyStr)
 			}
-			if diff := gocmp.Diff([]recordedTelemetryCall{tt.wantTelemetry}, telemetry.snapshot()); diff != "" {
-				t.Errorf("telemetry (-want +got):\n%s", diff)
+			if tt.wantEndWithStop {
+				if !strings.HasSuffix(bodyStr, literalMessageStop) {
+					t.Errorf("body did not end with literal message_stop frame; body=%q", bodyStr)
+				}
+				if got := strings.Count(bodyStr, literalMessageStop); got != tt.wantMessageStops {
+					t.Errorf("literal message_stop count = %d, want %d; body=%q", got, tt.wantMessageStops, bodyStr)
+				}
+			} else if strings.Contains(bodyStr, "message_stop") {
+				t.Errorf("unexpected message_stop in cut-off turn; body=%q", bodyStr)
+			}
+
+			res, handlerErr := h.waitResult(t)
+			if handlerErr != nil {
+				t.Fatalf("RelayProxy error = %v, want nil", handlerErr)
+			}
+			if diff := gocmp.Diff(tt.wantOutcome, res); diff != "" {
+				t.Errorf("outcome.Result (-want +got):\n%s", diff)
 			}
 		})
 	}
 }
 
 func TestProxyRelaySentryAccounting(t *testing.T) {
+	const literalMessageStop = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 	ordinaryReq := []byte(`{"model":"claude-gpt-5.6-sol","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
 	session := sentry.SessionKey(true, "session-1", nil)
 
@@ -492,14 +679,14 @@ func TestProxyRelaySentryAccounting(t *testing.T) {
 		var state sentry.State
 
 		runTurn := func(input, cacheRead, cacheCreate int) {
-			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			upSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Type", "text/event-stream")
 				w.WriteHeader(http.StatusOK)
 				_, _ = fmt.Fprintf(w, "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":%d,\"cache_read_input_tokens\":%d,\"cache_creation_input_tokens\":%d}}\n\n%s",
-					input, cacheRead, cacheCreate, sse.SynthesizedMessageStop)
+					input, cacheRead, cacheCreate, literalMessageStop)
 			}))
-			defer upstream.Close()
-			relaySrv, client := startRelayServer(t, upstream.URL, func(w http.ResponseWriter, r *http.Request, up *http.Response) error {
+			defer upSrv.Close()
+			h := startRelayServer(t, upSrv.URL, func(_ context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
 				return sse.RelayProxy(r.Context(), w, up, sse.ProxyOptions{
 					Provider:          "codex",
 					AdvertisedModel:   "claude-gpt-5.6-sol",
@@ -510,11 +697,11 @@ func TestProxyRelaySentryAccounting(t *testing.T) {
 					SentryTarget:      target,
 				})
 			})
-			req, reqErr := http.NewRequestWithContext(t.Context(), http.MethodPost, relaySrv.URL+"/v1/messages", nil)
+			req, reqErr := http.NewRequestWithContext(t.Context(), http.MethodPost, h.server.URL+"/v1/messages", nil)
 			if reqErr != nil {
 				t.Fatalf("NewRequestWithContext: %v", reqErr)
 			}
-			resp, doErr := client.Do(req)
+			resp, doErr := h.client.Do(req)
 			if doErr != nil {
 				t.Fatalf("Do: %v", doErr)
 			}
@@ -522,6 +709,9 @@ func TestProxyRelaySentryAccounting(t *testing.T) {
 			body, _ := io.ReadAll(resp.Body)
 			if resp.StatusCode != http.StatusOK {
 				t.Fatalf("status = %d (%q), want 200", resp.StatusCode, string(body))
+			}
+			if _, handlerErr := h.waitResult(t); handlerErr != nil {
+				t.Fatalf("RelayProxy error = %v", handlerErr)
 			}
 		}
 
@@ -558,17 +748,17 @@ func TestProxyRelaySentryAccounting(t *testing.T) {
 			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\n",
 			"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
 			"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}\n\n",
-			sse.SynthesizedMessageStop,
+			literalMessageStop,
 		}, "")
 
-		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(http.StatusOK)
 			_, _ = io.WriteString(w, llamaStream)
 		}))
-		t.Cleanup(upstream.Close)
+		t.Cleanup(upSrv.Close)
 
-		relaySrv, client := startRelayServer(t, upstream.URL, func(w http.ResponseWriter, r *http.Request, up *http.Response) error {
+		h := startRelayServer(t, upSrv.URL, func(_ context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
 			return sse.RelayProxy(r.Context(), w, up, sse.ProxyOptions{
 				Provider:          "local",
 				AdvertisedModel:   "claude-local/gguf",
@@ -580,11 +770,11 @@ func TestProxyRelaySentryAccounting(t *testing.T) {
 			})
 		})
 
-		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, relaySrv.URL+"/v1/messages", nil)
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, h.server.URL+"/v1/messages", nil)
 		if err != nil {
 			t.Fatalf("NewRequestWithContext: %v", err)
 		}
-		resp, err := client.Do(req)
+		resp, err := h.client.Do(req)
 		if err != nil {
 			t.Fatalf("Do: %v", err)
 		}
@@ -592,6 +782,9 @@ func TestProxyRelaySentryAccounting(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d (%q), want 200", resp.StatusCode, string(body))
+		}
+		if _, handlerErr := h.waitResult(t); handlerErr != nil {
+			t.Fatalf("RelayProxy error = %v", handlerErr)
 		}
 
 		crossing, fired := state.Check(session, target, ordinaryReq)
@@ -619,14 +812,14 @@ func TestProxyRelaySentryAccounting(t *testing.T) {
 
 		// Inclusive 30000 with 29990 cached would double-count to 59990 (> 43691) if uncorrected.
 		stream := lmStudioOrdinaryStream(30000, 29990)
-		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(http.StatusOK)
 			_, _ = io.WriteString(w, stream)
 		}))
-		t.Cleanup(upstream.Close)
+		t.Cleanup(upSrv.Close)
 
-		relaySrv, client := startRelayServer(t, upstream.URL, func(w http.ResponseWriter, r *http.Request, up *http.Response) error {
+		h := startRelayServer(t, upSrv.URL, func(_ context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
 			return sse.RelayProxy(r.Context(), w, up, sse.ProxyOptions{
 				Provider:          sse.LMStudioProvider,
 				AdvertisedModel:   "claude-lmstudio/qwen3-coder-30b",
@@ -639,11 +832,11 @@ func TestProxyRelaySentryAccounting(t *testing.T) {
 			})
 		})
 
-		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, relaySrv.URL+"/v1/messages", nil)
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, h.server.URL+"/v1/messages", nil)
 		if err != nil {
 			t.Fatalf("NewRequestWithContext: %v", err)
 		}
-		resp, err := client.Do(req)
+		resp, err := h.client.Do(req)
 		if err != nil {
 			t.Fatalf("Do: %v", err)
 		}
@@ -654,6 +847,9 @@ func TestProxyRelaySentryAccounting(t *testing.T) {
 		}
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d (%q), want 200", resp.StatusCode, string(body))
+		}
+		if _, handlerErr := h.waitResult(t); handlerErr != nil {
+			t.Fatalf("RelayProxy error = %v", handlerErr)
 		}
 		if !strings.Contains(string(body), `"input_tokens":10,"output_tokens":0,"cache_read_input_tokens":29990`) ||
 			!strings.Contains(string(body), `"input_tokens":10,"output_tokens":2,"cache_read_input_tokens":29990`) {
@@ -678,8 +874,11 @@ func TestProxyRelaySentryAccounting(t *testing.T) {
 		}
 
 		releaseStop := make(chan struct{})
+		var releaseOnce sync.Once
+		release := func() { releaseOnce.Do(func() { close(releaseStop) }) }
+
 		deltaFrame := "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"input_tokens\":105}}\n\n"
-		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(http.StatusOK)
 			rc := http.NewResponseController(w)
@@ -690,12 +889,14 @@ func TestProxyRelaySentryAccounting(t *testing.T) {
 			case <-r.Context().Done():
 				return
 			}
-			_, _ = io.WriteString(w, sse.SynthesizedMessageStop)
+			_, _ = io.WriteString(w, literalMessageStop)
 			_ = rc.Flush()
 		}))
-		t.Cleanup(upstream.Close)
+		// LIFO cleanup: release blocked upstream handler before closing upSrv.
+		t.Cleanup(upSrv.Close)
+		t.Cleanup(release)
 
-		relaySrv, client := startRelayServer(t, upstream.URL, func(w http.ResponseWriter, r *http.Request, up *http.Response) error {
+		h := startRelayServer(t, upSrv.URL, func(_ context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
 			return sse.RelayProxy(r.Context(), w, up, sse.ProxyOptions{
 				Provider:          "codex",
 				AdvertisedModel:   "claude-gpt-6.1-sol[1m]",
@@ -707,18 +908,19 @@ func TestProxyRelaySentryAccounting(t *testing.T) {
 			})
 		})
 
-		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, relaySrv.URL+"/v1/messages", nil)
+		reqCtx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, h.server.URL+"/v1/messages", nil)
 		if err != nil {
 			t.Fatalf("NewRequestWithContext: %v", err)
 		}
-		resp, err := client.Do(req)
+		resp, err := h.client.Do(req)
 		if err != nil {
 			t.Fatalf("Do: %v", err)
 		}
 		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode != http.StatusOK {
-			close(releaseStop)
 			body, _ := io.ReadAll(resp.Body)
 			t.Fatalf("status = %d (%q), want 200", resp.StatusCode, string(body))
 		}
@@ -727,19 +929,20 @@ func TestProxyRelaySentryAccounting(t *testing.T) {
 		for !strings.HasSuffix(first.String(), "\n\n") {
 			line, readErr := reader.ReadString('\n')
 			if readErr != nil {
-				close(releaseStop)
 				t.Fatalf("reading mid-stream delta: %v", readErr)
 			}
 			first.WriteString(line)
 		}
 		// While the stream is still open, high usage must not rearm the latched refusal.
 		if crossing, fired := state.Check(session, target, ordinaryReq); fired {
-			close(releaseStop)
 			t.Fatalf("stream chunk rearmed sentry before turn finished: %+v", crossing)
 		}
-		close(releaseStop)
+		release()
 		if _, err := io.ReadAll(reader); err != nil {
 			t.Fatalf("draining rest of stream: %v", err)
+		}
+		if _, handlerErr := h.waitResult(t); handlerErr != nil {
+			t.Fatalf("RelayProxy error = %v", handlerErr)
 		}
 		crossing, fired := state.Check(session, target, ordinaryReq)
 		if !fired {
@@ -762,14 +965,14 @@ func TestProxyRelaySentryAccounting(t *testing.T) {
 			t.Fatal("precondition: expected initial crossing to latch")
 		}
 
-		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(http.StatusOK)
-			_, _ = io.WriteString(w, "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":105}}\n\n"+sse.SynthesizedMessageStop)
+			_, _ = io.WriteString(w, "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":105}}\n\n"+literalMessageStop)
 		}))
-		t.Cleanup(upstream.Close)
+		t.Cleanup(upSrv.Close)
 
-		relaySrv, client := startRelayServer(t, upstream.URL, func(w http.ResponseWriter, r *http.Request, up *http.Response) error {
+		h := startRelayServer(t, upSrv.URL, func(_ context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
 			return sse.RelayProxy(r.Context(), w, up, sse.ProxyOptions{
 				Provider:          "codex",
 				AdvertisedModel:   "claude-gpt-6.1-sol[1m]",
@@ -782,11 +985,11 @@ func TestProxyRelaySentryAccounting(t *testing.T) {
 			})
 		})
 
-		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, relaySrv.URL+"/v1/messages", nil)
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, h.server.URL+"/v1/messages", nil)
 		if err != nil {
 			t.Fatalf("NewRequestWithContext: %v", err)
 		}
-		resp, err := client.Do(req)
+		resp, err := h.client.Do(req)
 		if err != nil {
 			t.Fatalf("Do: %v", err)
 		}
@@ -795,19 +998,102 @@ func TestProxyRelaySentryAccounting(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d (%q), want 200", resp.StatusCode, string(body))
 		}
+		if _, handlerErr := h.waitResult(t); handlerErr != nil {
+			t.Fatalf("RelayProxy error = %v", handlerErr)
+		}
 		if crossing, fired := state.Check(session, target, ordinaryReq); fired {
 			t.Fatalf("compaction stream rearmed latched refusal: %+v", crossing)
 		}
 	})
+
+	// Non-deliverable ordinary turns ending cleanly at transport EOF must not rearm a latched sentry.
+	nonDeliverableCases := map[string]struct {
+		stream string
+	}{
+		"error: ordinary stream with in-band error before clean EOF does not rearm latched sentry": {
+			stream: strings.Join([]string{
+				"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":105}}\n\n",
+				"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"transient failure\"}}\n\n",
+				literalMessageStop,
+			}, ""),
+		},
+		"error: incomplete ordinary stream with open block before clean EOF does not rearm latched sentry": {
+			stream: strings.Join([]string{
+				"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+				"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":105}}\n\n",
+			}, ""),
+		},
+	}
+	for name, tt := range nonDeliverableCases {
+		t.Run(name, func(t *testing.T) {
+			resolver := policy.NewResolver(policy.ResolverInputs{})
+			target, err := sentry.ResolveTarget(resolver, "claude-gpt-6.1-sol[1m]", 100, 0, 0)
+			if err != nil {
+				t.Fatalf("ResolveTarget: %v", err)
+			}
+			var state sentry.State
+			state.Observe(session, target, jsontext.Value(`{"type":"message_delta","usage":{"input_tokens":101}}`), true)
+			if _, fired := state.Check(session, target, ordinaryReq); !fired {
+				t.Fatal("precondition: expected initial crossing to latch")
+			}
+
+			upSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, tt.stream)
+			}))
+			t.Cleanup(upSrv.Close)
+
+			h := startRelayServer(t, upSrv.URL, func(_ context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
+				return sse.RelayProxy(r.Context(), w, up, sse.ProxyOptions{
+					Provider:          "codex",
+					AdvertisedModel:   "claude-gpt-6.1-sol[1m]",
+					BackendModel:      "gpt-6.1-sol",
+					HeartbeatInterval: -1,
+					SessionKey:        session,
+					Sentry:            &state,
+					SentryTarget:      target,
+				})
+			})
+
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, h.server.URL+"/v1/messages", nil)
+			if err != nil {
+				t.Fatalf("NewRequestWithContext: %v", err)
+			}
+			resp, err := h.client.Do(req)
+			if err != nil {
+				t.Fatalf("Do: %v", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			body, _ := io.ReadAll(resp.Body)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d (%q), want 200", resp.StatusCode, string(body))
+			}
+			res, handlerErr := h.waitResult(t)
+			if handlerErr != nil {
+				t.Fatalf("RelayProxy error = %v", handlerErr)
+			}
+			if diff := gocmp.Diff(outcome.Result{Status: http.StatusOK, StatusOverride: "upstream_error"}, res); diff != "" {
+				t.Errorf("outcome.Result (-want +got):\n%s", diff)
+			}
+			if crossing, fired := state.Check(session, target, ordinaryReq); fired {
+				t.Fatalf("non-deliverable ordinary turn rearmed latched sentry: %+v", crossing)
+			}
+		})
+	}
 }
 
 func TestLMStudioFirstEventPeek(t *testing.T) {
 	overflowFrame := lmStudioOverflowFrame(6017, 4096)
 	wordedFrame := lmStudioWordedOverflowFrame(6017, 4096)
+	multilineOverflow := "event: error\ndata: {\"type\":\"error\",\ndata: \"error\":{\"type\":\"exceed_context_size_error\",\"n_prompt_tokens\":6017,\"n_ctx\":4096}}\n\n"
+	markerOnlyOverflow := "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"exceed_context_size_error\"}}\n\n"
 	ordinary := lmStudioOrdinaryStream(19, 0)
 	otherError := "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"The model has crashed without additional information. (Exit code: 6)\"}}\n\n"
 	partialFrame := "event: message_start\ndata: {\"type\":\"mess"
 	unparseableFrame := "event: message_start\ndata: {broken-json}\n\n"
+	malformedThenOverflow := unparseableFrame + overflowFrame
+	nonErrorOverflowShaped := "event: message_start\ndata: {\"type\":\"message_start\",\"error\":{\"type\":\"exceed_context_size_error\",\"n_prompt_tokens\":6017,\"n_ctx\":4096}}\n\n"
 	secondEventOverflow := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"qwen3-coder-30b\"}}\n\n" + overflowFrame
 
 	tests := map[string]struct {
@@ -836,6 +1122,18 @@ func TestLMStudioFirstEventPeek(t *testing.T) {
 			wantPeek:     1,
 			wantOverflow: &recordedOverflow{Counts: sentry.Counts{Tokens: new(float64(6017)), Limit: new(float64(4096))}, UpstreamStatus: http.StatusOK},
 		},
+		"success: multiline data first error event normalizes to 413": {
+			chunks:       []string{multilineOverflow},
+			wantStatus:   http.StatusRequestEntityTooLarge,
+			wantPeek:     1,
+			wantOverflow: &recordedOverflow{Counts: sentry.Counts{Tokens: new(float64(6017)), Limit: new(float64(4096))}, UpstreamStatus: http.StatusOK},
+		},
+		"success: marker-only engine overflow without counts still normalizes to 413": {
+			chunks:       []string{markerOnlyOverflow},
+			wantStatus:   http.StatusRequestEntityTooLarge,
+			wantPeek:     1,
+			wantOverflow: &recordedOverflow{Counts: sentry.Counts{}, UpstreamStatus: http.StatusOK},
+		},
 		"success: ordinary answer replays original bytes unchanged as 200": {
 			chunks:     []string{ordinary},
 			wantStatus: http.StatusOK,
@@ -858,6 +1156,18 @@ func TestLMStudioFirstEventPeek(t *testing.T) {
 			chunks:     []string{unparseableFrame},
 			wantStatus: http.StatusOK,
 			wantBody:   unparseableFrame,
+			wantPeek:   1,
+		},
+		"error: malformed first data frame followed by overflow does not skip and stays 200": {
+			chunks:     []string{malformedThenOverflow},
+			wantStatus: http.StatusOK,
+			wantBody:   malformedThenOverflow,
+			wantPeek:   1,
+		},
+		"success: overflow-shaped fields on a non-error first event stay in-band on 200 stream": {
+			chunks:     []string{nonErrorOverflowShaped},
+			wantStatus: http.StatusOK,
+			wantBody:   nonErrorOverflowShaped,
 			wantPeek:   1,
 		},
 		"error: stream ending cleanly before one frame completes stays 200 with partial bytes": {
@@ -889,7 +1199,7 @@ func TestLMStudioFirstEventPeek(t *testing.T) {
 
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			upSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Type", "text/event-stream")
 				w.WriteHeader(http.StatusOK)
 				rc := http.NewResponseController(w)
@@ -900,13 +1210,13 @@ func TestLMStudioFirstEventPeek(t *testing.T) {
 					}
 				}
 			}))
-			t.Cleanup(upstream.Close)
+			t.Cleanup(upSrv.Close)
 
 			var peekCalls atomic.Int64
 			var mu sync.Mutex
 			var overflows []recordedOverflow
 
-			relaySrv, client := startRelayServer(t, upstream.URL, func(w http.ResponseWriter, r *http.Request, up *http.Response) error {
+			h := startRelayServer(t, upSrv.URL, func(_ context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
 				if tt.headWritten {
 					w.Header().Set("Content-Type", "text/event-stream")
 					w.WriteHeader(http.StatusOK)
@@ -919,20 +1229,20 @@ func TestLMStudioFirstEventPeek(t *testing.T) {
 					HeartbeatInterval: -1,
 					FirstEventWait:    5 * time.Second,
 					OnPeek:            func() { peekCalls.Add(1) },
-					OnOverflow: func(w http.ResponseWriter, counts sentry.Counts, upstreamStatus int) {
+					OnOverflow: func(w http.ResponseWriter, upstreamStatus int, counts sentry.Counts) (outcome.Result, error) {
 						mu.Lock()
 						overflows = append(overflows, recordedOverflow{Counts: counts, UpstreamStatus: upstreamStatus})
 						mu.Unlock()
-						writeNormalized413(w, counts, upstreamStatus)
+						return testEngineOverflowResponder(w, upstreamStatus, counts)
 					},
 				})
 			})
 
-			req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, relaySrv.URL+"/v1/messages", nil)
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, h.server.URL+"/v1/messages", nil)
 			if err != nil {
 				t.Fatalf("NewRequestWithContext: %v", err)
 			}
-			resp, err := client.Do(req)
+			resp, err := h.client.Do(req)
 			if err != nil {
 				t.Fatalf("Do: %v", err)
 			}
@@ -943,6 +1253,13 @@ func TestLMStudioFirstEventPeek(t *testing.T) {
 			}
 			if resp.StatusCode != tt.wantStatus {
 				t.Fatalf("status = %d (%q), want %d", resp.StatusCode, string(body), tt.wantStatus)
+			}
+			res, handlerErr := h.waitResult(t)
+			if handlerErr != nil {
+				t.Fatalf("RelayProxy error = %v, want nil", handlerErr)
+			}
+			if res.Status != tt.wantStatus {
+				t.Errorf("outcome.Status = %d, want %d", res.Status, tt.wantStatus)
 			}
 			if got := peekCalls.Load(); got != tt.wantPeek {
 				t.Errorf("peek calls = %d, want %d", got, tt.wantPeek)
@@ -967,6 +1284,9 @@ func TestLMStudioFirstEventPeek(t *testing.T) {
 				if got := resp.Header.Get("X-Model-Gateway-Upstream-Status"); got != "200" {
 					t.Errorf("X-Model-Gateway-Upstream-Status = %q, want 200", got)
 				}
+				if res.Route.Overflow == nil {
+					t.Errorf("outcome.Route.Overflow = nil, want non-nil propagated from OnOverflow")
+				}
 			}
 		})
 	}
@@ -977,9 +1297,12 @@ func TestLMStudioFirstEventPeek(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Listen: %v", err)
 		}
-		t.Cleanup(func() { _ = ln.Close() })
 
 		var wg sync.WaitGroup
+		// LIFO cleanup: close listener first so Accept unblocks, then wait for goroutine exit.
+		t.Cleanup(wg.Wait)
+		t.Cleanup(func() { _ = ln.Close() })
+
 		wg.Go(func() {
 			conn, acceptErr := ln.Accept()
 			if acceptErr != nil {
@@ -991,25 +1314,22 @@ func TestLMStudioFirstEventPeek(t *testing.T) {
 			// Truncated chunked stream before any complete frame.
 			_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n: hi\n\r\n")
 		})
-		t.Cleanup(wg.Wait)
 
-		telemetry := &recordingTelemetry{}
-		relaySrv, client := startRelayServer(t, "http://"+ln.Addr().String(), func(w http.ResponseWriter, r *http.Request, up *http.Response) error {
+		h := startRelayServer(t, "http://"+ln.Addr().String(), func(_ context.Context, w http.ResponseWriter, r *http.Request, up *upstream.Response) (outcome.Result, error) {
 			return sse.RelayProxy(r.Context(), w, up, sse.ProxyOptions{
 				Provider:          sse.LMStudioProvider,
 				AdvertisedModel:   "claude-lmstudio/qwen3-coder-30b",
 				BackendModel:      "lmstudio/qwen3-coder-30b",
 				HeartbeatInterval: -1,
 				FirstEventWait:    5 * time.Second,
-				Telemetry:         telemetry,
 			})
 		})
 
-		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, relaySrv.URL+"/v1/messages", nil)
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, h.server.URL+"/v1/messages", nil)
 		if err != nil {
 			t.Fatalf("NewRequestWithContext: %v", err)
 		}
-		resp, err := client.Do(req)
+		resp, err := h.client.Do(req)
 		if err != nil {
 			t.Fatalf("Do: %v", err)
 		}
@@ -1025,32 +1345,38 @@ func TestLMStudioFirstEventPeek(t *testing.T) {
 		if diff := gocmp.Diff(wantBody, string(body)); diff != "" {
 			t.Errorf("502 body mismatch (-want +got):\n%s", diff)
 		}
-		calls := telemetry.snapshot()
-		if len(calls) != 1 || calls[0].Status != http.StatusOK || (calls[0].Override != "upstream_error" && calls[0].Override != "upstream_aborted") {
-			t.Errorf("telemetry = %+v, want status 200 with upstream_error or upstream_aborted", calls)
+		res, handlerErr := h.waitResult(t)
+		if handlerErr != nil {
+			t.Fatalf("RelayProxy error = %v, want nil", handlerErr)
+		}
+		if res.Status != http.StatusOK || (res.StatusOverride != "upstream_error" && res.StatusOverride != "upstream_aborted") {
+			t.Errorf("outcome.Result = %+v, want status 200 with upstream_error or upstream_aborted", res)
 		}
 	})
 }
 
 func TestProxyTimers(t *testing.T) {
+	const literalMessageStop = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+
 	t.Run("success: default 20s heartbeat emits ping while idle and resets on upstream data", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			pr, pw := io.Pipe()
 			rec := newStreamingRecorder()
-			up := &http.Response{
-				StatusCode: http.StatusOK,
-				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-				Body:       pr,
+			up := &upstream.Response{
+				StatusCode:  http.StatusOK,
+				Header:      http.Header{"Content-Type": []string{"text/event-stream"}},
+				RelayHeader: http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:        pr,
 			}
-			done := make(chan error, 1)
+			done := make(chan handlerOutcome, 1)
 			go func() {
-				err := sse.RelayProxy(t.Context(), rec, up, sse.ProxyOptions{
+				res, err := sse.RelayProxy(t.Context(), rec, up, sse.ProxyOptions{
 					Provider:        "codex",
 					AdvertisedModel: "claude-gpt-5.6-terra",
 					BackendModel:    "gpt-5.6-terra",
 				})
 				_ = pr.Close()
-				done <- err
+				done <- handlerOutcome{res: res, err: err}
 			}()
 			joined := false
 			defer func() {
@@ -1063,9 +1389,9 @@ func TestProxyTimers(t *testing.T) {
 
 			synctest.Wait()
 			select {
-			case err := <-done:
+			case out := <-done:
 				joined = true
-				t.Fatalf("RelayProxy returned early: %v", err)
+				t.Fatalf("RelayProxy returned early: res=%+v err=%v", out.res, out.err)
 			default:
 			}
 
@@ -1115,18 +1441,20 @@ func TestProxyTimers(t *testing.T) {
 				t.Fatalf("heartbeats after second 20s silence = %d, want 2; body=%q", got, bodySecond)
 			}
 
-			stop := sse.SynthesizedMessageStop
-			if _, err := io.WriteString(pw, stop); err != nil {
+			if _, err := io.WriteString(pw, literalMessageStop); err != nil {
 				t.Fatalf("write stop: %v", err)
 			}
 			_ = pw.Close()
-			err := <-done
+			out := <-done
 			joined = true
-			if err != nil {
-				t.Fatalf("RelayProxy returned %v, want nil", err)
+			if out.err != nil {
+				t.Fatalf("RelayProxy returned %v, want nil", out.err)
+			}
+			if diff := gocmp.Diff(outcome.Result{Status: http.StatusOK}, out.res); diff != "" {
+				t.Errorf("outcome.Result (-want +got):\n%s", diff)
 			}
 			_, _, finalBody, _, _ := rec.snapshot()
-			if diff := gocmp.Diff(first+mid+stop, strings.ReplaceAll(finalBody, sse.HeartbeatComment, "")); diff != "" {
+			if diff := gocmp.Diff(first+mid+literalMessageStop, strings.ReplaceAll(finalBody, sse.HeartbeatComment, "")); diff != "" {
 				t.Errorf("stream without heartbeats (-want +got):\n%s", diff)
 			}
 		})
@@ -1136,21 +1464,22 @@ func TestProxyTimers(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			pr, pw := io.Pipe()
 			rec := newStreamingRecorder()
-			up := &http.Response{
-				StatusCode: http.StatusOK,
-				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-				Body:       pr,
+			up := &upstream.Response{
+				StatusCode:  http.StatusOK,
+				Header:      http.Header{"Content-Type": []string{"text/event-stream"}},
+				RelayHeader: http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:        pr,
 			}
-			done := make(chan error, 1)
+			done := make(chan handlerOutcome, 1)
 			go func() {
-				err := sse.RelayProxy(t.Context(), rec, up, sse.ProxyOptions{
+				res, err := sse.RelayProxy(t.Context(), rec, up, sse.ProxyOptions{
 					Provider:          "codex",
 					AdvertisedModel:   "claude-gpt-5.6-terra",
 					BackendModel:      "gpt-5.6-terra",
 					HeartbeatInterval: -1,
 				})
 				_ = pr.Close()
-				done <- err
+				done <- handlerOutcome{res: res, err: err}
 			}()
 			joined := false
 			defer func() {
@@ -1163,9 +1492,9 @@ func TestProxyTimers(t *testing.T) {
 
 			synctest.Wait()
 			select {
-			case err := <-done:
+			case out := <-done:
 				joined = true
-				t.Fatalf("RelayProxy returned early: %v", err)
+				t.Fatalf("RelayProxy returned early: res=%+v err=%v", out.res, out.err)
 			default:
 			}
 
@@ -1176,12 +1505,15 @@ func TestProxyTimers(t *testing.T) {
 				t.Fatalf("unexpected heartbeat when disabled: %q", body)
 			}
 
-			_, _ = io.WriteString(pw, sse.SynthesizedMessageStop)
+			_, _ = io.WriteString(pw, literalMessageStop)
 			_ = pw.Close()
-			err := <-done
+			out := <-done
 			joined = true
-			if err != nil {
-				t.Fatalf("RelayProxy returned %v, want nil", err)
+			if out.err != nil {
+				t.Fatalf("RelayProxy returned %v, want nil", out.err)
+			}
+			if diff := gocmp.Diff(outcome.Result{Status: http.StatusOK}, out.res); diff != "" {
+				t.Errorf("outcome.Result (-want +got):\n%s", diff)
 			}
 		})
 	})
@@ -1191,20 +1523,21 @@ func TestProxyTimers(t *testing.T) {
 			ordinary := lmStudioOrdinaryStream(19, 0)
 			pr, pw := io.Pipe()
 			rec := newStreamingRecorder()
-			up := &http.Response{
-				StatusCode: http.StatusOK,
-				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-				Body:       pr,
+			up := &upstream.Response{
+				StatusCode:  http.StatusOK,
+				Header:      http.Header{"Content-Type": []string{"text/event-stream"}},
+				RelayHeader: http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:        pr,
 			}
-			done := make(chan error, 1)
+			done := make(chan handlerOutcome, 1)
 			go func() {
-				err := sse.RelayProxy(t.Context(), rec, up, sse.ProxyOptions{
+				res, err := sse.RelayProxy(t.Context(), rec, up, sse.ProxyOptions{
 					Provider:        sse.LMStudioProvider,
 					AdvertisedModel: "claude-lmstudio/qwen3-coder-30b",
 					BackendModel:    "lmstudio/qwen3-coder-30b",
 				})
 				_ = pr.Close()
-				done <- err
+				done <- handlerOutcome{res: res, err: err}
 			}()
 			joined := false
 			defer func() {
@@ -1217,9 +1550,9 @@ func TestProxyTimers(t *testing.T) {
 
 			synctest.Wait()
 			select {
-			case err := <-done:
+			case out := <-done:
 				joined = true
-				t.Fatalf("RelayProxy returned early: %v", err)
+				t.Fatalf("RelayProxy returned early: res=%+v err=%v", out.res, out.err)
 			default:
 			}
 
@@ -1257,10 +1590,13 @@ func TestProxyTimers(t *testing.T) {
 				t.Fatalf("write rest of stream: %v", err)
 			}
 			_ = pw.Close()
-			err := <-done
+			out := <-done
 			joined = true
-			if err != nil {
-				t.Fatalf("RelayProxy returned %v, want nil", err)
+			if out.err != nil {
+				t.Fatalf("RelayProxy returned %v, want nil", out.err)
+			}
+			if diff := gocmp.Diff(outcome.Result{Status: http.StatusOK}, out.res); diff != "" {
+				t.Errorf("outcome.Result (-want +got):\n%s", diff)
 			}
 			_, _, finalBody, _, _ := rec.snapshot()
 			if !strings.HasPrefix(finalBody, sse.HeartbeatComment) {
@@ -1277,27 +1613,28 @@ func TestProxyTimers(t *testing.T) {
 			overflowFrame := lmStudioOverflowFrame(6017, 4096)
 			pr, pw := io.Pipe()
 			rec := newStreamingRecorder()
-			up := &http.Response{
-				StatusCode: http.StatusOK,
-				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-				Body:       pr,
+			up := &upstream.Response{
+				StatusCode:  http.StatusOK,
+				Header:      http.Header{"Content-Type": []string{"text/event-stream"}},
+				RelayHeader: http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:        pr,
 			}
 			overflowCalls := 0
-			done := make(chan error, 1)
+			done := make(chan handlerOutcome, 1)
 			go func() {
-				err := sse.RelayProxy(t.Context(), rec, up, sse.ProxyOptions{
+				res, err := sse.RelayProxy(t.Context(), rec, up, sse.ProxyOptions{
 					Provider:          sse.LMStudioProvider,
 					AdvertisedModel:   "claude-lmstudio/qwen3-coder-30b",
 					BackendModel:      "lmstudio/qwen3-coder-30b",
 					HeartbeatInterval: -1,
 					FirstEventWait:    50 * time.Millisecond,
-					OnOverflow: func(w http.ResponseWriter, counts sentry.Counts, upstreamStatus int) {
+					OnOverflow: func(w http.ResponseWriter, upstreamStatus int, counts sentry.Counts) (outcome.Result, error) {
 						overflowCalls++
-						writeNormalized413(w, counts, upstreamStatus)
+						return testEngineOverflowResponder(w, upstreamStatus, counts)
 					},
 				})
 				_ = pr.Close()
-				done <- err
+				done <- handlerOutcome{res: res, err: err}
 			}()
 			joined := false
 			defer func() {
@@ -1310,9 +1647,9 @@ func TestProxyTimers(t *testing.T) {
 
 			synctest.Wait()
 			select {
-			case err := <-done:
+			case out := <-done:
 				joined = true
-				t.Fatalf("RelayProxy returned early: %v", err)
+				t.Fatalf("RelayProxy returned early: res=%+v err=%v", out.res, out.err)
 			default:
 			}
 
@@ -1323,10 +1660,10 @@ func TestProxyTimers(t *testing.T) {
 				t.Fatalf("write late overflow: %v", err)
 			}
 			_ = pw.Close()
-			err := <-done
+			out := <-done
 			joined = true
-			if err != nil {
-				t.Fatalf("RelayProxy returned %v, want nil", err)
+			if out.err != nil {
+				t.Fatalf("RelayProxy returned %v, want nil", out.err)
 			}
 			status, _, finalBody, _, _ := rec.snapshot()
 			if status != http.StatusOK {

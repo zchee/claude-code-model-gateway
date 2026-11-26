@@ -16,14 +16,21 @@ package sse_test
 
 import (
 	"bytes"
-	"encoding/json/jsontext"
 	"strings"
 	"testing"
 
 	gocmp "github.com/google/go-cmp/cmp"
 
+	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/sse"
 )
+
+func TestSynthesizedMessageStopConstant(t *testing.T) {
+	const want = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	if sse.SynthesizedMessageStop != want {
+		t.Fatalf("SynthesizedMessageStop = %q, want %q", sse.SynthesizedMessageStop, want)
+	}
+}
 
 func TestTransformer(t *testing.T) {
 	planEvents := strings.Join([]string{
@@ -69,8 +76,18 @@ func TestTransformer(t *testing.T) {
 		"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
 	}, "")
 
+	onlyPlanObserved := []string{
+		`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+		`{"type":"content_block_stop","index":0}`,
+		`{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"exit","name":"ExitPlanMode","input":{}}}`,
+		`{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{}"}}`,
+		`{"type":"content_block_stop","index":1}`,
+		`{"type":"message_delta","delta":{"stop_reason":"tool_use"}}`,
+	}
+
 	tests := map[string]struct {
 		cfg          sse.TransformerConfig
+		nilObserve   bool
 		chunks       [][]byte
 		wantOut      []byte
 		wantObserved []string
@@ -88,6 +105,18 @@ func TestTransformer(t *testing.T) {
 			wantObserved: []string{
 				`{"type":"message_start","message":{"model":"kimi-k3","nested":{"model":"gpt-5.6-sol"},"items":[{"model":"claude-opus-5"},{"model":42},{"model":"kimi-k3"}]}}`,
 			},
+		},
+		"success: nil Observe rewrites frames safely without panicking": {
+			cfg: sse.TransformerConfig{
+				AdvertisedModel: "claude-gpt-5.6-sol",
+				BackendModel:    "gpt-5.6-sol",
+				Provider:        "codex",
+			},
+			nilObserve: true,
+			chunks: [][]byte{
+				[]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"gpt-5.6-sol\"}}\n\n"),
+			},
+			wantOut: []byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-gpt-5.6-sol\"}}\n\n"),
 		},
 		"success: plan tool filtering drops EnterPlanMode, shifts later indices, preserves split UTF-8, keeps tool_use when Bash remains": {
 			cfg: sse.TransformerConfig{
@@ -123,8 +152,9 @@ func TestTransformer(t *testing.T) {
 				Provider:        "codex",
 				FilterPlanTools: true,
 			},
-			chunks:  [][]byte{[]byte(onlyPlanTool)},
-			wantOut: []byte(wantOnlyPlanTool),
+			chunks:       [][]byte{[]byte(onlyPlanTool)},
+			wantOut:      []byte(wantOnlyPlanTool),
+			wantObserved: onlyPlanObserved,
 		},
 		"success: plan tool filtering disabled keeps EnterPlanMode and ExitPlanMode intact": {
 			cfg: sse.TransformerConfig{
@@ -133,8 +163,9 @@ func TestTransformer(t *testing.T) {
 				Provider:        "codex",
 				FilterPlanTools: false,
 			},
-			chunks:  [][]byte{[]byte(onlyPlanTool)},
-			wantOut: []byte(onlyPlanTool),
+			chunks:       [][]byte{[]byte(onlyPlanTool)},
+			wantOut:      []byte(onlyPlanTool),
+			wantObserved: onlyPlanObserved,
 		},
 		"success: LM Studio exclusive cache accounting subtracts cached input before observe and output": {
 			cfg: sse.TransformerConfig{
@@ -207,14 +238,30 @@ func TestTransformer(t *testing.T) {
 				"{\"type\":\"message_start\",\"message\":{\"model\":\"gpt-5.6-sol\",\"text\":\"a�b\"}}",
 			},
 		},
+		"success: valid rewritten unterminated tail preserves absence of trailing separator": {
+			cfg: sse.TransformerConfig{
+				AdvertisedModel: "claude-gpt-5.6-sol",
+				BackendModel:    "gpt-5.6-sol",
+				Provider:        "codex",
+			},
+			chunks: [][]byte{
+				[]byte("event: message_start\r\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"gpt-5.6-sol\"}}"),
+			},
+			wantOut: []byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-gpt-5.6-sol\"}}"),
+			wantObserved: []string{
+				`{"type":"message_start","message":{"model":"gpt-5.6-sol"}}`,
+			},
+		},
 	}
 
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			var observed []string
 			cfg := tt.cfg
-			cfg.Observe = func(event jsontext.Value) {
-				observed = append(observed, string(event))
+			if !tt.nilObserve {
+				cfg.Observe = func(event jsonx.WireValue) {
+					observed = append(observed, mustEncodeWire(t, event))
+				}
 			}
 			tr := sse.NewTransformer(cfg)
 			var out bytes.Buffer
@@ -233,7 +280,7 @@ func TestTransformer(t *testing.T) {
 			if diff := gocmp.Diff(tt.wantOut, out.Bytes()); diff != "" {
 				t.Errorf("wire output mismatch (-want +got):\n%s", diff)
 			}
-			if tt.wantObserved != nil {
+			if !tt.nilObserve {
 				if diff := gocmp.Diff(tt.wantObserved, observed); diff != "" {
 					t.Errorf("observed events mismatch (-want +got):\n%s", diff)
 				}
@@ -249,6 +296,7 @@ func TestAttempt(t *testing.T) {
 		wantDeliver    bool
 		wantTerminal   bool
 		wantTermCode   string
+		wantOpenBlocks int
 		wantVisible    bool
 		wantSawError   bool
 		wantErrorCode  string
@@ -300,9 +348,19 @@ func TestAttempt(t *testing.T) {
 				`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}`,
 				`{"type":"message_delta","delta":{"stop_reason":"end_turn"}}`,
 			},
-			wantFinished: false,
-			wantDeliver:  false,
-			wantVisible:  true,
+			wantFinished:   false,
+			wantDeliver:    false,
+			wantOpenBlocks: 1,
+			wantVisible:    true,
+		},
+		"error: unmatched content_block_stop leaves negative openBlocks and prevents inferred completion": {
+			events: []string{
+				`{"type":"content_block_stop","index":0}`,
+				`{"type":"message_delta","delta":{"stop_reason":"end_turn"}}`,
+			},
+			wantFinished:   false,
+			wantDeliver:    false,
+			wantOpenBlocks: -1,
 		},
 		"error: content block after end_turn prevents inferred completion": {
 			events: []string{
@@ -322,9 +380,11 @@ func TestAttempt(t *testing.T) {
 			wantFinished: false,
 			wantDeliver:  false,
 		},
-		"error: max_tokens stop_reason without message_stop is not finished": {
+		"error: max_tokens, refusal, and pause_turn stop reasons without message_stop are not finished": {
 			events: []string{
 				`{"type":"message_delta","delta":{"stop_reason":"max_tokens"}}`,
+				`{"type":"message_delta","delta":{"stop_reason":"refusal"}}`,
+				`{"type":"message_delta","delta":{"stop_reason":"pause_turn"}}`,
 			},
 			wantFinished: false,
 			wantDeliver:  false,
@@ -342,30 +402,65 @@ func TestAttempt(t *testing.T) {
 			wantErrorCode: "websocket_missing_terminal",
 			wantFatal:     false,
 		},
-		"error: fatal rate_limit_error sets Fatal and ErrorCode": {
-			events: []string{
-				`{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`,
-			},
-			wantFinished:  false,
-			wantDeliver:   false,
+		"error: fatal invalid_request_error": {
+			events:        []string{`{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}`},
+			wantSawError:  true,
+			wantErrorCode: "invalid_request_error",
+			wantFatal:     true,
+		},
+		"error: fatal authentication_error": {
+			events:        []string{`{"type":"error","error":{"type":"authentication_error","message":"expired"}}`},
+			wantSawError:  true,
+			wantErrorCode: "authentication_error",
+			wantFatal:     true,
+		},
+		"error: fatal permission_error": {
+			events:        []string{`{"type":"error","error":{"type":"permission_error","message":"denied"}}`},
+			wantSawError:  true,
+			wantErrorCode: "permission_error",
+			wantFatal:     true,
+		},
+		"error: fatal not_found_error": {
+			events:        []string{`{"type":"error","error":{"type":"not_found_error","message":"missing"}}`},
+			wantSawError:  true,
+			wantErrorCode: "not_found_error",
+			wantFatal:     true,
+		},
+		"error: fatal request_too_large": {
+			events:        []string{`{"type":"error","error":{"type":"request_too_large","message":"too big"}}`},
+			wantSawError:  true,
+			wantErrorCode: "request_too_large",
+			wantFatal:     true,
+		},
+		"error: fatal rate_limit_error": {
+			events:        []string{`{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`},
 			wantSawError:  true,
 			wantErrorCode: "rate_limit_error",
 			wantFatal:     true,
 		},
+		"error: fatal billing_error": {
+			events:        []string{`{"type":"error","error":{"type":"billing_error","message":"exhausted"}}`},
+			wantSawError:  true,
+			wantErrorCode: "billing_error",
+			wantFatal:     true,
+		},
 		"error: unrecognized error type classifies as unknown_error and non-fatal": {
-			events: []string{
-				`{"type":"error","error":{"type":"api_error","message":"transient backend hiccup"}}`,
-			},
-			wantFinished:  false,
-			wantDeliver:   false,
+			events:        []string{`{"type":"error","error":{"type":"api_error","message":"transient backend hiccup"}}`},
 			wantSawError:  true,
 			wantErrorCode: "unknown_error",
 			wantFatal:     false,
 		},
-		"success: whitespace-only text delta and input_json_delta do not count as visible text": {
+		"error: error event with missing error object classifies as unknown_error and non-fatal": {
+			events:        []string{`{"type":"error"}`},
+			wantSawError:  true,
+			wantErrorCode: "unknown_error",
+			wantFatal:     false,
+		},
+		"success: whitespace-only text delta, thinking_delta, and input_json_delta do not count as visible text": {
 			events: []string{
 				`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" \t\r\n "}}`,
-				`{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"a\":1}"}}`,
+				`{"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"hidden"}}`,
+				`{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"a\":1}"}}`,
 				`{"type":"message_stop"}`,
 			},
 			wantFinished: true,
@@ -374,13 +469,20 @@ func TestAttempt(t *testing.T) {
 			wantTermCode: "message_stop",
 			wantVisible:  false,
 		},
+		"success: absent, null, and scalar wire values are ignored cleanly": {
+			events:       []string{"", `null`, `42`, `"text"`, `{"type":"message_stop"}`},
+			wantFinished: true,
+			wantDeliver:  true,
+			wantTerminal: true,
+			wantTermCode: "message_stop",
+		},
 	}
 
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			var attempt sse.Attempt
 			for _, raw := range tt.events {
-				attempt.NoteEvent(jsontext.Value(raw))
+				attempt.NoteEvent(mustDecodeWire(t, raw))
 			}
 			if got := attempt.Finished(); got != tt.wantFinished {
 				t.Errorf("Finished() = %t, want %t", got, tt.wantFinished)
@@ -394,6 +496,9 @@ func TestAttempt(t *testing.T) {
 			if attempt.TerminalCode != tt.wantTermCode {
 				t.Errorf("TerminalCode = %q, want %q", attempt.TerminalCode, tt.wantTermCode)
 			}
+			if attempt.OpenBlocks != tt.wantOpenBlocks {
+				t.Errorf("OpenBlocks = %d, want %d", attempt.OpenBlocks, tt.wantOpenBlocks)
+			}
 			if attempt.HasVisibleText != tt.wantVisible {
 				t.Errorf("HasVisibleText = %t, want %t", attempt.HasVisibleText, tt.wantVisible)
 			}
@@ -406,10 +511,9 @@ func TestAttempt(t *testing.T) {
 			if attempt.Fatal != tt.wantFatal {
 				t.Errorf("Fatal = %t, want %t", attempt.Fatal, tt.wantFatal)
 			}
-			if tt.wantMergedJSON != "" {
-				if diff := gocmp.Diff(tt.wantMergedJSON, string(attempt.MergedUsage)); diff != "" {
-					t.Errorf("MergedUsage (-want +got):\n%s", diff)
-				}
+			wantMerged := mustDecodeWire(t, tt.wantMergedJSON)
+			if diff := gocmp.Diff(wantMerged, attempt.MergedUsage); diff != "" {
+				t.Errorf("MergedUsage (-want +got):\n%s", diff)
 			}
 		})
 	}
@@ -417,6 +521,12 @@ func TestAttempt(t *testing.T) {
 
 func TestEventObserver(t *testing.T) {
 	exactLimitFrame := "data: {\"type\":\"ping\",\"pad\":\"" + strings.Repeat("a", 64) + "\"}\n\n"
+	smallFrame1 := "data: {\"type\":\"e1\",\"v\":\"" + strings.Repeat("x", 30) + "\"}\n\n"
+	smallFrame2 := "data: {\"type\":\"e2\",\"v\":\"" + strings.Repeat("y", 30) + "\"}\n\n"
+	// Two invalid UTF-8 bytes (\xff\xff) expand from 2 raw bytes to 6 UTF-8 bytes (two U+FFFD).
+	malformedFrame := "data: {\"type\":\"m\",\"x\":\"\xff\xff\"}\n\n"
+	malformedDecodedLen := len(malformedFrame) + 4 // each \xff adds +2 bytes when replaced with 3-byte U+FFFD
+
 	tests := map[string]struct {
 		maxBytes      int
 		chunks        [][]byte
@@ -453,7 +563,35 @@ func TestEventObserver(t *testing.T) {
 			wantEvents:    nil,
 			wantOverflows: 1,
 		},
-		"success: cumulative stream larger than pending budget succeeds when each frame fits": {
+		"error: single write of multiple small frames exceeding limit together overflows before extraction": {
+			maxBytes: len(smallFrame1) + len(smallFrame2) - 1,
+			chunks: [][]byte{
+				[]byte(smallFrame1 + smallFrame2),
+				[]byte("data: {\"type\":\"after\"}\n\n"),
+			},
+			wantEvents:    nil,
+			wantOverflows: 1,
+		},
+		"success: malformed UTF-8 frame fitting at exact decoded UTF-8 byte limit observes without overflow": {
+			maxBytes: malformedDecodedLen,
+			chunks: [][]byte{
+				[]byte(malformedFrame),
+			},
+			wantEvents: []string{
+				"{\"type\":\"m\",\"x\":\"��\"}",
+			},
+			wantOverflows: 0,
+		},
+		"error: malformed UTF-8 bytes expanding past limit on decode overflow even when raw length fits": {
+			maxBytes: malformedDecodedLen - 1, // strictly greater than len(malformedFrame), one byte short of decoded length
+			chunks: [][]byte{
+				[]byte(malformedFrame),
+				[]byte("data: {\"type\":\"after\"}\n\n"),
+			},
+			wantEvents:    nil,
+			wantOverflows: 1,
+		},
+		"success: cumulative stream larger than pending budget succeeds when each write fits": {
 			maxBytes: 128,
 			chunks: [][]byte{
 				[]byte("data: {\"type\":\"e1\",\"v\":\"" + strings.Repeat("x", 40) + "\"}\n\n"),
@@ -473,8 +611,8 @@ func TestEventObserver(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			var got []string
 			overflows := 0
-			obs := sse.NewEventObserver(tt.maxBytes, func(event jsontext.Value) {
-				got = append(got, string(event))
+			obs := sse.NewEventObserver(tt.maxBytes, func(event jsonx.WireValue) {
+				got = append(got, mustEncodeWire(t, event))
 			}, func() {
 				overflows++
 			})
@@ -490,4 +628,43 @@ func TestEventObserver(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("success: zero maxPendingBytes defaults to 4 MiB exact boundary", func(t *testing.T) {
+		const prefix = `data: {"type":"big","pad":"`
+		const suffix = "\"}\n\n"
+		padLen := sse.DefaultMaxObserveBytes - len(prefix) - len(suffix)
+		exact4MiB := prefix + strings.Repeat("a", padLen) + suffix
+		if len(exact4MiB) != sse.DefaultMaxObserveBytes {
+			t.Fatalf("fixture len = %d, want %d", len(exact4MiB), sse.DefaultMaxObserveBytes)
+		}
+
+		// Exact 4 MiB fits without overflow.
+		var observedCount int
+		var overflows int
+		obsFit := sse.NewEventObserver(0, func(jsonx.WireValue) { observedCount++ }, func() { overflows++ })
+		obsFit.Write([]byte(exact4MiB))
+		obsFit.End()
+		if observedCount != 1 || overflows != 0 {
+			t.Errorf("exact 4 MiB: observed=%d overflows=%d, want 1 and 0", observedCount, overflows)
+		}
+
+		// 4 MiB + 1 byte overflows once and ignores subsequent frames.
+		over4MiB := prefix + strings.Repeat("a", padLen+1) + suffix
+		observedCount = 0
+		overflows = 0
+		obsOver := sse.NewEventObserver(0, func(jsonx.WireValue) { observedCount++ }, func() { overflows++ })
+		obsOver.Write([]byte(over4MiB))
+		obsOver.Write([]byte("data: {\"type\":\"after\"}\n\n"))
+		obsOver.End()
+		if observedCount != 0 || overflows != 1 {
+			t.Errorf("4 MiB + 1: observed=%d overflows=%d, want 0 and 1", observedCount, overflows)
+		}
+	})
+
+	t.Run("success: nil callbacks do not panic on normal events or overflow", func(t *testing.T) {
+		obs := sse.NewEventObserver(16, nil, nil)
+		obs.Write([]byte("data: {\"type\":\"ok\"}\n\n"))
+		obs.Write([]byte(exactLimitFrame))
+		obs.End()
+	})
 }
