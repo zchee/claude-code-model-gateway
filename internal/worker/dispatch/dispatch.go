@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -120,7 +121,8 @@ type CachedRoute struct {
 }
 
 type cacheEntry struct {
-	key        string // Canonical JSON string, retaining escaped lone surrogates loaded from disk.
+	key        string   // Canonical JSON string used for key equality.
+	keyText    []uint16 // The original key, including any unpaired surrogate loaded from disk.
 	route      CachedRoute
 	lastUsedAt float64
 }
@@ -137,6 +139,7 @@ type Cache struct {
 }
 
 // NewCache loads a cache using the supplied clock, idle lifetime in milliseconds and session limit.
+// The limit bounds live entries, not the size of the file read at startup.
 // An empty path disables persistence.
 func NewCache(path string, ttlMillis float64, maxSessions int, now func() time.Time) *Cache {
 	c := &Cache{path: path, ttlMillis: ttlMillis, maxSessions: max(maxSessions, 0), now: now, byKey: make(map[string]*list.Element)}
@@ -144,17 +147,20 @@ func NewCache(path string, ttlMillis float64, maxSessions int, now func() time.T
 	return c
 }
 
-// Set remembers a valid route for a nonempty identity; disk writes are best effort.
+// Set remembers a valid route for a nonempty UTF-8 key; disk writes are best effort.
 func (c *Cache) Set(key string, route CachedRoute) {
 	if key == "" || !validRoute(route) {
 		return
 	}
-	quoted, _ := jsontext.AppendQuote(nil, key)
+	quoted, err := jsontext.AppendQuote(nil, key)
+	if err != nil {
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := float64(c.now().UnixMilli())
 	c.prune(now)
-	entry := cacheEntry{key: string(quoted), route: cloneRoute(route), lastUsedAt: now}
+	entry := cacheEntry{key: string(quoted), keyText: utf16.Encode([]rune(key)), route: cloneRoute(route), lastUsedAt: now}
 	if el := c.byKey[entry.key]; el != nil {
 		el.Value = entry
 		c.lru.MoveToBack(el)
@@ -165,12 +171,16 @@ func (c *Cache) Set(key string, route CachedRoute) {
 	c.persist()
 }
 
-// Get returns and refreshes a live route, or returns nil for a missing or expired route.
+// Get returns and refreshes a live route for a nonempty UTF-8 key.
+// It returns nil for an invalid key or a missing or expired route.
 func (c *Cache) Get(key string) *CachedRoute {
 	if key == "" {
 		return nil
 	}
-	quoted, _ := jsontext.AppendQuote(nil, key)
+	quoted, err := jsontext.AppendQuote(nil, key)
+	if err != nil {
+		return nil
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	el := c.byKey[string(quoted)]
@@ -244,19 +254,29 @@ func (c *Cache) load() {
 	if version.Kind != '0' || version.Number != 1 || rows.Kind != '[' {
 		return
 	}
+	// Resolve duplicate keys before expiry and eviction: the first valid row fixes
+	// the position and the last valid row supplies the value.
+	positions := make(map[string]int)
+	var entries []cacheEntry
 	for _, row := range rows.Elements {
 		entry, ok := decodeEntry(row)
 		if !ok {
 			continue
 		}
-		if el := c.byKey[entry.key]; el != nil {
-			// Loading a repeated key replaces the value, not its insertion order.
-			el.Value = entry
+		if pos, ok := positions[entry.key]; ok {
+			entries[pos] = entry
 		} else {
-			c.byKey[entry.key] = c.lru.PushBack(entry)
+			positions[entry.key] = len(entries)
+			entries = append(entries, entry)
 		}
 	}
-	c.prune(float64(c.now().UnixMilli()))
+	now := float64(c.now().UnixMilli())
+	entries = slices.DeleteFunc(entries, func(entry cacheEntry) bool { return c.expired(entry, now) })
+	survivors := entries[max(len(entries)-c.maxSessions, 0):]
+	c.byKey = make(map[string]*list.Element, len(survivors))
+	for _, entry := range survivors {
+		c.byKey[entry.key] = c.lru.PushBack(entry)
+	}
 	c.persist()
 }
 
@@ -285,37 +305,46 @@ func decodeEntry(row jsonx.WireValue) (cacheEntry, bool) {
 		return cacheEntry{}, false
 	}
 	key, err := jsonx.EncodeWire(row.Elements[0])
-	return cacheEntry{key: string(key), route: route, lastUsedAt: used.Number}, err == nil
+	return cacheEntry{key: string(key), keyText: row.Elements[0].Text, route: route, lastUsedAt: used.Number}, err == nil
+}
+
+func stateMember(name string, value jsonx.WireValue) jsonx.Member {
+	return jsonx.Member{Name: utf16.Encode([]rune(name)), Value: value}
+}
+
+func stateString(value *string) jsonx.WireValue {
+	if value == nil {
+		return jsonx.WireValue{Kind: 'n'}
+	}
+	return jsonx.WireValue{Kind: '"', Text: utf16.Encode([]rune(*value))}
 }
 
 func (c *Cache) persist() {
 	if c.path == "" {
 		return
 	}
-	type storedRoute struct {
-		Model      string   `json:"model"`
-		Effort     **string `json:"effort,omitzero"`
-		Ticket     *string  `json:"ticket"`
-		LastUsedAt float64  `json:"lastUsedAt"`
-	}
-	routes := make([][2]any, 0, c.lru.Len())
+	routes := make([]jsonx.WireValue, 0, c.lru.Len())
 	for el := c.lru.Front(); el != nil; el = el.Next() {
 		entry := el.Value.(cacheEntry)
-		row := storedRoute{Model: entry.route.Model, Ticket: entry.route.Ticket, LastUsedAt: entry.lastUsedAt}
+		members := make([]jsonx.Member, 0, 4)
+		members = append(members, stateMember("model", stateString(&entry.route.Model)))
 		if !entry.route.EffortMissing {
-			row.Effort = &entry.route.Effort
+			members = append(members, stateMember("effort", stateString(entry.route.Effort)))
 		}
-		routes = append(routes, [2]any{jsontext.Value(entry.key), row})
+		members = append(members,
+			stateMember("ticket", stateString(entry.route.Ticket)),
+			stateMember("lastUsedAt", jsonx.WireValue{Kind: '0', Number: entry.lastUsedAt}),
+		)
+		routes = append(routes, jsonx.WireValue{Kind: '[', Elements: []jsonx.WireValue{
+			{Kind: '"', Text: entry.keyText},
+			{Kind: '{', Members: members},
+		}})
 	}
-	data, err := jsonx.EncodeState(struct {
-		Version int      `json:"version"`
-		Routes  [][2]any `json:"routes"`
-	}{Version: 1, Routes: routes})
+	data, err := jsonx.EncodeWire(jsonx.WireValue{Kind: '{', Members: []jsonx.Member{
+		stateMember("version", jsonx.WireValue{Kind: '0', Number: 1}),
+		stateMember("routes", jsonx.WireValue{Kind: '[', Elements: routes}),
+	}})
 	if err != nil {
-		return
-	}
-	compact := jsontext.Value(data)
-	if err := compact.Compact(); err != nil {
 		return
 	}
 	// Do not clean the parent separately: a symlink followed by .. is resolved by the filesystem.
@@ -323,5 +352,5 @@ func (c *Cache) persist() {
 	if parent != "" && os.MkdirAll(parent, 0o777) != nil {
 		return
 	}
-	_ = atomicfile.WriteFile(c.path, append(compact, '\n'), 0o600)
+	_ = atomicfile.WriteFile(c.path, append(data, '\n'), 0o600)
 }
