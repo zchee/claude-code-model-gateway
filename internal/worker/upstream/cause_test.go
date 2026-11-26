@@ -19,6 +19,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -78,6 +79,9 @@ func TestDoKeepsCallerCause(t *testing.T) {
 				up.serve = func(peer net.Conn, _ *faultConn) { replyAfterFirstByte(peer, "") }
 				var client *upstream.Client
 				dial := up.DialContext
+				// hookStarted and hookFinished record the Client.Close call made from the connection's
+				// Close, before it starts and after it returns.
+				var hookStarted, hookFinished atomic.Bool
 				if tt.closeWhileEnding {
 					var closeOnce sync.Once
 					dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -85,7 +89,13 @@ func TestDoKeepsCallerCause(t *testing.T) {
 						if err != nil {
 							return nil, err
 						}
-						return &closingConn{Conn: c, onClose: func() { closeOnce.Do(func() { _ = client.Close() }) }}, nil
+						return &closingConn{Conn: c, onClose: func() {
+							closeOnce.Do(func() {
+								hookStarted.Store(true)
+								_ = client.Close()
+								hookFinished.Store(true)
+							})
+						}}, nil
 					}
 				}
 				client = upstream.NewClient(upstream.Options{DialContext: dial})
@@ -93,7 +103,12 @@ func TestDoKeepsCallerCause(t *testing.T) {
 				ctx, end, release := tt.withCause(t.Context(), errCallerCause)
 				defer release()
 
-				done := make(chan error, 1)
+				// doResult is what the request goroutine saw at the moment Do returned.
+				type doResult struct {
+					err                       error
+					hookStarted, hookFinished bool
+				}
+				done := make(chan doResult, 1)
 				var reqWG sync.WaitGroup
 				defer func() {
 					_ = client.Close()
@@ -102,28 +117,40 @@ func TestDoKeepsCallerCause(t *testing.T) {
 				}()
 				reqWG.Go(func() {
 					resp, err := client.Do(ctx, messagesRequest())
+					// Read before anything else runs on this goroutine, so a hook still running
+					// elsewhere when Do returned shows as unfinished.
+					res := doResult{err: err, hookStarted: hookStarted.Load(), hookFinished: hookFinished.Load()}
 					if resp != nil {
 						_ = resp.Body.Close()
-						err = errors.New("unexpected response")
+						res.err = errors.New("unexpected response")
 					}
-					done <- err
+					done <- res
 				})
 
 				synctest.Wait()
 				select {
-				case err := <-done:
-					t.Fatalf("Do returned before the caller ended the request: %v", err)
+				case res := <-done:
+					t.Fatalf("Do returned before the caller ended the request: %v", res.err)
 				default:
 				}
 				end()
 				synctest.Wait()
 
-				var err error
+				var res doResult
 				select {
-				case err = <-done:
+				case res = <-done:
 				default:
 					t.Fatal("Do still pending after the caller ended the request")
 				}
+				if tt.closeWhileEnding {
+					switch {
+					case !res.hookStarted:
+						t.Error("Client.Close was not called from the connection's Close before Do returned; the case did not race Close with the caller's cancellation")
+					case !res.hookFinished:
+						t.Error("Client.Close called from the connection's Close had not returned when Do returned")
+					}
+				}
+				err := res.err
 				if err == nil {
 					t.Fatal("Do returned no error")
 				}

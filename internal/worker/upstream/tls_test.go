@@ -476,8 +476,17 @@ func TestDoHidesBrokenTLSRecords(t *testing.T) {
 					return err
 				})
 			},
-			wantTexts: []string{tlsFailureText, responseFailureText},
+			// The plain text reaches the client as a record header it rejects, an exported TLS
+			// error type, so Do reports the TLS failure rather than the generic response failure.
+			wantTexts: []string{tlsFailureText},
+			check: func(t *testing.T, err error) {
+				if _, ok := errors.AsType[tls.RecordHeaderError](err); !ok {
+					t.Errorf("Do against a plain-text response head after a completed handshake = %v, want tls.RecordHeaderError in the unwrap chain", err)
+				}
+			},
 		},
+		// The decryption failure is reported by an alert of a type the TLS package does not
+		// export, so either fixed sentence is accepted here.
 		"error: a corrupted record inside the response head after a completed handshake": {
 			handle: func(t *testing.T, cert tls.Certificate) func(net.Conn) {
 				return afterHandshake(t, cert, func(raw net.Conn, tc *tls.Conn) error {
@@ -561,6 +570,101 @@ func TestDoKeepsDialErrors(t *testing.T) {
 			}
 			if got, want := err.Error(), tt.dialErr.Error(); got != want {
 				t.Errorf("Do error text = %q, want the dial error's text %q", got, want)
+			}
+		})
+	}
+}
+
+// earlierFailureDial connects its first dial to a fake and fails every later dial with the error
+// set by refuseWith.
+type earlierFailureDial struct {
+	fake *loopbackFake
+
+	mu      sync.Mutex
+	dialed  bool
+	refusal error
+}
+
+func (d *earlierFailureDial) refuseWith(err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.refusal = err
+}
+
+func (d *earlierFailureDial) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	d.mu.Lock()
+	first := !d.dialed
+	d.dialed = true
+	refusal := d.refusal
+	d.mu.Unlock()
+	if first {
+		return d.fake.dialFake(ctx, network, addr)
+	}
+	if refusal == nil {
+		return nil, errors.New("a later dial ran before the test set its error")
+	}
+	return nil, refusal
+}
+
+func TestDoKeepsDialErrorWrappingEarlierTLSFailure(t *testing.T) {
+	tests := map[string]struct {
+		// wrap returns the error the custom dial reports, wrapping earlier, the error Do returned
+		// for a failed TLS exchange of the same client.
+		wrap func(earlier error) error
+	}{
+		"error: a custom dial wrapping the TLS error of an earlier exchange keeps its error and its text": {
+			wrap: func(earlier error) error {
+				return fmt.Errorf("dialer refuses after the earlier failure: %w", earlier)
+			},
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			cert, _ := newTrustedServerCert(t)
+			// The client trusts only another authority, so the first exchange fails verification.
+			stranger := newTestAuthority(t, pkix.Name{CommonName: "upstream authority the fake did not use"})
+			roots := x509.NewCertPool()
+			roots.AddCert(stranger.cert)
+
+			dial := &earlierFailureDial{fake: startLoopbackFake(t, serveTLS(t.Context(), cert))}
+			client := upstream.NewClient(upstream.Options{DialContext: dial.DialContext, TLSConfig: &tls.Config{RootCAs: roots}})
+			defer func() { _ = client.Close() }()
+
+			req := messagesRequest()
+			req.BaseURL = "https://" + tlsDialName
+			resp, earlier := doWithoutPanic(t, client, req)
+			if resp != nil {
+				_ = resp.Body.Close()
+				t.Fatalf("first Do returned status %d from a certificate the client does not trust, want an error", resp.StatusCode)
+			}
+			if earlier == nil {
+				t.Fatal("first Do returned neither a response nor an error")
+			}
+			// Preconditions: the wrapped error is the client's own fixed TLS error.
+			if got := earlier.Error(); got != tlsFailureText {
+				t.Fatalf("first Do error text = %q, want exactly %q; the case needs the client's TLS error", got, tlsFailureText)
+			}
+			if _, ok := errors.AsType[*tls.CertificateVerificationError](earlier); !ok {
+				t.Fatalf("first Do error = %v, want *tls.CertificateVerificationError in the unwrap chain", earlier)
+			}
+
+			dialErr := tt.wrap(earlier)
+			dial.refuseWith(dialErr)
+			resp, err := doWithoutPanic(t, client, req)
+			if resp != nil {
+				_ = resp.Body.Close()
+				t.Fatalf("second Do returned status %d, want the dial's error", resp.StatusCode)
+			}
+			if err == nil {
+				t.Fatal("second Do returned neither a response nor an error")
+			}
+			t.Logf("second Do error: %v", err)
+			if !errors.Is(err, dialErr) {
+				t.Errorf("second Do error = %v, want the dial's error %v in the unwrap chain", err, dialErr)
+			}
+			if got, want := err.Error(), dialErr.Error(); got != want {
+				t.Errorf("second Do error text = %q, want the dial error's text %q", got, want)
 			}
 		})
 	}
