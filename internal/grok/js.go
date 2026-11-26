@@ -15,12 +15,12 @@
 package grok
 
 import (
-	"errors"
 	"math"
-	"math/big"
+	"slices"
 	"strconv"
 	"unicode/utf16"
 
+	"github.com/zchee/claude-code-model-gateway/internal/config"
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
 )
 
@@ -128,34 +128,76 @@ func coalesce(a, b jsonx.WireValue) jsonx.WireValue {
 	return a
 }
 
-// jsString is String(v), which is also what a template literal and Array.prototype.join apply.
-func jsString(v jsonx.WireValue) []uint16 {
+// CoercionError reports that JavaScript's String() or Number() would throw on an upstream value.
+// ToPrimitive throws for an object whose own toString member is not callable, and a member of a
+// parsed object never is; Array.prototype.join applies the same conversion to every element. The
+// error carries no part of the value.
+type CoercionError struct{}
+
+func (*CoercionError) Error() string {
+	return "grok: an upstream object has its own toString member, so String() and Number() reject it"
+}
+
+// coercionThrows reports whether String(v) or Number(v) throws.
+func coercionThrows(v jsonx.WireValue) bool {
+	switch v.Kind {
+	case '{':
+		return get(v, "toString").Kind != 0
+	case '[':
+		return slices.ContainsFunc(v.Elements, coercionThrows)
+	}
+	return false
+}
+
+// toString is String(v), as template literals and Array.prototype.join apply it, with the
+// source's exception.
+func toString(v jsonx.WireValue) ([]uint16, error) {
+	if coercionThrows(v) {
+		return nil, &CoercionError{}
+	}
+	return jsString(v), nil
+}
+
+// toCount is Number(v) || 0 with the source's exception.
+func toCount(v jsonx.WireValue) (float64, error) {
+	if coercionThrows(v) {
+		return 0, &CoercionError{}
+	}
+	return count(v), nil
+}
+
+// jsString is String(v) for a value on which it does not throw (see toString); an object reads
+// as "[object Object]".
+func jsString(v jsonx.WireValue) []uint16 { return appendString(nil, v) }
+
+// appendString appends String(v) to dst. Nested arrays write into the one buffer, so the cost is
+// linear in the size of v.
+func appendString(dst []uint16, v jsonx.WireValue) []uint16 {
 	switch v.Kind {
 	case '"':
-		return v.Text
+		return append(dst, v.Text...)
 	case '0':
-		return units(numberString(v.Number))
+		return append(dst, units(numberString(v.Number))...)
 	case 't':
-		return units("true")
+		return append(dst, units("true")...)
 	case 'f':
-		return units("false")
+		return append(dst, units("false")...)
 	case 'n':
-		return units("null")
+		return append(dst, units("null")...)
 	case '{':
-		return units("[object Object]")
+		return append(dst, units("[object Object]")...)
 	case '[':
-		var out []uint16
 		for i, el := range v.Elements {
 			if i != 0 {
-				out = append(out, ',')
+				dst = append(dst, ',')
 			}
 			if el.Kind != 0 && el.Kind != 'n' {
-				out = append(out, jsString(el)...)
+				dst = appendString(dst, el)
 			}
 		}
-		return out
+		return dst
 	default:
-		return units("undefined")
+		return append(dst, units("undefined")...)
 	}
 }
 
@@ -176,7 +218,8 @@ func numberString(n float64) string {
 	return string(b)
 }
 
-// jsNumber is Number(v).
+// jsNumber is Number(v) for a value on which it does not throw (see toCount). Strings, and arrays
+// through their String() form, use the repository's ECMAScript StringToNumber.
 func jsNumber(v jsonx.WireValue) float64 {
 	switch v.Kind {
 	case '0':
@@ -186,15 +229,15 @@ func jsNumber(v jsonx.WireValue) float64 {
 	case 'f', 'n':
 		return 0
 	case '"':
-		return stringToNumber(v.Text)
+		return config.JSNumber(string(utf16.Decode(v.Text)))
 	case '[':
-		return stringToNumber(jsString(v))
+		return config.JSNumber(string(utf16.Decode(jsString(v))))
 	default:
 		return math.NaN()
 	}
 }
 
-// count is Number(v) || 0.
+// count is Number(v) || 0 for a value on which Number does not throw.
 func count(v jsonx.WireValue) float64 {
 	n := jsNumber(v)
 	if math.IsNaN(n) || n == 0 {
@@ -203,134 +246,13 @@ func count(v jsonx.WireValue) float64 {
 	return n
 }
 
-// isSpace reports the WhiteSpace and LineTerminator code points that String.prototype.trim and
-// Number() strip.
+// isSpace reports the WhiteSpace and LineTerminator code points that String.prototype.trim strips.
 func isSpace(r rune) bool {
 	switch r {
 	case '\t', '\n', '\v', '\f', '\r', ' ', 0x00a0, 0x1680, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0xfeff:
 		return true
 	}
 	return r >= 0x2000 && r <= 0x200a
-}
-
-func trimUnits(u []uint16) []uint16 {
-	for len(u) > 0 && isSpace(rune(u[0])) {
-		u = u[1:]
-	}
-	for len(u) > 0 && isSpace(rune(u[len(u)-1])) {
-		u = u[:len(u)-1]
-	}
-	return u
-}
-
-// stringToNumber applies the StringNumericLiteral grammar of ECMAScript: surrounding white space,
-// an empty string as 0, signed decimal literals and Infinity, and unsigned 0x, 0o and 0b integers.
-// Anything else, including spellings strconv accepts but JavaScript does not (inf, nan, digit
-// separators, hexadecimal floats), is NaN.
-func stringToNumber(u []uint16) float64 {
-	u = trimUnits(u)
-	if len(u) == 0 {
-		return 0
-	}
-	b := make([]byte, len(u))
-	for i, c := range u {
-		if c > 0x7f {
-			return math.NaN()
-		}
-		b[i] = byte(c)
-	}
-	s := string(b)
-	switch s {
-	case "Infinity", "+Infinity":
-		return math.Inf(1)
-	case "-Infinity":
-		return math.Inf(-1)
-	}
-	if len(s) > 2 && s[0] == '0' {
-		base := 0
-		switch s[1] {
-		case 'x', 'X':
-			base = 16
-		case 'o', 'O':
-			base = 8
-		case 'b', 'B':
-			base = 2
-		}
-		if base != 0 {
-			return integerLiteral(s[2:], base)
-		}
-	}
-	if !decimalLiteral(s) {
-		return math.NaN()
-	}
-	n, err := strconv.ParseFloat(s, 64)
-	if err != nil && !errors.Is(err, strconv.ErrRange) {
-		return math.NaN()
-	}
-	return n
-}
-
-func integerLiteral(digits string, base int) float64 {
-	for _, c := range []byte(digits) {
-		var d int
-		switch {
-		case c >= '0' && c <= '9':
-			d = int(c - '0')
-		case c >= 'a' && c <= 'f':
-			d = int(c-'a') + 10
-		case c >= 'A' && c <= 'F':
-			d = int(c-'A') + 10
-		default:
-			return math.NaN()
-		}
-		if d >= base {
-			return math.NaN()
-		}
-	}
-	i, ok := new(big.Int).SetString(digits, base)
-	if !ok {
-		return math.NaN()
-	}
-	f, _ := new(big.Float).SetInt(i).Float64()
-	return f
-}
-
-// decimalLiteral reports whether s is [+-] digits [. digits] [e [+-] digits] with at least one
-// mantissa digit.
-func decimalLiteral(s string) bool {
-	i := 0
-	if s[i] == '+' || s[i] == '-' {
-		i++
-	}
-	digits := 0
-	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
-		i++
-		digits++
-	}
-	if i < len(s) && s[i] == '.' {
-		i++
-		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
-			i++
-			digits++
-		}
-	}
-	if digits == 0 {
-		return false
-	}
-	if i < len(s) && (s[i] == 'e' || s[i] == 'E') {
-		i++
-		if i < len(s) && (s[i] == '+' || s[i] == '-') {
-			i++
-		}
-		exponent := i
-		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
-			i++
-		}
-		if i == exponent {
-			return false
-		}
-	}
-	return i == len(s)
 }
 
 // mapKey is the SameValueZero identity a JavaScript Map uses for a parsed value. Objects and

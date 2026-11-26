@@ -33,6 +33,21 @@ type tool struct {
 }
 
 // Stream holds translation state for one Responses event stream.
+//
+// Create a Stream with NewStream; the zero value, and a Stream after End, translate nothing. A
+// Stream belongs to one goroutine, which feeds it the frames of one upstream response in order,
+// and it must not be copied. Late events after response.completed are still translated until End,
+// as in the source.
+//
+// An event is handled whole or not at all where the source's String() or Number() would throw: the
+// worker catches that exception per event (lib/request-worker.js:363-377), and the translator finds
+// it before the event changes anything, so the event yields no frame and no state change. When a
+// frame cannot be encoded (an upstream value deeper than the wire policy's nesting limit), handling
+// of that event stops at that frame: frames already produced for the event are kept, and the
+// message start or content block the frame would have announced is not registered.
+//
+// An `event: error` frame relays the upstream error message to the client, as the source does;
+// that is response content passed through, not a Go error or a log line.
 type Stream struct {
 	model string
 	now   func() time.Time
@@ -51,7 +66,8 @@ type Stream struct {
 	out []byte
 }
 
-// NewStream starts a translator for the advertised model, using now for missing IDs.
+// NewStream starts a translator for the advertised model, using now for missing IDs. now must not
+// be nil.
 func NewStream(model string, now func() time.Time) *Stream {
 	return &Stream{
 		model:    model,
@@ -69,7 +85,7 @@ func NewStream(model string, now func() time.Time) *Stream {
 // The event is the first data line trimmed as String.prototype.trim trims; an empty line,
 // [DONE], or data that JSON.parse rejects is skipped (lib/request-worker.js:363-377).
 func (s *Stream) Frame(frame sse.Frame) string {
-	if frame.Delimiter == "" {
+	if s.byKey == nil || frame.Delimiter == "" {
 		return ""
 	}
 	data, ok := frame.Data()
@@ -84,19 +100,27 @@ func (s *Stream) Frame(frame sse.Frame) string {
 	if err != nil {
 		return ""
 	}
-	s.event(event)
+	// An error only ends the handling of this event; see the Stream documentation.
+	_ = s.event(event)
 	return s.flush()
 }
 
-// End emits any final frames on orderly upstream EOF. Do not call End on transport failure.
+// End emits any final frames on orderly upstream EOF and releases the stream's state. Do not call
+// End on transport failure.
 //
 // A stream that started and saw no response.completed ends with message_delta (end_turn, zero
 // usage) and message_stop; blocks still open get no content_block_stop (lib/grok-backend.js:389).
 func (s *Stream) End() string {
-	if s.started && !s.stopped {
-		s.stop(jsonx.WireValue{}, "end_turn")
+	if s.byKey == nil {
+		return ""
 	}
-	return s.flush()
+	if s.started && !s.stopped {
+		zero, _ := usage(jsonx.WireValue{}) // Absent fields never throw.
+		_ = s.stop(zero, "end_turn")
+	}
+	out := s.flush()
+	*s = Stream{}
+	return out
 }
 
 func (s *Stream) flush() string {
@@ -105,52 +129,90 @@ func (s *Stream) flush() string {
 	return out
 }
 
-// write appends `event: <type>\ndata: <JSON>\n\n`. Encoding fails only when an upstream value
-// nests deeper than the wire policy allows; that frame is dropped.
-func (s *Stream) write(typ string, members ...jsonx.Member) {
+// write appends `event: <type>\ndata: <JSON>\n\n`, or nothing when the frame cannot be encoded.
+func (s *Stream) write(typ string, members ...jsonx.Member) error {
 	data, err := jsonx.EncodeWire(obj(append([]jsonx.Member{member("type", str(typ))}, members...)...))
 	if err != nil {
-		return
+		return err
 	}
 	s.out = append(s.out, "event: "...)
 	s.out = append(s.out, typ...)
 	s.out = append(s.out, "\ndata: "...)
 	s.out = append(s.out, data...)
 	s.out = append(s.out, "\n\n"...)
+	return nil
 }
 
-// event follows the transformer's event handler (lib/grok-backend.js:340-388).
-func (s *Stream) event(event jsonx.WireValue) {
+// event follows the transformer's event handler (lib/grok-backend.js:340-388). Each case computes
+// every String() and Number() the source applies before its first frame or state change.
+func (s *Stream) event(event jsonx.WireValue) error {
 	typ := get(event, "type")
 	response := get(event, "response")
 	item := get(event, "item")
 	switch {
 	case isString(typ, "response.created"):
-		s.start(response)
-	case isString(typ, "response.output_text.delta"):
-		s.start(response)
-		key := coalesce(coalesce(get(event, "item_id"), get(event, "output_index")), str("default"))
-		b := s.startBlock("text:", key, get(event, "output_index"), obj(member("type", str("text")), member("text", str(""))))
-		s.write("content_block_delta", member("index", num(float64(b.index))), member("delta", obj(member("type", str("text_delta")), member("text", or(get(event, "delta"), str(""))))))
-	case isString(typ, "response.output_item.added") && isString(get(item, "type"), "function_call"):
-		s.start(response)
-		s.toolBlock(event, item)
-	case isString(typ, "response.function_call_arguments.delta"):
-		s.start(response)
-		t := s.toolBlock(event, jsonx.WireValue{})
-		t.sawArgumentDelta = true
-		s.argumentDelta(t, get(event, "delta"))
-	case isString(typ, "response.function_call_arguments.done"):
-		s.start(response)
-		if t := s.toolBlock(event, jsonx.WireValue{}); !t.sawArgumentDelta {
-			s.argumentDelta(t, get(event, "arguments"))
+		opening, err := s.opening(response)
+		if err != nil {
+			return err
 		}
+		return s.start(opening)
+	case isString(typ, "response.output_text.delta"):
+		opening, err := s.opening(response)
+		if err != nil {
+			return err
+		}
+		name, err := toString(coalesce(coalesce(get(event, "item_id"), get(event, "output_index")), str("default")))
+		if err != nil {
+			return err
+		}
+		if err := s.start(opening); err != nil {
+			return err
+		}
+		b, err := s.startBlock("text:"+unitsKey(name), get(event, "output_index"), obj(member("type", str("text")), member("text", str(""))))
+		if err != nil {
+			return err
+		}
+		return s.write("content_block_delta", member("index", num(float64(b.index))), member("delta", obj(member("type", str("text_delta")), member("text", or(get(event, "delta"), str(""))))))
+	case isString(typ, "response.output_item.added") && isString(get(item, "type"), "function_call"):
+		_, err := s.toolEvent(event, item, response)
+		return err
+	case isString(typ, "response.function_call_arguments.delta"):
+		t, err := s.toolEvent(event, jsonx.WireValue{}, response)
+		if err != nil {
+			return err
+		}
+		t.sawArgumentDelta = true
+		return s.argumentDelta(t, get(event, "delta"))
+	case isString(typ, "response.function_call_arguments.done"):
+		t, err := s.toolEvent(event, jsonx.WireValue{}, response)
+		if err != nil || t.sawArgumentDelta {
+			return err
+		}
+		return s.argumentDelta(t, get(event, "arguments"))
 	case isString(typ, "response.output_item.done") && isString(get(item, "type"), "web_search_call"):
-		s.start(response)
+		opening, err := s.opening(response)
+		if err != nil {
+			return err
+		}
 		use, result := webSearchBlocks(item, s.now)
-		id := get(use, "id")
-		s.stopBlock(s.startBlock("web_search_use:", id, jsonx.WireValue{}, use))
-		s.stopBlock(s.startBlock("web_search_result:", id, jsonx.WireValue{}, result))
+		name, err := toString(get(use, "id"))
+		if err != nil {
+			return err
+		}
+		if err := s.start(opening); err != nil {
+			return err
+		}
+		b, err := s.startBlock("web_search_use:"+unitsKey(name), jsonx.WireValue{}, use)
+		if err != nil {
+			return err
+		}
+		if err := s.stopBlock(b); err != nil {
+			return err
+		}
+		if b, err = s.startBlock("web_search_result:"+unitsKey(name), jsonx.WireValue{}, result); err != nil {
+			return err
+		}
+		return s.stopBlock(b)
 	case isString(typ, "response.output_item.done"):
 		// The source does not start the message here.
 		var b *block
@@ -159,35 +221,57 @@ func (s *Stream) event(event jsonx.WireValue) {
 		} else if k, ok := mapKey(get(event, "output_index")); ok {
 			b = s.byOutput[k]
 		}
-		s.stopBlock(b)
+		return s.stopBlock(b)
 	case isString(typ, "response.completed"):
-		s.start(response)
-		for _, b := range s.blocks {
-			s.stopBlock(b)
+		opening, err := s.opening(response)
+		if err != nil {
+			return err
+		}
+		var closing jsonx.WireValue
+		if !s.stopped {
+			if closing, err = usage(get(response, "usage")); err != nil {
+				return err
+			}
 		}
 		_, toolUse := responseContent(response, s.now)
-		s.stop(get(response, "usage"), stopReason(toolUse))
+		if err := s.start(opening); err != nil {
+			return err
+		}
+		for _, b := range s.blocks {
+			if err := s.stopBlock(b); err != nil {
+				return err
+			}
+		}
+		return s.stop(closing, stopReason(toolUse))
 	case isString(typ, "error") || isString(typ, "response.failed"):
-		message := or(or(get(get(event, "error"), "message"), get(get(response, "error"), "message")), str("Grok response failed"))
-		text := append(units("model-gateway: Grok upstream failed: "), jsString(message)...)
-		s.write("error", member("error", obj(member("type", str("api_error")), member("message", strUnits(text)))))
+		message, err := toString(or(or(get(get(event, "error"), "message"), get(get(response, "error"), "message")), str("Grok response failed")))
+		if err != nil {
+			return err
+		}
+		text := append(units("model-gateway: Grok upstream failed: "), message...)
+		return s.write("error", member("error", obj(member("type", str("api_error")), member("message", strUnits(text)))))
 	}
+	return nil
 }
 
-func (s *Stream) argumentDelta(t *tool, fragment jsonx.WireValue) {
-	s.write("content_block_delta", member("index", num(float64(t.block.index))), member("delta", obj(member("type", str("input_json_delta")), member("partial_json", or(fragment, str(""))))))
+func (s *Stream) argumentDelta(t *tool, fragment jsonx.WireValue) error {
+	return s.write("content_block_delta", member("index", num(float64(t.block.index))), member("delta", obj(member("type", str("input_json_delta")), member("partial_json", or(fragment, str(""))))))
 }
 
-func (s *Stream) start(response jsonx.WireValue) {
+// opening builds the message_start message for response, or nothing once the message started.
+func (s *Stream) opening(response jsonx.WireValue) (jsonx.WireValue, error) {
 	if s.started {
-		return
+		return jsonx.WireValue{}, nil
 	}
-	s.started = true
+	u, err := usage(get(response, "usage"))
+	if err != nil {
+		return jsonx.WireValue{}, err
+	}
 	id := get(response, "id")
 	if !truthy(id) {
 		id = fallbackID("msg_grok_", s.now)
 	}
-	s.write("message_start", member("message", obj(
+	return obj(
 		member("id", id),
 		member("type", str("message")),
 		member("role", str("assistant")),
@@ -195,41 +279,66 @@ func (s *Stream) start(response jsonx.WireValue) {
 		member("content", array(nil)),
 		member("stop_reason", null()),
 		member("stop_sequence", null()),
-		member("usage", usage(get(response, "usage"))),
-	)))
+		member("usage", u),
+	), nil
 }
 
-func (s *Stream) stop(u jsonx.WireValue, reason string) {
+// start writes message_start once; the message counts as started only when the frame is written.
+func (s *Stream) start(opening jsonx.WireValue) error {
+	if s.started {
+		return nil
+	}
+	if err := s.write("message_start", member("message", opening)); err != nil {
+		return err
+	}
+	s.started = true
+	return nil
+}
+
+func (s *Stream) stop(u jsonx.WireValue, reason string) error {
 	if s.stopped {
-		return
+		return nil
+	}
+	if err := s.write("message_delta", member("delta", obj(member("stop_reason", str(reason)), member("stop_sequence", null()))), member("usage", u)); err != nil {
+		return err
+	}
+	if err := s.write("message_stop"); err != nil {
+		return err
 	}
 	s.stopped = true
-	s.write("message_delta", member("delta", obj(member("stop_reason", str(reason)), member("stop_sequence", null()))), member("usage", usage(u)))
-	s.write("message_stop")
+	return nil
 }
 
-func (s *Stream) stopBlock(b *block) {
+func (s *Stream) stopBlock(b *block) error {
 	if b == nil || b.stopped {
-		return
+		return nil
+	}
+	if err := s.write("content_block_stop", member("index", num(float64(b.index)))); err != nil {
+		return err
 	}
 	b.stopped = true
-	s.write("content_block_stop", member("index", num(float64(b.index))))
 	if s.active == b.index {
 		s.active = -1
 	}
+	return nil
 }
 
-// startBlock returns the block of the key `${prefix}${name}`, opening it after closing the
-// active block when it does not exist yet. An existing block is returned without any frame.
-func (s *Stream) startBlock(prefix string, name, outputIndex, content jsonx.WireValue) *block {
-	key := prefix + unitsKey(jsString(name))
+// startBlock returns the block of key, opening it after closing the active block when it does not
+// exist yet. An existing block is returned without any frame. A block is registered only once its
+// content_block_start frame is written.
+func (s *Stream) startBlock(key string, outputIndex, content jsonx.WireValue) (*block, error) {
 	if b, ok := s.byKey[key]; ok {
-		return b
+		return b, nil
 	}
 	if s.active >= 0 {
-		s.stopBlock(s.blocks[s.active])
+		if err := s.stopBlock(s.blocks[s.active]); err != nil {
+			return nil, err
+		}
 	}
 	b := &block{index: len(s.blocks)}
+	if err := s.write("content_block_start", member("index", num(float64(b.index))), member("content_block", content)); err != nil {
+		return nil, err
+	}
 	s.blocks = append(s.blocks, b)
 	s.byKey[key] = b
 	if outputIndex.Kind != 0 && outputIndex.Kind != 'n' {
@@ -238,29 +347,44 @@ func (s *Stream) startBlock(prefix string, name, outputIndex, content jsonx.Wire
 		}
 	}
 	s.active = b.index
-	s.write("content_block_start", member("index", num(float64(b.index))), member("content_block", content))
-	return b
+	return b, nil
 }
 
-// toolBlock follows lib/grok-backend.js:316-325. item is the added output item, or undefined for
-// argument events.
-func (s *Stream) toolBlock(event, item jsonx.WireValue) *tool {
+// toolEvent starts the message and returns the tool of event, opening its block when it is new
+// (lib/grok-backend.js:316-325). item is the added output item, or undefined for argument events.
+func (s *Stream) toolEvent(event, item, response jsonx.WireValue) (*tool, error) {
+	opening, err := s.opening(response)
+	if err != nil {
+		return nil, err
+	}
 	itemID := or(or(or(get(item, "id"), get(event, "item_id")), get(event, "call_id")), str("tool"))
 	k, keyed := mapKey(itemID)
-	if t := s.byItem[k]; keyed && t != nil {
-		return t
+	existing := s.byItem[k]
+	var name []uint16
+	if !keyed || existing == nil {
+		if name, err = toString(itemID); err != nil {
+			return nil, err
+		}
+	}
+	if err := s.start(opening); err != nil {
+		return nil, err
+	}
+	if keyed && existing != nil {
+		return existing, nil
 	}
 	callID := or(or(get(item, "call_id"), get(event, "call_id")), itemID)
-	name := or(or(get(item, "name"), get(event, "name")), str(""))
-	b := s.startBlock("tool:", itemID, get(event, "output_index"), obj(
+	b, err := s.startBlock("tool:"+unitsKey(name), get(event, "output_index"), obj(
 		member("type", str("tool_use")),
 		member("id", callID),
-		member("name", name),
+		member("name", or(or(get(item, "name"), get(event, "name")), str(""))),
 		member("input", obj()),
 	))
+	if err != nil {
+		return nil, err
+	}
 	t := &tool{block: b}
 	if keyed {
 		s.byItem[k] = t
 	}
-	return t
+	return t, nil
 }

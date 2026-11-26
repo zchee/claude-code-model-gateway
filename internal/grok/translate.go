@@ -19,7 +19,6 @@ import (
 	"errors"
 	"strconv"
 	"time"
-	"unicode/utf16"
 
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
 )
@@ -36,7 +35,11 @@ func reasoningModel(id string) bool {
 }
 
 // TranslateRequest builds a Responses input for the backend model.
-// A null entry in messages returns a zero WireValue and an error instead of a partial request.
+//
+// The call fails where the source's translateRequest throws: on a null entry in messages, and with
+// a *CoercionError when String() of a text value would throw. It then returns a zero WireValue
+// and an error that holds no request content, never a partial request. The result may share
+// subtrees with payload; treat both as read-only.
 func TranslateRequest(payload jsonx.WireValue, model string) (jsonx.WireValue, error) {
 	effort := get(get(payload, "output_config"), "effort")
 	input, err := translateInput(payload)
@@ -76,12 +79,17 @@ func translateInput(payload jsonx.WireValue) ([]jsonx.WireValue, error) {
 				systemText = append(systemText, '\n')
 			}
 			if text := get(block, "text"); text.Kind != 0 && text.Kind != 'n' {
-				systemText = append(systemText, jsString(text)...)
+				part, err := toString(text)
+				if err != nil {
+					return nil, err
+				}
+				systemText = append(systemText, part...)
 			}
 		}
 	}
 	if len(systemText) > 0 {
-		input = append(input, obj(member("role", str("developer")), member("content", array([]jsonx.WireValue{inputText(strUnits(systemText))}))))
+		part, _ := textPart("input_text", strUnits(systemText)) // A string never throws.
+		input = append(input, obj(member("role", str("developer")), member("content", array([]jsonx.WireValue{part}))))
 	}
 	messages := get(payload, "messages")
 	if messages.Kind != '[' {
@@ -120,16 +128,17 @@ func translateInput(payload jsonx.WireValue) ([]jsonx.WireValue, error) {
 	return input, nil
 }
 
-// textPart is String(text || ”).
-func textPart(kind string, text jsonx.WireValue) jsonx.WireValue {
+// textPart builds an input_text or output_text part from the source's `String(text || "")`.
+func textPart(kind string, text jsonx.WireValue) (jsonx.WireValue, error) {
 	var u []uint16
 	if truthy(text) {
-		u = jsString(text)
+		var err error
+		if u, err = toString(text); err != nil {
+			return jsonx.WireValue{}, err
+		}
 	}
-	return obj(member("type", str(kind)), member("text", strUnits(u)))
+	return obj(member("type", str(kind)), member("text", strUnits(u))), nil
 }
-
-func inputText(text jsonx.WireValue) jsonx.WireValue { return textPart("input_text", text) }
 
 // translateContent follows lib/grok-backend.js:155-165. Blocks other than strings, text,
 // tool_use and tool_result are dropped.
@@ -146,10 +155,16 @@ func translateContent(message jsonx.WireValue, assistant bool) ([]jsonx.WireValu
 	var items []jsonx.WireValue
 	for _, block := range blocks {
 		switch typ := get(block, "type"); {
-		case block.Kind == '"':
-			items = append(items, textPart(kind, block))
-		case isString(typ, "text"):
-			items = append(items, textPart(kind, get(block, "text")))
+		case block.Kind == '"', isString(typ, "text"):
+			text := block
+			if block.Kind != '"' {
+				text = get(block, "text")
+			}
+			part, err := textPart(kind, text)
+			if err != nil {
+				return nil, err
+			}
+			items = append(items, part)
 		case isString(typ, "tool_use"):
 			arguments, err := jsonx.EncodeWire(or(get(block, "input"), obj()))
 			if err != nil {
@@ -222,14 +237,26 @@ func translateTools(tools jsonx.WireValue) []jsonx.WireValue {
 	return out
 }
 
-// usage is anthropicUsage (lib/grok-backend.js:225-231).
-func usage(u jsonx.WireValue) jsonx.WireValue {
-	reasoning := coalesce(get(get(u, "output_tokens_details"), "reasoning_tokens"), get(u, "reasoning_tokens"))
+// usage is anthropicUsage (lib/grok-backend.js:225-231). It fails where Number() throws.
+func usage(u jsonx.WireValue) (jsonx.WireValue, error) {
+	var counts [3]float64
+	fields := [3]jsonx.WireValue{
+		get(u, "input_tokens"),
+		get(u, "output_tokens"),
+		coalesce(get(get(u, "output_tokens_details"), "reasoning_tokens"), get(u, "reasoning_tokens")),
+	}
+	for i, field := range fields {
+		n, err := toCount(field)
+		if err != nil {
+			return jsonx.WireValue{}, err
+		}
+		counts[i] = n
+	}
 	return obj(
-		member("input_tokens", num(count(get(u, "input_tokens")))),
-		member("output_tokens", num(count(get(u, "output_tokens")))),
-		member("output_tokens_details", obj(member("reasoning_tokens", num(count(reasoning))))),
-	)
+		member("input_tokens", num(counts[0])),
+		member("output_tokens", num(counts[1])),
+		member("output_tokens_details", obj(member("reasoning_tokens", num(counts[2])))),
+	), nil
 }
 
 // fallbackID is the source's `${prefix}${Date.now()}`.
@@ -279,7 +306,8 @@ func webSearchBlocks(item jsonx.WireValue, now func() time.Time) (use, result js
 }
 
 // responseContent follows lib/grok-backend.js:249-265 and reports whether a tool_use block was
-// produced. Function arguments that JSON.parse rejects become an empty input.
+// produced. Function arguments become an empty input wherever the source's try block catches:
+// String() throwing on them, or JSON.parse rejecting them.
 func responseContent(response jsonx.WireValue, now func() time.Time) (content []jsonx.WireValue, toolUse bool) {
 	content = []jsonx.WireValue{}
 	output := get(response, "output")
@@ -303,10 +331,12 @@ func responseContent(response jsonx.WireValue, now func() time.Time) (content []
 		}
 		if isString(typ, "function_call") {
 			input := obj()
-			// JSON.parse converts a non-string argument with String() first.
-			text := string(utf16.Decode(jsString(or(get(item, "arguments"), str("{}")))))
-			if parsed, err := jsonx.DecodeWire([]byte(text)); err == nil {
-				input = parsed
+			// JSON.parse converts a non-string argument with String() first, and parses UTF-16
+			// units, so an unpaired surrogate inside a string literal survives.
+			if text, err := toString(or(get(item, "arguments"), str("{}"))); err == nil {
+				if parsed, err := jsonx.DecodeWireUnits(text); err == nil {
+					input = parsed
+				}
 			}
 			content = append(content, obj(
 				member("type", str("tool_use")),
@@ -327,8 +357,19 @@ func stopReason(toolUse bool) string {
 	return "end_turn"
 }
 
-// TranslateResponse builds a message for the advertised model, using now for missing IDs.
+// TranslateResponse builds a message for the advertised model, using now, which must not be nil,
+// for missing IDs. A response that could not be parsed is passed as JSON null and translates as
+// the source translates null.
+//
+// The call fails where the source's translateResponse throws, which is when Number() of a usage
+// field would throw (see CoercionError). It then returns the zero WireValue, whose Kind is 0 and
+// which EncodeWire refuses, so a caller cannot send it by mistake. The result may share subtrees
+// with response; treat both as read-only.
 func TranslateResponse(response jsonx.WireValue, model string, now func() time.Time) jsonx.WireValue {
+	u, err := usage(get(response, "usage"))
+	if err != nil {
+		return jsonx.WireValue{}
+	}
 	content, toolUse := responseContent(response, now)
 	id := get(response, "id")
 	if !truthy(id) {
@@ -342,6 +383,6 @@ func TranslateResponse(response jsonx.WireValue, model string, now func() time.T
 		member("content", array(content)),
 		member("stop_reason", str(stopReason(toolUse))),
 		member("stop_sequence", null()),
-		member("usage", usage(get(response, "usage"))),
+		member("usage", u),
 	)
 }
