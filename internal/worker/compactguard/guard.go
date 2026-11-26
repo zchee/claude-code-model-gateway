@@ -228,6 +228,20 @@ func (g *guard) attempt(resp *upstream.Response) (outcome.Result, bool, error) {
 			return res, false, err
 		case err != nil:
 			return outcome.Result{Contacted: g.contacted, Status: status, StatusOverride: overrideAborted}, false, err
+		case g.ServiceContext.Err() != nil:
+			// The service ended after the peek's last check, possibly while the peek closed the
+			// body itself: nothing the peek decided reaches the client. A replay body is closed
+			// here, once, and not relayed; the overflow responder still runs, on a writer that
+			// keeps nothing, so the sentry latches and learns the limit.
+			if peeked.Body != nil {
+				_ = peeked.Body.Close()
+			}
+			if peeked.Overflow != nil && opts.OnOverflow != nil {
+				res, _ := opts.OnOverflow(discardWriter{header: http.Header{}}, status, *peeked.Overflow)
+				g.contacted = g.contacted || res.Contacted
+			}
+			res, err := g.shutdown(status)
+			return res, false, err
 		case peeked.Overflow != nil:
 			if opts.OnOverflow == nil {
 				return outcome.Result{Contacted: g.contacted, Status: status}, false, errNoOverflowResponder
