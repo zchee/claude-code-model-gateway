@@ -39,6 +39,7 @@ func TestMain(m *testing.M) {
 
 func TestGatewayFixtureHelper(t *testing.T) {
 	gatewaytest.DispatchHelper(t, map[string]gatewaytest.HelperFunc{
+		"rewrite": checkRewriteProcess,
 		"directories": func(t testing.TB, _ []string) {
 			previous := unix.Umask(0o027)
 			defer unix.Umask(previous)
