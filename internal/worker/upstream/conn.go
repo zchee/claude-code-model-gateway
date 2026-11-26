@@ -16,6 +16,7 @@ package upstream
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"net"
@@ -36,39 +37,98 @@ type dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 // is cancelled, a connection whose dial finishes after lifetime ended is closed at once, and every
 // connection is closed as soon as lifetime ends.
 func inactivityDialer(dial dialFunc, lifetime context.Context) dialFunc {
-	if dial == nil {
-		var d net.Dialer
-		dial = d.DialContext
-	}
+	dial = defaultDial(dial)
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		if lifetime != nil && lifetime.Err() != nil {
-			return nil, errClientClosed
+		conn, err := dialInactivity(ctx, dial, lifetime, network, addr)
+		if err != nil {
+			return nil, err
 		}
-		// The source arms its socket timeout before the connect, so the connect is bounded too.
-		dialCtx, cancel := context.WithTimeoutCause(ctx, socketInactivity, ErrTimeout)
+		return conn, nil
+	}
+}
+
+// tlsDialer returns the dial function of HTTPS connections: it connects like inactivityDialer and
+// performs the TLS handshake with a copy of config, naming the dialled host when config names no
+// server. The handshake ends when ctx ends, which net/http does once no request waits for the
+// dial, and when lifetime ends. A failed handshake closes the connection and reports ErrTimeout
+// when the inactivity deadline closed the connection, the closed client when lifetime has ended,
+// and otherwise a tlsError wrapping the handshake's error, whatever its shape; a failed connect
+// keeps its own error.
+func tlsDialer(dial dialFunc, config *tls.Config, lifetime context.Context) dialFunc {
+	dial = defaultDial(dial)
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		conn, err := dialInactivity(ctx, dial, lifetime, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		cfg := config.Clone()
+		if cfg.ServerName == "" {
+			cfg.ServerName = host
+		}
+		handshakeCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
 		if lifetime != nil {
-			// net/http detaches the dial from the request context, so the client's lifetime is
-			// the only signal that ends a dial no request waits for any more.
 			stop := context.AfterFunc(lifetime, cancel)
 			defer stop()
 		}
-		conn, err := dial(dialCtx, network, addr)
-		if err != nil {
-			// A dialer reports its own error for an expired context (net.Dialer: an i/o timeout),
-			// so the deadline is recognised by its cause.
-			if errors.Is(context.Cause(dialCtx), ErrTimeout) {
-				return nil, ErrTimeout
-			}
-			return nil, err
-		}
-		if lifetime != nil && lifetime.Err() != nil {
-			// The client closed while the dial ran; its connections are already being closed.
+		tlsConn := tls.Client(conn, cfg)
+		if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
 			_ = conn.Close()
-			return nil, errClientClosed
+			switch {
+			case conn.expired.Load():
+				return nil, ErrTimeout
+			case lifetime != nil && lifetime.Err() != nil:
+				return nil, errClientClosed
+			default:
+				return nil, &tlsError{err: err}
+			}
 		}
-		return newInactivityConn(conn, lifetime), nil
+		return tlsConn, nil
 	}
+}
+
+// defaultDial returns dial, or a zero net.Dialer's DialContext when dial is nil.
+func defaultDial(dial dialFunc) dialFunc {
+	if dial == nil {
+		var d net.Dialer
+		return d.DialContext
+	}
+	return dial
+}
+
+// dialInactivity connects with dial under the rules of inactivityDialer.
+func dialInactivity(ctx context.Context, dial dialFunc, lifetime context.Context, network, addr string) (*inactivityConn, error) {
+	if lifetime != nil && lifetime.Err() != nil {
+		return nil, errClientClosed
+	}
+	// The source arms its socket timeout before the connect, so the connect is bounded too.
+	dialCtx, cancel := context.WithTimeoutCause(ctx, socketInactivity, ErrTimeout)
+	defer cancel()
+	if lifetime != nil {
+		// net/http detaches the dial from the request context, so the client's lifetime is
+		// the only signal that ends a dial no request waits for any more.
+		stop := context.AfterFunc(lifetime, cancel)
+		defer stop()
+	}
+	conn, err := dial(dialCtx, network, addr)
+	if err != nil {
+		// A dialer reports its own error for an expired context (net.Dialer: an i/o timeout),
+		// so the deadline is recognised by its cause.
+		if errors.Is(context.Cause(dialCtx), ErrTimeout) {
+			return nil, ErrTimeout
+		}
+		return nil, err
+	}
+	if lifetime != nil && lifetime.Err() != nil {
+		// The client closed while the dial ran; its connections are already being closed.
+		_ = conn.Close()
+		return nil, errClientClosed
+	}
+	return newInactivityConn(conn, lifetime), nil
 }
 
 // inactivityConn closes its connection once no read or write has made progress for
