@@ -36,6 +36,7 @@ import (
 
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
 	"github.com/zchee/claude-code-model-gateway/internal/proxymodels"
+	"github.com/zchee/claude-code-model-gateway/internal/readiness"
 )
 
 const (
@@ -60,16 +61,10 @@ type Policy struct {
 }
 
 // Readiness is the public summary; diagnostic checks are not part of the catalog.
-type Readiness struct {
-	Ready   bool   `json:"ready"`
-	State   string `json:"state"`
-	Message string `json:"message"`
-}
+type Readiness = readiness.ProviderReadiness
 
 // Checks records the gateway checks that every proxy provider shares with Codex.
-type Checks struct {
-	ProxyBinary, ProxyModels, ShimRunning, ServingVersionMatches bool
-}
+type Checks = readiness.SharedChecks
 
 // ReadinessSource provides observations not already supplied by the caller.
 type ReadinessSource interface {

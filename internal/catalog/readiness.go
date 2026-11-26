@@ -22,7 +22,9 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/readiness"
 )
 
-// LiveReadinessOptions configures live provider readiness resolution for catalog construction.
+// LiveReadinessOptions configures live provider readiness resolution for one catalog build.
+// LlamaState and StudioState are deep-copied on construction from one refresh snapshot so later caller
+// mutations do not affect Probe results. ReadGrok supplies read-only Grok readiness without refreshing credentials.
 type LiveReadinessOptions struct {
 	Lookup      config.LookupEnv
 	ConfigDir   string
@@ -34,11 +36,12 @@ type LiveReadinessOptions struct {
 	StudioState *localprov.StudioState
 }
 
-// LiveReadinessSource resolves provider readiness using live proxy provider checks and optional Grok readiness.
+// LiveReadinessSource resolves provider readiness for one catalog build using immutable local-engine
+// snapshots, live proxy provider checks, and a read-only Grok readiness callback.
 // It satisfies ReadinessSource.
 type LiveReadinessSource struct{}
 
-// NewLiveReadinessSource constructs a ReadinessSource backed by the live provider readiness path.
+// NewLiveReadinessSource constructs a per-build ReadinessSource, copying LlamaState and StudioState.
 func NewLiveReadinessSource(opts LiveReadinessOptions) *LiveReadinessSource {
 	_ = opts
 	return &LiveReadinessSource{}

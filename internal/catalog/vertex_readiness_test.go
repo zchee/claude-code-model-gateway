@@ -28,8 +28,16 @@ import (
 
 	"github.com/zchee/claude-code-model-gateway/internal/catalog"
 	"github.com/zchee/claude-code-model-gateway/internal/config"
+	"github.com/zchee/claude-code-model-gateway/internal/localprov"
 	"github.com/zchee/claude-code-model-gateway/internal/policy"
 	"github.com/zchee/claude-code-model-gateway/internal/proxymodels"
+	"github.com/zchee/claude-code-model-gateway/internal/readiness"
+)
+
+var (
+	_ readiness.ProviderReadiness = catalog.Readiness{}
+	_ readiness.SharedChecks      = catalog.Checks{}
+	_ catalog.ReadinessSource     = (*catalog.LiveReadinessSource)(nil)
 )
 
 func TestVertexNotConfiguredWithoutProject(t *testing.T) {
@@ -107,6 +115,89 @@ func TestVertexNotConfiguredWithoutProject(t *testing.T) {
 		wantMsg := regexp.MustCompile(`missing or invalid Vertex AI setting, most often an unset Google Cloud project`)
 		if !wantMsg.MatchString(vertex.Message) {
 			t.Errorf("vertex Message = %q, does not match %s", vertex.Message, wantMsg)
+		}
+	})
+}
+
+func TestLiveReadinessSourceSnapshotAndReadGrok(t *testing.T) {
+	dir := t.TempDir()
+	commandPath := filepath.Join(dir, "my gateway", "bin", "model-gateway")
+	lookup := config.LookupEnv(func(key string) (string, bool) {
+		switch key {
+		case "CCP_CONFIG_DIR":
+			return dir, true
+		case "CCP_LLAMA_PORT":
+			return "8080", true
+		default:
+			return "", false
+		}
+	})
+
+	llama := &localprov.LlamaState{Port: 8080, Configured: true, Reachable: true, ContextWindow: 65536}
+	studio := &localprov.StudioState{
+		Enabled:   true,
+		BaseURL:   "http://127.0.0.1:1234",
+		Reachable: true,
+		Models:    []localprov.Model{{Key: "qwen3-coder-30b", Loaded: true, ContextWindow: 65536}},
+	}
+	var grokCalls atomic.Int32
+	var statusCalls atomic.Int32
+	wantGrok := catalog.Readiness{Ready: true, State: "ready", Message: "Grok CLI auth present (read-only)."}
+
+	source := catalog.NewLiveReadinessSource(catalog.LiveReadinessOptions{
+		Lookup:      lookup,
+		ConfigDir:   dir,
+		ProxyBinary: filepath.Join(dir, "claude-code-proxy"),
+		CommandPath: commandPath,
+		RunStatus: func(context.Context, string, []string) (int, error) {
+			statusCalls.Add(1)
+			return 0, errors.New("status subprocess must not run for local, lmstudio, or grok")
+		},
+		ReadGrok: func(context.Context) catalog.Readiness {
+			grokCalls.Add(1)
+			return wantGrok
+		},
+		LlamaState:  llama,
+		StudioState: studio,
+	})
+
+	// Mutate caller-owned local states after construction; per-build snapshots must remain immutable.
+	llama.Reachable = false
+	llama.ContextWindow = 0
+	studio.Reachable = false
+	studio.Models[0].ContextWindow = 0
+
+	t.Run("success: local and lmstudio use immutable construction snapshot", func(t *testing.T) {
+		localGot := source.Probe(t.Context(), "local")
+		if !localGot.Ready || localGot.State != "ready" {
+			t.Errorf("local Probe = %+v, want ready from immutable construction snapshot", localGot)
+		}
+		studioGot := source.Probe(t.Context(), "lmstudio")
+		if !studioGot.Ready || studioGot.State != "ready" {
+			t.Errorf("lmstudio Probe = %+v, want ready from immutable construction snapshot", studioGot)
+		}
+		if got := grokCalls.Load(); got != 0 {
+			t.Errorf("ReadGrok invoked %d times for proxy providers, want 0", got)
+		}
+	})
+
+	t.Run("success: grok uses injected read-only callback without spawning status", func(t *testing.T) {
+		grokGot := source.Probe(t.Context(), "grok")
+		if diff := gocmp.Diff(wantGrok, grokGot); diff != "" {
+			t.Errorf("grok Probe mismatch (-want +got):\n%s", diff)
+		}
+		if got := grokCalls.Load(); got != 1 {
+			t.Errorf("ReadGrok calls = %d, want 1", got)
+		}
+		if got := statusCalls.Load(); got != 0 {
+			t.Errorf("RunStatus calls = %d, want 0", got)
+		}
+	})
+
+	t.Run("success: shared failure message uses quoted stable binary", func(t *testing.T) {
+		want := "claude-code-proxy is missing. Run `\"" + commandPath + "\" setup`."
+		if got := source.SharedFailureMessage("binary-missing"); got != want {
+			t.Errorf("SharedFailureMessage(binary-missing) = %q, want %q", got, want)
 		}
 	})
 }

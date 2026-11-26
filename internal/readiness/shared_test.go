@@ -33,6 +33,12 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/upstreamstate"
 )
 
+var (
+	_ func(context.Context, func(context.Context) readiness.ProxyAuthResult, func() time.Time) *readiness.SharedCheck             = readiness.NewSharedCheck
+	_ func(*readiness.SharedCheck) *readiness.ProxyAuthResult                                                                     = (*readiness.SharedCheck).Latest
+	_ func(*readiness.ProxyAuthResult, readiness.HealthInfo, time.Time, readiness.CodexReadinessOptions) readiness.CodexReadiness = readiness.HealthzCodexReadiness
+)
+
 func TestSharedCheck(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var mu sync.Mutex

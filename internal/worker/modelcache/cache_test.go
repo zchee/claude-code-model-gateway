@@ -40,11 +40,21 @@ import (
 	gocmp "github.com/google/go-cmp/cmp"
 
 	"github.com/zchee/claude-code-model-gateway/internal/config"
+	"github.com/zchee/claude-code-model-gateway/internal/localprov"
 	"github.com/zchee/claude-code-model-gateway/internal/paths"
 	"github.com/zchee/claude-code-model-gateway/internal/policy"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/modelcache"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/route"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/sentry"
+)
+
+var (
+	_ modelcache.RoutePublisher                                                     = (*route.Store)(nil)
+	_ modelcache.SentryPublisher                                                    = (*sentry.State)(nil)
+	_ func(*modelcache.Cache, context.Context, http.Header) (jsontext.Value, error) = (*modelcache.Cache).ModelsResponse
+	_ func(*modelcache.Cache) (string, int)                                         = (*modelcache.Cache).HealthCatalog
+	_ func(*modelcache.Cache, http.Header)                                          = (*modelcache.Cache).TriggerAnthropicRefresh
+	_ func(*modelcache.Cache) (route.Snapshot, uint64)                              = (*modelcache.Cache).Snapshot
 )
 
 const (
@@ -64,13 +74,13 @@ var allCredentialMarkers = map[string]string{
 	"disallowed header": disallowedHeaderMarker,
 }
 
-type staticBaseURL string
+func baseURLFunc(u string) func() (string, error) {
+	return func() (string, error) { return u, nil }
+}
 
-func (s staticBaseURL) EffectiveBaseURL() string { return string(s) }
-
-type staticPins map[string]string
-
-func (p staticPins) CurrentPins() map[string]string { return p }
+func pinsFunc(p map[string]string) func() map[string]string {
+	return func() map[string]string { return maps.Clone(p) }
+}
 
 type modelRow struct {
 	ID             string `json:"id"`
@@ -387,18 +397,11 @@ func TestRefreshOrderingGenerationAndSentryFollowsLatest(t *testing.T) {
 	}))
 	t.Cleanup(proxySrv.Close)
 
-	home, lookup, resolver := newTestPaths(t, map[string]string{
+	_, lookup, resolver := newTestPaths(t, map[string]string{
 		"CCP_LLAMA_PORT":        strconv.Itoa(llamaPort),
 		"CCP_LMSTUDIO_BASE_URL": studioSrv.URL,
 		"CCP_LMSTUDIO_API_KEY":  studioSecretMarker,
 	})
-	grokDir := filepath.Join(home, ".grok")
-	if err := os.MkdirAll(grokDir, 0o700); err != nil {
-		t.Fatalf("mkdir grok dir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(grokDir, "models_cache.json"), []byte(`["grok-4.7","grok-unlisted-not-in-policy"]`), 0o600); err != nil {
-		t.Fatalf("write grok cache: %v", err)
-	}
 
 	routes := &route.Store{}
 	sentryState := &sentry.State{}
@@ -417,6 +420,7 @@ func TestRefreshOrderingGenerationAndSentryFollowsLatest(t *testing.T) {
 		Client:         newTestClient(t),
 		Routes:         routes,
 		Sentry:         recSentry,
+		GrokIDs:        func() []string { return []string{"grok-4.7", "grok-unlisted-not-in-policy"} },
 		Logf:           logs.logf,
 	})
 	if err != nil {
@@ -465,6 +469,27 @@ func TestRefreshOrderingGenerationAndSentryFollowsLatest(t *testing.T) {
 	}
 	if diff := gocmp.Diff(wantRows, rows); diff != "" {
 		t.Errorf("refreshed catalog rows mismatch (-want +got):\n%s", diff)
+	}
+
+	// Local-engine state handed out by Cache must be an immutable deep copy.
+	llamaCopy := cache.LlamaState()
+	if llamaCopy == nil || !llamaCopy.Reachable || llamaCopy.ContextWindow != 65536 {
+		t.Fatalf("cache.LlamaState() = %+v, want reachable 65536", llamaCopy)
+	}
+	llamaCopy.Reachable = false
+	llamaCopy.ContextWindow = 999999
+	if got := cache.LlamaState(); got == nil || !got.Reachable || got.ContextWindow != 65536 {
+		t.Errorf("cache.LlamaState() mutated through returned copy: %+v", got)
+	}
+	studioCopy := cache.StudioState()
+	if studioCopy == nil || !studioCopy.Reachable || len(studioCopy.Models) != 1 || studioCopy.Models[0].ContextWindow != 65536 {
+		t.Fatalf("cache.StudioState() = %+v, want reachable 1 model with 65536", studioCopy)
+	}
+	studioCopy.Reachable = false
+	studioCopy.Models[0].ContextWindow = 999999
+	studioCopy.Models = append(studioCopy.Models, localprov.Model{Key: "injected", Loaded: true, ContextWindow: 50000})
+	if got := cache.StudioState(); got == nil || !got.Reachable || len(got.Models) != 1 || got.Models[0].ContextWindow != 65536 {
+		t.Errorf("cache.StudioState() mutated through returned copy: %+v", got)
 	}
 
 	// Simulate an in-flight request that captured snap1 while LM Studio had 65536 (trigger 43691).
@@ -535,6 +560,236 @@ func TestRefreshOrderingGenerationAndSentryFollowsLatest(t *testing.T) {
 	}
 	assertNoMarkers(t, "refresh logs", logs.bytes(), allCredentialMarkers)
 	assertNoMarkers(t, "refreshed catalog", rawCatalog, allCredentialMarkers)
+}
+
+type pubEvent struct {
+	Kind     string
+	Gen      uint64
+	Source   string
+	HasFresh bool
+	HasStale bool
+}
+
+type observingSentry struct {
+	state      *sentry.State
+	routeStore *route.Store
+	mu         *sync.Mutex
+	events     *[]pubEvent
+	onPublish  func(gen uint64)
+}
+
+func (o *observingSentry) Publish(generation uint64, resolver sentry.ModelResolver, windows policy.Windows, env float64) {
+	if o.onPublish != nil {
+		o.onPublish(generation)
+	}
+	hasFresh := resolver != nil && resolver.ResolveBackend("kimi-fresh") != nil
+	hasStale := resolver != nil && resolver.ResolveBackend("kimi-stale") != nil
+	o.mu.Lock()
+	*o.events = append(*o.events, pubEvent{Kind: "sentry", Gen: generation, HasFresh: hasFresh, HasStale: hasStale})
+	o.mu.Unlock()
+	o.state.Publish(generation, resolver, windows, env)
+}
+
+type observingRoutes struct {
+	store  *route.Store
+	mu     *sync.Mutex
+	events *[]pubEvent
+}
+
+func (o *observingRoutes) Publish(snapshot route.Snapshot) {
+	src, _ := snapshot.Catalog()
+	r := snapshot.Resolver()
+	hasFresh := r.ResolveBackend("kimi-fresh") != nil
+	hasStale := r.ResolveBackend("kimi-stale") != nil
+	o.mu.Lock()
+	*o.events = append(*o.events, pubEvent{Kind: "route", Source: src, HasFresh: hasFresh, HasStale: hasStale})
+	o.mu.Unlock()
+	o.store.Publish(snapshot)
+}
+
+func TestRefreshPublicationOrderAndOverlappingRefreshes(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var reqCount atomic.Int32
+		reqAStarted := make(chan struct{})
+		releaseA := make(chan struct{})
+		var closeAOnce sync.Once
+		closeA := func() { closeAOnce.Do(func() { close(releaseA) }) }
+
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/v1/models" {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			n := reqCount.Add(1)
+			if n == 1 {
+				close(reqAStarted)
+				select {
+				case <-releaseA:
+				case <-r.Context().Done():
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"data":[{"id":"kimi-stale","display_name":"kimi-stale (kimi)"}]}`))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"kimi-fresh","display_name":"kimi-fresh (kimi)"}]}`))
+		})
+
+		_, lookup, resolver := newTestPaths(t, nil)
+		routeStore := &route.Store{}
+		sentryState := &sentry.State{}
+		var evMu sync.Mutex
+		var events []pubEvent
+		obsSentry := &observingSentry{
+			state:      sentryState,
+			routeStore: routeStore,
+			mu:         &evMu,
+			events:     &events,
+			onPublish: func(gen uint64) {
+				snap, ok := routeStore.Load()
+				switch gen {
+				case 1:
+					if ok {
+						t.Errorf("route.Store already published before sentry generation 1")
+					}
+				case 2:
+					if !ok {
+						t.Errorf("route.Store missing generation 1 snapshot before sentry generation 2")
+					} else if snap.Resolver().ResolveBackend("kimi-fresh") != nil {
+						t.Errorf("route.Store already received kimi-fresh before sentry generation 2")
+					}
+				}
+			},
+		}
+		obsRoutes := &observingRoutes{store: routeStore, mu: &evMu, events: &events}
+
+		cache, err := modelcache.New(modelcache.Options{
+			Lookup:         lookup,
+			Paths:          resolver,
+			ProxyBaseURL:   "http://127.0.0.1:19991",
+			DefaultBaseURL: "http://127.0.0.1:19999",
+			Client:         &http.Client{Transport: handlerTransport{handler: handler}},
+			Clock:          time.Now,
+			Routes:         obsRoutes,
+			Sentry:         obsSentry,
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+
+		// Startup must publish sentry generation 1 before route.Store and expose (snapshot, 1).
+		snap0, gen0 := cache.Snapshot()
+		if gen0 != 1 {
+			t.Fatalf("startup Snapshot generation = %d, want 1", gen0)
+		}
+		storeSnap0, ok := routeStore.Load()
+		if !ok {
+			t.Fatal("route.Store empty after New")
+		}
+		if srcA, rawA := snap0.Catalog(); srcA != "fallback" {
+			t.Errorf("startup Cache.Snapshot source = %q, want fallback", srcA)
+		} else if _, rawB := storeSnap0.Catalog(); !bytes.Equal(rawA, rawB) {
+			t.Error("startup Cache.Snapshot differs from route.Store.Load")
+		}
+		evMu.Lock()
+		gotStartup := slices.Clone(events)
+		evMu.Unlock()
+		wantStartup := []pubEvent{
+			{Kind: "sentry", Gen: 1},
+			{Kind: "route", Source: "fallback"},
+		}
+		if diff := gocmp.Diff(wantStartup, gotStartup); diff != "" {
+			t.Fatalf("startup publication order mismatch (-want +got):\n%s", diff)
+		}
+
+		// Launch slow older refresh A and wait until it is inside the HTTP call.
+		errA := make(chan error, 1)
+		var waitAOnce sync.Once
+		var errAResult error
+		waitA := func() error {
+			waitAOnce.Do(func() {
+				errAResult = <-errA
+			})
+			return errAResult
+		}
+		defer func() {
+			closeA()
+			_ = waitA()
+		}()
+		go func() {
+			errA <- cache.Refresh(t.Context())
+		}()
+		<-reqAStarted
+		synctest.Wait()
+
+		// Readers must not block while refresh A is waiting on the network.
+		if _, g := cache.Snapshot(); g != 1 {
+			t.Errorf("Snapshot during network call returned generation %d, want 1", g)
+		}
+		if g := cache.Generation(); g != 1 {
+			t.Errorf("Generation during network call = %d, want 1", g)
+		}
+		if src, _ := cache.HealthCatalog(); src != "fallback" {
+			t.Errorf("HealthCatalog during network call = %q, want fallback", src)
+		}
+		_ = cache.LlamaState()
+		_ = cache.StudioState()
+		if _, err := cache.ModelsResponse(t.Context(), http.Header{}); err != nil {
+			t.Errorf("unauthenticated ModelsResponse during network call: %v", err)
+		}
+
+		// Launch newer overlapping refresh B while A is still blocked; B must complete and publish generation 2.
+		if err := cache.Refresh(t.Context()); err != nil {
+			t.Fatalf("overlapping refresh B: %v", err)
+		}
+		snapB, genB := cache.Snapshot()
+		if genB != 2 {
+			t.Fatalf("Snapshot generation after refresh B = %d, want 2", genB)
+		}
+		if d := snapB.Classify(http.MethodPost, "/v1/messages", []byte(`{"model":"claude-kimi-fresh"}`)); d.Branch != "proxy" || d.Provider != "kimi" {
+			t.Errorf("refresh B route decision for claude-kimi-fresh = %+v, want proxy/kimi", d)
+		}
+
+		// Unblock slow older refresh A; it must not overwrite refresh B's newer snapshot or sentry policy.
+		closeA()
+		if err := waitA(); err != nil {
+			t.Fatalf("slow older refresh A: %v", err)
+		}
+
+		snapAfter, genAfter := cache.Snapshot()
+		if genAfter != 2 {
+			t.Errorf("Snapshot generation after slow older refresh A = %d, want 2 (no stale overwrite)", genAfter)
+		}
+		storeAfter, ok := routeStore.Load()
+		if !ok {
+			t.Fatal("route.Store empty after overlapping refreshes")
+		}
+		if d := storeAfter.Classify(http.MethodPost, "/v1/messages", []byte(`{"model":"claude-kimi-fresh"}`)); d.Branch != "proxy" || d.Provider != "kimi" {
+			t.Errorf("route.Store lost kimi-fresh after slow older refresh A: %+v", d)
+		}
+		if d := storeAfter.Classify(http.MethodPost, "/v1/messages", []byte(`{"model":"claude-kimi-stale"}`)); d.Branch == "proxy" && d.Provider == "kimi" {
+			t.Errorf("slow older refresh A overwrote route.Store with kimi-stale: %+v", d)
+		}
+		if _, rawSnap := snapAfter.Catalog(); true {
+			if _, rawStore := storeAfter.Catalog(); !bytes.Equal(rawSnap, rawStore) {
+				t.Error("Cache.Snapshot diverges from route.Store after overlapping refreshes")
+			}
+		}
+
+		evMu.Lock()
+		gotEvents := slices.Clone(events)
+		evMu.Unlock()
+		wantEvents := []pubEvent{
+			{Kind: "sentry", Gen: 1},
+			{Kind: "route", Source: "fallback"},
+			{Kind: "sentry", Gen: 2, HasFresh: true},
+			{Kind: "route", Source: "proxy", HasFresh: true},
+		}
+		if diff := gocmp.Diff(wantEvents, gotEvents); diff != "" {
+			t.Errorf("publication event order mismatch (-want +got):\n%s", diff)
+		}
+	})
 }
 
 func TestRefreshFallbackAndModelsJSON(t *testing.T) {
@@ -949,8 +1204,8 @@ func TestAnthropicCatalogAndModelsEndpoint(t *testing.T) {
 			Clock:            func() time.Time { return now },
 			Routes:           &route.Store{},
 			Sentry:           &sentry.State{},
-			BaseURL:          staticBaseURL("http://127.0.0.1:19999"),
-			Pins:             staticPins{"�": "claude-�-2", "fable": "claude-fable-5-1[1m]"},
+			EffectiveBaseURL: baseURLFunc("http://127.0.0.1:19999"),
+			CurrentPins:      pinsFunc(map[string]string{"�": "claude-�-2", "fable": "claude-fable-5-1[1m]"}),
 			Logf:             logs.logf,
 		})
 		if err != nil {
@@ -1492,7 +1747,7 @@ func TestAnthropicCatalogAndModelsEndpoint(t *testing.T) {
 				Clock:            clock,
 				Routes:           &route.Store{},
 				Sentry:           &sentry.State{},
-				BaseURL:          staticBaseURL("http://127.0.0.1:19999"),
+				EffectiveBaseURL: baseURLFunc("http://127.0.0.1:19999"),
 				Logf:             logs.logf,
 			})
 			if err != nil {
@@ -1654,7 +1909,9 @@ func TestAnthropicCatalogAndModelsEndpoint(t *testing.T) {
 }
 
 func TestDiscoveryCacheSync(t *testing.T) {
+	var proxyHits atomic.Int32
 	proxySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyHits.Add(1)
 		if r.URL.Path == "/v1/models" {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"data":[{"id":"gpt-6-astra","display_name":"gpt-6-astra (codex)"}]}`))
@@ -1670,15 +1927,15 @@ func TestDiscoveryCacheSync(t *testing.T) {
 		home, lookup, resolver := newTestPaths(t, nil)
 		nowMs := int64(1234567890)
 		cache, err := modelcache.New(modelcache.Options{
-			Lookup:         lookup,
-			Paths:          resolver,
-			ProxyBaseURL:   proxySrv.URL,
-			DefaultBaseURL: defaultURL,
-			Client:         newTestClient(t),
-			Clock:          func() time.Time { return time.UnixMilli(nowMs) },
-			Routes:         &route.Store{},
-			Sentry:         &sentry.State{},
-			BaseURL:        staticBaseURL(defaultURL),
+			Lookup:           lookup,
+			Paths:            resolver,
+			ProxyBaseURL:     proxySrv.URL,
+			DefaultBaseURL:   defaultURL,
+			Client:           newTestClient(t),
+			Clock:            func() time.Time { return time.UnixMilli(nowMs) },
+			Routes:           &route.Store{},
+			Sentry:           &sentry.State{},
+			EffectiveBaseURL: baseURLFunc(defaultURL),
 		})
 		if err != nil {
 			t.Fatalf("New: %v", err)
@@ -1758,25 +2015,38 @@ func TestDiscoveryCacheSync(t *testing.T) {
 		}
 	})
 
-	t.Run("success: skipped modes never create or overwrite discovery cache even when forced", func(t *testing.T) {
+	t.Run("success: skipped modes never create, overwrite, or dial even when forced", func(t *testing.T) {
 		const preexistingSentinel = `{"sentinel":"preexisting-discovery-cache-must-not-change"}` + "\n"
 		tests := map[string]struct {
 			shadow       bool
-			effectiveURL string
+			effectiveURL func() (string, error)
 			wantReason   string
+			wantErr      bool
 		}{
 			"success: shadow mode": {
 				shadow:       true,
-				effectiveURL: defaultURL,
+				effectiveURL: baseURLFunc(defaultURL),
 				wantReason:   "shadow",
 			},
 			"success: legacy compat URL": {
-				effectiveURL: "http://api.anthropic.com",
+				effectiveURL: baseURLFunc("http://api.anthropic.com"),
 				wantReason:   "gateway-not-wired",
 			},
 			"success: unwired base URL": {
-				effectiveURL: "https://api.anthropic.com",
+				effectiveURL: baseURLFunc("https://api.anthropic.com"),
 				wantReason:   "gateway-not-wired",
+			},
+			"success: empty effective base URL": {
+				effectiveURL: baseURLFunc(""),
+				wantReason:   "gateway-not-wired",
+			},
+			"error: EffectiveBaseURL error with matching URL never writes": {
+				effectiveURL: func() (string, error) { return defaultURL, errors.New("settings unreadable") },
+				wantErr:      true,
+			},
+			"error: EffectiveBaseURL error with empty URL never writes": {
+				effectiveURL: func() (string, error) { return "", errors.New("settings unreadable") },
+				wantErr:      true,
 			},
 		}
 
@@ -1799,16 +2069,16 @@ func TestDiscoveryCacheSync(t *testing.T) {
 					}
 
 					cache, err := modelcache.New(modelcache.Options{
-						Lookup:         lookup,
-						Paths:          resolver,
-						ProxyBaseURL:   proxySrv.URL,
-						DefaultBaseURL: defaultURL,
-						Shadow:         tt.shadow,
-						Client:         newTestClient(t),
-						Clock:          func() time.Time { return time.UnixMilli(1234567890) },
-						Routes:         &route.Store{},
-						Sentry:         &sentry.State{},
-						BaseURL:        staticBaseURL(tt.effectiveURL),
+						Lookup:           lookup,
+						Paths:            resolver,
+						ProxyBaseURL:     proxySrv.URL,
+						DefaultBaseURL:   defaultURL,
+						Shadow:           tt.shadow,
+						Client:           newTestClient(t),
+						Clock:            func() time.Time { return time.UnixMilli(1234567890) },
+						Routes:           &route.Store{},
+						Sentry:           &sentry.State{},
+						EffectiveBaseURL: tt.effectiveURL,
 					})
 					if err != nil {
 						t.Fatalf("New: %v", err)
@@ -1836,12 +2106,22 @@ func TestDiscoveryCacheSync(t *testing.T) {
 
 					checkFileUnchanged("after Refresh")
 
+					hitsBefore := proxyHits.Load()
 					res, err := cache.SyncDiscoveryCache(true)
-					if err != nil {
-						t.Fatalf("SyncDiscoveryCache(true): %v", err)
+					if gotHits := proxyHits.Load(); gotHits != hitsBefore {
+						t.Errorf("SyncDiscoveryCache(true) dialed server %d times, want 0", gotHits-hitsBefore)
 					}
-					if res.State != "skipped" || res.Reason != tt.wantReason {
-						t.Errorf("SyncDiscoveryCache(true) = (%q, %q), want (%q, %q)", res.State, res.Reason, "skipped", tt.wantReason)
+					if tt.wantErr {
+						if err == nil {
+							t.Fatalf("SyncDiscoveryCache(true) error = nil, want non-nil error (result=%+v)", res)
+						}
+					} else {
+						if err != nil {
+							t.Fatalf("SyncDiscoveryCache(true): %v", err)
+						}
+						if res.State != "skipped" || res.Reason != tt.wantReason {
+							t.Errorf("SyncDiscoveryCache(true) = (%q, %q), want (%q, %q)", res.State, res.Reason, "skipped", tt.wantReason)
+						}
 					}
 					checkFileUnchanged("after SyncDiscoveryCache(true)")
 				})
@@ -1876,15 +2156,15 @@ func TestDiscoveryCacheSync(t *testing.T) {
 					}
 				}
 				cache, err := modelcache.New(modelcache.Options{
-					Lookup:         lookup,
-					Paths:          resolver,
-					ProxyBaseURL:   "http://proxy.invalid",
-					DefaultBaseURL: defaultURL,
-					Client:         newFailingClient(),
-					Clock:          func() time.Time { return time.UnixMilli(1234567890) },
-					Routes:         &route.Store{},
-					Sentry:         &sentry.State{},
-					BaseURL:        staticBaseURL(defaultURL),
+					Lookup:           lookup,
+					Paths:            resolver,
+					ProxyBaseURL:     "http://proxy.invalid",
+					DefaultBaseURL:   defaultURL,
+					Client:           newFailingClient(),
+					Clock:            func() time.Time { return time.UnixMilli(1234567890) },
+					Routes:           &route.Store{},
+					Sentry:           &sentry.State{},
+					EffectiveBaseURL: baseURLFunc(defaultURL),
 				})
 				if err != nil {
 					t.Fatalf("New: %v", err)

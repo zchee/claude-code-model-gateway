@@ -59,17 +59,10 @@ type SentryPublisher interface {
 	Publish(generation uint64, resolver sentry.ModelResolver, windows policy.Windows, env float64)
 }
 
-// BaseURLResolver reports the effective Anthropic base URL used to gate discovery-cache writes.
-type BaseURLResolver interface {
-	EffectiveBaseURL() string
-}
-
-// PinResolver supplies the effective pin model ID per family (opus, sonnet, fable) for relabelling older rows.
-type PinResolver interface {
-	CurrentPins() map[string]string
-}
-
 // Options configures a worker model cache without ambient environment or filesystem reads.
+// EffectiveBaseURL gates discovery-cache writes; an error must never enable a write.
+// CurrentPins supplies effective pin model IDs per family (opus, sonnet, fable) for relabelling older rows.
+// GrokIDs supplies cached Grok model IDs; nil or an empty slice falls back to the built-in Grok defaults.
 type Options struct {
 	Lookup           config.LookupEnv
 	Paths            paths.Resolver
@@ -82,8 +75,9 @@ type Options struct {
 	Clock            func() time.Time
 	Routes           RoutePublisher
 	Sentry           SentryPublisher
-	BaseURL          BaseURLResolver
-	Pins             PinResolver
+	EffectiveBaseURL func() (string, error)
+	CurrentPins      func() map[string]string
+	GrokIDs          func() []string
 	Logf             func(format string, args ...any)
 }
 
@@ -115,8 +109,10 @@ func (c *Cache) Start(ctx context.Context) {
 // Wait blocks until all background refresh, retry, and Anthropic catalog goroutines have exited.
 func (c *Cache) Wait() {}
 
-// Refresh fetches the proxy listing, probes live local providers, publishes the next route snapshot and
-// sentry policy with the same strictly increasing generation, and syncs the discovery cache when appropriate.
+// Refresh fetches the proxy listing and probes live local providers without holding commit locks across
+// network calls, then commits in order: obtain the next generation once, publish Sentry first with the
+// snapshot's resolver, publish Routes next, and expose (snapshot, generation) together. An older refresh
+// that finishes after a newer committed refresh does not overwrite it.
 func (c *Cache) Refresh(ctx context.Context) error {
 	_ = ctx
 	return errNotImplemented
@@ -149,7 +145,8 @@ func (c *Cache) TriggerAnthropicRefresh(incoming http.Header) {
 	_ = incoming
 }
 
-// SyncDiscoveryCache writes the gateway discovery cache when the effective base URL is wired and not in shadow mode.
+// SyncDiscoveryCache writes the gateway discovery cache when EffectiveBaseURL returns DefaultBaseURL
+// without error and Shadow is false. An error from EffectiveBaseURL is returned without writing.
 func (c *Cache) SyncDiscoveryCache(force bool) (DiscoverySyncResult, error) {
 	_ = force
 	return DiscoverySyncResult{}, errNotImplemented
