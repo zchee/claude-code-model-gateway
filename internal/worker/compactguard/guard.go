@@ -165,7 +165,9 @@ func (g *guard) serve() (outcome.Result, error) {
 			return g.shutdown(0)
 		}
 		resp, res, err := g.req.Next(g.ctx, g.headWritten)
+		// A later attempt that never reached the upstream does not undo an earlier contact.
 		g.contacted = g.contacted || res.Contacted
+		res.Contacted = g.contacted
 		if resp == nil {
 			if g.retries > 0 && res.Route.Compaction != nil {
 				merged := withUsage(*res.Route.Compaction, mergeUsage(g.observed, g.snapshot()))
@@ -204,11 +206,21 @@ func (g *guard) attempt(resp *upstream.Response) (outcome.Result, bool, error) {
 	if body == nil {
 		return outcome.Result{Contacted: g.contacted, Status: status}, false, errNilBody
 	}
+	// The guard owns the body until the peek or the body reader takes it over, so a panic
+	// before that hand-off (in OnPeek, say) still releases the upstream connection.
+	handedOff := false
+	defer func(body io.Closer) {
+		if !handedOff {
+			_ = body.Close()
+		}
+	}(body)
 	opts := g.req.Stream
 	if g.req.ProxyProvider == sse.LMStudioProvider && !g.headWritten {
 		if opts.OnPeek != nil {
 			opts.OnPeek()
 		}
+		// The peek owns the body from here on and closes it on every path that ends it.
+		handedOff = true
 		peeked, err := sse.PeekFirstEvent(g.ServiceContext, body, opts.FirstEventWait)
 		switch {
 		case err != nil && g.ServiceContext.Err() != nil:
@@ -219,6 +231,13 @@ func (g *guard) attempt(resp *upstream.Response) (outcome.Result, bool, error) {
 		case peeked.Overflow != nil:
 			if opts.OnOverflow == nil {
 				return outcome.Result{Contacted: g.contacted, Status: status}, false, errNoOverflowResponder
+			}
+			if g.clientGone() {
+				// The responder still runs so the sentry latches and learns the limit, but the
+				// client that left receives nothing.
+				res, _ := opts.OnOverflow(discardWriter{header: http.Header{}}, status, *peeked.Overflow)
+				g.contacted = g.contacted || res.Contacted
+				return g.departed(), false, nil
 			}
 			res, err := opts.OnOverflow(g.w, status, *peeked.Overflow)
 			res.Contacted = res.Contacted || g.contacted
@@ -234,6 +253,7 @@ func (g *guard) attempt(resp *upstream.Response) (outcome.Result, bool, error) {
 		body = peeked.Body
 	}
 
+	handedOff = true
 	rd := newBodyReader(body)
 	defer func() { _ = rd.close() }()
 
@@ -322,6 +342,11 @@ func (g *guard) attempt(resp *upstream.Response) (outcome.Result, bool, error) {
 			_ = rd.close()
 			res, err := g.shutdown(status)
 			return res, false, err
+		}
+		// A failed client write or flush ends heartbeats for good; stop() also keeps a later
+		// upstream chunk from re-arming the timer.
+		if g.gone {
+			hb.stop()
 		}
 	}
 	_ = rd.close()
@@ -444,6 +469,18 @@ func (g *guard) flush() {
 		g.gone = true
 	}
 }
+
+// discardWriter is the response writer handed to a responder whose client has gone: it
+// accepts everything and delivers nothing.
+type discardWriter struct {
+	header http.Header
+}
+
+func (d discardWriter) Header() http.Header { return d.header }
+
+func (discardWriter) Write(b []byte) (int, error) { return len(b), nil }
+
+func (discardWriter) WriteHeader(int) {}
 
 // retryDelay converts the configured retry delay as a JavaScript timer does: a value outside
 // [1, maxTimerMillis] milliseconds fires after one millisecond, and fractions are dropped.
