@@ -325,12 +325,49 @@ func reportFatal(stderr io.Writer, err error) error {
 		return nil
 	}
 	const prefix = installedName + ": "
-	line := strings.ReplaceAll(strings.TrimRight(err.Error(), "\n"), "\n", "; ")
-	// An error that wraps or joins causes repeats the prefix of every cause that carries one; the line keeps one.
-	line = strings.ReplaceAll(strings.ReplaceAll(line, ": "+prefix, ": "), "; "+prefix, "; ")
+	line := strings.ReplaceAll(strings.TrimRight(causeText(err, prefix), "\n"), "\n", "; ")
 	for strings.HasPrefix(line, prefix) {
 		line = line[len(prefix):]
 	}
 	_, _ = fmt.Fprintln(stderr, prefix+line)
 	return errReported
+}
+
+// causeText returns err's message with prefix dropped from the start of each wrapped cause's own message, which an
+// error that wraps or joins causes would otherwise repeat. A cause is recognised only where its wrapper puts it: at the
+// end of a wrapping message, or as one whole line of a joined one. Any other text, including data such as a path that
+// contains prefix, is kept as it is.
+func causeText(err error, prefix string) string {
+	msg := err.Error()
+	own := func(cause error) string {
+		text := causeText(cause, prefix)
+		for strings.HasPrefix(text, prefix) {
+			text = text[len(prefix):]
+		}
+		return text
+	}
+	switch e := err.(type) { //nolint:errorlint // Each level of the chain is visited in turn; only err's own causes are matched here.
+	case interface{ Unwrap() error }:
+		if cause := e.Unwrap(); cause != nil {
+			if head, ok := strings.CutSuffix(msg, cause.Error()); ok {
+				return head + own(cause)
+			}
+		}
+	case interface{ Unwrap() []error }:
+		causes := e.Unwrap()
+		lines := make([]string, len(causes))
+		for i, cause := range causes {
+			if cause == nil {
+				return msg
+			}
+			lines[i] = cause.Error()
+		}
+		if msg == strings.Join(lines, "\n") {
+			for i, cause := range causes {
+				lines[i] = own(cause)
+			}
+			return strings.Join(lines, "\n")
+		}
+	}
+	return msg
 }

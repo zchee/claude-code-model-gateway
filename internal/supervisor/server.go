@@ -691,8 +691,12 @@ func (b *requestBody) read(p []byte) (int, error) {
 // complete only at its empty line, so it is read to that line before any field line is judged: a section the stream
 // cut off, even after a complete malformed line or inside a line, is an early end of the body rather than a malformed
 // trailer. Only a complete section with a malformed field line is refused.
+//
+// The budget charges every byte of the section, including the bytes the connection's reader already holds when the
+// section starts. If the section's end is among them no further read is needed; otherwise all of them belong to the
+// section. Either way the section fits exactly when its raw size is within maxHeadBytes, however the bytes arrived.
 func (b *requestBody) readTrailer() error {
-	b.c.budget.remain, b.c.budget.ended = maxHeadBytes, false
+	b.c.budget.remain, b.c.budget.ended = max(maxHeadBytes-int64(b.c.br.Buffered()), 0), false
 	_ = b.c.rwc.SetReadDeadline(time.Now().Add(headTimeout))
 	defer func() {
 		b.c.budget.remain = -1

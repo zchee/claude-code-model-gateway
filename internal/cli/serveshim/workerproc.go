@@ -77,7 +77,10 @@ type shim struct {
 	respawn     *time.Timer
 	reportTimer *time.Timer
 	// reportEpoch identifies the installed report timer; a callback carrying another epoch is stale and does nothing.
-	reportEpoch  uint64
+	reportEpoch uint64
+	// timedOut records that the report timeout was decided. It holds until the supervisor stops: no worker becomes
+	// eligible after it and no report timer is armed again, so one run reports at most one timeout.
+	timedOut     bool
 	stderrWrites sync.Mutex
 	tasks        sync.WaitGroup
 }
@@ -100,9 +103,8 @@ func (s *shim) logf(format string, args ...any) {
 }
 
 // fail hands a fatal error to Run, which holds one. A failure that arrives while another one is pending is not the
-// one Run returns, so it is printed here as a warning instead of being lost. Every caller hands its failure over
-// before Run looks at the inbox for the last time: under mu while the supervisor is not stopped, or from a task that
-// Run awaits.
+// one Run returns, so it is printed here as a warning instead of being lost. It is called from a task that Run awaits,
+// without mu held; a caller holding mu uses failLocked.
 func (s *shim) fail(err error) {
 	select {
 	case s.fatal <- err:
@@ -111,17 +113,71 @@ func (s *shim) fail(err error) {
 	}
 }
 
+// failLocked hands a fatal error to Run while mu is held and the supervisor is not stopped, so the hand-over is decided
+// before Run looks at the inbox for the last time. Nothing is written while mu is held: when another failure is
+// pending, the returned function prints err as a warning and the caller runs it after releasing mu. Run's final wait
+// covers that write.
+func (s *shim) failLocked(err error) (warn func()) {
+	select {
+	case s.fatal <- err:
+		return func() {}
+	default:
+	}
+	s.tasks.Add(1)
+	return func() {
+		defer s.tasks.Done()
+		s.warnFatal(err)
+	}
+}
+
 // warnFatal prints a fatal error that Run does not return as one line with one "model-gateway: " prefix. The error
 // Run returns is printed by its caller only.
 func (s *shim) warnFatal(err error) {
 	const prefix = "model-gateway: "
-	line := strings.ReplaceAll(strings.TrimRight(err.Error(), "\n"), "\n", "; ")
-	// An error that wraps or joins causes repeats the prefix of every cause that carries one; the line keeps one.
-	line = strings.ReplaceAll(strings.ReplaceAll(line, ": "+prefix, ": "), "; "+prefix, "; ")
+	line := strings.ReplaceAll(strings.TrimRight(causeText(err, prefix), "\n"), "\n", "; ")
 	for strings.HasPrefix(line, prefix) {
 		line = line[len(prefix):]
 	}
 	s.logf("%s%s\n", prefix, line)
+}
+
+// causeText returns err's message with prefix dropped from the start of each wrapped cause's own message, which an
+// error that wraps or joins causes would otherwise repeat. A cause is recognised only where its wrapper puts it: at the
+// end of a wrapping message, or as one whole line of a joined one. Any other text, including data such as a path that
+// contains prefix, is kept as it is.
+func causeText(err error, prefix string) string {
+	msg := err.Error()
+	own := func(cause error) string {
+		text := causeText(cause, prefix)
+		for strings.HasPrefix(text, prefix) {
+			text = text[len(prefix):]
+		}
+		return text
+	}
+	switch e := err.(type) { //nolint:errorlint // Each level of the chain is visited in turn; only err's own causes are matched here.
+	case interface{ Unwrap() error }:
+		if cause := e.Unwrap(); cause != nil {
+			if head, ok := strings.CutSuffix(msg, cause.Error()); ok {
+				return head + own(cause)
+			}
+		}
+	case interface{ Unwrap() []error }:
+		causes := e.Unwrap()
+		lines := make([]string, len(causes))
+		for i, cause := range causes {
+			if cause == nil {
+				return msg
+			}
+			lines[i] = cause.Error()
+		}
+		if msg == strings.Join(lines, "\n") {
+			for i, cause := range causes {
+				lines[i] = own(cause)
+			}
+			return strings.Join(lines, "\n")
+		}
+	}
+	return msg
 }
 
 // publishSelf writes the supervisor's own pid record before it reports ready.
@@ -177,12 +233,12 @@ func (s *shim) writeRecord(name, role string, pid int, command, generation strin
 // (lib/commands.js:2593-2641).
 func (s *shim) startWorker() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.stopped || s.current != nil {
+		s.mu.Unlock()
 		return
 	}
 	s.endpoint.Store(0)
-	if s.reportTimer == nil {
+	if s.reportTimer == nil && !s.timedOut {
 		// An installed timer is kept across failed launches, so the deadline counts from the first of them.
 		s.reportEpoch++
 		epoch := s.reportEpoch
@@ -190,13 +246,16 @@ func (s *shim) startWorker() {
 	}
 	w, err := s.spawn()
 	if err != nil {
-		s.fail(fmt.Errorf("model-gateway: could not start the shim worker: %w", err))
+		warn := s.failLocked(fmt.Errorf("model-gateway: could not start the shim worker: %w", err))
+		s.mu.Unlock()
+		warn()
 		return
 	}
 	s.current = w
 	s.files.Record("worker-started", map[string]any{"component": "supervisor", "pid": s.pid, "startedAt": s.startedAt, "child": map[string]any{"component": "worker", "pid": w.pid}})
 	s.tasks.Go(func() { s.readReport(w) })
 	s.tasks.Go(func() { s.awaitExit(w) })
+	s.mu.Unlock()
 }
 
 func (s *shim) spawn() (*workerProc, error) {
@@ -292,7 +351,7 @@ func (s *shim) publish(w *workerProc, port int, eligible bool) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.stopped || s.current != w {
+	if s.stopped || s.current != w || s.timedOut {
 		return nil
 	}
 	s.endpoint.Store(int64(port))
@@ -326,17 +385,22 @@ func parseReport(data []byte, generation string) (int, bool) {
 // reportExpired stops the supervisor when no worker reported its listener in time. A callback whose timer was stopped
 // or replaced after it had already started finds another epoch and does nothing. The failure is decided and handed
 // over under mu, which stop also takes: a stop that comes first leaves the callback another epoch, and a stop that
-// comes after finds the failure already pending, so Run reports it or prints it as a warning.
+// comes after finds the failure already pending, so Run reports it or prints it as a warning. The decision is final
+// until the stop: from then on no worker becomes eligible and no report timer is armed.
 func (s *shim) reportExpired(epoch uint64) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if epoch != s.reportEpoch || s.reportTimer == nil {
+		s.mu.Unlock()
 		return
 	}
 	s.reportTimer = nil
+	warn := func() {}
 	if !s.stopped && s.endpoint.Load() == 0 {
-		s.fail(fmt.Errorf("model-gateway: shim worker did not report its listener port within %dms", reportTimeout.Milliseconds()))
+		s.timedOut = true
+		warn = s.failLocked(fmt.Errorf("model-gateway: shim worker did not report its listener port within %dms", reportTimeout.Milliseconds()))
 	}
+	s.mu.Unlock()
+	warn()
 }
 
 // awaitExit retires an exited worker, journals its exit, tells its waiters and schedules its replacement. The worker's
