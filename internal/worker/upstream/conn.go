@@ -49,11 +49,13 @@ func inactivityDialer(dial dialFunc, lifetime context.Context) dialFunc {
 
 // tlsDialer returns the dial function of HTTPS connections: it connects like inactivityDialer and
 // performs the TLS handshake with a copy of config, naming the dialled host when config names no
-// server. The handshake ends when ctx ends, which net/http does once no request waits for the
-// dial, and when lifetime ends. A failed handshake closes the connection and reports ErrTimeout
-// when the inactivity deadline closed the connection, the closed client when lifetime has ended,
-// and otherwise a tlsError wrapping the handshake's error, whatever its shape; a failed connect
-// keeps its own error.
+// server. The handshake ends when ctx ends and when lifetime ends. net/http detaches ctx from the
+// request and may keep a dial running after its request ended, so that a later request can use the
+// connection; it ends ctx only when CloseIdleConnections finds no request waiting for the dial. Such
+// a dial is bounded by the inactivity deadline and by lifetime. A failed handshake closes the
+// connection and reports ErrTimeout when the inactivity deadline closed the connection, the closed
+// client when lifetime has ended, and otherwise a tlsError wrapping the handshake's error, whatever
+// its shape; a failed connect keeps its own error.
 func tlsDialer(dial dialFunc, config *tls.Config, lifetime context.Context) dialFunc {
 	dial = defaultDial(dial)
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -109,8 +111,9 @@ func dialInactivity(ctx context.Context, dial dialFunc, lifetime context.Context
 	dialCtx, cancel := context.WithTimeoutCause(ctx, socketInactivity, ErrTimeout)
 	defer cancel()
 	if lifetime != nil {
-		// net/http detaches the dial from the request context, so the client's lifetime is
-		// the only signal that ends a dial no request waits for any more.
+		// net/http detaches the dial from the request context and may keep it running after its
+		// request ended, so that a later request can use the connection. Such a dial is bounded by
+		// the inactivity deadline above and by the client's lifetime.
 		stop := context.AfterFunc(lifetime, cancel)
 		defer stop()
 	}

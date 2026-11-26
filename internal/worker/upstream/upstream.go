@@ -167,6 +167,10 @@ type Client struct {
 // It takes no Target and builds no inference headers, allowing callers such as Grok OIDC
 // credential refresh to hold a distinct transport instance isolated from an inference Client's
 // lifetime.
+//
+// For HTTPS the TLS settings and the dial function come from opts, captured at construction: the
+// returned transport's TLSClientConfig, TLSHandshakeTimeout and DialContext fields are not consulted
+// for HTTPS after construction, so changing them does not change how HTTPS connections are made.
 func NewTransport(opts Options) *http.Transport {
 	return newTransport(opts, nil)
 }
@@ -217,6 +221,17 @@ func NewClient(opts Options) *Client {
 // handshake, and a TLS failure or any other failure after the connection was obtained, are each
 // reported as one fixed error, so no upstream bytes reach the error text; the fixed error of a TLS
 // failure unwraps to the TLS layer's error. A failed dial keeps its own error.
+//
+// ctx's cause is recognised only when its value can be compared. A cause whose value cannot be
+// compared (a struct whose interface field holds a slice, for example) is never matched: Do then
+// returns the transport's error as it is when no connection was obtained, and otherwise classifies
+// the failure like any other after the connection was obtained, which for most failures is the
+// fixed response error, or the closed-client error once Close was called. Such a cause never
+// makes Do panic.
+//
+// When ctx ended and Close was called both before the exchange failed, Do reports one of the two,
+// ctx's error or cause or the closed-client error; which one is not specified. A Close that starts
+// after the exchange already failed with ctx's error or cause does not replace it.
 func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 	if c == nil || c.transport == nil {
 		return nil, errors.New("upstream client not constructed by NewClient")
@@ -265,7 +280,10 @@ func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 }
 
 // Close cancels in-flight upstream requests and closes idle connections for service shutdown.
-// It is safe to call more than once.
+// It is safe to call more than once. A request whose context had also ended before its exchange
+// failed reports either its context's error or cause or the closed-client error, which one is not
+// specified; a Close that starts after an exchange already failed with its context's error or cause
+// does not replace that error.
 func (c *Client) Close() error {
 	if c == nil || c.cancel == nil {
 		return nil
@@ -291,8 +309,9 @@ func (c *Client) exchangeError(ctx context.Context, cause, err error, connected 
 		// broken connection before it sees the cancelled request.
 		return errClientClosed
 	}
-	if tlsErr, ok := errors.AsType[*tlsError](err); ok {
-		// The dial marked a failed handshake.
+	if tlsErr, ok := err.(*tlsError); ok { //nolint:errorlint // Only the marker the handshake step returned itself counts; a custom dial's error that wraps one keeps its own identity.
+		// The dial marked a failed handshake. net/http hands the TLS dial's error back as it is, so
+		// the marker is the error itself; one found deeper in a dial error's chain is not renamed.
 		return tlsErr
 	}
 	if !connected {
