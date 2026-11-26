@@ -119,13 +119,12 @@ func (s Snapshot) IsGatewayID(id string) bool {
 // Only a refused decision carries a Reason, which is one of the Refusal constants.
 type Decision struct{ Branch, Provider, Model, Reason string }
 
-// Reasons a /v1/messages body is refused locally rather than forwarded. Each names a limit of the port, not of the
-// source, so the source would have routed the request by its model; forwarding it to the default upstream instead could
-// send it to a provider the client did not ask for.
+// Reasons a /v1/messages body is refused locally rather than forwarded. Each names a classifier limit of the port
+// where falling back to the default upstream could change the recipient of the request.
 const (
-	// RefusalNestingDepth is the reason for a body nested deeper than the wire decoder accepts.
+	// RefusalNestingDepth is the reason for a body whose first JSON document opens more than 10,000 nested containers.
 	RefusalNestingDepth = "nesting-depth"
-	// RefusalIllFormedModel is the reason for a top-level model string holding an unpaired UTF-16 surrogate.
+	// RefusalIllFormedModel is the reason for an effective top-level model string holding an unpaired UTF-16 surrogate.
 	RefusalIllFormedModel = "ill-formed-model"
 )
 
@@ -133,15 +132,18 @@ const (
 // Target is the original request target including any query. Headers do not select the route.
 //
 // The order follows lib/request-worker.js:2361-2416 and 2430-2648: the drain endpoint, the health endpoint for any
-// method, the catalog, any HEAD request, then the body of a request whose path starts with /v1/messages. A body
-// that does not parse as exactly one JSON document takes the source's catch path to Anthropic, as does a body whose
-// top-level value is null or whose top-level model is absent or not a string.
+// method, the catalog, any HEAD request, then the body of a request whose path starts with /v1/messages. Except when
+// one of the two refusal conditions below fires first, a body that does not parse as a single JSON document takes the
+// source's catch path to Anthropic, as does a non-object document or an object whose effective model is absent or not
+// a string.
 //
-// Two bodies the source would route by their model are beyond the port's limits and take the "refused" branch, whose
-// Reason names the case; such a request is answered locally and never forwarded. A body nested deeper than 10,000
-// containers is refused with RefusalNestingDepth, and a top-level model string holding an unpaired UTF-16 surrogate
-// (one spelled as an escape; ill-formed UTF-8 bytes decode to U+FFFD as in Node and route normally) is refused with
-// RefusalIllFormedModel. A request settled before its body is read is never refused.
+// Two conditions exceed the port's classifier limits where passing the body through to the default upstream could
+// change the recipient; both take the "refused" branch with Reason naming the condition, so the caller answers locally
+// without forwarding. First, a body whose first JSON document opens a 10,001st nested container (including a top-level
+// array or a document truncated after that opening token) is refused with RefusalNestingDepth. Second, a JSON object
+// document whose effective top-level model string holds an unpaired UTF-16 surrogate (spelled as a JSON escape;
+// ill-formed UTF-8 bytes decode to U+FFFD as in Node and route normally) is refused with RefusalIllFormedModel. A
+// request settled before its body is inspected is never refused.
 func (s Snapshot) Classify(method, target string, body []byte) Decision {
 	path, _, _ := strings.Cut(target, "?")
 	switch {
@@ -174,11 +176,12 @@ func (s Snapshot) Classify(method, target string, body []byte) Decision {
 	return Decision{Branch: "anthropic"}
 }
 
-// requestedModel returns the string model member of a JSON object body, the last one when the name repeats. It
-// reports false when the body does not parse or the model is absent or not a string. It returns a refusal reason
-// instead when the body is nested past the wire decoder's limit, or when the model holds an unpaired UTF-16
-// surrogate: such a spelling cannot become a Go string without U+FFFD standing in for the surrogate and merging
-// distinct IDs, and the source would still route it by its model.
+// requestedModel returns the effective string model member of a single JSON object document, where the last member
+// wins when decoded names repeat. It returns RefusalNestingDepth when the first document opens more than 10,000 nested
+// containers, and RefusalIllFormedModel when the effective top-level model string holds an unpaired UTF-16 surrogate
+// (which cannot become a Go string without U+FFFD merging distinct spellings); passing either body through to the
+// default upstream could send a request to a recipient the client did not select. Any other syntax error, trailing
+// value, non-object document, or missing or non-string model reports ok == false with an empty refusal.
 func requestedModel(body []byte) (model, refusal string, ok bool) {
 	v, err := jsonx.DecodeWire(body)
 	if _, deep := errors.AsType[*jsonx.WireDepthError](err); deep {

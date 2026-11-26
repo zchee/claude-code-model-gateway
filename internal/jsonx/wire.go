@@ -93,9 +93,16 @@ func readWire(d *jsontext.Decoder) (WireValue, error) {
 		if v.Kind == '{' {
 			end = '}'
 		}
-		for d.PeekKind() != end {
+		for kind := d.PeekKind(); kind != end; kind = d.PeekKind() {
 			var name []uint16
 			if v.Kind == '{' {
+				if kind != '"' {
+					if kind == 0 {
+						_, err := d.ReadToken()
+						return WireValue{}, err
+					}
+					return WireValue{}, errors.New("expected string for object member name")
+				}
 				key, err := d.ReadValue()
 				if err != nil {
 					return WireValue{}, err
