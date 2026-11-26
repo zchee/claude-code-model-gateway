@@ -203,10 +203,14 @@ func TestAutomaticPathsKeepLegacyURL(t *testing.T) {
 		equal(t, shared, text(t, f.shared))
 		equal(t, user, text(t, f.user))
 	}
-	healthy := wiring.Health{HostsDetected: true, Port80Bound: true}
+	healthy := wiring.Health{HostsDetected: true, Port80Bound: true, HostsLine: "127.0.0.1 api.anthropic.com"}
 	r, err := f.SyncMode(&healthy, "")
 	check(t, err)
-	equal(t, wiring.ModeResult{Mode: "compat", Compat: healthy}, r)
+	wantResult := wiring.ModeResult{
+		Mode:   "compat",
+		Compat: wiring.Health{HostsDetected: true, Port80Bound: true, HostsLine: "127.0.0.1 api.anthropic.com"},
+	}
+	equal(t, wantResult, r)
 	_, err = f.SyncMode(nil, "")
 	check(t, err)
 	migrated, err := f.MigrateLegacy()
@@ -231,4 +235,19 @@ func TestAutomaticPathsKeepLegacyURL(t *testing.T) {
 		}
 	}
 	equal(t, shared, text(t, f.shared))
+
+	t.Run("success: shared legacy URL preserves unrelated local value during sync", func(t *testing.T) {
+		f := sandbox(t)
+		putEnv(t, f.shared, gatewaySettings(compat))
+		putEnv(t, f.local, map[string]any{"PROJECT_LOCAL_VALUE": "keep-me"})
+		sharedBefore := text(t, f.shared)
+		localBefore := text(t, f.local)
+		health := wiring.Health{}
+		got, err := f.SyncMode(&health, "")
+		check(t, err)
+		equal(t, wiring.ModeResult{Mode: "compat"}, got)
+		equal(t, localBefore, text(t, f.local))
+		equal(t, "keep-me", envAt(t, f.local)["PROJECT_LOCAL_VALUE"])
+		equal(t, sharedBefore, text(t, f.shared))
+	})
 }

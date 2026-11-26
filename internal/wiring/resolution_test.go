@@ -236,13 +236,14 @@ func TestBypassedWiring(t *testing.T) {
 
 func TestWiredMode(t *testing.T) {
 	tests := map[string]struct {
-		env, local          string
+		env, local, user    string
 		wired               bool
 		scope, mode, source string
 	}{
 		"success: unwired":                    {},
 		"success: environment only":           {env: direct, wired: true, mode: "default", source: "env"},
 		"success: file defines writable mode": {env: direct, local: compat, wired: true, scope: "project", mode: "compat", source: "project-local"},
+		"success: user legacy compat":         {user: compat, wired: true, scope: "user", mode: "compat", source: "user"},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -251,9 +252,13 @@ func TestWiredMode(t *testing.T) {
 				f.env[base] = tt.env
 			}
 			var file string
-			if tt.local != "" {
+			switch {
+			case tt.local != "":
 				file = f.local
 				putEnv(t, file, map[string]any{base: tt.local})
+			case tt.user != "":
+				file = f.user
+				putEnv(t, file, map[string]any{base: tt.user})
 			}
 			is, err := f.IsWired()
 			check(t, err)

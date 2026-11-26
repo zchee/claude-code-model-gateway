@@ -323,6 +323,7 @@ func TestSentryStateRetention(t *testing.T) {
 	}{
 		"success: armed session retained after idle period and session churn":       {mode: "armed"},
 		"success: fired latch retained after idle period and session churn":         {mode: "fired"},
+		"success: fired session usage retained after idle period and session churn": {mode: "fired-usage"},
 		"success: below-trigger usage retained after idle period and session churn": {mode: "below"},
 	}
 	for name, tt := range tests {
@@ -334,7 +335,7 @@ func TestSentryStateRetention(t *testing.T) {
 				switch tt.mode {
 				case "armed":
 					observe(&s, key, m, 105, false)
-				case "fired":
+				case "fired", "fired-usage":
 					observe(&s, key, m, 108, false)
 					check(t, &s, key, m, first, sentry.Crossing{Usage: 108, Trigger: 100})
 				case "below":
@@ -359,6 +360,12 @@ func TestSentryStateRetention(t *testing.T) {
 					check(t, &s, key, m, first, sentry.Crossing{})
 					if got := s.Overflow(key, m, false); got != 109 {
 						t.Errorf("Overflow(%q) = %v, want 109", key, got)
+					}
+				case "fired-usage":
+					// First post-idle action inspects the fired session's retained usage directly
+					// before any subsequent Observe could repopulate it.
+					if got := s.Overflow(key, m, false); got != 108 {
+						t.Errorf("Overflow(%q) = %v, want 108", key, got)
 					}
 				case "below":
 					if got := s.Overflow(key, m, false); got != 85 {

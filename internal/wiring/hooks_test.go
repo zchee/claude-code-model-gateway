@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestReadinessHookForms(t *testing.T) {
@@ -227,9 +228,12 @@ func TestWiringUnregisteredProjectHookUntouched(t *testing.T) {
 			unregisteredContent := strings.Replace(regOriginal, direct, tt.url, 1)
 			otherLocal := filepath.Join(t.TempDir(), ".claude", "settings.local.json")
 			unregisteredFiles := []string{f.local, f.shared, otherLocal}
+			oldTime := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
 			beforeInfo := make([]os.FileInfo, len(unregisteredFiles))
 			for i, file := range unregisteredFiles {
 				put(t, file, unregisteredContent)
+				check(t, os.Chmod(file, 0o640))
+				check(t, os.Chtimes(file, oldTime, oldTime))
 				info, err := os.Stat(file)
 				check(t, err)
 				beforeInfo[i] = info
@@ -247,6 +251,8 @@ func TestWiringUnregisteredProjectHookUntouched(t *testing.T) {
 				afterInfo, err := os.Stat(file)
 				check(t, err)
 				equal(t, true, os.SameFile(beforeInfo[i], afterInfo))
+				equal(t, beforeInfo[i].ModTime(), afterInfo.ModTime())
+				equal(t, beforeInfo[i].Mode(), afterInfo.Mode())
 				equal(t, false, f.ReadinessHookPresent([]byte(text(t, file))))
 			}
 			absent(t, f.user)

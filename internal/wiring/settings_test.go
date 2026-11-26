@@ -56,42 +56,52 @@ func TestWriteEnvironment(t *testing.T) {
 	tests := map[string]struct {
 		start, mode string
 		remove      bool
+		socketModes []bool
 	}{
-		"default": {mode: "default"},
-		"legacy":  {start: compat, mode: "default"},
-		"remove":  {start: compat, mode: "default", remove: true},
+		"default": {mode: "default", socketModes: []bool{false, true}},
+		"legacy":  {start: compat, mode: "default", socketModes: []bool{true}},
+		"remove":  {start: compat, mode: "default", remove: true, socketModes: []bool{false, true}},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			f := sandbox(t)
-			initial := map[string]any{"USER_SETTING": "keep-me", "ANTHROPIC_UNIX_SOCKET": "retired-socket-value"}
-			if tt.start != "" {
-				initial[base] = tt.start
+			for _, seedSocket := range tt.socketModes {
+				f := sandbox(t)
+				initial := map[string]any{"USER_SETTING": "keep-me"}
+				if seedSocket {
+					initial["ANTHROPIC_UNIX_SOCKET"] = "retired-socket-value"
+				}
+				if tt.start != "" {
+					initial[base] = tt.start
+				}
+				if tt.remove {
+					entries := `"ANTHROPIC_BASE_URL":"` + compat + `", `
+					if seedSocket {
+						socketPath := filepath.Join(filepath.Dir(f.registry), "gateway.sock")
+						entries += `"ANTHROPIC_UNIX_SOCKET":` + encoded(t, socketPath) + `, `
+					}
+					entries += `"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY":"1", `
+					put(t, f.user, envPrefix+entries+userPair+envSuffix)
+				} else {
+					putEnv(t, f.user, initial)
+				}
+				check(t, f.WriteEnv("user", tt.mode, tt.remove))
+				env := envAt(t, f.user)
+				_, socket := env["ANTHROPIC_UNIX_SOCKET"]
+				equal(t, false, socket)
+				equal(t, "keep-me", env["USER_SETTING"])
+				var want *wiring.Wiring
+				if tt.remove {
+					equal(t, envPrefix+userPair+envSuffix, text(t, f.user))
+					_, present := env[base]
+					equal(t, false, present)
+				} else {
+					equal(t, direct, env[base])
+					want = &wiring.Wiring{Scope: "user", Mode: tt.mode, Source: "user", File: f.user}
+				}
+				actual, err := f.WiredMode()
+				check(t, err)
+				equal(t, want, actual)
 			}
-			if tt.remove {
-				socketPath := filepath.Join(filepath.Dir(f.registry), "gateway.sock")
-				entries := `"ANTHROPIC_BASE_URL":"` + compat + `", "ANTHROPIC_UNIX_SOCKET":` + encoded(t, socketPath) + `, "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY":"1", `
-				put(t, f.user, envPrefix+entries+userPair+envSuffix)
-			} else {
-				putEnv(t, f.user, initial)
-			}
-			check(t, f.WriteEnv("user", tt.mode, tt.remove))
-			env := envAt(t, f.user)
-			_, socket := env["ANTHROPIC_UNIX_SOCKET"]
-			equal(t, false, socket)
-			equal(t, "keep-me", env["USER_SETTING"])
-			var want *wiring.Wiring
-			if tt.remove {
-				equal(t, envPrefix+userPair+envSuffix, text(t, f.user))
-				_, present := env[base]
-				equal(t, false, present)
-			} else {
-				equal(t, direct, env[base])
-				want = &wiring.Wiring{Scope: "user", Mode: tt.mode, Source: "user", File: f.user}
-			}
-			actual, err := f.WiredMode()
-			check(t, err)
-			equal(t, want, actual)
 		})
 	}
 }

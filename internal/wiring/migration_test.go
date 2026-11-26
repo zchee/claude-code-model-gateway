@@ -31,10 +31,11 @@ func gatewaySettings(url string) map[string]any {
 
 func TestLegacyMigration(t *testing.T) {
 	tests := map[string]struct{ identity string }{
-		"success: separate files":        {"separate"},
-		"success: absent user file":      {"absent"},
-		"success: uncertain identity":    {"loop"},
-		"success: shared and user alias": {"alias"},
+		"success: separate files":                  {"separate"},
+		"success: absent user file":                {"absent"},
+		"success: sync removes emptied shared env": {"sync"},
+		"success: uncertain identity":              {"loop"},
+		"success: shared and user alias":           {"alias"},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -64,6 +65,16 @@ func TestLegacyMigration(t *testing.T) {
 				equal(t, true, got)
 				absent(t, f.user)
 				equal(t, direct, envAt(t, f.local)[base])
+				_, sharedEnvPresent := object(t, text(t, f.shared))["env"]
+				equal(t, false, sharedEnvPresent)
+			case "sync":
+				got, err := f.SyncMode(nil, "")
+				check(t, err)
+				equal(t, wiring.ModeResult{Mode: "default"}, got)
+				absent(t, f.user)
+				equal(t, direct, envAt(t, f.local)[base])
+				_, sharedEnvPresent := object(t, text(t, f.shared))["env"]
+				equal(t, false, sharedEnvPresent)
 			case "separate":
 				user := gatewaySettings(direct)
 				user["USER_UNRELATED"] = "keep-user"
