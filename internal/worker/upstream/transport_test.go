@@ -28,6 +28,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1449,6 +1450,17 @@ func TestLiveUpstreamHeadersToUpstreamState(t *testing.T) {
 				}
 			}
 
+			// Mutating RelayHeader must not affect the parsed capture Header copy.
+			headerSnapshot := resp.Header.Clone()
+			resp.RelayHeader.Set("Upgrade", "mutated")
+			resp.RelayHeader.Set("X-Relay-Only", "mutated")
+			if vals := resp.RelayHeader.Values("Set-Cookie"); len(vals) > 0 {
+				vals[0] = "mutated=1"
+			}
+			if diff := gocmp.Diff(headerSnapshot, resp.Header); diff != "" {
+				t.Fatalf("mutating RelayHeader altered Header (-want +got):\n%s", diff)
+			}
+
 			// Parsed Header passed directly to upstreamstate must preserve exact occurrences.
 			store := upstreamstate.Store{
 				Dir: t.TempDir(),
@@ -1463,4 +1475,855 @@ func TestLiveUpstreamHeadersToUpstreamState(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNewTransport(t *testing.T) {
+	t.Run("success: returned transport configures safe policy and distinct instances", func(t *testing.T) {
+		tr1 := upstream.NewTransport(upstream.Options{})
+		if tr1 == nil {
+			t.Fatal("NewTransport returned nil")
+		}
+		t.Cleanup(tr1.CloseIdleConnections)
+
+		tr2 := upstream.NewTransport(upstream.Options{})
+		if tr2 == nil {
+			t.Fatal("second NewTransport returned nil")
+		}
+		t.Cleanup(tr2.CloseIdleConnections)
+
+		if tr1 == tr2 {
+			t.Fatal("NewTransport returned the same *http.Transport instance twice")
+		}
+		if tr1.Proxy != nil {
+			t.Error("NewTransport returned non-nil Proxy, want nil (no environment proxy)")
+		}
+		if !tr1.DisableCompression {
+			t.Error("NewTransport returned DisableCompression=false, want true")
+		}
+		if tr1.DisableKeepAlives {
+			t.Error("NewTransport returned DisableKeepAlives=true, want false (keep-alive pooling enabled)")
+		}
+		if diff := gocmp.Diff(64, tr1.MaxConnsPerHost); diff != "" {
+			t.Errorf("NewTransport MaxConnsPerHost (-want +got):\n%s", diff)
+		}
+		h2Disabled := (tr1.Protocols != nil && tr1.Protocols.HTTP1() && !tr1.Protocols.HTTP2() && !tr1.Protocols.UnencryptedHTTP2()) ||
+			(!tr1.ForceAttemptHTTP2 && tr1.TLSNextProto != nil && len(tr1.TLSNextProto) == 0)
+		if !h2Disabled {
+			t.Errorf("NewTransport did not disable HTTP/2 (Protocols=%v, ForceAttemptHTTP2=%v, TLSNextProto=%v)", tr1.Protocols, tr1.ForceAttemptHTTP2, tr1.TLSNextProto)
+		}
+	})
+
+	t.Run("success: HTTP and HTTPS non-loopback requests ignore environment proxy without inference headers", func(t *testing.T) {
+		var decoyProxyHits atomic.Int32
+		decoyProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			decoyProxyHits.Add(1)
+			http.Error(w, "environment proxy must never be dialed", http.StatusBadGateway)
+		}))
+		t.Cleanup(decoyProxy.Close)
+
+		var mu sync.Mutex
+		var httpHits, httpsHits atomic.Int32
+		var seenAuth, seenContentType, seenBody string
+
+		handleOIDC := func(hits *atomic.Int32) http.HandlerFunc {
+			return func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				hits.Add(1)
+				mu.Lock()
+				seenAuth = r.Header.Get("Authorization")
+				seenContentType = r.Header.Get("Content-Type")
+				seenBody = string(body)
+				mu.Unlock()
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, `{"access_token":"refreshed"}`)
+			}
+		}
+
+		httpTarget := httptest.NewServer(handleOIDC(&httpHits))
+		t.Cleanup(httpTarget.Close)
+
+		httpsTarget := httptest.NewTLSServer(handleOIDC(&httpsHits))
+		t.Cleanup(httpsTarget.Close)
+
+		tlsCfg := httpsTarget.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+		tlsCfg.ServerName = "127.0.0.1"
+
+		cases := map[string]struct {
+			url       string
+			tlsConfig *tls.Config
+			hits      *atomic.Int32
+		}{
+			"success: HTTP OIDC form POST ignores environment proxy": {
+				url:  "http://upstream.invalid:8080/oauth/token",
+				hits: &httpHits,
+			},
+			"success: HTTPS OIDC form POST ignores environment proxy": {
+				url:       "https://upstream.invalid:8443/oauth/token",
+				tlsConfig: tlsCfg,
+				hits:      &httpsHits,
+			},
+		}
+
+		for name, tc := range cases {
+			t.Run(name, func(t *testing.T) {
+				var decoyDialHits atomic.Int32
+				var dialer net.Dialer
+				dialCtx := func(ctx context.Context, network, addr string) (net.Conn, error) {
+					switch addr {
+					case "upstream.invalid:8080":
+						return dialer.DialContext(ctx, network, httpTarget.Listener.Addr().String())
+					case "upstream.invalid:8443":
+						return dialer.DialContext(ctx, network, httpsTarget.Listener.Addr().String())
+					case testEnvProxyHost:
+						decoyDialHits.Add(1)
+						return dialer.DialContext(ctx, network, decoyProxy.Listener.Addr().String())
+					default:
+						t.Errorf("attempted dial to unapproved address %q", addr)
+						return nil, fmt.Errorf("blocked unapproved dial to %q", addr)
+					}
+				}
+
+				probeReq, err := http.NewRequestWithContext(t.Context(), http.MethodGet, tc.url, nil)
+				if err != nil {
+					t.Fatalf("NewRequestWithContext: %v", err)
+				}
+				control := &http.Transport{Proxy: http.ProxyFromEnvironment, DialContext: dialCtx}
+				proxied, proxyErr := control.RoundTrip(probeReq)
+				if proxied != nil {
+					_ = proxied.Body.Close()
+				}
+				control.CloseIdleConnections()
+				if decoyDialHits.Swap(0) != 1 || (proxyErr == nil && proxied.StatusCode != http.StatusBadGateway) {
+					t.Fatalf("environment-proxy control missed decoy: response=%v err=%v", proxied, proxyErr)
+				}
+
+				tr := upstream.NewTransport(upstream.Options{DialContext: dialCtx, TLSConfig: tc.tlsConfig})
+				if tr == nil {
+					t.Fatal("NewTransport returned nil")
+				}
+				t.Cleanup(tr.CloseIdleConnections)
+
+				beforeHits := tc.hits.Load()
+				beforeDecoy := decoyProxyHits.Load()
+
+				const formPayload = "grant_type=refresh_token&refresh_token=tok"
+				req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, tc.url, strings.NewReader(formPayload))
+				if err != nil {
+					t.Fatalf("NewRequestWithContext: %v", err)
+				}
+				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				req.Header.Set("Authorization", "Bearer oidc-refresh-auth")
+
+				resp, err := tr.RoundTrip(req)
+				if err != nil {
+					t.Fatalf("RoundTrip returned error: %v", err)
+				}
+				defer func() { _ = resp.Body.Close() }()
+				if _, err := io.ReadAll(resp.Body); err != nil {
+					t.Fatalf("reading response body: %v", err)
+				}
+				if diff := gocmp.Diff(http.StatusOK, resp.StatusCode); diff != "" {
+					t.Fatalf("status (-want +got):\n%s", diff)
+				}
+				if decoyDialHits.Load() != 0 {
+					t.Fatalf("transport dialed environment proxy %d time(s), want 0", decoyDialHits.Load())
+				}
+				if decoyProxyHits.Load() != beforeDecoy {
+					t.Fatalf("environment proxy received %d hit(s), want 0", decoyProxyHits.Load()-beforeDecoy)
+				}
+				if got := tc.hits.Load() - beforeHits; got != 1 {
+					t.Fatalf("target received %d request(s), want 1", got)
+				}
+				mu.Lock()
+				gotAuth, gotCT, gotBody := seenAuth, seenContentType, seenBody
+				mu.Unlock()
+				if diff := gocmp.Diff("Bearer oidc-refresh-auth", gotAuth); diff != "" {
+					t.Errorf("Authorization (-want +got):\n%s", diff)
+				}
+				if diff := gocmp.Diff("application/x-www-form-urlencoded", gotCT); diff != "" {
+					t.Errorf("Content-Type (-want +got):\n%s", diff)
+				}
+				if diff := gocmp.Diff(formPayload, gotBody); diff != "" {
+					t.Errorf("form body (-want +got):\n%s", diff)
+				}
+			})
+		}
+	})
+
+	t.Run("success: RoundTrip refuses redirects, skips auto-decompression, and forces HTTP/1.1 over TLS", func(t *testing.T) {
+		var rawCompressed bytes.Buffer
+		gz := gzip.NewWriter(&rawCompressed)
+		if _, err := gz.Write([]byte(`{"issuer":"https://oidc.invalid"}`)); err != nil {
+			t.Fatalf("gzip write: %v", err)
+		}
+		if err := gz.Close(); err != nil {
+			t.Fatalf("gzip close: %v", err)
+		}
+		wantGzip := rawCompressed.Bytes()
+
+		var redirectTargetHits atomic.Int32
+		var protoMajor, protoMinor atomic.Int32
+		srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			protoMajor.Store(int32(r.ProtoMajor))
+			protoMinor.Store(int32(r.ProtoMinor))
+			switch r.URL.Path {
+			case "/redirect":
+				w.Header().Set("Location", "/redirect-target")
+				w.WriteHeader(http.StatusFound)
+			case "/redirect-target":
+				redirectTargetHits.Add(1)
+				w.WriteHeader(http.StatusOK)
+			case "/gzip":
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Content-Encoding", "gzip")
+				w.Header().Set("Content-Length", strconv.Itoa(len(wantGzip)))
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(wantGzip)
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
+		}))
+		srv.EnableHTTP2 = true
+		srv.StartTLS()
+		t.Cleanup(srv.Close)
+
+		tlsCfg := srv.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+		tr := upstream.NewTransport(upstream.Options{TLSConfig: tlsCfg})
+		if tr == nil {
+			t.Fatal("NewTransport returned nil")
+		}
+		t.Cleanup(tr.CloseIdleConnections)
+
+		reqRedir, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/redirect", nil)
+		if err != nil {
+			t.Fatalf("NewRequestWithContext: %v", err)
+		}
+		respRedir, err := tr.RoundTrip(reqRedir)
+		if err != nil {
+			t.Fatalf("RoundTrip /redirect: %v", err)
+		}
+		_, _ = io.ReadAll(respRedir.Body)
+		_ = respRedir.Body.Close()
+		if diff := gocmp.Diff(http.StatusFound, respRedir.StatusCode); diff != "" {
+			t.Fatalf("redirect status (-want +got):\n%s", diff)
+		}
+		if diff := gocmp.Diff("/redirect-target", respRedir.Header.Get("Location")); diff != "" {
+			t.Fatalf("redirect Location (-want +got):\n%s", diff)
+		}
+		if hits := redirectTargetHits.Load(); hits != 0 {
+			t.Fatalf("redirect target received %d hit(s), want 0", hits)
+		}
+
+		reqGzip, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/gzip", nil)
+		if err != nil {
+			t.Fatalf("NewRequestWithContext: %v", err)
+		}
+		respGzip, err := tr.RoundTrip(reqGzip)
+		if err != nil {
+			t.Fatalf("RoundTrip /gzip: %v", err)
+		}
+		gotGzip, readErr := io.ReadAll(respGzip.Body)
+		_ = respGzip.Body.Close()
+		if readErr != nil {
+			t.Fatalf("reading gzip body: %v", readErr)
+		}
+		if diff := gocmp.Diff("gzip", respGzip.Header.Get("Content-Encoding")); diff != "" {
+			t.Errorf("Content-Encoding (-want +got):\n%s", diff)
+		}
+		if diff := gocmp.Diff(wantGzip, gotGzip); diff != "" {
+			t.Fatalf("gzip bytes altered (-want +got):\n%s", diff)
+		}
+		if protoMajor.Load() != 1 || protoMinor.Load() != 1 {
+			t.Fatalf("TLS server received HTTP/%d.%d, want HTTP/1.1", protoMajor.Load(), protoMinor.Load())
+		}
+	})
+
+	t.Run("error: 1 hour socket-inactivity deadline fires at boundary", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ln := newPipeListener("127.0.0.1:12352")
+			entered := make(chan struct{})
+			release := make(chan struct{})
+
+			srv := &http.Server{
+				Handler: http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+					close(entered)
+					select {
+					case <-release:
+					case <-r.Context().Done():
+					}
+				}),
+			}
+			serveDone := make(chan struct{})
+			go func() {
+				defer close(serveDone)
+				_ = srv.Serve(ln)
+			}()
+
+			tr := upstream.NewTransport(upstream.Options{DialContext: ln.DialContext})
+			var reqWG sync.WaitGroup
+			defer func() {
+				close(release)
+				if tr != nil {
+					tr.CloseIdleConnections()
+				}
+				_ = srv.Close()
+				_ = ln.Close()
+				reqWG.Wait()
+				<-serveDone
+				synctest.Wait()
+			}()
+			if tr == nil {
+				t.Fatal("NewTransport returned nil")
+			}
+
+			done := make(chan error, 1)
+			reqWG.Go(func() {
+				req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://127.0.0.1:12352/.well-known/openid-configuration", nil)
+				if err != nil {
+					done <- err
+					return
+				}
+				resp, err := tr.RoundTrip(req)
+				if resp != nil && resp.Body != nil {
+					_ = resp.Body.Close()
+				}
+				done <- err
+			})
+
+			select {
+			case <-entered:
+			case err := <-done:
+				t.Fatalf("RoundTrip returned before server received request: err=%v", err)
+			}
+
+			time.Sleep(time.Hour - time.Nanosecond)
+			synctest.Wait()
+			select {
+			case err := <-done:
+				t.Fatalf("RoundTrip timed out before 1 hour elapsed: err=%v", err)
+			default:
+			}
+
+			time.Sleep(time.Nanosecond)
+			synctest.Wait()
+			select {
+			case err := <-done:
+				if !errors.Is(err, upstream.ErrTimeout) {
+					t.Fatalf("expected ErrTimeout after 1 hour silence, got %v", err)
+				}
+			default:
+				t.Fatal("RoundTrip did not time out once 1 hour of silence elapsed")
+			}
+		})
+	})
+
+	t.Run("success: transport instance is distinct and isolated from Client lifetime", func(t *testing.T) {
+		const (
+			part1 = "data: part1\n\n"
+			part2 = "data: part2\n\n"
+		)
+		releasePart2 := make(chan struct{})
+		releaseOnce := sync.OnceFunc(func() { close(releasePart2) })
+		t.Cleanup(releaseOnce)
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/stream" {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, part1)
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+				select {
+				case <-releasePart2:
+				case <-r.Context().Done():
+					return
+				}
+				_, _ = io.WriteString(w, part2)
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+				return
+			}
+			w.Header().Set("X-Peer", r.RemoteAddr)
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "ok")
+		}))
+		t.Cleanup(srv.Close)
+
+		client := upstream.NewClient(upstream.Options{})
+		t.Cleanup(func() { _ = client.Close() })
+
+		authTr := upstream.NewTransport(upstream.Options{})
+		if authTr == nil {
+			t.Fatal("NewTransport returned nil")
+		}
+		t.Cleanup(authTr.CloseIdleConnections)
+
+		pingClient := func() string {
+			t.Helper()
+			resp, err := client.Do(t.Context(), upstream.Request{
+				Target:     upstream.TargetAnthropic,
+				BaseURL:    srv.URL,
+				Method:     http.MethodGet,
+				RequestURI: "/ping",
+			})
+			if err != nil {
+				t.Fatalf("client.Do /ping returned error: %v", err)
+			}
+			_, readErr := io.ReadAll(resp.Body)
+			closeErr := resp.Body.Close()
+			if readErr != nil || closeErr != nil {
+				t.Fatalf("draining client /ping body: read=%v close=%v", readErr, closeErr)
+			}
+			return resp.Header.Get("X-Peer")
+		}
+
+		pingAuth := func() string {
+			t.Helper()
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/ping", nil)
+			if err != nil {
+				t.Fatalf("NewRequestWithContext: %v", err)
+			}
+			resp, err := authTr.RoundTrip(req)
+			if err != nil {
+				t.Fatalf("authTr.RoundTrip /ping returned error: %v", err)
+			}
+			_, readErr := io.ReadAll(resp.Body)
+			closeErr := resp.Body.Close()
+			if readErr != nil || closeErr != nil {
+				t.Fatalf("draining auth /ping body: read=%v close=%v", readErr, closeErr)
+			}
+			return resp.Header.Get("X-Peer")
+		}
+
+		clientAddr1 := pingClient()
+		authAddr1 := pingAuth()
+		if clientAddr1 == "" || authAddr1 == "" {
+			t.Fatalf("missing peer addresses: client=%q auth=%q", clientAddr1, authAddr1)
+		}
+		if clientAddr1 == authAddr1 {
+			t.Fatalf("NewClient and NewTransport shared TCP connection %q", clientAddr1)
+		}
+
+		// Closing idle connections on authTr must not disturb client's pooled connection.
+		authTr.CloseIdleConnections()
+		clientAddr2 := pingClient()
+		if diff := gocmp.Diff(clientAddr1, clientAddr2); diff != "" {
+			t.Fatalf("authTr.CloseIdleConnections disturbed client pool (-before +after):\n%s", diff)
+		}
+
+		// Closing client must not cancel an open stream on authTr or prevent later authTr calls.
+		streamReq, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/stream", nil)
+		if err != nil {
+			t.Fatalf("NewRequestWithContext: %v", err)
+		}
+		streamResp, err := authTr.RoundTrip(streamReq)
+		if err != nil {
+			t.Fatalf("authTr.RoundTrip /stream returned error: %v", err)
+		}
+		defer func() { _ = streamResp.Body.Close() }()
+
+		gotPart1 := make([]byte, len(part1))
+		if _, err := io.ReadFull(streamResp.Body, gotPart1); err != nil {
+			t.Fatalf("reading stream part1: %v", err)
+		}
+		if diff := gocmp.Diff(part1, string(gotPart1)); diff != "" {
+			t.Fatalf("stream part1 (-want +got):\n%s", diff)
+		}
+
+		if err := client.Close(); err != nil {
+			t.Fatalf("client.Close returned error: %v", err)
+		}
+
+		releaseOnce()
+		gotPart2 := make([]byte, len(part2))
+		if _, err := io.ReadFull(streamResp.Body, gotPart2); err != nil {
+			t.Fatalf("authTr stream failed after client.Close: %v", err)
+		}
+		if diff := gocmp.Diff(part2, string(gotPart2)); diff != "" {
+			t.Fatalf("stream part2 (-want +got):\n%s", diff)
+		}
+
+		if peerAfterClose := pingAuth(); peerAfterClose == "" {
+			t.Fatal("authTr /ping after client.Close returned empty peer")
+		}
+	})
+}
+
+func TestSendAndContextOwnership(t *testing.T) {
+	t.Run("success: Send bound to an immutable Request performs one attempt per call and two calls are two attempts", func(t *testing.T) {
+		srv, captured := startCaptureServer(t, http.StatusOK, `{"ok":true}`)
+		client := upstream.NewClient(upstream.Options{})
+		t.Cleanup(func() { _ = client.Close() })
+
+		reqHeaders := http.Header{
+			"Content-Type": {"application/json"},
+			"X-Multi":      {"one", "two"},
+		}
+		reqBody := []byte(`{"model":"gpt-5.6-sol","attempt":"immutable"}`)
+		req := upstream.Request{
+			Target:        upstream.TargetProxy,
+			BaseURL:       srv.URL,
+			Method:        http.MethodPost,
+			RequestURI:    "/v1/messages",
+			ClientHeaders: reqHeaders,
+			Body:          reqBody,
+		}
+		headersBefore := reqHeaders.Clone()
+		bodyBefore := bytes.Clone(reqBody)
+
+		var send upstream.Send = func(ctx context.Context) (*upstream.Response, error) {
+			return client.Do(ctx, req)
+		}
+
+		for attempt := 1; attempt <= 2; attempt++ {
+			resp, err := send(t.Context())
+			if err != nil {
+				t.Fatalf("Send attempt %d returned error: %v", attempt, err)
+			}
+			_, readErr := io.ReadAll(resp.Body)
+			closeErr := resp.Body.Close()
+			if readErr != nil || closeErr != nil {
+				t.Fatalf("Send attempt %d body drain: read=%v close=%v", attempt, readErr, closeErr)
+			}
+			if diff := gocmp.Diff(attempt, len(captured())); diff != "" {
+				t.Fatalf("upstream attempt count after call %d (-want +got):\n%s", attempt, diff)
+			}
+		}
+
+		all := captured()
+		for i, rec := range all {
+			if diff := gocmp.Diff(bodyBefore, rec.Body); diff != "" {
+				t.Errorf("attempt %d body (-want +got):\n%s", i+1, diff)
+			}
+			if diff := gocmp.Diff([]string{"one, two"}, rec.Header.Values("X-Multi")); diff != "" {
+				t.Errorf("attempt %d X-Multi (-want +got):\n%s", i+1, diff)
+			}
+		}
+		if diff := gocmp.Diff(headersBefore, reqHeaders); diff != "" {
+			t.Errorf("Send mutated bound Request headers (-want +got):\n%s", diff)
+		}
+		if diff := gocmp.Diff(bodyBefore, reqBody); diff != "" {
+			t.Errorf("Send mutated bound Request body (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("error: Send performs one attempt on closed pooled connection and a second call is a second attempt", func(t *testing.T) {
+		var mu sync.Mutex
+		var warmAddr string
+		var probeAddrs []string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.ReadAll(r.Body)
+			if r.URL.Path == "/warmup" {
+				mu.Lock()
+				warmAddr = r.RemoteAddr
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, "warm")
+				return
+			}
+			mu.Lock()
+			probeAddrs = append(probeAddrs, r.RemoteAddr)
+			attempt := len(probeAddrs)
+			mu.Unlock()
+			if attempt == 1 {
+				if hj, ok := w.(http.Hijacker); ok {
+					if conn, _, err := hj.Hijack(); err == nil {
+						_ = conn.Close()
+					}
+				}
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"ok":true}`)
+		}))
+		t.Cleanup(srv.Close)
+
+		client := upstream.NewClient(upstream.Options{})
+		t.Cleanup(func() { _ = client.Close() })
+
+		warm, err := client.Do(t.Context(), upstream.Request{
+			Target:     upstream.TargetAnthropic,
+			BaseURL:    srv.URL,
+			Method:     http.MethodGet,
+			RequestURI: "/warmup",
+		})
+		if err != nil {
+			t.Fatalf("warmup Do failed: %v", err)
+		}
+		_, readErr := io.ReadAll(warm.Body)
+		closeErr := warm.Body.Close()
+		if readErr != nil || closeErr != nil {
+			t.Fatalf("warmup body drain: read=%v close=%v", readErr, closeErr)
+		}
+
+		req := upstream.Request{
+			Target:     upstream.TargetAnthropic,
+			BaseURL:    srv.URL,
+			Method:     http.MethodPost,
+			RequestURI: "/v1/messages",
+			ClientHeaders: http.Header{
+				"Content-Type":    {"application/json"},
+				"Idempotency-Key": {"send-idem-1"},
+			},
+			Body: []byte(`{"model":"claude-sonnet-4-6"}`),
+		}
+		var send upstream.Send = func(ctx context.Context) (*upstream.Response, error) {
+			return client.Do(ctx, req)
+		}
+
+		resp1, err := send(t.Context())
+		if resp1 != nil && resp1.Body != nil {
+			_ = resp1.Body.Close()
+		}
+		if err == nil {
+			t.Fatal("first Send call expected error on closed pooled connection, got nil")
+		}
+		mu.Lock()
+		gotWarm := warmAddr
+		afterFirst := slices.Clone(probeAddrs)
+		mu.Unlock()
+		if diff := gocmp.Diff(1, len(afterFirst)); diff != "" {
+			t.Fatalf("first Send call replayed automatically (attempts=%v) (-want +got):\n%s", afterFirst, diff)
+		}
+		if diff := gocmp.Diff(gotWarm, afterFirst[0]); diff != "" {
+			t.Fatalf("first Send call did not reuse warmed connection (-warm +probe):\n%s", diff)
+		}
+
+		resp2, err := send(t.Context())
+		if err != nil {
+			t.Fatalf("second explicit Send call failed: %v", err)
+		}
+		_, readErr = io.ReadAll(resp2.Body)
+		closeErr = resp2.Body.Close()
+		if readErr != nil || closeErr != nil {
+			t.Fatalf("second Send body drain: read=%v close=%v", readErr, closeErr)
+		}
+		if diff := gocmp.Diff(http.StatusOK, resp2.StatusCode); diff != "" {
+			t.Fatalf("second Send status (-want +got):\n%s", diff)
+		}
+		mu.Lock()
+		afterSecond := slices.Clone(probeAddrs)
+		mu.Unlock()
+		if diff := gocmp.Diff(2, len(afterSecond)); diff != "" {
+			t.Fatalf("two Send calls must produce two upstream attempts (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("success: Send bound to service context survives caller cancellation and is bounded by Client.Close", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			const (
+				firstFrame  = "data: first\n\n"
+				secondFrame = "data: second\n\n"
+			)
+			ln := newPipeListener("127.0.0.1:12353")
+			sendSecond := make(chan struct{})
+			release := make(chan struct{})
+			sendSecondOnce := sync.OnceFunc(func() { close(sendSecond) })
+			releaseOnce := sync.OnceFunc(func() { close(release) })
+			var sawEarlyCancel atomic.Bool
+
+			srv := &http.Server{
+				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "text/event-stream")
+					w.WriteHeader(http.StatusOK)
+					_, _ = io.WriteString(w, firstFrame)
+					if f, ok := w.(http.Flusher); ok {
+						f.Flush()
+					}
+					select {
+					case <-sendSecond:
+					case <-r.Context().Done():
+						sawEarlyCancel.Store(true)
+						return
+					}
+					_, _ = io.WriteString(w, secondFrame)
+					if f, ok := w.(http.Flusher); ok {
+						f.Flush()
+					}
+					select {
+					case <-release:
+					case <-r.Context().Done():
+					}
+				}),
+			}
+			serveDone := make(chan struct{})
+			go func() {
+				defer close(serveDone)
+				_ = srv.Serve(ln)
+			}()
+
+			client := upstream.NewClient(upstream.Options{DialContext: ln.DialContext})
+			var readWG sync.WaitGroup
+			defer func() {
+				sendSecondOnce()
+				releaseOnce()
+				_ = client.Close()
+				_ = srv.Close()
+				_ = ln.Close()
+				readWG.Wait()
+				<-serveDone
+				synctest.Wait()
+			}()
+
+			serviceCtx, cancelService := context.WithCancel(t.Context())
+			defer cancelService()
+			callerCtx, cancelCaller := context.WithCancel(t.Context())
+			defer cancelCaller()
+
+			req := upstream.Request{
+				Target:     upstream.TargetAnthropic,
+				BaseURL:    "http://127.0.0.1:12353",
+				Method:     http.MethodPost,
+				RequestURI: "/v1/messages",
+				Body:       []byte(`{"model":"claude-sonnet-4-6"}`),
+			}
+			// Caller deliberately binds the provider exchange to serviceCtx rather than callerCtx.
+			var send upstream.Send = func(_ context.Context) (*upstream.Response, error) {
+				return client.Do(serviceCtx, req)
+			}
+
+			resp, err := send(callerCtx)
+			if err != nil {
+				t.Fatalf("Send returned error: %v", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+
+			gotFirst := make([]byte, len(firstFrame))
+			if _, err := io.ReadFull(resp.Body, gotFirst); err != nil {
+				t.Fatalf("reading first frame: %v", err)
+			}
+			if diff := gocmp.Diff(firstFrame, string(gotFirst)); diff != "" {
+				t.Fatalf("first frame (-want +got):\n%s", diff)
+			}
+
+			// Canceling the caller's request context leaves the service-bound provider exchange alive.
+			cancelCaller()
+			synctest.Wait()
+			if sawEarlyCancel.Load() {
+				t.Fatal("provider request was canceled when only callerCtx was canceled")
+			}
+
+			sendSecondOnce()
+			gotSecond := make([]byte, len(secondFrame))
+			if _, err := io.ReadFull(resp.Body, gotSecond); err != nil {
+				t.Fatalf("reading second frame after callerCtx cancel: %v", err)
+			}
+			if diff := gocmp.Diff(secondFrame, string(gotSecond)); diff != "" {
+				t.Fatalf("second frame (-want +got):\n%s", diff)
+			}
+
+			// Service shutdown via Client.Close still bounds the surviving exchange immediately.
+			readErr := make(chan error, 1)
+			readWG.Go(func() {
+				buf := make([]byte, 64)
+				_, err := resp.Body.Read(buf)
+				readErr <- err
+			})
+			synctest.Wait()
+
+			requireImmediateClose(t, client)
+			select {
+			case err := <-readErr:
+				if err == nil {
+					t.Fatal("expected stream read error after Client.Close")
+				}
+			default:
+				t.Fatal("Client.Close did not immediately bound surviving service-context stream")
+			}
+		})
+	})
+
+	t.Run("error: Send passing caller context aborts active stream promptly on cancellation", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			const firstFrame = "data: first\n\n"
+			ln := newPipeListener("127.0.0.1:12354")
+			release := make(chan struct{})
+
+			srv := &http.Server{
+				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "text/event-stream")
+					w.WriteHeader(http.StatusOK)
+					_, _ = io.WriteString(w, firstFrame)
+					if f, ok := w.(http.Flusher); ok {
+						f.Flush()
+					}
+					select {
+					case <-release:
+					case <-r.Context().Done():
+					}
+				}),
+			}
+			serveDone := make(chan struct{})
+			go func() {
+				defer close(serveDone)
+				_ = srv.Serve(ln)
+			}()
+
+			client := upstream.NewClient(upstream.Options{DialContext: ln.DialContext})
+			var readWG sync.WaitGroup
+			defer func() {
+				close(release)
+				_ = client.Close()
+				_ = srv.Close()
+				_ = ln.Close()
+				readWG.Wait()
+				<-serveDone
+				synctest.Wait()
+			}()
+
+			callerCtx, cancelCaller := context.WithCancel(t.Context())
+			defer cancelCaller()
+
+			req := upstream.Request{
+				Target:     upstream.TargetAnthropic,
+				BaseURL:    "http://127.0.0.1:12354",
+				Method:     http.MethodPost,
+				RequestURI: "/v1/messages",
+				Body:       []byte(`{"model":"claude-sonnet-4-6"}`),
+			}
+			var send upstream.Send = func(ctx context.Context) (*upstream.Response, error) {
+				return client.Do(ctx, req)
+			}
+
+			resp, err := send(callerCtx)
+			if err != nil {
+				t.Fatalf("Send returned error: %v", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+
+			gotFirst := make([]byte, len(firstFrame))
+			if _, err := io.ReadFull(resp.Body, gotFirst); err != nil {
+				t.Fatalf("reading first frame: %v", err)
+			}
+			if diff := gocmp.Diff(firstFrame, string(gotFirst)); diff != "" {
+				t.Fatalf("first frame (-want +got):\n%s", diff)
+			}
+
+			readErr := make(chan error, 1)
+			readWG.Go(func() {
+				buf := make([]byte, 64)
+				_, err := resp.Body.Read(buf)
+				readErr <- err
+			})
+			synctest.Wait()
+
+			beforeCancel := time.Now()
+			cancelCaller()
+			synctest.Wait()
+			if !time.Now().Equal(beforeCancel) {
+				t.Fatalf("caller cancel advanced virtual clock by %v", time.Since(beforeCancel))
+			}
+			select {
+			case err := <-readErr:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("expected context.Canceled on stream read, got %v", err)
+				}
+			default:
+				t.Fatal("canceling caller context did not immediately abort active stream read")
+			}
+		})
+	})
 }

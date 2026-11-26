@@ -42,7 +42,7 @@ const (
 	TargetGrok Target = "grok"
 )
 
-// Options configures an upstream HTTP/1.1 client.
+// Options configures an upstream HTTP/1.1 client or standalone transport.
 type Options struct {
 	// DialContext overrides outbound connection dialing when non-nil.
 	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
@@ -73,25 +73,46 @@ type Request struct {
 type Response struct {
 	// StatusCode is the HTTP status code returned by the upstream.
 	StatusCode int
-	// Header holds the parsed upstream response headers returned by net/http without
-	// additional trimming or joining, preserving repeated values in order for capture
-	// and upstream-state tracking.
+	// Header holds the parsed capture copy of the upstream response headers returned by
+	// net/http, with no additional trimming or joining, preserving repeated values in
+	// order for rate-limit state and usage capture.
 	Header http.Header
-	// RelayHeader holds the normalized outbound relay headers with Transfer-Encoding,
-	// Connection, and Keep-Alive removed, single-value headers reduced to their first value,
-	// Cookie joined with "; ", Set-Cookie kept separate, other repeated headers joined
-	// with ", ", and declared chunked Trailer header names preserved.
+	// RelayHeader holds the normalized, independently cloned copy of the response headers
+	// that may be written to the client: Transfer-Encoding, Connection, and Keep-Alive are
+	// removed, single-value headers keep their first value, Cookie is joined with "; ",
+	// Set-Cookie stays separate, other repeated headers are joined with ", ", and declared
+	// chunked Trailer header names are preserved. Mutating RelayHeader never affects Header.
 	RelayHeader http.Header
 	// Body streams the upstream response bytes without automatic decompression.
+	// Body is owned by exactly one consumer at a time and must be closed by its current
+	// owner; a consumer that hands the open stream on (such as a reply handler transferring
+	// a stream to a relay) must not close it.
 	Body io.ReadCloser
 }
+
+// Send executes one outbound upstream attempt for an immutable Request bound once by the
+// worker or branch caller to a Client. Each call performs exactly one outbound attempt
+// and never triggers an automatic replay.
+type Send func(context.Context) (*Response, error)
 
 // Client executes pooled HTTP/1.1 requests (up to 64 connections per host, 1-hour socket-inactivity
 // timeout) to upstream providers without environment proxy lookup, automatic decompression,
 // redirect following, or automatic replay of requests carrying a body.
 type Client struct{}
 
-// NewClient constructs a pooled HTTP/1.1 upstream client with the given options.
+// NewTransport constructs a standalone pooled HTTP/1.1 transport with the same safe policy
+// used by NewClient: no environment proxy lookup, no automatic decompression, HTTP/1.1 only,
+// at most 64 concurrent connections per host, and a one-hour per-socket inactivity deadline
+// reporting ErrTimeout. Using RoundTrip directly follows no redirects.
+// It takes no Target and builds no inference headers, allowing callers such as Grok OIDC
+// credential refresh to hold a distinct transport instance isolated from an inference Client's
+// lifetime.
+func NewTransport(opts Options) *http.Transport {
+	_ = opts
+	return nil
+}
+
+// NewClient constructs a pooled HTTP/1.1 upstream client using NewTransport with the given options.
 func NewClient(opts Options) *Client {
 	_ = opts
 	return &Client{}
