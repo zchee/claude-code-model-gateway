@@ -33,7 +33,8 @@ type dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 // inactivityDialer wraps dial so that every connection it returns closes itself after one hour
 // without socket activity, and a connect that does not finish within that hour fails with
 // ErrTimeout. When lifetime is non-nil, no dial starts once lifetime has ended, an outstanding dial
-// is cancelled and every connection is closed as soon as lifetime ends.
+// is cancelled, a connection whose dial finishes after lifetime ended is closed at once, and every
+// connection is closed as soon as lifetime ends.
 func inactivityDialer(dial dialFunc, lifetime context.Context) dialFunc {
 	if dial == nil {
 		var d net.Dialer
@@ -60,6 +61,11 @@ func inactivityDialer(dial dialFunc, lifetime context.Context) dialFunc {
 				return nil, ErrTimeout
 			}
 			return nil, err
+		}
+		if lifetime != nil && lifetime.Err() != nil {
+			// The client closed while the dial ran; its connections are already being closed.
+			_ = conn.Close()
+			return nil, errClientClosed
 		}
 		return newInactivityConn(conn, lifetime), nil
 	}

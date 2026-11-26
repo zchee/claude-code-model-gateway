@@ -113,6 +113,74 @@ var errClientClosed = errors.New("upstream client closed")
 // value), and the error reaches the client in a gateway error body.
 var errResponseFailed = errors.New("upstream response failed")
 
+// tlsError reports a failed TLS handshake, certificate verification included, or a TLS failure
+// after the handshake with fixed text. TLS errors quote values the upstream sent, such as the names
+// in its certificate or the version of a record, and the error reaches the client in a gateway
+// error body. Unwrap keeps the original error reachable for errors.Is and errors.As.
+type tlsError struct {
+	err error
+}
+
+// Error returns the fixed text of a TLS failure.
+func (e *tlsError) Error() string {
+	return "upstream TLS connection failed"
+}
+
+// Unwrap returns the error the TLS layer reported.
+func (e *tlsError) Unwrap() error {
+	return e.err
+}
+
+// isTLSError reports whether err wraps one of the exported error types the TLS layer returns.
+func isTLSError(err error) bool {
+	if _, ok := errors.AsType[tls.RecordHeaderError](err); ok {
+		return true
+	}
+	if _, ok := errors.AsType[tls.AlertError](err); ok {
+		return true
+	}
+	_, ok := errors.AsType[*tls.CertificateVerificationError](err)
+	return ok
+}
+
+// exchangeTrace follows one Do through net/http's trace hooks. The hooks of a dial run on the
+// dial's goroutine, and a dial started for an earlier attempt of the same request can still report
+// while a later attempt runs.
+type exchangeTrace struct {
+	// connected reports that the current attempt obtained a connection.
+	connected atomic.Bool
+
+	mu sync.Mutex
+	// handshakeErrs holds the error of every failed TLS handshake of the request's dials.
+	handshakeErrs []error
+}
+
+// clientTrace returns the hooks that feed t.
+func (t *exchangeTrace) clientTrace() *httptrace.ClientTrace {
+	return &httptrace.ClientTrace{
+		// net/http starts every attempt, including each retry, with GetConn.
+		GetConn: func(string) { t.connected.Store(false) },
+		GotConn: func(httptrace.GotConnInfo) { t.connected.Store(true) },
+		// net/http reports a failed handshake here before its dial returns the same error.
+		TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
+			if err == nil {
+				return
+			}
+			t.mu.Lock()
+			defer t.mu.Unlock()
+			t.handshakeErrs = append(t.handshakeErrs, err)
+		},
+	}
+}
+
+// handshakeFailed reports whether err is, or wraps, the error of a failed TLS handshake of the
+// request's dials.
+func (t *exchangeTrace) handshakeFailed(err error) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return slices.ContainsFunc(t.handshakeErrs, func(handshakeErr error) bool { return errors.Is(err, handshakeErr) })
+}
+
 // idlePoolTimeout is how long an unused pooled connection waits for its next request. It is shorter
 // than socketInactivity so that net/http evicts an idle connection under its own pool lock before
 // the inactivity deadline closes it, which could otherwise happen while a request carrying a body,
@@ -177,8 +245,11 @@ func NewClient(opts Options) *Client {
 // Do sends req over the upstream transport and returns the upstream response.
 // ctx bounds the whole exchange, including reads of the returned Body; Close on the Client ends it
 // too. The caller owns the returned Body and must close it. A failure after the connection was
-// obtained is reported as one fixed error unless it is ErrTimeout, the context's cancellation or
-// deadline, or the client's closing, so no upstream bytes reach the error text.
+// obtained, and a TLS failure, are each reported as one fixed error unless it is ErrTimeout, the
+// context's cancellation or deadline, or the client's closing, so no upstream bytes reach the error
+// text. The fixed error of a TLS failure unwraps to the TLS layer's error. A request ended by
+// Close reports the closed-client error unless it already failed with ErrTimeout or with the end
+// of ctx.
 func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 	if c == nil || c.transport == nil {
 		return nil, errors.New("upstream client not constructed by NewClient")
@@ -197,22 +268,19 @@ func (c *Client) Do(ctx context.Context, req Request) (*Response, error) {
 		stop()
 		cancel(nil)
 	}
-	// connected tells a failure of the attempt's connection setup (dial, TLS) from one after a
-	// connection was obtained; net/http starts a new attempt with GetConn when it retries.
-	var connected atomic.Bool
-	traced := httptrace.WithClientTrace(reqCtx, &httptrace.ClientTrace{
-		GetConn: func(string) { connected.Store(false) },
-		GotConn: func(httptrace.GotConnInfo) { connected.Store(true) },
-	})
+	var trace exchangeTrace
+	traced := httptrace.WithClientTrace(reqCtx, trace.clientTrace())
 	resp, err := c.transport.RoundTrip(outbound.WithContext(traced)) //nolint:bodyclose // The body is handed to the caller inside Response, which owns closing it.
 	if err != nil {
 		release()
-		if c.lifetime.Err() != nil {
+		// The caller's own end counts only when err is that end, not a cancellation the closing caused.
+		callerEnded := ctx.Err() != nil && errors.Is(err, ctx.Err())
+		if c.lifetime.Err() != nil && !callerEnded && !errors.Is(err, ErrTimeout) {
 			// Closing the client also closes its connections, and the transport can report the
 			// broken connection before it sees the cancelled request.
 			return nil, errClientClosed
 		}
-		return nil, exchangeError(err, connected.Load())
+		return nil, exchangeError(err, &trace)
 	}
 
 	relay := ResponseHeaders(resp.Header)
@@ -239,19 +307,26 @@ func (c *Client) Close() error {
 	return nil
 }
 
-// exchangeError keeps the identity of an error that cannot carry upstream bytes: a failure before
-// the attempt had a connection (dial, TLS handshake), the inactivity timeout, the request
-// context's cancellation or deadline, and the client's own closing. Every other error is replaced
-// by errResponseFailed, without inspecting its text.
-func exchangeError(err error, connected bool) error {
-	if !connected ||
-		errors.Is(err, ErrTimeout) ||
-		errors.Is(err, errClientClosed) ||
-		errors.Is(err, context.Canceled) ||
-		errors.Is(err, context.DeadlineExceeded) {
+// exchangeError keeps an error that cannot carry upstream bytes as it is: the inactivity timeout,
+// the request context's cancellation or deadline, the client's own closing, and a failed dial. A
+// failed TLS handshake of the request's dial, or an error of an exported TLS type, is wrapped in
+// tlsError. Any other error of an attempt that obtained a connection is replaced by
+// errResponseFailed. The class is decided by where the error arose and by its type, never by its
+// text.
+func exchangeError(err error, trace *exchangeTrace) error {
+	switch {
+	case errors.Is(err, ErrTimeout),
+		errors.Is(err, errClientClosed),
+		errors.Is(err, context.Canceled),
+		errors.Is(err, context.DeadlineExceeded):
+		return err
+	case trace.handshakeFailed(err), isTLSError(err):
+		return &tlsError{err: err}
+	case trace.connected.Load():
+		return errResponseFailed
+	default:
 		return err
 	}
-	return errResponseFailed
 }
 
 // responseBody owns a live upstream response body and the request context bound to it.
