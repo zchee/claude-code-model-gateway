@@ -211,7 +211,7 @@ type flight struct {
 	// Guarded by AuthStore.mu.
 	waiters   int
 	abandoned bool // every waiter left before the exchange was sent, and the flight's context was ended
-	committed bool // the exchange was handed to the transport; the flight no longer follows its waiters
+	committed bool // the exchange request is built and goes to the transport next; waiters no longer end it
 
 	// Written before done is closed and read only after it.
 	token     string
@@ -247,6 +247,10 @@ func (s *AuthStore) nowMillis() float64 { return float64(s.now().UnixMilli()) }
 // before it would return a fresh stored token and before any shadow-mode refusal; it starts and
 // joins no refresh. ctx is checked again under the store's lock before the caller enrolls in a
 // refresh. A caller that stops waiting gets ctx's error at once and does not fail the others.
+//
+// Outside shadow mode, a caller whose stored token is fresh still joins a refresh whose exchange
+// has already gone to the transport and returns that refresh's result, because the issuer may have
+// rotated the stored credentials. A refresh that has not reached its exchange does not delay it.
 func (s *AuthStore) AccessToken(ctx context.Context) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
@@ -262,10 +266,23 @@ func (s *AuthStore) AccessToken(ctx context.Context) (string, error) {
 		}
 		return keyOf(current), nil
 	}
-	if !s.expiresSoon(expires) {
+	if s.expiresSoon(expires) {
+		return s.shared(ctx, false)
+	}
+	s.mu.Lock()
+	f := s.flight
+	if f == nil || !f.committed {
+		s.mu.Unlock()
 		return keyOf(current), nil
 	}
-	return s.shared(ctx, false)
+	if err := ctx.Err(); err != nil {
+		s.mu.Unlock()
+		return "", err
+	}
+	f.waiters++
+	s.mu.Unlock()
+	token, _, err := s.wait(ctx, f)
+	return token, err
 }
 
 // expiresSoon compares with the whole skew, so a skew below a millisecond still counts.
@@ -302,7 +319,8 @@ func (s *AuthStore) Refresh(ctx context.Context) (string, error) {
 // was sent, the refresh's own context ends; once the exchange was sent, the refresh reads the reply
 // and stores the new credential although nobody waits for it, because the issuer may already have
 // rotated the refresh token. A caller arriving at an abandoned refresh waits for it to stop, then
-// starts a new one. A forced caller accepts only a key that an exchange produced.
+// starts a new one. A forced caller accepts only a key that an exchange produced. A caller whose
+// ctx has ended when it finds the refresh finished gets ctx's error, not the refresh's result.
 func (s *AuthStore) shared(ctx context.Context, forced bool) (string, error) {
 	for {
 		s.mu.Lock()
@@ -327,24 +345,37 @@ func (s *AuthStore) shared(ctx context.Context, forced bool) (string, error) {
 		}
 		s.mu.Unlock()
 
-		select {
-		case <-f.done:
-			if f.err != nil {
-				return "", f.err
-			}
-			if forced && !f.exchanged {
-				continue
-			}
-			return f.token, nil
-		case <-ctx.Done():
-			s.mu.Lock()
-			if f.waiters--; f.waiters == 0 && !f.committed {
-				f.abandoned = true
-				f.cancel()
-			}
-			s.mu.Unlock()
-			return "", ctx.Err()
+		token, exchanged, err := s.wait(ctx, f)
+		if err != nil {
+			return "", err
 		}
+		if forced && !exchanged {
+			continue
+		}
+		return token, nil
+	}
+}
+
+// wait waits for f, in which the caller is enrolled, to finish, and returns its result. When ctx
+// ends first, the caller leaves f and gets ctx's error; the last waiter leaving a flight that has
+// not committed its exchange ends it. When both have happened by the time the wait returns, ctx's
+// error wins: the caller has stopped waiting, so it gets no result.
+func (s *AuthStore) wait(ctx context.Context, f *flight) (string, bool, error) {
+	select {
+	case <-f.done:
+		// f has ended and left s.flight, so a departing caller has nothing to release.
+		if err := ctx.Err(); err != nil {
+			return "", false, err
+		}
+		return f.token, f.exchanged, f.err
+	case <-ctx.Done():
+		s.mu.Lock()
+		if f.waiters--; f.waiters == 0 && !f.committed {
+			f.abandoned = true
+			f.cancel()
+		}
+		s.mu.Unlock()
+		return "", false, ctx.Err()
 	}
 }
 
@@ -382,8 +413,11 @@ func (s *AuthStore) run(ctx context.Context, f *flight, forced bool) (token stri
 	return token, err == nil, err
 }
 
-// commit marks f as past the point where its waiters can end it: from here on the exchange runs
-// to its end under its own deadline. It reports false when every waiter had already left.
+// commit decides, in one step under s.mu, whether f's exchange is sent: it reports false when every
+// waiter had already left, and otherwise marks f past the point where its waiters can end it, so
+// the exchange runs to its end under its own deadline. requestJSON calls it with the request built,
+// immediately before the transport call, and s.mu is not held across that call. The instant between
+// this decision and the first byte on the wire counts as sent.
 func (s *AuthStore) commit(f *flight) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -395,7 +429,8 @@ func (s *AuthStore) commit(f *flight) bool {
 }
 
 // refresh follows refreshGrokAuth (lib/grok-backend.js:83-113). Discovery follows the flight's
-// context; the exchange does not, so a refresh token the issuer rotated is always stored.
+// context; the exchange does not, so a refresh token the issuer rotated is always stored. The
+// exchange is committed to, or dropped because every waiter left, at the transport call.
 func (s *AuthStore) refresh(ctx context.Context, f *flight, current *authFile) (string, error) {
 	entry := current.value()
 	refreshToken, ok := nonEmptyString(get(entry, "refresh_token"))
@@ -411,10 +446,7 @@ func (s *AuthStore) refresh(ctx context.Context, f *flight, current *authFile) (
 		return "", ErrAuthRefreshFailed
 	}
 	form := formEncode([][2]string{{"grant_type", "refresh_token"}, {"refresh_token", refreshToken}, {"client_id", clientID}})
-	if !s.commit(f) {
-		return "", ErrAuthRefreshFailed
-	}
-	status, body, err := s.requestJSON(context.WithoutCancel(ctx), http.MethodPost, endpoint, form)
+	status, body, err := s.requestJSON(context.WithoutCancel(ctx), f, http.MethodPost, endpoint, form)
 	if err != nil || status < 200 || status >= 300 {
 		return "", ErrAuthRefreshFailed
 	}
@@ -450,7 +482,7 @@ func (s *AuthStore) tokenEndpoint(ctx context.Context, entry jsonx.WireValue) (s
 	if custom, ok := nonEmptyString(get(entry, "oidc_issuer")); ok {
 		issuer = strings.TrimSuffix(custom, "/")
 	}
-	status, body, err := s.requestJSON(ctx, http.MethodGet, issuer+"/.well-known/openid-configuration", "")
+	status, body, err := s.requestJSON(ctx, nil, http.MethodGet, issuer+"/.well-known/openid-configuration", "")
 	if errors.Is(err, errAuthRequestEnded) || errors.Is(err, errAuthBodyTooLarge) {
 		return "", err
 	}
@@ -470,7 +502,11 @@ func (s *AuthStore) tokenEndpoint(ctx context.Context, entry jsonx.WireValue) (s
 // request and its body read end after authRequestTimeout (errAuthRequestEnded), and a body above
 // maxAuthBody is refused (errAuthBodyTooLarge) whether or not the read also failed. The deadline
 // holds only with a transport that honours the request's context.
-func (s *AuthStore) requestJSON(ctx context.Context, method, target, form string) (int, jsonx.WireValue, error) {
+//
+// For an exchange, f is the flight it belongs to: the request is built first, then commit decides
+// whether it is sent, as the last step before the transport call. A flight every waiter has left
+// sends nothing and gets errAuthRequestEnded. Discovery passes a nil f and is not committed.
+func (s *AuthStore) requestJSON(ctx context.Context, f *flight, method, target, form string) (int, jsonx.WireValue, error) {
 	ctx, cancel := context.WithTimeout(ctx, authRequestTimeout)
 	defer cancel()
 	var body io.Reader
@@ -485,6 +521,9 @@ func (s *AuthStore) requestJSON(ctx context.Context, method, target, form string
 	req.Header["User-Agent"] = []string{""}
 	if method == http.MethodPost {
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
+	if f != nil && !s.commit(f) {
+		return 0, jsonx.WireValue{}, errAuthRequestEnded
 	}
 	resp, err := s.transport.RoundTrip(req)
 	if err != nil {
