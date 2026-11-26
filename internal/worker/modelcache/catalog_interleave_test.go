@@ -72,12 +72,10 @@ func readSavedCatalog(t *testing.T, path string) savedCatalog {
 }
 
 // TestStaleCatalogReadNeverOverwritesNewerRows parks a caller right after it read a stale catalog,
-// lets another caller refresh the catalog to newer rows, then releases the first caller while every
-// further catalog fetch fails. The newer rows stay on disk and no redundant fetch starts.
+// lets another caller refresh the catalog to newer rows or wait behind the parked one, then releases
+// the first caller while every further catalog fetch fails. The newer rows stay on disk and no
+// redundant fetch starts.
 func TestStaleCatalogReadNeverOverwritesNewerRows(t *testing.T) {
-	// A caller serialized behind the parked one cannot report back, so the test waits this long for it
-	// before releasing the parked caller.
-	const serializedGrace = 2 * time.Second
 	tests := map[string]struct {
 		newerRows string
 		wantIDs   []string
@@ -89,99 +87,110 @@ func TestStaleCatalogReadNeverOverwritesNewerRows(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			_, lookup, resolver := newTestPaths(t, nil)
-			stateDir, err := resolver.StateDir()
-			if err != nil {
-				t.Fatalf("StateDir: %v", err)
-			}
-			path := filepath.Join(stateDir, "anthropic-models.json")
-			now := time.UnixMilli(1_900_000_000_000)
-			stale := []byte(`[{"id":"claude-sonnet-4-0","display_name":"Claude Sonnet 4"}]`)
-			if err := anthropiccatalog.WriteSuccess(path, stale, now.Add(-2*time.Hour)); err != nil {
-				t.Fatalf("seed the stale catalog: %v", err)
-			}
+			synctest.Test(t, func(t *testing.T) {
+				_, lookup, resolver := newTestPaths(t, nil)
+				stateDir, err := resolver.StateDir()
+				if err != nil {
+					t.Fatalf("StateDir: %v", err)
+				}
+				path := filepath.Join(stateDir, "anthropic-models.json")
+				now := time.UnixMilli(1_900_000_000_000)
+				stale := []byte(`[{"id":"claude-sonnet-4-0","display_name":"Claude Sonnet 4"}]`)
+				if err := anthropiccatalog.WriteSuccess(path, stale, now.Add(-2*time.Hour)); err != nil {
+					t.Fatalf("seed the stale catalog: %v", err)
+				}
 
-			var parkNext atomic.Bool
-			parked := make(chan struct{})
-			releaseClock := make(chan struct{})
-			var releaseOnce sync.Once
-			release := func() { releaseOnce.Do(func() { close(releaseClock) }) }
-			defer release()
-			clock := func() time.Time {
-				if parkNext.CompareAndSwap(true, false) {
-					close(parked)
-					select {
-					case <-releaseClock:
-					case <-time.After(time.Minute):
-						t.Error("the parked clock read was never released")
+				var parkNext atomic.Bool
+				parked := make(chan struct{})
+				releaseClock := make(chan struct{})
+				var releaseOnce sync.Once
+				release := func() { releaseOnce.Do(func() { close(releaseClock) }) }
+				defer release()
+				clock := func() time.Time {
+					if parkNext.CompareAndSwap(true, false) {
+						close(parked)
+						select {
+						case <-releaseClock:
+						case <-time.After(time.Minute):
+							t.Error("the parked clock read was never released")
+						}
 					}
+					return now
 				}
-				return now
-			}
-			var pages atomic.Int32
-			handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				if pages.Add(1) > 1 {
-					w.WriteHeader(http.StatusInternalServerError)
-					return
+				var pages atomic.Int32
+				handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					if pages.Add(1) > 1 {
+						w.WriteHeader(http.StatusInternalServerError)
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(tt.newerRows))
+				})
+				cache, err := modelcache.New(modelcache.Options{
+					Lookup:           lookup,
+					Paths:            resolver,
+					ProxyBaseURL:     "http://127.0.0.1:19991",
+					AnthropicBaseURL: catalogTestBase,
+					DefaultBaseURL:   "http://127.0.0.1:19999",
+					Client:           &http.Client{Transport: handlerTransport{handler: handler}},
+					Clock:            clock,
+					Routes:           &route.Store{},
+					Sentry:           &sentry.State{},
+				})
+				if err != nil {
+					t.Fatalf("New: %v", err)
 				}
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(tt.newerRows))
-			})
-			cache, err := modelcache.New(modelcache.Options{
-				Lookup:           lookup,
-				Paths:            resolver,
-				ProxyBaseURL:     "http://127.0.0.1:19991",
-				AnthropicBaseURL: catalogTestBase,
-				DefaultBaseURL:   "http://127.0.0.1:19999",
-				Client:           &http.Client{Transport: handlerTransport{handler: handler}},
-				Clock:            clock,
-				Routes:           &route.Store{},
-				Sentry:           &sentry.State{},
-			})
-			if err != nil {
-				t.Fatalf("New: %v", err)
-			}
-			credentials := http.Header{"X-Api-Key": {apiKeyMarker}}
+				credentials := http.Header{"X-Api-Key": {apiKeyMarker}}
 
-			parkNext.Store(true)
-			staleDone := make(chan struct{})
-			go func() {
-				defer close(staleDone)
-				cache.TriggerAnthropicRefresh(credentials)
-			}()
-			awaitSignal(t, parked, "the first caller to park in its clock read")
+				parkNext.Store(true)
+				staleDone := make(chan struct{})
+				go func() {
+					defer close(staleDone)
+					cache.TriggerAnthropicRefresh(credentials)
+				}()
+				awaitSignal(t, parked, "the first caller to park in its clock read")
 
-			newerDone := make(chan struct{})
-			go func() {
-				defer close(newerDone)
-				cache.TriggerAnthropicRefresh(credentials)
-			}()
-			newerReturned := false
-			select {
-			case <-newerDone:
-				newerReturned = true
+				newerDone := make(chan struct{})
+				go func() {
+					defer close(newerDone)
+					triggerBehindParkedCaller(cache, credentials)
+				}()
+				// The second caller either finishes its own refresh, or waits on the lock the parked caller
+				// holds; only then is the parked caller released.
+				newerReturned, ok := doneOrLockWait(newerDone, "modelcache_test.triggerBehindParkedCaller")
+				if !ok {
+					t.Fatal("the second caller neither returned nor waited behind the parked caller")
+				}
+				if newerReturned {
+					cache.Wait()
+				}
+
+				release()
+				awaitSignal(t, staleDone, "the parked caller to return")
 				cache.Wait()
-			case <-time.After(serializedGrace):
-				// The second caller is serialized behind the parked one.
-			}
+				if !newerReturned {
+					awaitSignal(t, newerDone, "the second caller to return")
+					cache.Wait()
+				}
 
-			release()
-			awaitSignal(t, staleDone, "the parked caller to return")
-			cache.Wait()
-			if !newerReturned {
-				awaitSignal(t, newerDone, "the second caller to return")
-				cache.Wait()
-			}
-
-			got := readSavedCatalog(t, path)
-			if diff := gocmp.Diff(savedCatalog{IDs: tt.wantIDs}, got); diff != "" {
-				t.Errorf("catalog on disk mismatch (-want +got):\n%s", diff)
-			}
-			if n := pages.Load(); n != 1 {
-				t.Errorf("catalog pages fetched = %d, want 1: a caller holding a stale read started a redundant refresh after a newer one finished", n)
-			}
+				got := readSavedCatalog(t, path)
+				if diff := gocmp.Diff(savedCatalog{IDs: tt.wantIDs}, got); diff != "" {
+					t.Errorf("catalog on disk mismatch (-want +got):\n%s", diff)
+				}
+				if n := pages.Load(); n != 1 {
+					t.Errorf("catalog pages fetched = %d, want 1: a caller holding a stale read started a redundant refresh after a newer one finished", n)
+				}
+			})
 		})
 	}
+}
+
+// triggerBehindParkedCaller is the second caller's entry point; its frame names that goroutine in a
+// goroutine dump.
+//
+//go:noinline
+func triggerBehindParkedCaller(cache *modelcache.Cache, credentials http.Header) {
+	cache.TriggerAnthropicRefresh(credentials)
 }
 
 // TestPreStartCatalogRefreshEndsWithServiceContext starts a catalog refresh before Start, parks its

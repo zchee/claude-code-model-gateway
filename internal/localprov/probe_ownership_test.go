@@ -15,6 +15,7 @@
 package localprov_test
 
 import (
+	"encoding/json/jsontext"
 	json "encoding/json/v2"
 	"net"
 	"net/http"
@@ -70,6 +71,13 @@ func (l *probeHopLog) snapshot() ([]probeHop, []string, []bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return slices.Clone(l.hops), slices.Clone(l.referers), slices.Clone(l.cookies)
+}
+
+// probeOutcome is what a tracker refresh reports about one probe.
+type probeOutcome struct {
+	Reachable bool
+	Window    int64
+	Error     string
 }
 
 func studioModelsBody(t *testing.T, contextLength int64) []byte {
@@ -270,29 +278,29 @@ func TestProbeRedirectHygiene(t *testing.T) {
 	}
 }
 
-// TestOverLimitProbeBodyKeepsLastMeasurement answers a second probe with a body whose first 16 MiB
-// are a complete JSON document followed by more bytes. The body is over the limit, so the probe is
-// unreadable and the tracker keeps its last measurement.
+// TestOverLimitProbeBodyKeepsLastMeasurement answers a second probe with a valid JSON document padded
+// with whitespace past 16 MiB, so only the size bound can refuse it. The body is over the limit, so
+// the probe is unreadable with a size error and the tracker keeps its last measurement.
 func TestOverLimitProbeBodyKeepsLastMeasurement(t *testing.T) {
 	tests := map[string]struct {
 		path    string
 		first   func(t *testing.T) []byte
 		second  func(t *testing.T) []byte
-		refresh func(t *testing.T, serverURL string, port uint16, opts localprov.ProbeOptions) (reachable bool, window int64)
+		refresh func(t *testing.T, serverURL string, port uint16, opts localprov.ProbeOptions) probeOutcome
 	}{
 		"success: llama-server keeps the last window": {
 			path:   "/props",
 			first:  func(*testing.T) []byte { return []byte(`{"default_generation_settings":{"n_ctx":65536}}`) },
 			second: func(*testing.T) []byte { return []byte(`{"default_generation_settings":{"n_ctx":40960}}`) },
-			refresh: func() func(*testing.T, string, uint16, localprov.ProbeOptions) (bool, int64) {
+			refresh: func() func(*testing.T, string, uint16, localprov.ProbeOptions) probeOutcome {
 				var tracker localprov.LlamaTracker
 				routes := []proxymodels.Route{{ID: "local/gguf", Provider: "local"}}
-				return func(t *testing.T, _ string, port uint16, opts localprov.ProbeOptions) (bool, int64) {
+				return func(t *testing.T, _ string, port uint16, opts localprov.ProbeOptions) probeOutcome {
 					state := tracker.Refresh(t.Context(), routes, mapLookup(map[string]string{"CCP_LLAMA_PORT": strconv.Itoa(int(port))}), opts)
 					if state == nil {
-						return false, 0
+						return probeOutcome{}
 					}
-					return state.Reachable, state.ContextWindow
+					return probeOutcome{Reachable: state.Reachable, Window: state.ContextWindow, Error: state.Error}
 				}
 			}(),
 		},
@@ -300,15 +308,15 @@ func TestOverLimitProbeBodyKeepsLastMeasurement(t *testing.T) {
 			path:   "/api/v1/models",
 			first:  func(t *testing.T) []byte { return studioModelsBody(t, 65536) },
 			second: func(t *testing.T) []byte { return studioModelsBody(t, 40960) },
-			refresh: func() func(*testing.T, string, uint16, localprov.ProbeOptions) (bool, int64) {
+			refresh: func() func(*testing.T, string, uint16, localprov.ProbeOptions) probeOutcome {
 				var tracker localprov.StudioTracker
 				routes := []proxymodels.Route{{ID: "lmstudio/qwen3-coder-30b", Provider: "lmstudio"}}
-				return func(t *testing.T, serverURL string, _ uint16, opts localprov.ProbeOptions) (bool, int64) {
+				return func(t *testing.T, serverURL string, _ uint16, opts localprov.ProbeOptions) probeOutcome {
 					state := tracker.Refresh(t.Context(), routes, mapLookup(map[string]string{"CCP_LMSTUDIO_BASE_URL": serverURL}), t.TempDir(), opts)
 					if state == nil {
-						return false, 0
+						return probeOutcome{}
 					}
-					return state.Reachable, state.Windows()["qwen3-coder-30b"]
+					return probeOutcome{Reachable: state.Reachable, Window: state.Windows()["qwen3-coder-30b"], Error: state.Error}
 				}
 			}(),
 		},
@@ -316,12 +324,19 @@ func TestOverLimitProbeBodyKeepsLastMeasurement(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			second := tt.second(t)
+			if !jsontext.Value(second).IsValid() {
+				t.Fatalf("test precondition: the second document is not valid JSON: %s", second)
+			}
+			// Trailing whitespace keeps the document valid, so a reader without the bound would accept
+			// the second measurement.
 			oversized := make([]byte, 0, probeBodyLimit+16)
 			oversized = append(oversized, second...)
-			for len(oversized) < probeBodyLimit {
+			for len(oversized) <= probeBodyLimit+8 {
 				oversized = append(oversized, ' ')
 			}
-			oversized = append(oversized, "trailing"...)
+			if !jsontext.Value(oversized).IsValid() {
+				t.Fatal("test precondition: the padded body is not valid JSON")
+			}
 			bodies := [][]byte{tt.first(t), oversized}
 			var calls atomic.Int32
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -338,15 +353,16 @@ func TestOverLimitProbeBodyKeepsLastMeasurement(t *testing.T) {
 			// The oversized answer takes longer than the default probe deadline under the race detector.
 			opts := localprov.ProbeOptions{Timeout: 30 * time.Second}
 
-			if reachable, window := tt.refresh(t, srv.URL, port, opts); !reachable || window != 65536 {
-				t.Fatalf("test precondition: first probe = (reachable %v, window %d), want (true, 65536)", reachable, window)
+			if got := tt.refresh(t, srv.URL, port, opts); !got.Reachable || got.Window != 65536 {
+				t.Fatalf("test precondition: first probe = %+v, want reachable with window 65536", got)
 			}
-			reachable, window := tt.refresh(t, srv.URL, port, opts)
-			if reachable {
-				t.Error("probe answered with a body over the limit is reachable, want an unreadable probe")
+			got := tt.refresh(t, srv.URL, port, opts)
+			if n := calls.Load(); n != 2 {
+				t.Fatalf("test precondition: the engine answered %d probe request(s), want 2", n)
 			}
-			if window != 65536 {
-				t.Errorf("window after the over-limit probe = %d, want the last measurement 65536", window)
+			want := probeOutcome{Window: 65536, Error: "response too large"}
+			if diff := gocmp.Diff(want, got); diff != "" {
+				t.Errorf("probe answered with a body over the limit mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}

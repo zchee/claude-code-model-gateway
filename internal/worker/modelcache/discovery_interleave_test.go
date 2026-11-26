@@ -15,6 +15,7 @@
 package modelcache_test
 
 import (
+	"context"
 	json "encoding/json/v2"
 	"net/http"
 	"os"
@@ -23,6 +24,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 	"unicode/utf16"
 
@@ -73,12 +75,9 @@ func discoveryFileIDs(t *testing.T, path string) []string {
 }
 
 // TestForcedDiscoverySyncNeverOverwritesNewerGeneration parks a forced discovery sync in its pin
-// lookup, commits and synchronizes a newer generation meanwhile, then lets the older sync finish: the
-// discovery cache on disk holds the newer generation's rows.
+// lookup, commits a newer generation meanwhile and lets its sync finish or wait behind the parked one,
+// then lets the older sync finish: the discovery cache on disk holds the newer generation's rows.
 func TestForcedDiscoverySyncNeverOverwritesNewerGeneration(t *testing.T) {
-	// A sync serialized behind the parked one cannot report back, so the test waits this long for the
-	// newer refresh before it releases the older sync.
-	const newerSyncGrace = 2 * time.Second
 	tests := map[string]struct {
 		listing string
 		wantID  string
@@ -90,104 +89,114 @@ func TestForcedDiscoverySyncNeverOverwritesNewerGeneration(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			_, lookup, resolver := newTestPaths(t, nil)
-			discoveryPath, err := resolver.DiscoveryCachePath()
-			if err != nil {
-				t.Fatalf("DiscoveryCachePath: %v", err)
-			}
-			pinsParked := make(chan struct{})
-			releasePins := make(chan struct{})
-			var releaseOnce sync.Once
-			release := func() { releaseOnce.Do(func() { close(releasePins) }) }
-			defer release()
-			var pinCalls atomic.Int32
-			pins := func() map[string]string {
-				if pinCalls.Add(1) == 1 {
-					close(pinsParked)
-					select {
-					case <-releasePins:
-					case <-time.After(time.Minute):
-						t.Error("the parked pin lookup was never released")
-					}
-				}
-				return nil
-			}
-			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path != "/v1/models" {
-					w.WriteHeader(http.StatusNotFound)
-					return
-				}
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(tt.listing))
-			})
-			routes := &proxyCommitSignal{store: &route.Store{}, committed: make(chan struct{})}
-			cache, err := modelcache.New(modelcache.Options{
-				Lookup:           lookup,
-				Paths:            resolver,
-				ProxyBaseURL:     "http://127.0.0.1:19991",
-				DefaultBaseURL:   discoveryGatewayURL,
-				Client:           &http.Client{Transport: handlerTransport{handler: handler}},
-				Clock:            time.Now,
-				Routes:           routes,
-				Sentry:           &sentry.State{},
-				EffectiveBaseURL: baseURLFunc(discoveryGatewayURL),
-				CurrentPins:      pins,
-			})
-			if err != nil {
-				t.Fatalf("New: %v", err)
-			}
-
-			type syncOutcome struct {
-				result modelcache.DiscoverySyncResult
-				err    error
-			}
-			olderDone := make(chan syncOutcome, 1)
-			go func() {
-				result, err := cache.SyncDiscoveryCache(true)
-				olderDone <- syncOutcome{result, err}
-			}()
-			awaitSignal(t, pinsParked, "the older forced sync to park in its pin lookup")
-
-			refreshDone := make(chan error, 1)
-			go func() { refreshDone <- cache.Refresh(t.Context()) }()
-			awaitSignal(t, routes.committed, "the newer refresh to commit its proxy table")
-
-			refreshReturned := false
-			select {
-			case err := <-refreshDone:
-				refreshReturned = true
+			synctest.Test(t, func(t *testing.T) {
+				_, lookup, resolver := newTestPaths(t, nil)
+				discoveryPath, err := resolver.DiscoveryCachePath()
 				if err != nil {
-					t.Fatalf("newer Refresh: %v", err)
+					t.Fatalf("DiscoveryCachePath: %v", err)
 				}
-			case <-time.After(newerSyncGrace):
-				// The newer sync is serialized behind the parked older one.
-			}
-
-			release()
-			var older syncOutcome
-			select {
-			case older = <-olderDone:
-			case <-time.After(time.Minute):
-				t.Fatal("timed out waiting for the older forced sync")
-			}
-			if older.err != nil {
-				t.Fatalf("older SyncDiscoveryCache: %v", older.err)
-			}
-			if !refreshReturned {
-				if err := awaitResult(t, refreshDone, "the newer refresh"); err != nil {
-					t.Fatalf("newer Refresh: %v", err)
+				pinsParked := make(chan struct{})
+				releasePins := make(chan struct{})
+				var releaseOnce sync.Once
+				release := func() { releaseOnce.Do(func() { close(releasePins) }) }
+				defer release()
+				var pinCalls atomic.Int32
+				pins := func() map[string]string {
+					if pinCalls.Add(1) == 1 {
+						close(pinsParked)
+						select {
+						case <-releasePins:
+						case <-time.After(time.Minute):
+							t.Error("the parked pin lookup was never released")
+						}
+					}
+					return nil
 				}
-			}
+				handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path != "/v1/models" {
+						w.WriteHeader(http.StatusNotFound)
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(tt.listing))
+				})
+				routes := &proxyCommitSignal{store: &route.Store{}, committed: make(chan struct{})}
+				cache, err := modelcache.New(modelcache.Options{
+					Lookup:           lookup,
+					Paths:            resolver,
+					ProxyBaseURL:     "http://127.0.0.1:19991",
+					DefaultBaseURL:   discoveryGatewayURL,
+					Client:           &http.Client{Transport: handlerTransport{handler: handler}},
+					Clock:            time.Now,
+					Routes:           routes,
+					Sentry:           &sentry.State{},
+					EffectiveBaseURL: baseURLFunc(discoveryGatewayURL),
+					CurrentPins:      pins,
+				})
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
 
-			ids := discoveryFileIDs(t, discoveryPath)
-			if !slices.Contains(ids, tt.wantID) {
-				t.Errorf("discovery cache on disk holds %q, want the newer generation's rows including %q: the older forced sync wrote last", ids, tt.wantID)
-			}
-			if result, err := cache.SyncDiscoveryCache(false); err != nil || result.State != "unchanged" {
-				t.Errorf("SyncDiscoveryCache(false) after both writers = (%+v, %v), want unchanged: the file did not match the committed generation", result, err)
-			}
+				type syncOutcome struct {
+					result modelcache.DiscoverySyncResult
+					err    error
+				}
+				olderDone := make(chan syncOutcome, 1)
+				go func() {
+					result, err := cache.SyncDiscoveryCache(true)
+					olderDone <- syncOutcome{result, err}
+				}()
+				awaitSignal(t, pinsParked, "the older forced sync to park in its pin lookup")
+
+				var refreshErr error
+				refreshDone := make(chan struct{})
+				go func() {
+					defer close(refreshDone)
+					refreshErr = refreshBehindParkedSync(t.Context(), cache)
+				}()
+				awaitSignal(t, routes.committed, "the newer refresh to commit its proxy table")
+				// The newer refresh either finishes its own sync, or waits on the lock the parked sync
+				// holds; only then is the older sync released.
+				refreshReturned, ok := doneOrLockWait(refreshDone, "modelcache_test.refreshBehindParkedSync")
+				if !ok {
+					t.Fatal("the newer refresh neither returned nor waited behind the parked sync")
+				}
+
+				release()
+				var older syncOutcome
+				select {
+				case older = <-olderDone:
+				case <-time.After(time.Minute):
+					t.Fatal("timed out waiting for the older forced sync")
+				}
+				if older.err != nil {
+					t.Fatalf("older SyncDiscoveryCache: %v", older.err)
+				}
+				if !refreshReturned {
+					awaitSignal(t, refreshDone, "the newer refresh to return")
+				}
+				if refreshErr != nil {
+					t.Fatalf("newer Refresh: %v", refreshErr)
+				}
+
+				ids := discoveryFileIDs(t, discoveryPath)
+				if !slices.Contains(ids, tt.wantID) {
+					t.Errorf("discovery cache on disk holds %q, want the newer generation's rows including %q: the older forced sync wrote last", ids, tt.wantID)
+				}
+				if result, err := cache.SyncDiscoveryCache(false); err != nil || result.State != "unchanged" {
+					t.Errorf("SyncDiscoveryCache(false) after both writers = (%+v, %v), want unchanged: the file did not match the committed generation", result, err)
+				}
+			})
 		})
 	}
+}
+
+// refreshBehindParkedSync is the newer refresh's entry point; its frame names that goroutine in a
+// goroutine dump.
+//
+//go:noinline
+func refreshBehindParkedSync(ctx context.Context, cache *modelcache.Cache) error {
+	return cache.Refresh(ctx)
 }
 
 // TestDiscoveryDisplayNameKeepsLoneSurrogate checks that a display name carrying an escaped lone

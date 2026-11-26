@@ -15,7 +15,10 @@
 package modelcache_test
 
 import (
+	"encoding/json/jsontext"
+	json "encoding/json/v2"
 	"net/http"
+	"slices"
 	"strconv"
 	"sync"
 	"testing"
@@ -153,6 +156,20 @@ func routesToProvider(snap route.Snapshot, advertised, provider string) bool {
 	return d.Branch == "proxy" && d.Provider == provider
 }
 
+// catalogRowIDs returns the IDs of advertised catalog rows in their order.
+func catalogRowIDs(t *testing.T, rows jsontext.Value) []string {
+	t.Helper()
+	var decoded []idDisplay
+	if err := json.Unmarshal(rows, &decoded); err != nil {
+		t.Fatalf("unmarshal advertised rows: %v", err)
+	}
+	ids := make([]string, 0, len(decoded))
+	for _, row := range decoded {
+		ids = append(ids, row.ID)
+	}
+	return ids
+}
+
 func newInterleaveCache(t *testing.T, engine *scriptedEngine, routes *route.Store) *modelcache.Cache {
 	t.Helper()
 	_, lookup, resolver := newTestPaths(t, map[string]string{"CCP_LLAMA_PORT": strconv.Itoa(interleaveLlamaPort)})
@@ -234,9 +251,16 @@ func TestEmptyListingKeepsLatestCommittedTable(t *testing.T) {
 				if err := awaitResult(t, earlierDone, "the earlier refresh"); err != nil {
 					t.Fatalf("earlier Refresh: %v", err)
 				}
-				committed, _ := cache.Snapshot()
+				committed, committedGen := cache.Snapshot()
 				if !routesToProvider(committed, "claude-kimi-newer", "kimi") {
 					t.Fatal("test precondition: the earlier refresh did not commit the newer table while the later refresh was parked")
+				}
+				if cache.LlamaState() != nil {
+					t.Fatal("test precondition: the newer table lists no llama-server row, but the committed generation keeps llama-server state")
+				}
+				_, committedRows := committed.Catalog()
+				if ids := catalogRowIDs(t, committedRows); !slices.Contains(ids, "claude-kimi-newer") || slices.Contains(ids, "claude-local/gguf") {
+					t.Fatalf("test precondition: rows of the newer table = %q, want claude-kimi-newer and no claude-local/gguf", ids)
 				}
 
 				laterProbe.open()
@@ -244,7 +268,17 @@ func TestEmptyListingKeepsLatestCommittedTable(t *testing.T) {
 					t.Fatalf("later Refresh: %v", err)
 				}
 
-				snap, _ := cache.Snapshot()
+				snap, gen := cache.Snapshot()
+				if gen != committedGen+1 {
+					t.Errorf("generation after the later refresh = %d, want %d: the later refresh must commit once, rebuilt on the newer table", gen, committedGen+1)
+				}
+				if got := cache.LlamaState(); got != nil {
+					t.Errorf("llama-server state after the later refresh = %+v, want none: the kept table lists no llama-server row", got)
+				}
+				_, rows := snap.Catalog()
+				if diff := gocmp.Diff(catalogRowIDs(t, committedRows), catalogRowIDs(t, rows)); diff != "" {
+					t.Errorf("advertised rows after the later refresh differ from those of the kept table (-kept +got):\n%s", diff)
+				}
 				stored, ok := routes.Load()
 				if !ok {
 					t.Fatal("route store is empty")

@@ -15,6 +15,7 @@
 package readiness_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
@@ -23,6 +24,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -102,20 +104,48 @@ func TestProxyCheckNeverUsesInjectedCookieJar(t *testing.T) {
 	}
 }
 
+// paddedModelsBody is a valid /v1/models document of exactly size bytes.
+func paddedModelsBody(t *testing.T, size int) []byte {
+	t.Helper()
+	const doc = `{"data":[]}`
+	if size < len(doc) {
+		t.Fatalf("test precondition: size %d is below the document's own %d bytes", size, len(doc))
+	}
+	return append([]byte(doc), bytes.Repeat([]byte(" "), size-len(doc))...)
+}
+
 // TestProxyCheckRequiresCompleteBody answers /v1/models with HTTP 200 and a body that cannot be read
-// to its end. Only a body read completely counts as an answering proxy.
+// to its end, or one at or just over the size bound. Only a body read completely within the bound
+// counts as an answering proxy. The stalled body is served in memory, so the test also sees that the
+// check had the headers and was reading the body when it gave up at its own deadline.
 func TestProxyCheckRequiresCompleteBody(t *testing.T) {
-	const declaredLength = "1000"
+	const (
+		declaredLength = "1000"
+		// proxyModelsBodyLimit is the largest /v1/models body the check reads as an answer.
+		proxyModelsBodyLimit = 1 << 20
+	)
 	tests := map[string]struct {
 		handler func(w http.ResponseWriter, r *http.Request)
-		timeout time.Duration
-		want    bool
+		// stallAfter, when set, is the part of the body served before it stalls; handler is unused.
+		stallAfter string
+		want       bool
 	}{
 		"success: complete body is an answering proxy": {
 			handler: func(w http.ResponseWriter, _ *http.Request) {
 				_, _ = w.Write([]byte(`{"data":[]}`))
 			},
 			want: true,
+		},
+		"success: body exactly at the size bound is an answering proxy": {
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write(paddedModelsBody(t, proxyModelsBodyLimit))
+			},
+			want: true,
+		},
+		"error: body one byte over the size bound": {
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write(paddedModelsBody(t, proxyModelsBodyLimit+1))
+			},
 		},
 		"error: body that breaks off before its declared length": {
 			handler: func(w http.ResponseWriter, _ *http.Request) {
@@ -132,27 +162,34 @@ func TestProxyCheckRequiresCompleteBody(t *testing.T) {
 			},
 		},
 		"error: body that stalls until the check gives up": {
-			handler: func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Length", declaredLength)
-				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write([]byte(`{"data":[`))
-				_ = http.NewResponseController(w).Flush()
-				<-r.Context().Done()
-			},
-			timeout: 500 * time.Millisecond,
+			stallAfter: `{"data":[`,
 		},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
+			if tt.stallAfter != "" {
+				synctest.Test(t, func(t *testing.T) {
+					entered := make(chan struct{})
+					got := readiness.ProbeProxyAndAuth(t.Context(), readiness.ProxyAuthProbe{
+						ProxyBinary:    fakeProxyBinary(t),
+						ProxyModelsURL: "http://proxy-models.test/v1/models",
+						Client:         &http.Client{Transport: stallingTransport{prefix: []byte(tt.stallAfter), entered: entered}},
+					})
+					select {
+					case <-entered:
+					default:
+						t.Fatal("test precondition: the check never read past the delivered part of the body")
+					}
+					want := readiness.ProxyAuthResult{ProxyBinary: true, ProxyModels: tt.want}
+					if diff := gocmp.Diff(want, got); diff != "" {
+						t.Errorf("ProbeProxyAndAuth mismatch (-want +got):\n%s", diff)
+					}
+				})
+				return
+			}
 			srv := httptest.NewServer(http.HandlerFunc(tt.handler))
 			t.Cleanup(srv.Close)
-			ctx := t.Context()
-			if tt.timeout > 0 {
-				var cancel context.CancelFunc
-				ctx, cancel = context.WithTimeout(ctx, tt.timeout)
-				defer cancel()
-			}
-			got := readiness.ProbeProxyAndAuth(ctx, readiness.ProxyAuthProbe{
+			got := readiness.ProbeProxyAndAuth(t.Context(), readiness.ProxyAuthProbe{
 				ProxyBinary:    fakeProxyBinary(t),
 				ProxyModelsURL: srv.URL + "/v1/models",
 			})
@@ -163,6 +200,43 @@ func TestProxyCheckRequiresCompleteBody(t *testing.T) {
 		})
 	}
 }
+
+// stallingTransport answers every request with HTTP 200 headers and a body that yields prefix, then
+// closes entered and blocks until the request's context ends.
+type stallingTransport struct {
+	prefix  []byte
+	entered chan struct{}
+}
+
+func (s stallingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode:    http.StatusOK,
+		Header:        http.Header{"Content-Type": {"application/json"}},
+		ContentLength: -1,
+		Body:          &stallingBody{ctx: req.Context(), rest: s.prefix, entered: s.entered},
+		Request:       req,
+	}, nil
+}
+
+type stallingBody struct {
+	ctx     context.Context
+	rest    []byte
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (b *stallingBody) Read(p []byte) (int, error) {
+	if len(b.rest) > 0 {
+		n := copy(p, b.rest)
+		b.rest = b.rest[n:]
+		return n, nil
+	}
+	b.once.Do(func() { close(b.entered) })
+	<-b.ctx.Done()
+	return 0, b.ctx.Err()
+}
+
+func (b *stallingBody) Close() error { return nil }
 
 // TestStatusRunnersGetSourceDeadline gives each injected status runner a command that honours only
 // its context: the runner's context carries a deadline and ends exactly 15 s after the runner starts,
