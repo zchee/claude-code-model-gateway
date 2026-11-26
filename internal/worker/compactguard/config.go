@@ -16,7 +16,21 @@
 // generations can be retried while the client remains writable.
 package compactguard
 
-import "github.com/zchee/claude-code-model-gateway/internal/config"
+import (
+	"math"
+
+	"github.com/zchee/claude-code-model-gateway/internal/config"
+	"github.com/zchee/claude-code-model-gateway/internal/worker/sentry"
+)
+
+const (
+	defaultRetries          = 2
+	defaultRetryDelayMillis = 250
+	defaultMaxBufferedBytes = 16 * 1024 * 1024
+
+	// messagesPath is the only request path whose compaction turns are guarded.
+	messagesPath = "/v1/messages"
+)
 
 // Settings holds the compaction stream guard configuration loaded from an injected environment.
 type Settings struct {
@@ -27,16 +41,51 @@ type Settings struct {
 }
 
 // LoadSettings reads the compaction guard settings from lookup.
+//
+// The guard is disabled only by the exact value "0". Each numeric setting is converted with
+// JavaScript's Number semantics (an unset variable is NaN, an empty one is zero) and keeps its
+// default unless it is valid: retries must be a non-negative integer, the retry delay a finite
+// non-negative number, and the buffer ceiling a finite positive number. Valid values are kept
+// as numbers, not narrowed to machine counters or durations.
 func LoadSettings(lookup config.LookupEnv) Settings {
-	return Settings{}
+	guard, ok := lookup("CODEX_GATEWAY_COMPACT_STREAM_GUARD")
+	s := Settings{
+		StreamGuard:      !ok || guard != "0",
+		Retries:          defaultRetries,
+		MaxBufferedBytes: defaultMaxBufferedBytes,
+		RetryDelayMillis: defaultRetryDelayMillis,
+	}
+	// Adding zero turns a negative zero into the zero JSON.stringify prints.
+	if n := envNumber(lookup, "CODEX_GATEWAY_COMPACT_STREAM_RETRIES"); finite(n) && n == math.Trunc(n) && n >= 0 {
+		s.Retries = n + 0
+	}
+	if n := envNumber(lookup, "CODEX_GATEWAY_COMPACT_STREAM_RETRY_DELAY_MS"); finite(n) && n >= 0 {
+		s.RetryDelayMillis = n + 0
+	}
+	if n := envNumber(lookup, "CODEX_GATEWAY_COMPACT_STREAM_MAX_BYTES"); finite(n) && n > 0 {
+		s.MaxBufferedBytes = n
+	}
+	return s
 }
+
+// envNumber is Number(process.env[key]): NaN when the variable is unset.
+func envNumber(lookup config.LookupEnv, key string) float64 {
+	v, ok := lookup(key)
+	if !ok {
+		return math.NaN()
+	}
+	return config.JSNumber(v)
+}
+
+func finite(n float64) bool { return !math.IsNaN(n) && !math.IsInf(n, 0) }
 
 // IsCompactionRequest reports whether body is a streaming JSON request whose system prompt contains the compaction prompt fragment.
 func IsCompactionRequest(body []byte) bool {
-	return false
+	return sentry.RequestPhase(body) == "compaction"
 }
 
 // ShouldGuard reports whether a request should be buffered and retried by the compaction stream guard.
+// Only proxy traffic is guarded: an empty provider is native Anthropic passthrough.
 func ShouldGuard(settings Settings, proxyProvider, pathOnly string, body []byte) bool {
-	return false
+	return settings.StreamGuard && proxyProvider != "" && pathOnly == messagesPath && IsCompactionRequest(body)
 }
