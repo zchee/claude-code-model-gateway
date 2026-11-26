@@ -15,6 +15,7 @@
 package grok_test
 
 import (
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -108,8 +109,16 @@ func TestVersionAndHeaders(t *testing.T) {
 				version = grok.ReadVersion(file)
 			}
 			got := grok.Headers(tt.token, tt.model, version)
-			if diff := gocmp.Diff(tt.wantHeaders, got); diff != "" {
-				t.Errorf("Headers() (-want +got):\n%s", diff)
+			if !gocmp.Equal(tt.wantHeaders.Values("Authorization"), got.Values("Authorization")) {
+				t.Error("Authorization header mismatch (values redacted)")
+			}
+			want := tt.wantHeaders.Clone()
+			want.Del("Authorization")
+			gotCopy := got.Clone()
+			gotCopy.Del("Authorization")
+			assertNoSecrets(t, "non-authorization headers", fmt.Sprint(gotCopy), tt.token)
+			if diff := gocmp.Diff(want, gotCopy); diff != "" {
+				t.Errorf("non-authorization headers (-want +got):\n%s", diff)
 			}
 		})
 	}

@@ -15,11 +15,11 @@
 package grok_test
 
 import (
-	"os"
 	"testing"
 	"time"
 
 	gocmp "github.com/google/go-cmp/cmp"
+	"go.uber.org/goleak"
 
 	"github.com/zchee/claude-code-model-gateway/internal/grok"
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
@@ -28,7 +28,7 @@ import (
 
 func TestMain(m *testing.M) {
 	venue.Require()
-	os.Exit(m.Run())
+	goleak.VerifyTestMain(m)
 }
 
 func clock() time.Time { return time.UnixMilli(123456789) }

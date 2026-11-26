@@ -51,7 +51,7 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 func denyNetworkTransport(t *testing.T) http.RoundTripper {
 	t.Helper()
 	return roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		t.Errorf("unexpected outbound auth HTTP request: %s %s", r.Method, r.URL.Path)
+		t.Error("unexpected outbound auth HTTP request")
 		return nil, errors.New("network disabled in test")
 	})
 }
@@ -70,7 +70,7 @@ func mustNewAuthStore(t *testing.T, opts grok.AuthOptions) *grok.AuthStore {
 	t.Helper()
 	store, err := grok.NewAuthStore(opts)
 	if err != nil {
-		t.Fatalf("NewAuthStore() unexpected error: %v", err)
+		t.Fatal("NewAuthStore returned an unexpected error")
 	}
 	if store == nil {
 		t.Fatal("NewAuthStore() returned nil store")
@@ -82,7 +82,7 @@ func assertNoSecrets(t *testing.T, label, text string, secrets ...string) {
 	t.Helper()
 	for i, secret := range secrets {
 		if secret != "" && strings.Contains(text, secret) {
-			t.Errorf("%s leaked fixture secret #%d", label, i+1)
+			t.Fatalf("%s leaked fixture secret #%d", label, i+1)
 		}
 	}
 }
@@ -123,11 +123,7 @@ func assertAuthFixtureUntouched(t *testing.T, dir, file string, before os.FileIn
 		t.Fatalf("read auth fixture dir: %v", err)
 	}
 	if len(entries) != 1 || entries[0].Name() != filepath.Base(file) {
-		names := make([]string, len(entries))
-		for i, e := range entries {
-			names[i] = e.Name()
-		}
-		t.Errorf("auth fixture directory entries = %v, want only [%s]", names, filepath.Base(file))
+		t.Errorf("auth fixture directory entries changed (found %d; want only the fixture file)", len(entries))
 	}
 	gotBytes, err := os.ReadFile(file)
 	if err != nil {
@@ -200,7 +196,7 @@ func TestNewAuthStore(t *testing.T) {
 				return
 			}
 			if err != nil {
-				t.Fatalf("NewAuthStore() unexpected error: %v", err)
+				t.Fatal("NewAuthStore returned an unexpected error")
 			}
 			if store == nil {
 				t.Fatal("NewAuthStore() returned nil store")
@@ -351,6 +347,7 @@ func TestReadiness(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			got := grok.Readiness(tt.check(t))
+			assertNoSecrets(t, "readiness", fmt.Sprint(got), "fixture-token", "fixture-refresh", "fixture-expired-key", "fixture-secret-refresh-checkauth", "ignored")
 			if diff := gocmp.Diff(tt.want, got); diff != "" {
 				t.Errorf("Readiness() (-want +got):\n%s", diff)
 			}
@@ -376,6 +373,7 @@ func TestRefreshAuth(t *testing.T) {
 		wantTokenURL        string // empty means tokenSrv.URL + "/discovered/oauth/token"
 		wantRefreshRotated  string
 		wantExpiresAt       int64
+		wantIssuer          string
 		wantPreserveOther   bool
 		wantZeroNetworkCall bool
 		wantFileUnchanged   bool
@@ -423,6 +421,7 @@ func TestRefreshAuth(t *testing.T) {
 			wantTokenURL:        "https://issuer.example.test/oauth/token",
 			wantRefreshRotated:  "fixture-new-refresh",
 			wantExpiresAt:       now.UnixMilli() + 1200*1000,
+			wantIssuer:          "https://issuer.example.test/",
 			secrets:             []string{"fixture-expired-token", "fixture-old-refresh", "fixture-rotated-token", "fixture-new-refresh"},
 		},
 		"error: missing refresh token cannot refresh": {
@@ -558,10 +557,12 @@ func TestRefreshAuth(t *testing.T) {
 
 				handleTokenExchange := func(w http.ResponseWriter, r *http.Request, raw []byte) {
 					w.Header().Set("Content-Type", "application/json")
-					form, parseErr := url.ParseQuery(string(raw))
+					rawBody := string(raw)
+					form, parseErr := url.ParseQuery(rawBody)
 					if parseErr != nil ||
 						r.Method != http.MethodPost ||
 						!strings.HasPrefix(r.Header.Get("Content-Type"), "application/x-www-form-urlencoded") ||
+						!strings.Contains(rawBody, "grant_type=refresh_token") ||
 						form.Get("grant_type") != "refresh_token" ||
 						form.Get("refresh_token") != tt.expectedRefresh ||
 						form.Get("client_id") != "fixture-client" {
@@ -631,7 +632,7 @@ func TestRefreshAuth(t *testing.T) {
 					case tokenAddr:
 						return dialer.DialContext(ctx, network, tokenAddr)
 					default:
-						t.Errorf("blocked unapproved auth dial to %q", addr)
+						t.Error("blocked an unapproved auth dial")
 						return nil, fmt.Errorf("blocked unapproved dial to %q", addr)
 					}
 				}
@@ -649,6 +650,9 @@ func TestRefreshAuth(t *testing.T) {
 			})
 
 			gotToken, err := store.Refresh(t.Context())
+			if err != nil {
+				assertNoSecrets(t, "Refresh() error", err.Error(), tt.secrets...)
+			}
 			if tt.wantErr != nil {
 				if !errors.Is(err, tt.wantErr) {
 					t.Fatalf("Refresh() error = %v, want %v", err, tt.wantErr)
@@ -659,7 +663,6 @@ func TestRefreshAuth(t *testing.T) {
 				if gotToken != "" {
 					t.Errorf("Refresh() returned non-empty token on error (len=%d)", len(gotToken))
 				}
-				assertNoSecrets(t, "Refresh() error", err.Error(), tt.secrets...)
 				if tt.wantFileUnchanged {
 					assertAuthFixtureUntouched(t, dir, file, beforeInfo, tt.authJSON)
 				}
@@ -667,7 +670,7 @@ func TestRefreshAuth(t *testing.T) {
 					mu.Lock()
 					gotReqs := append([]recordedAuthRequest(nil), requests...)
 					mu.Unlock()
-					assertOrderedRefreshRequests(t, gotReqs, tt.wantDiscoveryURL, expectedTokenURL, tt.expectedRefresh)
+					assertOrderedRefreshRequests(t, gotReqs, tt.wantDiscoveryURL, expectedTokenURL, tt.expectedRefresh, tt.secrets...)
 				}
 				return
 			}
@@ -682,7 +685,7 @@ func TestRefreshAuth(t *testing.T) {
 			mu.Lock()
 			gotReqs := append([]recordedAuthRequest(nil), requests...)
 			mu.Unlock()
-			assertOrderedRefreshRequests(t, gotReqs, tt.wantDiscoveryURL, expectedTokenURL, tt.expectedRefresh)
+			assertOrderedRefreshRequests(t, gotReqs, tt.wantDiscoveryURL, expectedTokenURL, tt.expectedRefresh, tt.secrets...)
 
 			persistedBytes, readErr := os.ReadFile(file)
 			if readErr != nil {
@@ -701,7 +704,7 @@ func TestRefreshAuth(t *testing.T) {
 
 			var persisted map[string]any
 			if unmarshalErr := json.Unmarshal(persistedBytes, &persisted); unmarshalErr != nil {
-				t.Fatalf("unmarshal persisted auth.json: %v", unmarshalErr)
+				t.Fatal("persisted auth.json was not a JSON object")
 			}
 			wantKeys := 1
 			if tt.wantPreserveOther {
@@ -710,6 +713,7 @@ func TestRefreshAuth(t *testing.T) {
 				if !ok {
 					t.Fatal("persisted auth.json lost unrelated entry")
 				}
+				assertNoSecrets(t, "persisted unrelated entry", fmt.Sprint(other), tt.secrets...)
 				if diff := gocmp.Diff(map[string]any{"keep": true}, other); diff != "" {
 					t.Errorf("persisted unrelated entry (-want +got):\n%s", diff)
 				}
@@ -722,24 +726,45 @@ func TestRefreshAuth(t *testing.T) {
 			if !ok {
 				t.Fatal("persisted auth.json missing x.ai entry")
 			}
+			wantEntry := map[string]any{
+				"key":            tt.wantToken,
+				"refresh_token":  tt.wantRefreshRotated,
+				"expires_at":     float64(tt.wantExpiresAt),
+				"oidc_client_id": "fixture-client",
+			}
+			if tt.wantIssuer != "" {
+				wantEntry["oidc_issuer"] = tt.wantIssuer
+			}
 			if entry["key"] != tt.wantToken {
 				t.Error("persisted key did not match refreshed access token")
 			}
 			if entry["refresh_token"] != tt.wantRefreshRotated {
 				t.Error("persisted refresh_token did not match expected refresh token")
 			}
+			assertNoSecrets(t, "persisted auth metadata", fmt.Sprint(entry["expires_at"], entry["oidc_client_id"], entry["oidc_issuer"]), tt.secrets...)
 			if diff := gocmp.Diff(float64(tt.wantExpiresAt), entry["expires_at"]); diff != "" {
 				t.Errorf("persisted expires_at (-want +got):\n%s", diff)
 			}
 			if diff := gocmp.Diff("fixture-client", entry["oidc_client_id"]); diff != "" {
 				t.Errorf("persisted oidc_client_id (-want +got):\n%s", diff)
 			}
+			if tt.wantIssuer != "" {
+				if diff := gocmp.Diff(tt.wantIssuer, entry["oidc_issuer"]); diff != "" {
+					t.Errorf("persisted oidc_issuer (-want +got):\n%s", diff)
+				}
+			}
+			if !gocmp.Equal(wantEntry, entry) {
+				t.Errorf("persisted x.ai entry did not match expected entry (got %d fields, want %d; values redacted)", len(entry), len(wantEntry))
+			}
 		})
 	}
 }
 
-func assertOrderedRefreshRequests(t *testing.T, reqs []recordedAuthRequest, wantDiscoveryURL, wantTokenURL, wantRefreshToken string) {
+func assertOrderedRefreshRequests(t *testing.T, reqs []recordedAuthRequest, wantDiscoveryURL, wantTokenURL, wantRefreshToken string, secrets ...string) {
 	t.Helper()
+	for _, r := range reqs {
+		assertNoSecrets(t, "auth request metadata", fmt.Sprint(r.method, r.url, r.contentType, r.headers), secrets...)
+	}
 	if len(reqs) != 2 {
 		t.Fatalf("recorded auth HTTP requests = %d, want 2 (discovery then exchange)", len(reqs))
 	}
@@ -761,10 +786,14 @@ func assertOrderedRefreshRequests(t *testing.T, reqs []recordedAuthRequest, want
 	if !strings.HasPrefix(exch.contentType, "application/x-www-form-urlencoded") {
 		t.Errorf("exchange Content-Type = %q, want prefix application/x-www-form-urlencoded", exch.contentType)
 	}
+	if !strings.Contains(exch.body, "grant_type=refresh_token") {
+		t.Error("exchange form body missing literal grant_type=refresh_token")
+	}
 	form, err := url.ParseQuery(exch.body)
 	if err != nil {
-		t.Fatalf("parse exchange form body: %v", err)
+		t.Fatal("could not parse exchange form body")
 	}
+	assertNoSecrets(t, "exchange form metadata", fmt.Sprint(form["grant_type"], form["client_id"]), secrets...)
 	wantForm := url.Values{
 		"grant_type":    {"refresh_token"},
 		"refresh_token": {wantRefreshToken},
@@ -902,7 +931,7 @@ func TestAccessToken(t *testing.T) {
 				tr = newAuthTransport(t, upstream.Options{
 					DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 						if addr != srvAddr {
-							t.Errorf("blocked unapproved auth dial to %q", addr)
+							t.Error("blocked an unapproved auth dial")
 							return nil, fmt.Errorf("blocked unapproved dial to %q", addr)
 						}
 						return dialer.DialContext(ctx, network, srvAddr)
@@ -935,6 +964,9 @@ func TestAccessToken(t *testing.T) {
 			})
 
 			got, err := store.AccessToken(t.Context())
+			if err != nil {
+				assertNoSecrets(t, "AccessToken() error", err.Error(), "fixture-current-token", "fixture-refresh-token", "fixture-fresh-token")
+			}
 			if tt.wantErr != nil {
 				if !errors.Is(err, tt.wantErr) {
 					t.Fatalf("AccessToken() error = %v, want %v", err, tt.wantErr)
@@ -945,7 +977,6 @@ func TestAccessToken(t *testing.T) {
 				if got != "" {
 					t.Errorf("AccessToken() returned non-empty token on error (len=%d)", len(got))
 				}
-				assertNoSecrets(t, "AccessToken() error", err.Error(), "fixture-current-token", "fixture-refresh-token", "fixture-fresh-token")
 				assertAuthFixtureUntouched(t, dir, file, beforeInfo, initial)
 				return
 			}
@@ -1027,6 +1058,7 @@ func TestAccessTokenSingleFlight(t *testing.T) {
 
 		for i := range callers {
 			if errs[i] != nil {
+				assertNoSecrets(t, "AccessToken() error", errs[i].Error(), "fixture-expired-token", "fixture-refresh-token", "fixture-fresh-token")
 				t.Fatalf("caller %d AccessToken() error: %v", i, errs[i])
 			}
 			if tokens[i] != "fixture-fresh-token" {

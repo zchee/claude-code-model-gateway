@@ -56,10 +56,10 @@ type BranchOptions struct {
 // Branch handles HTTP requests routed to the native Grok backend.
 type Branch struct{}
 
-// NewBranch constructs a Grok branch handler.
-func NewBranch(opts BranchOptions) *Branch {
+// NewBranch constructs a Grok branch handler. It returns an error if opts.Client is nil.
+func NewBranch(opts BranchOptions) (*Branch, error) {
 	_ = opts
-	return &Branch{}
+	return &Branch{}, nil
 }
 
 // Request carries one classified Grok inference request into Branch.Prepare and Branch.Handle.
@@ -99,7 +99,8 @@ func (b *Branch) Prepare(w http.ResponseWriter, r *http.Request, req Request) (o
 // locally with HTTP 502, error type "api_error", fixed message
 // "model-gateway: Grok response could not be translated.", and StatusOverride "upstream_error".
 //
-// r.Context() carries client liveness; b.Client governs upstream lifetime. outcome.Result.Cancelled
+// After r.Context() is canceled, Handle writes nothing more to w but continues consuming
+// the upstream stream; the configured Client governs its lifetime. outcome.Result.Cancelled
 // is always false here and is decided by the worker root. If the upstream breaks after response
 // headers are committed, Handle returns the terminal outcome facts alongside http.ErrAbortHandler
 // rather than panicking.
