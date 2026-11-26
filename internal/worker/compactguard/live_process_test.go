@@ -94,8 +94,9 @@ func checkLive(t *testing.T, provider string, enabled bool) {
 			resp, err = send()
 			if err == nil {
 				if provider == "" {
-					_, err = sse.RelayPassthrough(service, w, resp, sse.PassthroughOptions{})
+					_, err = sse.RelayPassthrough(service, w, resp, sse.PassthroughOptions{ClientDone: r.Context().Done()})
 				} else {
+					req.Stream.ClientDone = r.Context().Done()
 					_, err = sse.RelayProxy(service, w, resp, req.Stream)
 				}
 			}

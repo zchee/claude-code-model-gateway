@@ -24,6 +24,7 @@ import (
 	"net/http"
 
 	"github.com/zchee/claude-code-model-gateway/internal/config"
+	"github.com/zchee/claude-code-model-gateway/internal/readiness"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/outcome"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/route"
 )
@@ -51,6 +52,12 @@ type Options struct {
 	HealthCatalog func() (string, int)
 	// RefreshAnthropic starts catalog refresh for an accepted Anthropic request.
 	RefreshAnthropic func(context.Context, http.Header)
+	// LogRoute records an accepted or dispatch-unbound route audit entry immediately, never at completion.
+	// When nil, no route audit entry is written.
+	LogRoute func(*http.Request, outcome.Audit)
+	// CodexReadiness computes the /healthz codexReadiness summary when non-nil.
+	// When nil, /healthz reports the default checking summary.
+	CodexReadiness func() readiness.CodexReadiness
 }
 
 // NewHandler constructs the handler shared by the TCP and Unix listeners.
