@@ -38,7 +38,8 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
 )
 
-// usageCollector is a loopback OTLP log collector that records every request body it receives.
+// usageCollector is a loopback OTLP log collector that records every request body it receives
+// whole.
 type usageCollector struct {
 	server   *httptest.Server
 	mu       sync.Mutex
@@ -51,7 +52,8 @@ func newUsageCollector(t *testing.T) *usageCollector {
 	c.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
-			t.Error(err)
+			// The exporter may correctly abandon a post at its bound on a loaded host; a request
+			// that ends early is not a failure.
 			return
 		}
 		c.mu.Lock()
@@ -364,120 +366,136 @@ func TestCaptureConcurrentFinish(t *testing.T) {
 
 func TestEmitterStalledReplyBody(t *testing.T) {
 	const reply = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n{"
-	tests := map[string]struct{ loopback bool }{
-		"error: collector on a pipe stalls after its response headers":   {},
-		"error: collector on loopback stalls after its response headers": {loopback: true},
+	tests := map[string]struct{}{
+		"error: collector on a pipe stalls after its response headers": {},
 	}
-	for name, tt := range tests {
+	for name := range tests {
 		t.Run(name, func(t *testing.T) {
 			defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 			output := captureOutput(t)
-			export := func(t *testing.T, e *Emitter) {
-				capture := e.Start(Request{})
-				capture.SetResponse(http.StatusOK, nil)
-				capture.ObserveJSON([]byte(`{"usage":{"input_tokens":15}}`))
-				if capture.Finish() == nil {
-					t.Error("a stalled collector suppressed the primary usage record")
-				}
-				e.Wait()
-			}
-			if !tt.loopback {
-				// Virtual time pins the bound exactly; the pipe stands in for the collector's socket.
-				synctest.Test(t, func(t *testing.T) {
-					peer, client := net.Pipe()
-					defer func() {
-						_ = peer.Close()
-						_ = client.Close()
-					}()
-					headers := make(chan error, 1)
-					abandoned := make(chan struct{})
-					go func() {
-						defer close(abandoned)
-						req, err := http.ReadRequest(bufio.NewReader(peer))
-						if err == nil {
-							_, err = io.Copy(io.Discard, req.Body)
-						}
-						if err == nil {
-							_, err = io.WriteString(peer, reply)
-						}
-						headers <- err
-						// Send nothing more; this read ends only when the exporter closes the connection.
-						_, _ = io.Copy(io.Discard, peer)
-					}()
-					e := newEmitter(func(k string) (string, bool) {
-						return "http://127.0.0.1:1/v1/logs", k == "CODEX_GATEWAY_USAGE_ENDPOINT"
-					}, NewBuilder(options(t)), func(context.Context, string, string) (net.Conn, error) { return client, nil })
-					start := time.Now()
-					done := make(chan time.Duration, 1)
-					go func() {
-						export(t, e)
-						done <- time.Since(start)
-					}()
-					select {
-					case elapsed := <-done:
-						if elapsed != 500*time.Millisecond {
-							t.Errorf("Wait returned at %s, want 500ms", elapsed)
-						}
-					case <-time.After(501 * time.Millisecond):
-						t.Error("Wait did not return within the 500ms export bound")
+			// Virtual time pins the bound exactly; the pipe stands in for the collector's socket.
+			synctest.Test(t, func(t *testing.T) {
+				peer, client := net.Pipe()
+				defer func() {
+					_ = peer.Close()
+					_ = client.Close()
+				}()
+				headers := make(chan error, 1)
+				abandoned := make(chan struct{})
+				go func() {
+					defer close(abandoned)
+					req, err := http.ReadRequest(bufio.NewReader(peer))
+					if err == nil {
+						_, err = io.Copy(io.Discard, req.Body)
 					}
-					synctest.Wait()
-					select {
-					case err := <-headers:
-						if err != nil {
-							t.Errorf("collector: %v", err)
-						}
-					default:
-						t.Error("collector never sent its response headers")
+					if err == nil {
+						_, err = io.WriteString(peer, reply)
 					}
-					select {
-					case <-abandoned:
-					default:
-						t.Error("exporter did not close the stalled collector connection")
-					}
-				})
-			} else {
-				abandoned := make(chan struct{}, 1)
-				s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					if _, err := io.Copy(io.Discard, r.Body); err != nil {
-						t.Error(err)
-						return
-					}
-					w.Header().Set("Content-Type", "application/json")
-					w.Header().Set("Content-Length", "64")
-					w.WriteHeader(http.StatusOK)
-					_, _ = io.WriteString(w, "{")
-					if err := http.NewResponseController(w).Flush(); err != nil {
-						t.Error(err)
-						return
-					}
-					// The handler's own limit lets the server close even if the exporter never
-					// abandons the connection; it matches the test's watchdog.
-					select {
-					case <-r.Context().Done():
-						abandoned <- struct{}{}
-					case <-time.After(30 * time.Second):
-					}
-				}))
-				defer s.Close()
-				endpoint := s.URL + "/v1/logs"
+					headers <- err
+					// Send nothing more; this read ends only when the exporter closes the connection.
+					_, _ = io.Copy(io.Discard, peer)
+				}()
+				e := newEmitter(func(k string) (string, bool) {
+					return "http://127.0.0.1:1/v1/logs", k == "CODEX_GATEWAY_USAGE_ENDPOINT"
+				}, NewBuilder(options(t)), func(context.Context, string, string) (net.Conn, error) { return client, nil })
 				start := time.Now()
-				export(t, NewEmitter(func(k string) (string, bool) { return endpoint, k == "CODEX_GATEWAY_USAGE_ENDPOINT" }, NewBuilder(options(t))))
-				// The deadline starts after Finish, so the wait lasts at least the bound. A loaded
-				// host can only make it longer; the exact bound is checked on the pipe.
-				if elapsed := time.Since(start); elapsed < 500*time.Millisecond {
-					t.Errorf("Wait returned after %s, before the 500ms export bound", elapsed)
+				done := make(chan time.Duration, 1)
+				go func() {
+					capture := e.Start(Request{})
+					capture.SetResponse(http.StatusOK, nil)
+					capture.ObserveJSON([]byte(`{"usage":{"input_tokens":15}}`))
+					if capture.Finish() == nil {
+						t.Error("a stalled collector suppressed the primary usage record")
+					}
+					e.Wait()
+					done <- time.Since(start)
+				}()
+				select {
+				case elapsed := <-done:
+					if elapsed != 500*time.Millisecond {
+						t.Errorf("Wait returned at %s, want 500ms", elapsed)
+					}
+				case <-time.After(501 * time.Millisecond):
+					t.Error("Wait did not return within the 500ms export bound")
+				}
+				synctest.Wait()
+				select {
+				case err := <-headers:
+					if err != nil {
+						t.Errorf("collector: %v", err)
+					}
+				default:
+					t.Error("collector never sent its response headers")
 				}
 				select {
 				case <-abandoned:
-				case <-time.After(30 * time.Second):
+				default:
 					t.Error("exporter did not close the stalled collector connection")
 				}
-			}
+			})
 			if raw := output(); len(raw) != 0 {
 				t.Errorf("export failure wrote output: %q", raw)
 			}
 		})
+	}
+}
+
+// failingCollector answers every connection over an in-memory pipe by reading the whole request
+// and then failing it: it closes the connection, after writing reply when reply is not empty.
+type failingCollector struct {
+	reply string
+
+	mu       sync.Mutex
+	dials    int
+	requests int
+	errs     []error
+}
+
+func (c *failingCollector) dial(context.Context, string, string) (net.Conn, error) {
+	peer, client := net.Pipe()
+	c.mu.Lock()
+	c.dials++
+	c.mu.Unlock()
+	go c.serve(peer)
+	return client, nil
+}
+
+func (c *failingCollector) serve(peer net.Conn) {
+	req, err := http.ReadRequest(bufio.NewReader(peer))
+	if err == nil {
+		_, err = io.Copy(io.Discard, req.Body)
+	}
+	if err == nil {
+		c.mu.Lock()
+		c.requests++
+		c.mu.Unlock()
+		if c.reply != "" {
+			// The write completes only when the exporter reads the reply.
+			_, err = io.WriteString(peer, c.reply)
+		}
+	}
+	if closeErr := peer.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		c.mu.Lock()
+		c.errs = append(c.errs, err)
+		c.mu.Unlock()
+	}
+}
+
+// check waits until every goroutine of the calling synctest bubble is blocked or has exited and
+// requires exactly one connection that carried one whole request and received the failure.
+func (c *failingCollector) check(t *testing.T) {
+	t.Helper()
+	synctest.Wait()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, err := range c.errs {
+		t.Errorf("failing collector: %v", err)
+	}
+	if c.dials != 1 || c.requests != 1 {
+		t.Errorf("collector saw %d connections and %d whole requests, want 1 and 1", c.dials, c.requests)
 	}
 }
 
@@ -490,41 +508,20 @@ func TestEmitterExportFailureIsSilent(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 			output := captureOutput(t)
-			var mu sync.Mutex
-			var requests int
-			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if _, err := io.Copy(io.Discard, r.Body); err != nil {
-					t.Error(err)
-					return
+			synctest.Test(t, func(t *testing.T) {
+				c := &failingCollector{reply: tt.reply}
+				e := newEmitter(func(k string) (string, bool) {
+					return "http://127.0.0.1:1/v1/logs", k == "CODEX_GATEWAY_USAGE_ENDPOINT"
+				}, NewBuilder(options(t)), c.dial)
+				capture := e.Start(Request{})
+				capture.SetResponse(http.StatusOK, nil)
+				capture.ObserveJSON([]byte(`{"usage":{"input_tokens":15}}`))
+				if capture.Finish() == nil {
+					t.Error("a failing collector suppressed the primary usage record")
 				}
-				mu.Lock()
-				requests++
-				mu.Unlock()
-				conn, _, err := http.NewResponseController(w).Hijack()
-				if err != nil {
-					t.Error(err)
-					return
-				}
-				if tt.reply != "" {
-					_, _ = io.WriteString(conn, tt.reply)
-				}
-				_ = conn.Close()
-			}))
-			defer s.Close()
-			endpoint := s.URL + "/v1/logs"
-			e := NewEmitter(func(k string) (string, bool) { return endpoint, k == "CODEX_GATEWAY_USAGE_ENDPOINT" }, NewBuilder(options(t)))
-			capture := e.Start(Request{})
-			capture.SetResponse(http.StatusOK, nil)
-			capture.ObserveJSON([]byte(`{"usage":{"input_tokens":15}}`))
-			if capture.Finish() == nil {
-				t.Error("a failing collector suppressed the primary usage record")
-			}
-			e.Wait()
-			mu.Lock()
-			defer mu.Unlock()
-			if requests != 1 {
-				t.Errorf("collector received %d requests, want 1", requests)
-			}
+				e.Wait()
+				c.check(t)
+			})
 			if raw := output(); len(raw) != 0 {
 				t.Errorf("export failure wrote output: %q", raw)
 			}

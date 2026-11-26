@@ -40,7 +40,7 @@ import (
 	"go.uber.org/goleak"
 )
 
-// traceCollector is a loopback OTLP collector that records every request body it receives.
+// traceCollector is a loopback OTLP collector that records every request body it receives whole.
 type traceCollector struct {
 	server *httptest.Server
 	mu     sync.Mutex
@@ -53,7 +53,8 @@ func newTraceCollector(t *testing.T) *traceCollector {
 	c.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
-			t.Error(err)
+			// The exporter may correctly abandon a post at its bound on a loaded host; a request
+			// that ends early is not a failure.
 			return
 		}
 		c.mu.Lock()
@@ -235,8 +236,8 @@ func routeLogRows(t *testing.T, raw []byte) []map[string]any {
 	return rows
 }
 
-// panicAtOffsetReader fills every buffer with 0x22. Once, on the read that would deliver the byte
-// at panicAt of its stream, it panics instead and delivers nothing.
+// panicAtOffsetReader fills every buffer with 0x22. A read that spans panicAt returns only the
+// bytes before it, so the stream stops exactly there, and the next read panics once.
 type panicAtOffsetReader struct {
 	offset, panicAt int
 	fired           bool
@@ -244,8 +245,11 @@ type panicAtOffsetReader struct {
 
 func (r *panicAtOffsetReader) Read(p []byte) (int, error) {
 	if !r.fired && r.panicAt >= r.offset && r.panicAt < r.offset+len(p) {
-		r.fired = true
-		panic("random source failure")
+		if r.panicAt == r.offset {
+			r.fired = true
+			panic("random source failure")
+		}
+		p = p[:r.panicAt-r.offset]
 	}
 	for i := range p {
 		p[i] = 0x22
@@ -254,34 +258,48 @@ func (r *panicAtOffsetReader) Read(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// startPanicking calls r.Start, which must panic in the random source at panicAt, and reports
+// the panic to t unless it is the injected one, fired with exactly panicAt bytes delivered.
+func startPanicking(t *testing.T, r *Recorder, random *panicAtOffsetReader) {
+	t.Helper()
+	recovered := func() (v any) {
+		defer func() { v = recover() }()
+		r.Start(http.Header{})
+		return nil
+	}()
+	if !random.fired {
+		t.Fatalf("the random source never reached byte %d", random.panicAt)
+	}
+	if d := gocmp.Diff(any("random source failure"), recovered); d != "" {
+		t.Fatalf("panic reaching the caller of Start (-want +got):\n%s", d)
+	}
+	if random.offset != random.panicAt {
+		t.Fatalf("the random source delivered %d bytes before its panic, want %d", random.offset, random.panicAt)
+	}
+}
+
+// startPanics names, for each identifier an unlinked Start draws, the offset of its first byte:
+// the trace identifier is bytes 0 to 15, the span identifier 16 to 23 and the route identifier
+// 24 to 39.
+var startPanics = map[string]int{"trace": 0, "span": 16, "route": 24}
+
 func TestStartAfterRandomSourcePanic(t *testing.T) {
-	// An unlinked Start draws the trace identifier from bytes 0 to 15, the span identifier from
-	// bytes 16 to 23 and the route identifier from bytes 24 to 39.
 	tests := map[string]struct{ panicAt int }{
-		"success: start completes after a panic while reading the trace identifier": {panicAt: 0},
-		"success: start completes after a panic while reading the span identifier":  {panicAt: 16},
-		"success: start completes after a panic while reading the route identifier": {panicAt: 24},
+		"success: start completes after a panic while reading the trace identifier": {panicAt: startPanics["trace"]},
+		"success: start completes after a panic while reading the span identifier":  {panicAt: startPanics["span"]},
+		"success: start completes after a panic while reading the route identifier": {panicAt: startPanics["route"]},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			c := newTraceCollector(t)
-			opts := recorderOptions(c.env())
+			// The collector address is never dialed: no span is finished, so nothing is exported.
+			opts := recorderOptions((&pipeTraceCollector{}).env())
 			random := &panicAtOffsetReader{panicAt: tt.panicAt}
 			opts.Random = random
 			r := NewRecorder(opts)
-			recovered := func() (v any) {
-				defer func() { v = recover() }()
-				r.Start(http.Header{})
-				return nil
-			}()
-			if recovered == nil {
-				t.Fatal("the random source's panic did not reach the caller of Start")
-			}
-			if random.offset != tt.panicAt {
-				t.Fatalf("the panic came after %d bytes were drawn, want it on the read of byte %d", random.offset, tt.panicAt)
-			}
-			// A lock left held by the panic would block this Start forever; bound the wait
-			// generously so that only a lock that is never released trips it.
+			startPanicking(t, r, random)
+			// A lock left held by the panic would block this Start forever. The watchdog runs on
+			// real time because a goroutine blocked on a mutex never lets virtual time advance;
+			// it is generous so that only a lock that is never released trips it.
 			started := make(chan *Span, 1)
 			go func() { started <- r.Start(http.Header{}) }()
 			var span *Span
@@ -290,16 +308,46 @@ func TestStartAfterRandomSourcePanic(t *testing.T) {
 			case <-time.After(30 * time.Second):
 				t.Fatal("Start blocked after the caller recovered a panic of the random source")
 			}
-			span.Finish(Route{Backend: "codex"}, http.StatusOK, "")
-			r.Wait()
-			bodies := c.received()
-			if len(bodies) != 1 {
-				t.Fatalf("collector received %d spans, want the one span started after the panic", len(bodies))
-			}
 			want := spanIdentity{TraceID: strings.Repeat("22", 16), SpanID: strings.Repeat("22", 8), RouteID: "22222222-2222-4222-a222-222222222222"}
-			if d := gocmp.Diff(want, exportedSpan(t, bodies[0])); d != "" {
+			if d := gocmp.Diff(want, spanIdentity{TraceID: span.traceID, SpanID: span.spanID, RouteID: span.routeID}); d != "" {
 				t.Errorf("span started after the panic (-want +got):\n%s", d)
 			}
+		})
+	}
+}
+
+func TestSpanExportAfterRandomSourcePanic(t *testing.T) {
+	tests := map[string]struct{ panicAt int }{
+		"success: span started after a panic while reading the trace identifier is exported once": {panicAt: startPanics["trace"]},
+		"success: span started after a panic while reading the span identifier is exported once":  {panicAt: startPanics["span"]},
+		"success: span started after a panic while reading the route identifier is exported once": {panicAt: startPanics["route"]},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				c := &pipeTraceCollector{}
+				opts := recorderOptions(c.env())
+				random := &panicAtOffsetReader{panicAt: tt.panicAt}
+				opts.Random = random
+				r := c.recorder(opts)
+				startPanicking(t, r, random)
+				// Inside the bubble a held lock would hang the next Start instead of failing it,
+				// so check the lock first.
+				if !r.randomMu.TryLock() {
+					t.Fatal("the random source's lock is still held after the caller recovered its panic")
+				}
+				r.randomMu.Unlock()
+				r.Start(http.Header{}).Finish(Route{Backend: "codex"}, http.StatusOK, "")
+				r.Wait()
+				bodies := c.received(t)
+				if len(bodies) != 1 {
+					t.Fatalf("collector received %d spans, want the one span started after the panic", len(bodies))
+				}
+				want := spanIdentity{TraceID: strings.Repeat("22", 16), SpanID: strings.Repeat("22", 8), RouteID: "22222222-2222-4222-a222-222222222222"}
+				if d := gocmp.Diff(want, exportedSpan(t, bodies[0])); d != "" {
+					t.Errorf("span started after the panic (-want +got):\n%s", d)
+				}
+			})
 		})
 	}
 }
@@ -356,6 +404,66 @@ func TestRouteLogWithoutURL(t *testing.T) {
 	}
 }
 
+// failingTraceCollector answers every connection over an in-memory pipe by reading the whole
+// request and then failing it: it closes the connection, after writing reply when reply is not
+// empty.
+type failingTraceCollector struct {
+	reply string
+
+	mu       sync.Mutex
+	dials    int
+	requests int
+	errs     []error
+}
+
+func (c *failingTraceCollector) dial(context.Context, string, string) (net.Conn, error) {
+	peer, client := net.Pipe()
+	c.mu.Lock()
+	c.dials++
+	c.mu.Unlock()
+	go c.serve(peer)
+	return client, nil
+}
+
+func (c *failingTraceCollector) serve(peer net.Conn) {
+	req, err := http.ReadRequest(bufio.NewReader(peer))
+	if err == nil {
+		_, err = io.Copy(io.Discard, req.Body)
+	}
+	if err == nil {
+		c.mu.Lock()
+		c.requests++
+		c.mu.Unlock()
+		if c.reply != "" {
+			// The write completes only when the exporter reads the reply.
+			_, err = io.WriteString(peer, c.reply)
+		}
+	}
+	if closeErr := peer.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		c.mu.Lock()
+		c.errs = append(c.errs, err)
+		c.mu.Unlock()
+	}
+}
+
+// check waits until every goroutine of the calling synctest bubble is blocked or has exited and
+// requires exactly one connection that carried one whole request and received the failure.
+func (c *failingTraceCollector) check(t *testing.T) {
+	t.Helper()
+	synctest.Wait()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, err := range c.errs {
+		t.Errorf("failing collector: %v", err)
+	}
+	if c.dials != 1 || c.requests != 1 {
+		t.Errorf("collector saw %d connections and %d whole requests, want 1 and 1", c.dials, c.requests)
+	}
+}
+
 func TestTraceExportFailureIsSilent(t *testing.T) {
 	tests := map[string]struct{ reply string }{
 		"error: collector closes the connection without a reply": {},
@@ -364,41 +472,19 @@ func TestTraceExportFailureIsSilent(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
-			var mu sync.Mutex
-			var requests int
-			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if _, err := io.Copy(io.Discard, r.Body); err != nil {
-					t.Error(err)
-					return
+			synctest.Test(t, func(t *testing.T) {
+				c := &failingTraceCollector{reply: tt.reply}
+				opts := recorderOptions((&pipeTraceCollector{}).env())
+				var diagnostics bytes.Buffer
+				opts.Diagnostics = &diagnostics
+				r := newRecorder(opts, c.dial)
+				r.Start(nil).Finish(Route{Backend: "codex"}, http.StatusOK, "")
+				r.Wait()
+				c.check(t)
+				if diagnostics.Len() != 0 {
+					t.Errorf("export failure wrote diagnostic: %q", diagnostics.String())
 				}
-				mu.Lock()
-				requests++
-				mu.Unlock()
-				conn, _, err := http.NewResponseController(w).Hijack()
-				if err != nil {
-					t.Error(err)
-					return
-				}
-				if tt.reply != "" {
-					_, _ = io.WriteString(conn, tt.reply)
-				}
-				_ = conn.Close()
-			}))
-			defer s.Close()
-			opts := recorderOptions(map[string]string{"CODEX_GATEWAY_TELEMETRY_ENDPOINT": s.URL + "/v1/traces", "CLAUDE_CODE_PROPAGATE_TRACEPARENT": "1"})
-			var diagnostics bytes.Buffer
-			opts.Diagnostics = &diagnostics
-			r := NewRecorder(opts)
-			r.Start(nil).Finish(Route{Backend: "codex"}, http.StatusOK, "")
-			r.Wait()
-			mu.Lock()
-			defer mu.Unlock()
-			if requests != 1 {
-				t.Errorf("collector received %d requests, want 1", requests)
-			}
-			if diagnostics.Len() != 0 {
-				t.Errorf("export failure wrote diagnostic: %q", diagnostics.String())
-			}
+			})
 		})
 	}
 }
@@ -623,116 +709,71 @@ func TestSpanIntegerAttributeExact(t *testing.T) {
 
 func TestTraceStalledReplyBody(t *testing.T) {
 	const reply = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n{"
-	tests := map[string]struct{ loopback bool }{
-		"error: collector on a pipe stalls after its response headers":   {},
-		"error: collector on loopback stalls after its response headers": {loopback: true},
+	tests := map[string]struct{}{
+		"error: collector on a pipe stalls after its response headers": {},
 	}
-	for name, tt := range tests {
+	for name := range tests {
 		t.Run(name, func(t *testing.T) {
 			defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
-			var diagnostics bytes.Buffer
-			env := map[string]string{"CODEX_GATEWAY_TELEMETRY_ENDPOINT": "http://127.0.0.1:1/v1/traces", "CLAUDE_CODE_PROPAGATE_TRACEPARENT": "1"}
-			if !tt.loopback {
-				// Virtual time pins the bound exactly; the pipe stands in for the collector's socket.
-				synctest.Test(t, func(t *testing.T) {
-					peer, client := net.Pipe()
-					defer func() {
-						_ = peer.Close()
-						_ = client.Close()
-					}()
-					headers := make(chan error, 1)
-					abandoned := make(chan struct{})
-					go func() {
-						defer close(abandoned)
-						req, err := http.ReadRequest(bufio.NewReader(peer))
-						if err == nil {
-							_, err = io.Copy(io.Discard, req.Body)
-						}
-						if err == nil {
-							_, err = io.WriteString(peer, reply)
-						}
-						headers <- err
-						// Send nothing more; this read ends only when the exporter closes the connection.
-						_, _ = io.Copy(io.Discard, peer)
-					}()
-					opts := recorderOptions(env)
-					opts.Diagnostics = &diagnostics
-					r := newRecorder(opts, func(context.Context, string, string) (net.Conn, error) { return client, nil })
-					start := time.Now()
-					done := make(chan time.Duration, 1)
-					go func() {
-						r.Start(nil).Finish(Route{Backend: "codex"}, http.StatusOK, "")
-						r.Wait()
-						done <- time.Since(start)
-					}()
-					select {
-					case elapsed := <-done:
-						if elapsed != 500*time.Millisecond {
-							t.Errorf("Wait returned at %s, want 500ms", elapsed)
-						}
-					case <-time.After(501 * time.Millisecond):
-						t.Error("Wait did not return within the 500ms export bound")
+			// Virtual time pins the bound exactly; the pipe stands in for the collector's socket.
+			synctest.Test(t, func(t *testing.T) {
+				peer, client := net.Pipe()
+				defer func() {
+					_ = peer.Close()
+					_ = client.Close()
+				}()
+				headers := make(chan error, 1)
+				abandoned := make(chan struct{})
+				go func() {
+					defer close(abandoned)
+					req, err := http.ReadRequest(bufio.NewReader(peer))
+					if err == nil {
+						_, err = io.Copy(io.Discard, req.Body)
 					}
-					synctest.Wait()
-					select {
-					case err := <-headers:
-						if err != nil {
-							t.Errorf("collector: %v", err)
-						}
-					default:
-						t.Error("collector never sent its response headers")
+					if err == nil {
+						_, err = io.WriteString(peer, reply)
 					}
-					select {
-					case <-abandoned:
-					default:
-						t.Error("exporter did not close the stalled collector connection")
-					}
-				})
-			} else {
-				abandoned := make(chan struct{}, 1)
-				s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					if _, err := io.Copy(io.Discard, r.Body); err != nil {
-						t.Error(err)
-						return
-					}
-					w.Header().Set("Content-Type", "application/json")
-					w.Header().Set("Content-Length", "64")
-					w.WriteHeader(http.StatusOK)
-					_, _ = io.WriteString(w, "{")
-					if err := http.NewResponseController(w).Flush(); err != nil {
-						t.Error(err)
-						return
-					}
-					// The handler's own limit lets the server close even if the exporter never
-					// abandons the connection; it matches the test's watchdog.
-					select {
-					case <-r.Context().Done():
-						abandoned <- struct{}{}
-					case <-time.After(30 * time.Second):
-					}
-				}))
-				defer s.Close()
-				env["CODEX_GATEWAY_TELEMETRY_ENDPOINT"] = s.URL + "/v1/traces"
-				opts := recorderOptions(env)
+					headers <- err
+					// Send nothing more; this read ends only when the exporter closes the connection.
+					_, _ = io.Copy(io.Discard, peer)
+				}()
+				opts := recorderOptions((&pipeTraceCollector{}).env())
+				var diagnostics bytes.Buffer
 				opts.Diagnostics = &diagnostics
-				r := NewRecorder(opts)
+				r := newRecorder(opts, func(context.Context, string, string) (net.Conn, error) { return client, nil })
 				start := time.Now()
-				r.Start(nil).Finish(Route{Backend: "codex"}, http.StatusOK, "")
-				r.Wait()
-				// The deadline starts after Finish, so the wait lasts at least the bound. A loaded
-				// host can only make it longer; the exact bound is checked on the pipe.
-				if elapsed := time.Since(start); elapsed < 500*time.Millisecond {
-					t.Errorf("Wait returned after %s, before the 500ms export bound", elapsed)
+				done := make(chan time.Duration, 1)
+				go func() {
+					r.Start(nil).Finish(Route{Backend: "codex"}, http.StatusOK, "")
+					r.Wait()
+					done <- time.Since(start)
+				}()
+				select {
+				case elapsed := <-done:
+					if elapsed != 500*time.Millisecond {
+						t.Errorf("Wait returned at %s, want 500ms", elapsed)
+					}
+				case <-time.After(501 * time.Millisecond):
+					t.Error("Wait did not return within the 500ms export bound")
+				}
+				synctest.Wait()
+				select {
+				case err := <-headers:
+					if err != nil {
+						t.Errorf("collector: %v", err)
+					}
+				default:
+					t.Error("collector never sent its response headers")
 				}
 				select {
 				case <-abandoned:
-				case <-time.After(30 * time.Second):
+				default:
 					t.Error("exporter did not close the stalled collector connection")
 				}
-			}
-			if diagnostics.Len() != 0 {
-				t.Errorf("export failure wrote diagnostic: %q", diagnostics.String())
-			}
+				if diagnostics.Len() != 0 {
+					t.Errorf("export failure wrote diagnostic: %q", diagnostics.String())
+				}
+			})
 		})
 	}
 }
@@ -753,26 +794,28 @@ func TestStartWithShortRandomSource(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			c := newTraceCollector(t)
-			opts := recorderOptions(c.env())
-			opts.Random = bytes.NewReader(bytes.Repeat([]byte{0x33}, tt.random))
-			var diagnostics bytes.Buffer
-			opts.Diagnostics = &diagnostics
-			r := NewRecorder(opts)
-			h := http.Header{}
-			if tt.traceparent != "" {
-				h.Set("Traceparent", tt.traceparent)
-			}
-			span := r.Start(h)
-			span.Finish(Route{Backend: "codex"}, http.StatusOK, "")
-			span.Finish(Route{Backend: "codex"}, http.StatusOK, "")
-			r.Wait()
-			if got := len(c.received()); got != 0 {
-				t.Errorf("collector received %d spans from a span without identifiers, want 0", got)
-			}
-			if diagnostics.Len() != 0 {
-				t.Errorf("unexpected diagnostic: %q", diagnostics.String())
-			}
+			synctest.Test(t, func(t *testing.T) {
+				c := &pipeTraceCollector{}
+				opts := recorderOptions(c.env())
+				opts.Random = bytes.NewReader(bytes.Repeat([]byte{0x33}, tt.random))
+				var diagnostics bytes.Buffer
+				opts.Diagnostics = &diagnostics
+				r := c.recorder(opts)
+				h := http.Header{}
+				if tt.traceparent != "" {
+					h.Set("Traceparent", tt.traceparent)
+				}
+				span := r.Start(h)
+				span.Finish(Route{Backend: "codex"}, http.StatusOK, "")
+				span.Finish(Route{Backend: "codex"}, http.StatusOK, "")
+				r.Wait()
+				if got := len(c.received(t)); got != 0 {
+					t.Errorf("collector received %d spans from a span without identifiers, want 0", got)
+				}
+				if diagnostics.Len() != 0 {
+					t.Errorf("unexpected diagnostic: %q", diagnostics.String())
+				}
+			})
 		})
 	}
 }

@@ -17,10 +17,8 @@ package usage_test
 import (
 	"bytes"
 	"encoding/hex"
-	"io"
 	"math"
 	"net/http"
-	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -275,9 +273,9 @@ func TestCaptureFinishConcurrent(t *testing.T) {
 	}
 }
 
-// offsetRandom fills every buffer with the low byte of each byte's offset in its stream. Once, on
-// the read that would deliver the byte at panicAt, it panics instead and delivers nothing; a
-// negative panicAt never panics.
+// offsetRandom fills every buffer with the low byte of each byte's offset in its stream. A read
+// that spans panicAt returns only the bytes before it, so the stream stops exactly there, and the
+// next read panics once; a negative panicAt never panics.
 type offsetRandom struct {
 	mu      sync.Mutex
 	offset  int
@@ -289,8 +287,11 @@ func (r *offsetRandom) Read(p []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if !r.fired && r.panicAt >= r.offset && r.panicAt < r.offset+len(p) {
-		r.fired = true
-		panic("injected random panic")
+		if r.panicAt == r.offset {
+			r.fired = true
+			panic("injected random panic")
+		}
+		p = p[:r.panicAt-r.offset]
 	}
 	for i := range p {
 		p[i] = byte(r.offset + i)
@@ -346,17 +347,15 @@ func TestFinishPanicOutsideCallerCallback(t *testing.T) {
 				}
 				return
 			}
-			collector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				_, _ = io.Copy(io.Discard, r.Body)
-				w.WriteHeader(http.StatusNoContent)
-			}))
-			defer collector.Close()
-			endpoint := collector.URL + "/v1/logs"
-			lookup := func(k string) (string, bool) { return endpoint, k == "CODEX_GATEWAY_USAGE_ENDPOINT" }
+			// The endpoint 0 disables export: the emitter derives its records whether or not it posts
+			// them, so no collector is needed.
 			finish := func(random *offsetRandom) (*usage.Record, any) {
 				opts := newTestOptions(t)
 				opts.Random = random
-				e := usage.NewEmitter(lookup, usage.NewBuilder(opts))
+				e := usage.NewEmitter(func(k string) (string, bool) { return "0", k == "CODEX_GATEWAY_USAGE_ENDPOINT" }, usage.NewBuilder(opts))
+				if e.Enabled() {
+					t.Fatal("the emitter exports although its endpoint is disabled")
+				}
 				defer e.Wait()
 				c := e.Start(usage.Request{Body: decodeWire(t, mcpBody)})
 				c.SetResponse(http.StatusOK, nil)
@@ -382,6 +381,9 @@ func TestFinishPanicOutsideCallerCallback(t *testing.T) {
 			rec, panicked = finish(random)
 			if !random.fired {
 				t.Fatal("the random source never reached byte 32")
+			}
+			if random.offset != 32 {
+				t.Errorf("the random source delivered %d bytes before its panic, want 32", random.offset)
 			}
 			if diff := gocmp.Diff(any("injected random panic"), panicked); diff != "" {
 				t.Errorf("panic reaching the caller of Finish (-want +got):\n%s", diff)

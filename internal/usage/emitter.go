@@ -115,8 +115,9 @@ func (e *Emitter) Start(req Request) *Capture {
 
 // emit schedules the primary record and the records derived from it without waiting for the
 // collector. Nothing on this path recovers: the capture runs emit outside the recovery it keeps
-// for caller-supplied callbacks, and the export goroutines have none, so a panic in the emitter
-// reaches the caller of Finish instead of being hidden. Each lock it takes is released by a
+// for caller-supplied callbacks, so only a panic on the calling goroutine, while emit encodes or
+// derives a record, reaches the caller of Finish instead of being hidden; a panic in an export
+// goroutine that schedule starts cannot reach that caller. Each lock it takes is released by a
 // deferred unlock, so the emitter and its builder stay usable after such a panic.
 func (e *Emitter) emit(primary Record, key identity, blocks []block) {
 	e.schedule(primary)
