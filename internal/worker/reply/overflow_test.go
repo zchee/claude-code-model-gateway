@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build process
+
 package reply_test
 
 import (
@@ -23,6 +25,7 @@ import (
 	"testing"
 
 	"github.com/zchee/claude-code-model-gateway/internal/policy"
+	"github.com/zchee/claude-code-model-gateway/internal/worker/outcome"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/reply"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/sentry"
 )
@@ -62,10 +65,11 @@ func TestOverflowNormalization(t *testing.T) {
 				state.Observe(session, target, jsontext.Value(fmt.Sprintf(`{"type":"message_delta","usage":{"input_tokens":%d}}`, tokens)), false)
 			}
 			observe("only", tc.prior)
-			w, result := handle(t, reply.Request{Provider: "local", AdvertisedModel: "shown", BackendModel: "model", Window: 110, Session: "only", Body: request, Target: target, Sentry: state, SentryEnabled: tc.enabled}, answer(t, tc.code, tc.body).forward)
+			capture := newCapture()
+			w, result := handle(t, reply.Request{Usage: capture, Provider: "local", AdvertisedModel: "shown", BackendModel: "model", Window: 110, Session: "only", Body: request, Target: target, Sentry: state, SentryEnabled: tc.enabled}, answer(t, tc.code, tc.body))
 			equal(t, 413, w.Code)
 			equal(t, 413, result.Status)
-			equal(t, tc.code, result.CaptureStatus)
+			checkCapture(t, capture, tc.code, len(tc.body), map[string]any{"retry_after_ms": float64(2000)})
 			equal(t, "application/json", w.Header().Get("Content-Type"))
 			equal(t, strconv.Itoa(w.Body.Len()), w.Header().Get("Content-Length"))
 			if tc.code == 413 {
@@ -97,11 +101,11 @@ func TestOverflowNormalization(t *testing.T) {
 			}
 			equal(t, details, payload.Error.Overflow)
 			equal(t, fmt.Sprintf("%s [model-gateway: phase first_turn, refused by upstream; request %d bytes, %s, limit %d tokens; recovery: nothing to compact, the request has no prior turn: shrink the first prompt (a dispatched subagent's briefing) or route to a larger-window model]", tc.lead, len(request), measured, tc.limit), payload.Error.Message)
-			var logged map[string]any
-			if err := json.Unmarshal(result.Overflow, &logged); err != nil {
-				t.Fatal(err)
+			logged := &outcome.Overflow{Phase: "first_turn", RefusedBy: "upstream", RequestBytes: int64(len(request)), LimitTokens: new(float64(tc.limit)), TokensFrom: tc.from}
+			if tc.tokens > 0 {
+				logged.Tokens = new(float64(tc.tokens))
 			}
-			equal(t, details, logged)
+			equal(t, logged, result.Route.Overflow)
 			if strings.Contains(w.Body.String(), "private-") {
 				t.Error("normalized public body leaked private text")
 			}
@@ -132,11 +136,11 @@ func TestEarlierResponseWins(t *testing.T) {
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			w, r := handle(t, reply.Request{Provider: tc.provider, AdvertisedModel: "shown", BackendModel: "engine", Window: 110, Sentry: new(sentry.State), SentryEnabled: tc.enabled, Body: []byte(`{"messages":[]}`)}, answer(t, tc.code, tc.body).forward)
+			w, r := handle(t, reply.Request{Provider: tc.provider, AdvertisedModel: "shown", BackendModel: "engine", Window: 110, Sentry: new(sentry.State), SentryEnabled: tc.enabled, Body: []byte(`{"messages":[]}`)}, answer(t, tc.code, tc.body))
 			equal(t, tc.code, w.Code)
 			equal(t, tc.want, w.Body.String())
 			equal(t, "kept", w.Header().Get("X-Upstream-Test"))
-			equal(t, 0, len(r.Overflow))
+			equal(t, (*outcome.Overflow)(nil), r.Route.Overflow)
 		})
 	}
 }

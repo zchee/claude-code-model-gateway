@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build process
+
 package reply_test
 
 import (
@@ -22,13 +24,16 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/zchee/claude-code-model-gateway/internal/policy"
 	"github.com/zchee/claude-code-model-gateway/internal/upstreamstate"
+	"github.com/zchee/claude-code-model-gateway/internal/worker/outcome"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/reply"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/sentry"
+	"github.com/zchee/claude-code-model-gateway/internal/worker/upstream"
 )
 
 func TestSuccessfulJSON(t *testing.T) {
@@ -52,11 +57,11 @@ func TestSuccessfulJSON(t *testing.T) {
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			var observed []string
+			capture := newCapture()
 			state := new(sentry.State)
 			target := sentry.Target{Key: "engine", Policy: &policy.Sentry{BackendWindow: 3000, CompactTrigger: 2900, Source: "derived"}, Headroom: 100}
-			r := reply.Request{Provider: tc.provider, AdvertisedModel: "shown", BackendModel: "engine", FilterPlanTools: tc.filter, Session: "session", Body: []byte(`{"messages":[]}`), Target: target, Sentry: state, SentryEnabled: true, ObserveJSON: func(b []byte) { observed = append(observed, string(b)) }}
-			w, result := handle(t, r, answer(t, 200, tc.body).forward)
+			r := reply.Request{Provider: tc.provider, AdvertisedModel: "shown", BackendModel: "engine", FilterPlanTools: tc.filter, Session: "session", Body: []byte(`{"messages":[]}`), Target: target, Sentry: state, SentryEnabled: true, Usage: capture}
+			w, result := handle(t, r, answer(t, 200, tc.body))
 			want := tc.want
 			if tc.provider == "lmstudio" {
 				want = strings.Replace(want, inclusive, exclusive, 1)
@@ -68,7 +73,15 @@ func TestSuccessfulJSON(t *testing.T) {
 			if wantObserved == "" {
 				wantObserved = tc.body
 			}
-			equal(t, []string{wantObserved}, observed)
+			fields := map[string]any{}
+			if tc.body == raw {
+				fields["model"] = "engine"
+			}
+			if tc.usage > 0 {
+				fields["input_tokens"] = tc.usage - 2497
+				fields["cache_read_tokens"] = float64(2497)
+			}
+			checkCapture(t, capture, 200, len(wantObserved), fields)
 			equal(t, tc.override, result.StatusOverride)
 			equal(t, 200, result.Status)
 			crossed, ok := state.Check("session", target, r.Body)
@@ -96,7 +109,7 @@ func TestEmptyCompletion(t *testing.T) {
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			w, result := handle(t, reply.Request{Provider: tc.provider, AdvertisedModel: "shown", Body: []byte(tc.request), NewMessageID: func() string { return id }}, answer(t, 503, tc.up).forward)
+			w, result := handle(t, reply.Request{Provider: tc.provider, AdvertisedModel: "shown", Body: []byte(tc.request), NewMessageID: func() string { return id }}, answer(t, 503, tc.up))
 			equal(t, tc.status, w.Code)
 			equal(t, tc.status, result.Status)
 			equal(t, tc.contentType, w.Header().Get("Content-Type"))
@@ -121,18 +134,19 @@ func TestRejectionAttribution(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			store := &upstreamstate.Store{Dir: t.TempDir(), Now: func() time.Time { return time.Unix(1000, 0) }}
 			const body = `{"error":{"message":"provider rejection"}}`
-			w, result := handle(t, reply.Request{Provider: tc.provider, AdvertisedModel: "shown", Body: []byte(`{}`), Upstream: store}, upstream(t, func(w http.ResponseWriter, _ *http.Request) {
+			capture := newCapture()
+			w, _ := handle(t, reply.Request{Provider: tc.provider, AdvertisedModel: "shown", Body: []byte(`{}`), Upstream: store, Usage: capture}, newProxy(t, func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("X-OpenAI-Request-Id", "private-id")
 				w.Header().Add("Retry-After", "1")
 				w.Header().Add("Retry-After", "60")
+				w.Header().Add("X-Codex-Primary-Used-Percent", "31")
+				w.Header().Add("X-Codex-Primary-Used-Percent", "99")
 				w.WriteHeader(tc.status)
 				_, _ = io.WriteString(w, body)
-			}).forward)
+			}))
 			equal(t, tc.status, w.Code)
 			equal(t, body, w.Body.String())
-			equal(t, tc.status, result.CaptureStatus)
-			equal(t, []string{"1", "60"}, result.CaptureHeaders.Values("Retry-After"))
-			equal(t, int64(len(body)), result.ResponseBytes)
+			checkCapture(t, capture, tc.status, len(body), map[string]any{"retry_after_ms": float64(1000), "codex_throttle_used_percent": float64(31)})
 			block := store.ReadBlocked()
 			if (block != nil) != tc.want {
 				t.Fatalf("ReadBlocked = %+v, want present=%v", block, tc.want)
@@ -178,9 +192,10 @@ func TestCommittedCompaction(t *testing.T) {
 			state := new(sentry.State)
 			target := sentry.Target{Key: "model", Policy: &policy.Sentry{BackendWindow: 110, CompactTrigger: 100, Source: "derived"}, Headroom: 10}
 			store := &upstreamstate.Store{Dir: t.TempDir(), Now: func() time.Time { return time.Unix(1000, 0) }}
-			req := reply.Request{Provider: "codex", AdvertisedModel: "shown", Compaction: true, HeadWritten: true, Body: []byte(`{}`), Session: "only", Target: target, SentryEnabled: true, Sentry: state, Upstream: store, CommandPath: "/stable gateway"}
+			capture := newCapture()
+			req := reply.Request{Usage: capture, Provider: "codex", AdvertisedModel: "shown", Compaction: true, HeadWritten: true, Body: []byte(`{}`), Session: "only", Target: target, SentryEnabled: true, Sentry: state, Upstream: store, CommandPath: "/stable gateway"}
 			state.Observe("only", target, []byte(`{"type":"message_delta","usage":{"input_tokens":80}}`), false)
-			r, e := reply.Handle(t.Context(), w, req, upstream(t, func(w http.ResponseWriter, _ *http.Request) {
+			r, e := reply.Handle(t.Context(), w, req, newProxy(t, func(w http.ResponseWriter, _ *http.Request) {
 				if tc.status == 401 {
 					w.Header().Set("X-Openai-Request-Id", "req_test")
 				}
@@ -189,15 +204,16 @@ func TestCommittedCompaction(t *testing.T) {
 				}
 				w.WriteHeader(tc.status)
 				_, _ = io.WriteString(w, tc.body)
-			}).forward)
+			}).forward(req.Body))
 			if e != nil {
 				t.Fatal(e)
 			}
 			equal(t, []int{200}, w.heads)
 			equal(t, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":"+strconv.Quote(tc.kind)+",\"message\":"+strconv.Quote(tc.detail)+"}}\n\n", w.Body.String())
 			equal(t, tc.status, r.Status)
-			equal(t, true, r.Incomplete)
-			equal(t, "upstream_error", r.CompactionOutcome)
+			equal(t, true, r.Contacted && r.Stream == nil)
+			checkIncomplete(t, capture)
+			equal(t, &outcome.Compaction{Outcome: "upstream_error", ErrorCode: "upstream_http_error", UpstreamStatus: new(tc.status)}, r.Route.Compaction)
 			if tc.truncated && r.StatusOverride != "upstream_error" && r.StatusOverride != "upstream_aborted" {
 				t.Errorf("unexpected truncated response status %q", r.StatusOverride)
 			}
@@ -236,11 +252,14 @@ func TestBufferedReadFailure(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			w := httptest.NewRecorder()
-			result, e := reply.Handle(t.Context(), w, reply.Request{Provider: "codex", AdvertisedModel: "shown", Compaction: true, SentryEnabled: tc.enabled, Sentry: new(sentry.State), Body: []byte(`{}`)}, upstream(t, func(w http.ResponseWriter, _ *http.Request) {
+			capture := newCapture()
+			req := reply.Request{Usage: capture, Provider: "codex", AdvertisedModel: "shown", Compaction: true, SentryEnabled: tc.enabled, Sentry: new(sentry.State), Body: []byte(`{}`)}
+			result, e := reply.Handle(t.Context(), w, req, newProxy(t, func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Length", "100")
 				w.WriteHeader(tc.status)
 				_, _ = io.WriteString(w, "truncated")
-			}).forward)
+			}).forward(req.Body))
+			equal(t, true, result.Contacted && result.Stream == nil)
 			if tc.abort {
 				if !errors.Is(e, http.ErrAbortHandler) || w.Body.Len() != 0 {
 					t.Errorf("must abort without a clean partial reply: err=%v body=%q", e, w.Body.String())
@@ -257,8 +276,8 @@ func TestBufferedReadFailure(t *testing.T) {
 			if result.StatusOverride != "upstream_error" && result.StatusOverride != "upstream_aborted" {
 				t.Errorf("unexpected incomplete status %q", result.StatusOverride)
 			}
-			equal(t, "upstream_error", result.CompactionOutcome)
-			equal(t, true, result.Incomplete)
+			equal(t, &outcome.Compaction{Outcome: "upstream_error", ErrorCode: "upstream_http_error", UpstreamStatus: new(tc.status)}, result.Route.Compaction)
+			checkIncomplete(t, capture)
 		})
 	}
 }
@@ -274,7 +293,20 @@ func TestTransportFailure(t *testing.T) {
 			if tc.committed {
 				w.WriteHeader(200)
 			}
-			r, err := reply.Handle(t.Context(), w, reply.Request{Origin: "https://proxy.invalid", Compaction: true, HeadWritten: tc.committed}, func(context.Context) (*http.Response, error) { return nil, errors.New("connection refused") })
+			fixture := answer(t, 200, "")
+			fixture.server.Close()
+			capture := newCapture()
+			req := reply.Request{Usage: capture, Origin: fixture.server.URL, Compaction: true, HeadWritten: tc.committed}
+			send := fixture.forward(req.Body)
+			var refused error
+			r, err := reply.Handle(t.Context(), w, req, func(ctx context.Context) (*upstream.Response, error) {
+				resp, err := send(ctx)
+				refused = err
+				return resp, err
+			})
+			if !errors.Is(refused, syscall.ECONNREFUSED) {
+				t.Fatalf("expected a refused loopback connection, got %v (Handle: %v)", refused, err)
+			}
 			if tc.committed {
 				if !errors.Is(err, http.ErrAbortHandler) {
 					t.Fatalf("committed response: got %v, want http.ErrAbortHandler", err)
@@ -286,12 +318,13 @@ func TestTransportFailure(t *testing.T) {
 					t.Fatal(err)
 				}
 				equal(t, []int{502}, w.heads)
-				equal(t, `{"type":"error","error":{"type":"api_error","message":"model-gateway shim: upstream https://proxy.invalid failed: connection refused"}}`, w.Body.String())
+				equal(t, `{"type":"error","error":{"type":"api_error","message":`+strconv.Quote("model-gateway shim: upstream "+req.Origin+" failed: "+refused.Error())+`}}`, w.Body.String())
 			}
 			equal(t, 502, r.Status)
 			equal(t, "upstream_error", r.StatusOverride)
-			equal(t, "upstream_error", r.CompactionOutcome)
-			equal(t, true, r.Incomplete)
+			equal(t, true, r.Contacted && r.Stream == nil)
+			equal(t, &outcome.Compaction{Outcome: "upstream_error", ErrorCode: "upstream_http_error", UpstreamStatus: new(502)}, r.Route.Compaction)
+			checkIncomplete(t, capture)
 		})
 	}
 }
@@ -310,14 +343,25 @@ func TestUnbufferedOwnership(t *testing.T) {
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			w, r := handle(t, reply.Request{Provider: tc.provider, AdvertisedModel: tc.model, Compaction: tc.committed, HeadWritten: tc.committed, SentryEnabled: true}, upstream(t, func(w http.ResponseWriter, _ *http.Request) {
+			capture := newCapture()
+			req := reply.Request{Provider: tc.provider, AdvertisedModel: tc.model, Compaction: tc.committed, HeadWritten: tc.committed, SentryEnabled: true, Usage: capture}
+			w := &countedWriter{ResponseRecorder: httptest.NewRecorder()}
+			r, err := reply.Handle(t.Context(), w, req, newProxy(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Retry-After", "2")
 				w.Header().Set("Content-Type", tc.contentType)
 				w.WriteHeader(tc.status)
 				_, _ = io.WriteString(w, tc.body)
-			}).forward)
+			}).forward(req.Body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			equal(t, true, r.Contacted)
+			equal(t, 0, len(w.heads))
 			if r.Stream == nil {
 				t.Fatal("response was consumed instead of handed to the relay")
 			}
+			t.Cleanup(func() { _ = r.Stream.Body.Close() })
+			checkCapture(t, capture, tc.status, 0, map[string]any{"retry_after_ms": float64(2000)})
 			equal(t, 0, w.Body.Len())
 			equal(t, tc.status, r.Stream.StatusCode)
 			b, e := io.ReadAll(r.Stream.Body)

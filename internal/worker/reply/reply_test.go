@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build process
+
 package reply_test
 
 import (
@@ -33,41 +35,104 @@ import (
 	"time"
 
 	gocmp "github.com/google/go-cmp/cmp"
-	"go.uber.org/goleak"
 
-	"github.com/zchee/claude-code-model-gateway/internal/venue"
+	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
+	"github.com/zchee/claude-code-model-gateway/internal/usage"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/reply"
+	"github.com/zchee/claude-code-model-gateway/internal/worker/upstream"
 )
 
-func TestMain(m *testing.M) { venue.Require(); goleak.VerifyTestMain(m) }
+var _ reply.UsageCapture = (*usage.Capture)(nil)
 
-func equal[T any](t *testing.T, want, got T) {
+func newCapture() *usage.Capture {
+	return usage.NewCapture(usage.NewBuilder(usage.Options{Now: time.Now}), usage.Request{}, 0, nil)
+}
+
+func checkCapture(t *testing.T, c *usage.Capture, status, size int, fields map[string]any) {
 	t.Helper()
-	if diff := gocmp.Diff(want, got); diff != "" {
-		t.Errorf("(-want +got):\n%s", diff)
-	}
-}
-
-type proxyFixture struct{ *httptest.Server }
-
-func (p proxyFixture) forward(ctx context.Context) (*http.Response, error) {
-	r, err := http.NewRequestWithContext(ctx, http.MethodPost, p.URL+"/v1/messages", nil)
+	// A success without token measurements would not produce an inspectable record.
+	// Supply one measurement without adding bytes or changing the response identity.
+	event, err := jsonx.DecodeWire([]byte(`{"type":"message_delta","usage":{"cache_creation_input_tokens":1}}`))
 	if err != nil {
-		return nil, err
+		t.Fatal(err)
 	}
-	return p.Client().Do(r)
+	c.ObserveEvent(event)
+	r := c.Finish()
+	if r == nil {
+		t.Fatal("usage record missing")
+	}
+	equal[any](t, status, r.Attributes["status_code"])
+	equal[any](t, int64(size), r.Attributes["response_body_bytes"])
+	for key, want := range fields {
+		if diff := gocmp.Diff(want, r.Attributes[key]); diff != "" {
+			t.Errorf("%s (-want +got): %s", key, diff)
+		}
+	}
 }
 
-func upstream(t *testing.T, serve http.HandlerFunc) proxyFixture {
+func checkIncomplete(t *testing.T, c *usage.Capture) {
+	t.Helper()
+	// Incompleteness suppresses success records, not limit signals. Give this capture
+	// otherwise exportable inputs without touching its completeness flag.
+	c.SetResponse(200, nil)
+	c.ObserveJSON([]byte(`{"usage":{"output_tokens":1}}`))
+	if c.Finish() != nil {
+		t.Error("incomplete response emitted a success record")
+	}
+}
+
+type proxyFixture struct {
+	server *httptest.Server
+	client *upstream.Client
+	t      *testing.T
+}
+
+type observedBody struct {
+	io.ReadCloser
+	closes atomic.Int32
+}
+
+func (b *observedBody) Close() error {
+	b.closes.Add(1)
+	return b.ReadCloser.Close()
+}
+
+func (p proxyFixture) forward(body []byte) upstream.Send {
+	req := upstream.Request{Target: upstream.TargetProxy, BaseURL: p.server.URL, Method: http.MethodPost, RequestURI: "/v1/messages", Body: body}
+	var previous *observedBody
+	return func(context.Context) (*upstream.Response, error) {
+		if previous != nil && previous.closes.Load() != 1 {
+			p.t.Error("previous upstream body not closed before retry")
+		}
+		res, err := p.client.Do(p.t.Context(), req)
+		if err == nil {
+			b := &observedBody{ReadCloser: res.Body}
+			res.Body = b
+			previous = b
+			p.t.Cleanup(func() {
+				if got := b.closes.Load(); got != 1 {
+					p.t.Errorf("upstream body closed %d times, want once", got)
+					_ = b.ReadCloser.Close()
+				}
+			})
+		}
+		return res, err
+	}
+}
+
+func newProxy(t *testing.T, serve http.HandlerFunc) proxyFixture {
 	t.Helper()
 	server := httptest.NewServer(serve)
 	t.Cleanup(server.Close)
-	return proxyFixture{server}
+	client := upstream.NewClient(upstream.Options{})
+	t.Cleanup(func() { _ = client.Close() })
+	return proxyFixture{server, client, t}
 }
 
 func answer(t *testing.T, code int, body string) proxyFixture {
 	t.Helper()
-	return upstream(t, func(w http.ResponseWriter, _ *http.Request) {
+	return newProxy(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "2")
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("X-Upstream-Test", "kept")
 		w.WriteHeader(code)
@@ -75,16 +140,18 @@ func answer(t *testing.T, code int, body string) proxyFixture {
 	})
 }
 
-func handle(t *testing.T, req reply.Request, forward func(context.Context) (*http.Response, error)) (*httptest.ResponseRecorder, reply.Result) {
+func handle(t *testing.T, req reply.Request, fixture proxyFixture) (*httptest.ResponseRecorder, reply.Result) {
 	t.Helper()
 	w := httptest.NewRecorder()
-	result, err := reply.Handle(t.Context(), w, req, forward)
+	result, err := reply.Handle(t.Context(), w, req, fixture.forward(req.Body))
 	if err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
 	if result.Stream != nil {
-		t.Cleanup(func() { _ = result.Stream.Body.Close() })
+		_ = result.Stream.Body.Close()
+		t.Fatal("terminal response transferred a stream")
 	}
+	equal(t, true, result.Contacted)
 	return w, result
 }
 
@@ -106,7 +173,7 @@ func TestCodexAuthFailure(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			body := fmt.Appendf(nil, `{"stream":%t}`, tc.stream)
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			server := newProxy(t, func(w http.ResponseWriter, r *http.Request) {
 				attempts.Add(1)
 				b, e := io.ReadAll(r.Body)
 				if e != nil {
@@ -116,15 +183,8 @@ func TestCodexAuthFailure(t *testing.T) {
 				w.Header().Set("Content-Type", "text/plain")
 				w.WriteHeader(tc.status)
 				_, _ = io.WriteString(w, detail)
-			}))
-			t.Cleanup(server.Close)
-			w, _ := handle(t, reply.Request{Provider: "codex", AdvertisedModel: "claude-gpt-5.6-sol", Body: body, CommandPath: stable}, func(ctx context.Context) (*http.Response, error) {
-				r, e := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/v1/messages", strings.NewReader(string(body)))
-				if e != nil {
-					return nil, e
-				}
-				return server.Client().Do(r)
 			})
+			w, _ := handle(t, reply.Request{Provider: "codex", AdvertisedModel: "claude-gpt-5.6-sol", Body: body, CommandPath: stable}, server)
 			equal(t, tc.status, w.Code)
 			equal(t, "application/json", w.Header().Get("Content-Type"))
 			equal(t, strconv.Itoa(w.Body.Len()), w.Header().Get("Content-Length"))
@@ -157,19 +217,26 @@ func TestCodexAuthFailure(t *testing.T) {
 	equal(t, int32(3), attempts.Load())
 }
 
-func TestOpenAIRejectionEvidence(t *testing.T) {
-	tests := map[string]struct {
-		status  int
-		headers http.Header
-		body    string
-		want    bool
-	}{
-		"header": {403, http.Header{"X-Openai-Request-Id": {"req_1"}}, "", true}, "body": {429, nil, "OpenAI rejected this request", true}, "unattributed": {403, nil, "forbidden", false}, "server_error": {500, http.Header{"X-Openai-Request-Id": {"req_1"}}, "", false}, "word_boundary": {401, nil, "notopenai", false}, "processing_header": {401, http.Header{"OPENAI-PROCESSING-MS": {""}}, "", true},
+// Keep the real transport and its idle-connection timers outside the retry's virtual clock.
+func outsideClock(t *testing.T, send upstream.Send) upstream.Send {
+	t.Helper()
+	type result struct {
+		response *upstream.Response
+		err      error
 	}
-	for name, tc := range tests {
-		t.Run(name, func(t *testing.T) {
-			equal(t, tc.want, reply.HasOpenAIRejectionEvidence(tc.status, tc.headers, []byte(tc.body)))
-		})
+	call, returned, stopped := make(chan struct{}), make(chan result), make(chan struct{})
+	go func() {
+		defer close(stopped)
+		for range call {
+			r, err := send(t.Context())
+			returned <- result{r, err}
+		}
+	}()
+	t.Cleanup(func() { close(call); <-stopped })
+	return func(context.Context) (*upstream.Response, error) {
+		call <- struct{}{}
+		r := <-returned
+		return r.response, r.err
 	}
 }
 
@@ -192,33 +259,51 @@ func TestUpgradeRetry(t *testing.T) {
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
+			const recovered = `{"model":"gpt-test"}`
+			capture := newCapture()
+			req := reply.Request{Provider: tc.provider, AdvertisedModel: "public", Body: []byte(`{}`), Retries: tc.retries, RetryDelay: tc.delay, Usage: capture}
+			var attempts atomic.Int32
+			fixture := newProxy(t, func(w http.ResponseWriter, _ *http.Request) {
+				n := attempts.Add(1)
+				w.Header().Set("X-Attempt", "kept")
+				w.Header().Set("Retry-After", "2")
+				w.Header().Set("Transfer-Encoding", "chunked")
+				w.Header().Set("Connection", "keep-alive")
+				w.Header().Set("Keep-Alive", "timeout=5")
+				if tc.recover && n == 3 {
+					_, _ = io.WriteString(w, recovered)
+				} else {
+					w.WriteHeader(403)
+					_, _ = io.WriteString(w, rejection)
+				}
+			})
+			send := outsideClock(t, fixture.forward(req.Body))
 			synctest.Test(t, func(t *testing.T) {
 				start := time.Now()
 				var calls []time.Duration
-				w, res := handle(t, reply.Request{Provider: tc.provider, AdvertisedModel: "public", Body: []byte(`{}`), Retries: tc.retries, RetryDelay: tc.delay}, func(context.Context) (*http.Response, error) {
+				w := httptest.NewRecorder()
+				res, err := reply.Handle(t.Context(), w, req, func(ctx context.Context) (*upstream.Response, error) {
 					calls = append(calls, time.Since(start))
 					if len(calls) > len(tc.wantCodes) {
 						return nil, errors.New("unexpected extra attempt")
 					}
-					r := httptest.NewRecorder()
-					r.Header().Set("X-Attempt", "kept")
-					r.Header().Set("Transfer-Encoding", "chunked")
-					r.Header().Set("Connection", "keep-alive")
-					r.Header().Set("Keep-Alive", "timeout=5")
-					if tc.recover && len(calls) == 3 {
-						r.WriteHeader(200)
-						_, _ = io.WriteString(r, `{"model":"gpt-test"}`)
-					} else {
-						r.WriteHeader(403)
-						_, _ = io.WriteString(r, rejection)
-					}
-					return r.Result(), nil
+					return send(ctx)
 				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				equal(t, true, res.Contacted)
+				equal(t, true, res.Stream == nil)
+				equal(t, len(tc.wantCodes), int(attempts.Load()))
 				equal(t, tc.wantCodes, calls)
 				equal(t, tc.status, w.Code)
 				equal(t, tc.want, w.Body.String())
 				equal(t, "kept", w.Header().Get("X-Attempt"))
-				equal(t, tc.status, res.CaptureStatus)
+				bytes := len(calls) * len(rejection)
+				if tc.recover {
+					bytes += len(recovered) - len(rejection)
+				}
+				checkCapture(t, capture, tc.status, bytes, map[string]any{"retry_after_ms": float64(2000)})
 				if tc.status == 503 {
 					equal(t, 503, res.Status)
 					equal(t, "upstream_error", res.StatusOverride)
@@ -233,20 +318,22 @@ func TestUpgradeRetry(t *testing.T) {
 		})
 	}
 	t.Run("error: disconnect during retry delay", func(t *testing.T) {
+		req := reply.Request{Provider: "codex", Body: []byte(`{}`)}
+		var attempts atomic.Int32
+		fixture := newProxy(t, func(w http.ResponseWriter, _ *http.Request) {
+			attempts.Add(1)
+			w.WriteHeader(403)
+			_, _ = io.WriteString(w, rejection)
+		})
+		send := outsideClock(t, fixture.forward(req.Body))
 		synctest.Test(t, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
-			var attempts int
+			var result reply.Result
 			done := make(chan struct{})
 			go func() {
 				defer close(done)
-				_, _ = reply.Handle(ctx, httptest.NewRecorder(), reply.Request{Provider: "codex", Body: []byte(`{}`)}, func(context.Context) (*http.Response, error) {
-					attempts++
-					r := httptest.NewRecorder()
-					r.WriteHeader(403)
-					_, _ = io.WriteString(r, rejection)
-					return r.Result(), nil
-				})
+				result, _ = reply.Handle(ctx, httptest.NewRecorder(), req, send)
 			}()
 			synctest.Wait()
 			select {
@@ -254,10 +341,12 @@ func TestUpgradeRetry(t *testing.T) {
 				t.Fatal("Handle returned before waiting to retry")
 			default:
 			}
-			equal(t, 1, attempts)
+			equal(t, 1, int(attempts.Load()))
 			cancel()
 			<-done
-			equal(t, 1, attempts)
+			equal(t, 1, int(attempts.Load()))
+			equal(t, true, result.Cancelled)
+			equal(t, true, result.Contacted)
 		})
 	})
 }

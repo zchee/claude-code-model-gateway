@@ -17,14 +17,23 @@ package reply
 
 import (
 	"context"
-	"encoding/json/jsontext"
 	"errors"
 	"net/http"
 	"time"
 
 	"github.com/zchee/claude-code-model-gateway/internal/upstreamstate"
+	"github.com/zchee/claude-code-model-gateway/internal/worker/outcome"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/sentry"
+	"github.com/zchee/claude-code-model-gateway/internal/worker/upstream"
 )
+
+// UsageCapture observes buffered responses and the headers of streams passed to the relay.
+type UsageCapture interface {
+	SetResponse(int, http.Header)
+	NoteResponseBytes(int64)
+	ObserveJSON([]byte)
+	SetResponseComplete(bool)
+}
 
 // Request describes one forwarded inference turn. Body contains the serialized upstream request.
 // SentryEnabled controls refusal normalization and learning separately from usage observation.
@@ -41,25 +50,29 @@ type Request struct {
 	Retries                                                               *int
 	RetryDelay                                                            *time.Duration
 	NewMessageID                                                          func() string
-	ObserveJSON                                                           func([]byte)
+	Usage                                                                 UsageCapture
 }
 
-// Result contains the upstream stream for an unhandled reply, or the route and capture outcomes
-// for a buffered reply. A stream's recipient owns its body. Overflow contains diagnostics only.
+// Result carries terminal facts, or an unsettled response whose open body belongs to the caller.
 type Result struct {
-	Stream                            *http.Response
-	Status, CaptureStatus             int
-	CaptureHeaders                    http.Header
-	ResponseBytes                     int64
-	StatusOverride, CompactionOutcome string
-	Incomplete                        bool
-	Overflow                          jsontext.Value
+	outcome.Result
+	Stream *upstream.Response
 }
 
 // Handle calls forward for each attempt, closes buffered bodies and writes one client response.
 // It returns an untouched open response for the stream relay, or an error wrapping http.ErrAbortHandler when the client connection must abort.
-func Handle(ctx context.Context, w http.ResponseWriter, req Request, forward func(context.Context) (*http.Response, error)) (Result, error) {
+func Handle(ctx context.Context, w http.ResponseWriter, req Request, forward upstream.Send) (Result, error) {
 	return Result{}, errors.New("not implemented")
+}
+
+// WriteSentry reports a local refusal using the original request bytes and the provider's display label.
+func WriteSentry(w http.ResponseWriter, original []byte, provider string, cross sentry.Crossing) (outcome.Result, error) {
+	return outcome.Result{}, errors.New("not implemented")
+}
+
+// WriteEngineOverflow normalizes an upstream refusal using the prepared request and source HTTP status.
+func WriteEngineOverflow(w http.ResponseWriter, req Request, status int, counts sentry.Counts) (outcome.Result, error) {
+	return outcome.Result{}, errors.New("not implemented")
 }
 
 // HasOpenAIRejectionEvidence reports whether an eligible HTTP rejection identifies OpenAI.
