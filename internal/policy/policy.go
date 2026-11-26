@@ -133,7 +133,14 @@ func replaceFirst(s, match, replacement string) string {
 
 // Resolve returns the model's uncapped policy, or nil for an unrecognized spelling.
 func (r Resolver) Resolve(id string) *Model {
-	backend := r.BackendID(id)
+	return r.resolveBackend(r.BackendID(id), strings.HasPrefix(id, "claude-") && !strings.HasPrefix(id, "claude-codex-"))
+}
+
+// ResolveBackend returns a fresh policy for an already resolved backend ID. Use it instead of
+// Resolve for stored backend keys: it never strips picker decorations or follows advertised aliases.
+func (r Resolver) ResolveBackend(id string) *Model { return r.resolveBackend(id, false) }
+
+func (r Resolver) resolveBackend(backend string, nativeFallback bool) *Model {
 	base := baseID(backend)
 	var m Model
 	if base != "default" {
@@ -150,7 +157,7 @@ func (r Resolver) Resolve(id string) *Model {
 			m = modelRows[0]
 		case provider != "":
 			m = r.providerPolicy(provider, backend)
-		case strings.HasPrefix(id, "claude-") && !strings.HasPrefix(id, "claude-codex-"):
+		case nativeFallback:
 			m = modelRows[len(modelRows)-1]
 		default:
 			return nil

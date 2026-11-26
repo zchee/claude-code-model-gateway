@@ -25,8 +25,8 @@ import (
 // fixedWindow supplies one immutable policy row at a scale where strict boundaries are easy to check.
 type fixedWindow int64
 
-func (w fixedWindow) Resolve(id string) *policy.Model {
-	if id != "claude-gpt-5.6-sol[1m]" {
+func (w fixedWindow) ResolveBackend(id string) *policy.Model {
+	if id != "gpt-5.6-sol" {
 		return nil
 	}
 	return &policy.Model{Backend: "codex", BackendWindow: int64(w), CompactHeadroom: 10, Sentry: "synthetic-413"}

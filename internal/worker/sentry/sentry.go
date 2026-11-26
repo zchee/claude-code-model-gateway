@@ -120,13 +120,14 @@ type modelState struct {
 	policy.Sentry
 	ceiling  float64
 	headroom int64
+	dormant  bool // No current guard; retain the last guarded window and its learned ceiling.
 }
 
 // ModelResolver is an immutable, in-memory policy snapshot such as policy.Resolver.
-// Resolve must not perform I/O or call back into State. A missing row or one with an
-// unusable backend window has no sentry policy.
+// ResolveBackend takes an exact backend ID and must not perform I/O or call back into State.
+// A missing row or one with an unusable backend window has no sentry policy.
 type ModelResolver interface {
-	Resolve(id string) *policy.Model
+	ResolveBackend(id string) *policy.Model
 }
 
 type publication struct {
@@ -140,9 +141,7 @@ func (p *publication) model(key string, old *modelState) *modelState {
 	if p.resolver == nil {
 		return nil
 	}
-	// Key is already the backend identity. Supply the outer picker decorations
-	// so the resolver does not strip a literal prefix or suffix belonging to it.
-	row := p.resolver.Resolve("claude-" + key + "[1m]")
+	row := p.resolver.ResolveBackend(key)
 	if row == nil {
 		return nil
 	}
@@ -188,7 +187,7 @@ func (s *State) Publish(generation uint64, resolver ModelResolver, windows polic
 		if m := s.current.model(key, old); m != nil {
 			s.models[key] = m
 		} else {
-			delete(s.models, key)
+			old.dormant = true
 		}
 	}
 }
@@ -198,6 +197,9 @@ func (s *State) model(t Target, admission bool) *modelState {
 	m := s.models[t.Key]
 	if s.current != nil {
 		if m != nil {
+			if m.dormant {
+				return nil
+			}
 			return m
 		}
 		m = s.current.model(t.Key, nil)
