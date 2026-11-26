@@ -290,11 +290,9 @@ func (in Inputs) PinEnv() []Entry {
 
 func description(id string) string { return DisplayName(id) + " · current Fable, through the gateway" }
 
-// EnvBlock returns the complete settings block using the injected default gateway URL.
-func (in Inputs) EnvBlock(mode, defaultURL string) []Entry {
-	if mode == "compat" {
-		defaultURL = "http://api.anthropic.com"
-	}
+// EnvBlock returns the complete settings block using the injected default gateway URL. The port has no
+// remote-control compatibility listener, so every mode, the retired "compat" included, writes that URL.
+func (in Inputs) EnvBlock(_, defaultURL string) []Entry {
 	return append([]Entry{
 		{"ANTHROPIC_BASE_URL", defaultURL},
 		{"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "1"},

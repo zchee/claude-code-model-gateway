@@ -91,12 +91,12 @@ func TestExplicitAndAutomaticSettingsChanges(t *testing.T) {
 		equal(t, 0, len(r.Changed))
 		equal(t, before, text(t, f.local))
 	})
-	t.Run("success: user write honors migrated project mode", func(t *testing.T) {
+	t.Run("success: user write replaces a migrated legacy URL", func(t *testing.T) {
 		f := sandbox(t)
 		putEnv(t, f.shared, gatewaySettings(compat))
 		check(t, f.WriteEnv("user", "default", false))
-		equal(t, compat, envAt(t, f.user)[base])
-		equal(t, compat, envAt(t, f.local)[base])
+		equal(t, direct, envAt(t, f.user)[base])
+		equal(t, direct, envAt(t, f.local)[base])
 		equal(t, map[string]any(nil), envAt(t, f.shared))
 	})
 }
@@ -149,12 +149,14 @@ func TestPartialCompatHealth(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			f := sandbox(t)
 			putEnv(t, f.local, map[string]any{base: compat})
-			want := wiring.ModeResult{Mode: "default", Compat: tt.health, Changed: true}
+			before := text(t, f.local)
+			// Mode synchronization never switches endpoints: a legacy URL is reported and left as written.
+			want := wiring.ModeResult{Mode: "compat", Compat: tt.health}
 			observation := tt.health
 			r, err := f.SyncMode(&observation, "")
 			check(t, err)
 			equal(t, want, r)
-			equal(t, direct, envAt(t, f.local)[base])
+			equal(t, before, text(t, f.local))
 		})
 	}
 }

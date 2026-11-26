@@ -26,7 +26,10 @@ type Settings struct {
 	EnabledPlugins map[string]any
 }
 
-// Policy returns unwired, disabled or recover using settings in decreasing precedence order.
+// Policy returns unwired, disabled, legacy or recover using settings in decreasing precedence order.
+// Legacy means the effective base URL is the retired remote-control compatibility URL: the gateway owns it, but
+// the port has no listener that serves it, so a healthy gateway is no evidence that such a session can reach
+// it, and recovery does not apply.
 func Policy(lookup config.LookupEnv, settings []Settings, pluginID string) string {
 	// The launcher compares the raw port spelling, with no numeric conversion (lib/recovery-policy.js:29).
 	endpoint, ok := recoveryEndpoint(lookup, settings)
@@ -35,6 +38,9 @@ func Policy(lookup config.LookupEnv, settings []Settings, pluginID string) strin
 	}
 	if enabled, ok := pluginEnabled(settings, pluginID); ok && !enabled {
 		return "disabled"
+	}
+	if endpoint == compatBaseURL {
+		return "legacy"
 	}
 	return "recover"
 }

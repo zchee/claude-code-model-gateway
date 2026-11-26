@@ -37,7 +37,7 @@ func TestAuthoredWriterBytes(t *testing.T) {
 		before, want string
 		run          func(*testing.T, fixture)
 	}{
-		"success: write environment": {`"ANTHROPIC_BASE_URL" : "` + direct + `", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY":"1", "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK":"1", "ENABLE_TOOL_SEARCH":"true", "CLAUDE_CODE_MAX_OUTPUT_TOKENS":"64000", ` + userPair, `"ANTHROPIC_BASE_URL" : "` + compat + `", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY":"1", "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK":"1", "ENABLE_TOOL_SEARCH":"true", "CLAUDE_CODE_MAX_OUTPUT_TOKENS":"64000", ` + userPair, func(t *testing.T, f fixture) { check(t, f.WriteEnv("project", "compat", false)) }},
+		"success: write environment": {`"ANTHROPIC_BASE_URL" : "` + compat + `", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY":"1", "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK":"1", "ENABLE_TOOL_SEARCH":"true", "CLAUDE_CODE_MAX_OUTPUT_TOKENS":"64000", ` + userPair, `"ANTHROPIC_BASE_URL" : "` + direct + `", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY":"1", "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK":"1", "ENABLE_TOOL_SEARCH":"true", "CLAUDE_CODE_MAX_OUTPUT_TOKENS":"64000", ` + userPair, func(t *testing.T, f fixture) { check(t, f.WriteEnv("project", "default", false)) }},
 		"success: sync pins": {`"ANTHROPIC_BASE_URL" : "` + direct + `", "ANTHROPIC_DEFAULT_OPUS_MODEL":"old", ` + userPair, `"ANTHROPIC_BASE_URL" : "` + direct + `", "ANTHROPIC_DEFAULT_OPUS_MODEL":"new", ` + userPair, func(t *testing.T, f fixture) {
 			f.Pins = wiring.Pins{Current: []wiring.Entry{{Key: opus, Value: "new"}}, Owned: map[string][]string{opus: {"old", "new"}}}
 			put(t, f.registry, encoded(t, map[string]any{"projects": []string{f.Project}}))

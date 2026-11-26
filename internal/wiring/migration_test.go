@@ -86,23 +86,19 @@ func TestLegacyMigration(t *testing.T) {
 }
 
 func TestVerifiedMode(t *testing.T) {
-	healthy := wiring.Health{HostsDetected: true, Port80Bound: true, HostsLine: "127.0.0.1 api.anthropic.com"}
 	tests := map[string]struct {
-		from, to, required string
-		health             *wiring.Health
-		ignore             bool
+		local  map[string]any
+		ignore bool
 	}{
-		"success: verified compat":  {direct, compat, "compat", &healthy, false},
-		"success: verified default": {compat, direct, "", &wiring.Health{}, false},
-		"error: write not observed": {direct, compat, "compat", &healthy, true},
+		"success: explicit write replaces a migrated legacy URL": {local: map[string]any{"PROJECT_LOCAL_VALUE": "keep-me"}},
+		"success: explicit write replaces a local legacy URL":    {local: map[string]any{base: compat, "PROJECT_LOCAL_VALUE": "keep-me"}},
+		"error: write not observed":                              {local: map[string]any{base: compat, "PROJECT_LOCAL_VALUE": "keep-me"}, ignore: true},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			f := sandbox(t)
-			putEnv(t, f.shared, gatewaySettings(tt.from))
-			if tt.to == direct {
-				putEnv(t, f.local, map[string]any{"PROJECT_LOCAL_VALUE": "keep-me"})
-			}
+			putEnv(t, f.shared, gatewaySettings(compat))
+			putEnv(t, f.local, tt.local)
 			if tt.ignore {
 				f.Replace = func(file string, edit func([]byte) ([]byte, error)) error {
 					if file != f.local && file != f.shared && file != f.user {
@@ -110,32 +106,27 @@ func TestVerifiedMode(t *testing.T) {
 					}
 					return atomicfile.ReplaceSettings(file, func(old []byte) ([]byte, error) {
 						next, err := edit(old)
-						if err == nil && file == f.local && bytes.Contains(next, []byte(compat)) {
+						if err == nil && file == f.local && bytes.Contains(next, []byte(direct)) {
 							return old, nil
 						}
 						return next, err
 					})
 				}
 			}
-			observations := *tt.health
-			got, err := f.SyncMode(&observations, tt.required)
+			err := f.WriteEnv("project", "default", false)
 			if tt.ignore {
 				if err == nil || !strings.Contains(err.Error(), "Could not verify gateway settings") {
 					t.Fatalf("expected verification failure, got %v", err)
 				}
-				equal(t, direct, envAt(t, f.local)[base])
+				equal(t, compat, envAt(t, f.local)[base])
 			} else {
 				check(t, err)
-				wantMode := "compat"
-				if tt.to == direct {
-					wantMode = "default"
-				}
-				equal(t, wiring.ModeResult{Mode: wantMode, Changed: true, Compat: *tt.health}, got)
-				equal(t, tt.to, envAt(t, f.local)[base])
-				if tt.to == direct {
-					equal(t, "keep-me", envAt(t, f.local)["PROJECT_LOCAL_VALUE"])
-				}
+				equal(t, direct, envAt(t, f.local)[base])
+				mode, err := f.WiredMode()
+				check(t, err)
+				equal(t, &wiring.Wiring{Scope: "project", Mode: "default", Source: "project-local", File: f.local}, mode)
 			}
+			equal(t, "keep-me", envAt(t, f.local)["PROJECT_LOCAL_VALUE"])
 			_, present := object(t, text(t, f.shared))["env"]
 			equal(t, false, present)
 		})
@@ -146,9 +137,10 @@ func TestUnknownHealth(t *testing.T) {
 	f := sandbox(t)
 	putEnv(t, f.shared, gatewaySettings(direct))
 	before := text(t, f.shared)
-	got, err := f.SyncMode(nil, "compat")
-	check(t, err)
-	equal(t, wiring.ModeResult{Mode: "default"}, got)
+	// The compatibility mode cannot be required: the port has no listener for it.
+	if _, err := f.SyncMode(nil, "compat"); err == nil {
+		t.Fatal("compat requirement accepted")
+	}
 	equal(t, before, text(t, f.shared))
 	absent(t, f.local)
 }
@@ -164,7 +156,7 @@ func TestEnvironmentOnlyMode(t *testing.T) {
 			f.env[base] = tt.url
 			health := wiring.Health{HostsDetected: true, Port80Bound: true}
 			want := wiring.ModeResult{Mode: tt.mode, Compat: health}
-			got, err := f.SyncMode(&health, "compat")
+			got, err := f.SyncMode(&health, "")
 			check(t, err)
 			equal(t, want, got)
 			absent(t, f.local)

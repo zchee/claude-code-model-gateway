@@ -291,13 +291,11 @@ func (s Store) expectedPins() []Entry {
 }
 
 // EnvBlock returns the static and pin entries for the selected transport.
-func (s Store) EnvBlock(mode string) []Entry {
-	url := s.defaultBaseURL()
-	if mode == "compat" {
-		url = compatBaseURL
-	}
+// Every mode selects the gateway's own URL: the compatibility URL is recognized as owned but never written,
+// because the port has no listener that could serve it.
+func (s Store) EnvBlock(string) []Entry {
 	static := staticBlock()
-	out := append([]Entry{{baseURLKey, url}}, static[:]...)
+	out := append([]Entry{{baseURLKey, s.defaultBaseURL()}}, static[:]...)
 	return append(out, s.expectedPins()...)
 }
 
@@ -417,9 +415,13 @@ func assignEnv(doc *document, file string, block []Entry) error {
 }
 
 // WriteEnv writes or removes gateway-owned settings in the specified scope and verifies the result.
+// An explicit write replaces the retired compatibility URL with the gateway URL; requesting the "compat" mode
+// for a write is an error, because the port cannot serve that URL.
 func (s Store) WriteEnv(scope, mode string, remove bool) error {
-	_, err := s.writeEnv(scope, mode, remove)
-	return err
+	if !remove && mode == "compat" {
+		return errors.New("the remote-control compatibility mode is not supported; wire the default gateway URL")
+	}
+	return s.writeEnv(scope, remove)
 }
 
 func (s Store) recordIfProject(scope string) error {
@@ -429,35 +431,32 @@ func (s Store) recordIfProject(scope string) error {
 	return nil
 }
 
-// writeEnv follows lib/commands.js:1177-1218 and returns the verified mode. Publishing the stable launcher, which
-// the source does here, belongs to installation.
-func (s Store) writeEnv(scope, mode string, removeAll bool) (string, error) {
-	effective := mode
+// writeEnv follows lib/commands.js:1177-1218 for the default mode only. Publishing the stable launcher, which the
+// source does here, belongs to installation.
+func (s Store) writeEnv(scope string, removeAll bool) error {
 	if !removeAll {
 		// A committed project settings.json with gateway keys outranks the user file, so migrate it even for a
-		// user-scope write.
-		m, err := s.migrateLegacy()
-		if err != nil {
-			return "", err
+		// user-scope write. This write is explicit, so a migrated compatibility URL becomes the gateway URL.
+		if _, err := s.migrateLegacy(true); err != nil {
+			return err
 		}
-		effective = cmp.Or(m.mode, mode)
 	}
 	file, err := s.settingsPath(scope)
 	if err != nil {
-		return "", err
+		return err
 	}
 	if removeAll && !exists(file) {
-		return "", s.recordIfProject(scope)
+		return s.recordIfProject(scope)
 	}
 	current, err := readSettingsForWrite(file)
 	if err != nil {
-		return "", err
+		return err
 	}
 	forms, err := s.hookForms()
 	if err != nil {
-		return "", err
+		return err
 	}
-	block := s.EnvBlock(effective)
+	block := s.EnvBlock("default")
 	var final document
 	change := func(doc *document) error {
 		edits, err := forms.sync(doc.root, !removeAll)
@@ -481,21 +480,21 @@ func (s Store) writeEnv(scope, mode string, removeAll bool) (string, error) {
 	if removeAll {
 		probe := current
 		if err := change(&probe); err != nil {
-			return "", err
+			return err
 		}
 		if bytes.Equal(probe.data, current.data) {
-			return "", s.recordIfProject(scope)
+			return s.recordIfProject(scope)
 		}
 	} else if cache, err := s.Paths.DiscoveryCachePath(); err == nil {
 		// Advisory, as in the source: a cache that cannot be cleaned never fails the write.
 		_, _ = s.CleanModelCache(cache, nil)
 	}
 	if _, err := s.writeSettings(file, change); err != nil {
-		return "", err
+		return err
 	}
 	verified, err := readSettingsForWrite(file)
 	if err != nil {
-		return "", err
+		return err
 	}
 	got, gotOK := verified.envValue(baseURLKey)
 	want, wantOK := text(block[0].Value), true
@@ -503,97 +502,92 @@ func (s Store) writeEnv(scope, mode string, removeAll bool) (string, error) {
 		want, wantOK = final.envValue(baseURLKey)
 	}
 	if !strictEqual(got, gotOK, want, wantOK) {
-		return "", fmt.Errorf("Could not verify gateway settings in %s", file) //nolint:staticcheck // The message is the source's user-facing wording.
+		return fmt.Errorf("Could not verify gateway settings in %s", file) //nolint:staticcheck // The message is the source's user-facing wording.
 	}
-	verifiedMode := "default"
-	if gotOK && isString(got, compatBaseURL) {
-		verifiedMode = "compat"
-	}
-	return verifiedMode, s.recordIfProject(scope)
+	return s.recordIfProject(scope)
 }
 
 // SyncMode migrates eligible settings and verifies a mode change against the supplied health observations.
+// The port has no remote-control compatibility listener, so it never switches a project between the gateway URL
+// and the compatibility URL (the source's lib/commands.js:1226-1253): it runs the automatic legacy migration and
+// reports the observed mode unchanged. Requiring the "compat" mode is an error.
 func (s Store) SyncMode(health *Health, required string) (ModeResult, error) {
 	var compat Health
-	desired := "default"
 	if health != nil {
 		compat = *health
-		if compat.HostsDetected && compat.Port80Bound {
-			desired = "compat"
-		}
 	}
-	if required != "" && desired != required {
-		return ModeResult{Mode: desired, Compat: compat}, nil
+	if required == "compat" {
+		return ModeResult{}, errors.New("the remote-control compatibility mode is not supported")
 	}
-	if _, err := s.migrateLegacy(); err != nil {
+	if _, err := s.migrateLegacy(false); err != nil {
 		return ModeResult{}, err
 	}
 	current, err := s.WiredMode()
 	if err != nil {
 		return ModeResult{}, err
 	}
-	// An unwired project is written in the default scope; a definition only the environment holds has no
-	// writable scope (lib/commands.js:1226-1235).
-	scope, observed := "project", "default"
+	observed := "default"
 	if current != nil {
-		scope, observed = current.Scope, current.Mode
+		observed = current.Mode
 	}
-	if scope == "" || desired == observed {
-		return ModeResult{Mode: observed, Compat: compat}, nil
-	}
-	mode, err := s.writeEnv(scope, desired, false)
-	if err != nil {
-		return ModeResult{}, err
-	}
-	return ModeResult{Mode: mode, Compat: compat, Changed: true}, nil
-}
-
-type migration struct {
-	migrated bool
-	mode     string
+	return ModeResult{Mode: observed, Compat: compat}, nil
 }
 
 // MigrateLegacy moves only gateway-owned entries from shared project settings to local settings.
+// It is the automatic migration: shared settings wired to the compatibility URL are left untouched.
 func (s Store) MigrateLegacy() (bool, error) {
-	m, err := s.migrateLegacy()
-	return m.migrated, err
+	return s.migrateLegacy(false)
 }
 
 // migrateLegacy follows lib/settings-wiring.js:361-402. It refuses when the shared project file is, lexically or
-// after resolving links, the user file, or when that identity cannot be decided.
-func (s Store) migrateLegacy() (migration, error) {
+// after resolving links, the user file, or when that identity cannot be decided. A shared file wired to the
+// compatibility URL moves only in an explicit write, which copies the gateway URL in its place.
+func (s Store) migrateLegacy(explicit bool) (bool, error) {
 	legacyFile, err := s.settingsPath("legacy-project")
 	if err != nil {
-		return migration{}, err
+		return false, err
 	}
 	userFile, err := s.settingsPath("user")
 	if err != nil {
-		return migration{}, err
+		return false, err
 	}
 	if !exists(legacyFile) || filepath.Clean(legacyFile) == filepath.Clean(userFile) {
-		return migration{}, nil
+		return false, nil
 	}
 	resolved, err := filepath.EvalSymlinks(legacyFile)
 	if err != nil {
-		return migration{}, nil
+		return false, nil
 	}
 	real, err := filepath.EvalSymlinks(userFile)
 	switch {
 	case err == nil && real == resolved:
-		return migration{}, nil
+		return false, nil
 	case err != nil && !errors.Is(err, fs.ErrNotExist):
 		// A user file whose identity cannot be decided, such as a link loop, may be the same file.
-		return migration{}, nil
+		return false, nil
 	}
 	legacy, err := readSettingsForWrite(legacyFile)
 	if err != nil {
-		return migration{}, err
+		return false, err
 	}
-	if !s.ours(legacy.envValue(baseURLKey)) {
-		return migration{}, nil
+	base, ok := legacy.envValue(baseURLKey)
+	if !s.ours(base, ok) {
+		return false, nil
+	}
+	retired := isString(base, compatBaseURL)
+	if retired && !explicit {
+		return false, nil
 	}
 	env, _ := legacy.env()
 	entries := s.ownedEntries(env)
+	if retired {
+		entries = slices.Clone(entries)
+		for i, m := range entries {
+			if wtf8(m.Name) == baseURLKey {
+				entries[i].Value = text(s.defaultBaseURL())
+			}
+		}
+	}
 	var drop []string
 	for _, m := range entries {
 		drop = append(drop, wtf8(m.Name))
@@ -602,27 +596,21 @@ func (s Store) migrateLegacy() (migration, error) {
 		drop = append(drop, legacyKey)
 	}
 	if len(drop) == 0 {
-		return migration{}, nil
+		return false, nil
 	}
 	if len(entries) > 0 {
 		localFile, err := s.settingsPath("project")
 		if err != nil {
-			return migration{}, err
+			return false, err
 		}
 		if _, err := s.writeSettings(localFile, func(doc *document) error { return copyMissing(doc, localFile, entries) }); err != nil {
-			return migration{}, err
+			return false, err
 		}
 	}
 	if _, err := s.writeSettings(legacyFile, func(doc *document) error { return removeEnvKeys(doc, drop) }); err != nil {
-		return migration{}, err
+		return false, err
 	}
-	m := migration{migrated: true}
-	for _, e := range entries {
-		if wtf8(e.Name) == baseURLKey {
-			m.mode = s.modeFor(wtf8(e.Value.Text))
-		}
-	}
-	return m, nil
+	return true, nil
 }
 
 // copyMissing sets each entry the local env does not already define.
@@ -673,7 +661,7 @@ func removeEnvKeys(doc *document, keys []string) error {
 
 // CleanLegacyEnv migrates legacy wiring and removes the stale compact-window key from gateway settings.
 func (s Store) CleanLegacyEnv() error {
-	if _, err := s.migrateLegacy(); err != nil {
+	if _, err := s.migrateLegacy(false); err != nil {
 		return err
 	}
 	for _, scope := range [...]string{"user", "project"} {

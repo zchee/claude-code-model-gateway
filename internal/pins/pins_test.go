@@ -368,9 +368,9 @@ func TestEmptyFamilyDescription(t *testing.T) {
 
 func TestEnvBlock(t *testing.T) {
 	tests := map[string]struct{ mode, url string }{
-		"success: default":      {"default", "http://127.0.0.1:31234"},
-		"success: compat":       {"compat", "http://api.anthropic.com"},
-		"success: unknown mode": {"other", "http://127.0.0.1:31234"},
+		"success: default": {"default", "http://127.0.0.1:31234"},
+		"success: retired compat mode writes the gateway URL": {"compat", "http://127.0.0.1:31234"},
+		"success: unknown mode":                               {"other", "http://127.0.0.1:31234"},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {

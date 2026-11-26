@@ -17,6 +17,7 @@ package wiring_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/zchee/claude-code-model-gateway/internal/wiring"
@@ -170,4 +171,64 @@ func TestRetireModeConfigKeepsDirectory(t *testing.T) {
 	info, err := os.Stat(dir)
 	check(t, err)
 	equal(t, true, info.IsDir())
+}
+
+func TestCompatModeWriteRefused(t *testing.T) {
+	f := sandbox(t)
+	putEnv(t, f.local, map[string]any{base: direct, "USER_SETTING": "keep-me"})
+	before := text(t, f.local)
+	if err := f.WriteEnv("project", "compat", false); err == nil {
+		t.Fatal("compat write accepted")
+	}
+	equal(t, before, text(t, f.local))
+	// Removal does not depend on the mode, so an unwire that names it still works.
+	check(t, f.WriteEnv("project", "compat", true))
+	equal(t, map[string]any{"USER_SETTING": "keep-me"}, envAt(t, f.local))
+}
+
+func TestAutomaticPathsKeepLegacyURL(t *testing.T) {
+	f := sandbox(t)
+	f.Pins.Current = shippedEntries()
+	// The authored spacing marks the exact bytes of the legacy URL member.
+	const legacy = `"ANTHROPIC_BASE_URL" :  "` + compat + `"`
+	local := "{\r\n\t\"env\" : { " + legacy + `, "USER_SETTING" : "keep-me", "CLAUDE_CODE_AUTO_COMPACT_WINDOW" : "940000" }` + "\r\n}"
+	shared := `{"env":{` + legacy + `,"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY":"1","SHARED":"keep"}}`
+	user := `{ "env" : { ` + legacy + ` } }`
+	put(t, f.local, local)
+	put(t, f.shared, shared)
+	put(t, f.user, user)
+	unchanged := func(t *testing.T) {
+		t.Helper()
+		equal(t, local, text(t, f.local))
+		equal(t, shared, text(t, f.shared))
+		equal(t, user, text(t, f.user))
+	}
+	healthy := wiring.Health{HostsDetected: true, Port80Bound: true}
+	r, err := f.SyncMode(&healthy, "")
+	check(t, err)
+	equal(t, wiring.ModeResult{Mode: "compat", Compat: healthy}, r)
+	_, err = f.SyncMode(nil, "")
+	check(t, err)
+	migrated, err := f.MigrateLegacy()
+	check(t, err)
+	equal(t, false, migrated)
+	check(t, f.CleanLegacyEnv())
+	var reports []string
+	check(t, f.Repair(func(s string) { reports = append(reports, s) }))
+	equal(t, []string{"model-gateway: registered wired project " + f.Project + " for pin sync"}, reports)
+	unchanged(t)
+	// The registry records the legacy wiring it found.
+	got, _, err := f.Projects(true)
+	check(t, err)
+	equal(t, []wiring.Registration{{Project: f.Project, File: f.local, Value: compat}}, got)
+	// Hook and pin refreshes may edit other members of a legacy-wired file, never the URL member.
+	check(t, f.MigrateReadinessHooks())
+	_, err = f.SyncPins()
+	check(t, err)
+	for _, file := range []string{f.local, f.user} {
+		if !strings.Contains(text(t, file), legacy) {
+			t.Fatalf("legacy URL member rewritten in %s:\n%s", file, text(t, file))
+		}
+	}
+	equal(t, shared, text(t, f.shared))
 }

@@ -42,8 +42,8 @@ func TestRecoveryPolicy(t *testing.T) {
 		"success: empty environment overrides file":  {map[string]string{"ANTHROPIC_BASE_URL": ""}, []readiness.Settings{{BaseURL: new(compat)}}, "unwired"},
 		"success: local URL wins":                    {settings: []readiness.Settings{{BaseURL: new("https://example.invalid")}, {BaseURL: new(compat)}}, want: "unwired"},
 		"success: env route and lower file disables": {map[string]string{"ANTHROPIC_BASE_URL": loopback, "CODEX_GATEWAY_PORT": "49123"}, []readiness.Settings{{EnabledPlugins: map[string]any{id: "false"}}, {EnabledPlugins: map[string]any{id: false}}}, "disabled"},
-		"success: explicit enable wins":              {settings: []readiness.Settings{{EnabledPlugins: map[string]any{id: true}}, {BaseURL: new(compat), EnabledPlugins: map[string]any{id: false}}}, want: "recover"},
-		"success: unrelated plugin ignored":          {settings: []readiness.Settings{{BaseURL: new(compat), EnabledPlugins: map[string]any{"model-gateway@eigenwise-toolshed": false}}}, want: "recover"},
+		"success: explicit enable wins":              {settings: []readiness.Settings{{EnabledPlugins: map[string]any{id: true}}, {BaseURL: new(compat), EnabledPlugins: map[string]any{id: false}}}, want: "legacy"},
+		"success: unrelated plugin ignored":          {settings: []readiness.Settings{{BaseURL: new(compat), EnabledPlugins: map[string]any{"model-gateway@eigenwise-toolshed": false}}}, want: "legacy"},
 		"success: default port":                      {settings: []readiness.Settings{{BaseURL: new("http://127.0.0.1:18764")}}, want: "recover"},
 		"success: configured port excludes default":  {env: map[string]string{"CODEX_GATEWAY_PORT": "49123"}, settings: []readiness.Settings{{BaseURL: new("http://127.0.0.1:18764")}}, want: "unwired"},
 	}

@@ -48,7 +48,7 @@ func TestEnvBlock(t *testing.T) {
 	want := []wiring.Entry{{Key: base, Value: direct}, {Key: discovery, Value: "1"}, {Key: "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK", Value: "1"}, {Key: "ENABLE_TOOL_SEARCH", Value: "true"}, {Key: "CLAUDE_CODE_MAX_OUTPUT_TOKENS", Value: "64000"}}
 	want = append(want, shippedEntries()...)
 	equal(t, want, f.EnvBlock("default"))
-	want[0].Value = compat
+	// The compatibility URL is never written: the retired mode selects the gateway URL too.
 	equal(t, want, f.EnvBlock("compat"))
 }
 
@@ -58,7 +58,7 @@ func TestWriteEnvironment(t *testing.T) {
 		remove      bool
 	}{
 		"default": {mode: "default"},
-		"compat":  {start: direct, mode: "compat"},
+		"legacy":  {start: compat, mode: "default"},
 		"remove":  {start: compat, mode: "default", remove: true},
 	}
 	for name, tt := range tests {
@@ -85,7 +85,7 @@ func TestWriteEnvironment(t *testing.T) {
 				_, present := env[base]
 				equal(t, false, present)
 			} else {
-				equal(t, map[string]string{"default": direct, "compat": compat}[tt.mode], env[base])
+				equal(t, direct, env[base])
 				want = &wiring.Wiring{Scope: "user", Mode: tt.mode, Source: "user", File: f.user}
 			}
 			actual, err := f.WiredMode()
