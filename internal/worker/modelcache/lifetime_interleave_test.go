@@ -124,6 +124,8 @@ func TestCanceledSupersededRefreshReturnsContextError(t *testing.T) {
 // lifetimeRequests counts the requests of one test: every request, and the Anthropic catalog page
 // requests apart. It answers the proxy listing with one row, and parks each catalog page request
 // until its context ends, so a catalog refresh that started stays in flight until shutdown reaches it.
+// When release is set, a catalog page request whose context ended closes canceled and then stays
+// parked until the test closes release, so the cancellation alone never lets the refresh finish.
 type lifetimeRequests struct {
 	all          atomic.Int32
 	catalog      atomic.Int32
@@ -132,10 +134,19 @@ type lifetimeRequests struct {
 	waitReturned atomic.Bool
 	arrived      chan struct{}
 	arriveOnce   sync.Once
+	release      chan struct{}
+	canceled     chan struct{}
+	cancelOnce   sync.Once
 }
 
 func newLifetimeRequests() *lifetimeRequests {
 	return &lifetimeRequests{arrived: make(chan struct{})}
+}
+
+// newHeldLifetimeRequests is newLifetimeRequests whose catalog page requests stay parked after their
+// context ended until release is closed.
+func newHeldLifetimeRequests() *lifetimeRequests {
+	return &lifetimeRequests{arrived: make(chan struct{}), release: make(chan struct{}), canceled: make(chan struct{})}
 }
 
 func (c *lifetimeRequests) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -152,6 +163,13 @@ func (c *lifetimeRequests) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	c.catalog.Add(1)
 	c.arriveOnce.Do(func() { close(c.arrived) })
+	if c.release != nil {
+		<-r.Context().Done()
+		c.cancelOnce.Do(func() { close(c.canceled) })
+		<-c.release
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
 	select {
 	case <-r.Context().Done():
 	case <-time.After(time.Hour):
@@ -182,8 +200,11 @@ func newLifetimeCache(t *testing.T, requests *lifetimeRequests, routes modelcach
 }
 
 // TestCatalogRefreshInFlightAtShutdownIsDrained starts the cache, starts a catalog refresh and lets
-// its first page request park, then ends the service context and calls Wait. Wait returns only after
-// the refresh ended: no catalog request is still running when it returns and none starts afterwards.
+// its first page request park, then ends the service context. The page request sees the cancellation
+// but stays parked until the test releases it, so the refresh cannot finish on the cancellation alone.
+// Wait, called from its own goroutine, must still be blocked once every goroutine of the test has
+// settled, and must return after the release: it joins the refresh rather than returning while the
+// refresh runs. No catalog request is still running when it returns and none starts afterwards.
 //
 // This shows that shutdown drains a refresh that was already registered and running. It says nothing
 // about a refresh admitted while shutdown begins: the refresh here was admitted long before.
@@ -198,7 +219,12 @@ func TestCatalogRefreshInFlightAtShutdownIsDrained(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				requests := newLifetimeRequests()
+				requests := newHeldLifetimeRequests()
+				var releaseOnce sync.Once
+				release := func() { releaseOnce.Do(func() { close(requests.release) }) }
+				// A failure before the release must not leave the page request parked: the bubble
+				// would then end in a deadlock instead of the failure.
+				defer release()
 				routes := &proxyCommitSignal{store: &route.Store{}, committed: make(chan struct{})}
 				cache := newLifetimeCache(t, requests, routes)
 				ctx, cancel := context.WithCancel(t.Context())
@@ -209,9 +235,24 @@ func TestCatalogRefreshInFlightAtShutdownIsDrained(t *testing.T) {
 				cache.TriggerAnthropicRefresh(tt.credentials)
 				awaitSignal(t, requests.arrived, "the catalog refresh to request its first page")
 				cancel()
-				cache.Wait()
-				inFlight := requests.active.Load()
-				requests.waitReturned.Store(true)
+				awaitSignal(t, requests.canceled, "the catalog page request to see the service context end")
+
+				var inFlight int32
+				waitDone := make(chan struct{})
+				go func() {
+					defer close(waitDone)
+					cache.Wait()
+					inFlight = requests.active.Load()
+					requests.waitReturned.Store(true)
+				}()
+				synctest.Wait()
+				select {
+				case <-waitDone:
+					t.Errorf("Wait returned while the catalog refresh was still running (%d catalog request(s) in flight), want it to join the refresh", inFlight)
+				default:
+				}
+				release()
+				awaitSignal(t, waitDone, "Wait to return after the catalog page request was released")
 				time.Sleep(time.Hour)
 				synctest.Wait()
 
