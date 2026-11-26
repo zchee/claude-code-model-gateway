@@ -40,9 +40,34 @@ function edits(before, after, pointer, result) {
   }
 }
 
+const mode = process.argv[4] ?? 'toolschema-goldens';
+assert.ok(['toolschema-goldens', 'toolschema-supplement'].includes(mode));
+const supplement = mode === 'toolschema-supplement';
 const directory = new URL('../internal/toolschema/testdata/', import.meta.url);
-const inputs = JSON.parse(readFileSync(new URL('node-inputs.json', directory), 'utf8'));
-assert.ok(Array.isArray(inputs), 'expected an array of cases');
+const inputFile = supplement ? 'node-supplement-inputs.json' : 'node-inputs.json';
+let inputs = JSON.parse(readFileSync(new URL(inputFile, directory), 'utf8'));
+assert.ok(Array.isArray(inputs) && inputs.length > 0, 'expected a nonempty array of cases');
+const direct = Object.create(null);
+if (supplement) {
+  const adapters = [];
+  for (const input of inputs) {
+    const { name, note, pattern, repeat = 1, adapter = false } = input;
+    assert.ok(Object.keys(input).every(key => ['name', 'note', 'pattern', 'repeat', 'adapter'].includes(key)), `${name}: unknown field`);
+    assert.ok(typeof name === 'string' && name.length && !Object.hasOwn(direct, name), `empty or duplicate name: ${name}`);
+    assert.ok(typeof note === 'string' && note.trim().length && typeof pattern === 'string', `${name}: expected a note and a pattern`);
+    assert.ok(Number.isSafeInteger(repeat) && repeat > 0 && typeof adapter === 'boolean', `${name}: invalid repeat or adapter`);
+    const expanded = pattern.repeat(repeat);
+    try {
+      new RegExp(expanded, 'u');
+      direct[name] = 'valid';
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+      direct[name] = error.name;
+    }
+    if (adapter) adapters.push({ name, schema: { pattern: expanded } });
+  }
+  inputs = adapters;
+}
 const cases = Object.create(null);
 for (const input of inputs) {
   assert.ok(input !== null && typeof input === 'object' && !Array.isArray(input), 'expected a case object');
@@ -85,7 +110,9 @@ for (const input of inputs) {
   if (!input.selfCycle) assert.equal(JSON.stringify(tools), inputWire, `${name}: serialized input mutated`);
 }
 assert.deepEqual(new Set(Object.keys(cases)), new Set(inputs.map(input => input.name)), 'input and output names differ');
-const bytes = JSON.stringify({ node: process.version, ajv, cases }, null, 2) + '\n';
-writeFileSync(new URL('node-golden.json', directory), bytes);
+const { v8, icu, unicode } = process.versions;
+const corpus = supplement ? { node: process.version, v8, icu, unicode, ajv, direct, cases } : { node: process.version, ajv, cases };
+const bytes = JSON.stringify(corpus, null, 2) + '\n';
+writeFileSync(new URL(supplement ? 'node-supplement.json' : 'node-golden.json', directory), bytes);
 // Successful remote runs discard the checkout. Return the same bytes on stdout.
 process.stdout.write(bytes);

@@ -1,0 +1,231 @@
+{
+  "node": "v24.11.1",
+  "v8": "13.6.233.10-node.28",
+  "icu": "77.1",
+  "unicode": "16.0",
+  "ajv": "8.20.0",
+  "direct": {
+    "space-short": "valid",
+    "space-long": "valid",
+    "space-posix": "valid",
+    "space-short-lowercase": "SyntaxError",
+    "space-long-separator": "SyntaxError",
+    "space-long-lowercase": "SyntaxError",
+    "property-letter": "valid",
+    "property-punctuation": "valid",
+    "property-number": "valid",
+    "property-unassigned-alias": "SyntaxError",
+    "property-astral": "valid",
+    "property-uppercase-letter": "valid",
+    "property-category-value": "valid",
+    "property-script-value": "valid",
+    "script-short-combined": "SyntaxError",
+    "script-long-combined": "SyntaxError",
+    "script-sidetic": "SyntaxError",
+    "script-tulu-tigalari": "valid",
+    "duplicate-later-branch": "valid",
+    "duplicate-later-branch-ref": "valid",
+    "duplicate-disjoint": "valid",
+    "duplicate-disjoint-ref": "valid",
+    "duplicate-adjacent": "SyntaxError",
+    "duplicate-adjacent-ref": "SyntaxError",
+    "duplicate-after-branch": "SyntaxError",
+    "duplicate-after-branch-ref": "SyntaxError",
+    "duplicate-first-branch": "SyntaxError",
+    "duplicate-first-branch-ref": "SyntaxError",
+    "duplicate-successive-branches": "valid",
+    "duplicate-successive-branches-ref": "valid",
+    "duplicate-nested": "valid",
+    "duplicate-nested-ref": "valid",
+    "capture-refusal": "SyntaxError",
+    "modifier-empty-removal": "valid",
+    "modifier-bare-hyphen": "SyntaxError",
+    "modifier-enable": "valid",
+    "modifier-conflict": "SyntaxError",
+    "modifier-repeat": "SyntaxError",
+    "modifier-disable": "valid",
+    "modifier-all-empty-removal": "valid",
+    "bound-descending-at-limit": "valid",
+    "bound-ascending-at-limit": "valid",
+    "bound-many-digits": "valid",
+    "bound-descending": "SyntaxError",
+    "capture-at-limit": "valid",
+    "capture-over-limit": "SyntaxError",
+    "name-literal": "valid",
+    "name-fixed-escape": "valid",
+    "name-braced-escape": "valid",
+    "name-zwnj-first": "SyntaxError",
+    "name-zwnj-after-letter": "valid",
+    "name-dollar": "valid",
+    "name-underscore": "valid",
+    "name-digit-first": "SyntaxError"
+  },
+  "cases": {
+    "space-short": {
+      "same": false,
+      "wire": "{\"pattern\":\"[^x]\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "[^x]"
+        }
+      ]
+    },
+    "space-long": {
+      "same": false,
+      "wire": "{\"pattern\":\"[^x]\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "[^x]"
+        }
+      ]
+    },
+    "space-posix": {
+      "same": false,
+      "wire": "{\"pattern\":\"[^x]\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "[^x]"
+        }
+      ]
+    },
+    "space-short-lowercase": {
+      "error": {
+        "reasonCode": "invalid-regex",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "space-long-separator": {
+      "error": {
+        "reasonCode": "invalid-regex",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "space-long-lowercase": {
+      "error": {
+        "reasonCode": "invalid-regex",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "property-letter": {
+      "same": false,
+      "wire": "{\"pattern\":\"[^x]\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "[^x]"
+        }
+      ]
+    },
+    "property-punctuation": {
+      "same": false,
+      "wire": "{\"pattern\":\"[^x]\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "[^x]"
+        }
+      ]
+    },
+    "property-number": {
+      "same": false,
+      "wire": "{\"pattern\":\"[^x]\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "[^x]"
+        }
+      ]
+    },
+    "property-unassigned-alias": {
+      "error": {
+        "reasonCode": "invalid-regex",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "property-astral": {
+      "same": false,
+      "wire": "{\"pattern\":\"[^x]\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "[^x]"
+        }
+      ]
+    },
+    "property-uppercase-letter": {
+      "same": false,
+      "wire": "{\"pattern\":\"[^x]\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "[^x]"
+        }
+      ]
+    },
+    "property-category-value": {
+      "same": false,
+      "wire": "{\"pattern\":\"[^x]\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "[^x]"
+        }
+      ]
+    },
+    "property-script-value": {
+      "same": false,
+      "wire": "{\"pattern\":\"[^x]\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "[^x]"
+        }
+      ]
+    },
+    "script-short-combined": {
+      "error": {
+        "reasonCode": "invalid-regex",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "script-long-combined": {
+      "error": {
+        "reasonCode": "invalid-regex",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "script-sidetic": {
+      "error": {
+        "reasonCode": "invalid-regex",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    },
+    "script-tulu-tigalari": {
+      "same": false,
+      "wire": "{\"pattern\":\"[^x]\"}",
+      "edits": [
+        {
+          "pointer": "/tools/0/input_schema/pattern",
+          "replacement": "[^x]"
+        }
+      ]
+    },
+    "capture-refusal": {
+      "error": {
+        "reasonCode": "capture-or-unsupported-group",
+        "pointer": "/tools/0/input_schema/pattern",
+        "toolName": "artifact_tool"
+      }
+    }
+  }
+}
