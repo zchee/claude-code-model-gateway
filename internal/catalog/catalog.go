@@ -23,6 +23,7 @@ import (
 	json "encoding/json/v2"
 	"errors"
 	"fmt"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -149,16 +150,13 @@ func Build(ctx context.Context, ids []string, inputs Inputs) Catalog {
 	return build(ctx, inputs, models)
 }
 
-func prepareModels(ids []string, observe func(string) Policy, note func(id, provider string) (string, error)) ([]Model, error) {
-	models := make([]Model, 0, len(ids))
-	type pendingNote struct {
-		id    string
-		index int
+func prepareModels(ids []string, observe func(string) Policy, window func(id, provider string) (int, string, error)) ([]Model, error) {
+	type retainedModel struct {
+		id, base string
+		model    Model
 	}
-	var pendingNotes []pendingNote
-	used := make(map[string]struct{}, len(ids))
+	retained := make([]retainedModel, 0, len(ids))
 	pattern := regexp.MustCompile(codexLabelPattern)
-	lower := cases.Lower(language.Und)
 	for _, id := range ids {
 		if !candidate(id) {
 			continue
@@ -175,28 +173,36 @@ func prepareModels(ids []string, observe func(string) Policy, note func(id, prov
 		if err != nil {
 			return nil, err
 		}
-		model := Model{Slug: slugFor(lower, provider, base, used), ID: cmp.Or(p.ClientID, id), Label: label, Provider: provider}
+		model := Model{ID: cmp.Or(p.ClientID, id), Label: label, Provider: provider}
 		if p.Window != 0 {
 			model.ContextWindow, model.ContextWindowNote = p.Window, p.WindowNote
-			if note != nil {
-				pendingNotes = append(pendingNotes, pendingNote{id, len(models)})
-			}
 		}
-		models = append(models, model)
+		retained = append(retained, retainedModel{id, base, model})
 	}
-	// All labels must be valid before formatting the first window note.
-	for _, pending := range pendingNotes {
-		m := &models[pending.index]
-		text, err := note(pending.id, m.Provider)
-		if err != nil {
-			return nil, err
+	// Validate every label before allocating slugs or formatting window notes.
+	models := make([]Model, 0, len(retained))
+	used := make(map[string]struct{}, len(retained))
+	lower := cases.Lower(language.Und)
+	for _, row := range retained {
+		m := row.model
+		m.Slug = slugFor(lower, m.Provider, row.base, used)
+		if window != nil {
+			size, note, err := window(row.id, m.Provider)
+			if err != nil {
+				return nil, err
+			}
+			m.ContextWindow, m.ContextWindowNote = size, note
 		}
-		m.ContextWindowNote = text
+		models = append(models, m)
 	}
 	return models, nil
 }
 
 func build(ctx context.Context, inputs Inputs, models []Model) Catalog {
+	// An interface holding a nil pointer does not compare equal to nil.
+	if fallback := reflect.ValueOf(inputs.Fallback); fallback.Kind() == reflect.Pointer && fallback.IsNil() {
+		inputs.Fallback = nil
+	}
 	catalog := Catalog{
 		SchemaVersion: 4,
 		Source:        "model-gateway",

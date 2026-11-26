@@ -44,18 +44,23 @@ func Prepare(ids []string, inputs Inputs, modelInputs policy.ResolverInputs, loo
 	modelInputs.Windows = maps.Clone(modelInputs.Windows)
 	resolver := policy.NewResolver(modelInputs)
 	observe := func(id string) Policy {
-		p := Policy{ClientID: resolver.ClientID(id), Window: int(resolver.AdvertisedWindow(id))}
+		p := Policy{ClientID: resolver.ClientID(id)}
 		// Route membership resolves the bare spelling; the client ID and window resolve the original.
 		if routing := resolver.Resolve(strings.TrimSuffix(id, longWindow)); routing != nil {
 			p.BackendID, p.Provider, p.Transport = routing.BackendID, routing.Backend, routing.Transport
 		}
 		return p
 	}
-	note := func(id, provider string) (string, error) {
+	window := func(id, provider string) (int, string, error) {
+		size := int(resolver.AdvertisedWindow(id))
+		if size == 0 {
+			return 0, "", nil
+		}
 		windows := modelInputs.Windows
-		return policy.CheckedWindowNote(provider, windows.Cap(provider), windows[provider].CompactAt, resolver.Resolve(id), lookup)
+		note, err := policy.CheckedWindowNote(provider, windows.Cap(provider), windows[provider].CompactAt, resolver.Resolve(id), lookup)
+		return size, note, err
 	}
-	models, err := prepareModels(ids, observe, note)
+	models, err := prepareModels(ids, observe, window)
 	if err != nil {
 		return nil, err
 	}

@@ -263,6 +263,37 @@ func TestPreparedReadinessSnapshot(t *testing.T) {
 	}
 }
 
+func TestTypedNilFallback(t *testing.T) {
+	tests := map[string]struct{ prepared bool }{
+		"success: direct build ignores typed nil":   {},
+		"success: prepared build ignores typed nil": {prepared: true},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			ids := []string{"claude-kimi-k3", "claude-grok-4.5"}
+			inputs := catalog.Inputs{Fallback: (*observations)(nil), SharedChecks: &catalog.Checks{}, Policy: modelPolicy}
+			var got catalog.Catalog
+			if tc.prepared {
+				routes := proxymodels.NewTable([]proxymodels.Route{{ID: "kimi-k3", Provider: "kimi"}})
+				prepared, err := catalog.Prepare(ids, inputs, policy.ResolverInputs{Routes: routes}, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got = prepared.Build(t.Context())
+			} else {
+				got = catalog.Build(t.Context(), ids, inputs)
+			}
+			want := map[string]catalog.Readiness{
+				"kimi": {State: "binary-missing", Message: "Readiness is unavailable."},
+				"grok": {State: "unavailable", Message: "grok readiness is unavailable."},
+			}
+			if diff := gocmp.Diff(want, got.Providers); diff != "" {
+				t.Errorf("providers (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
 func TestPrepareWindowSnapshot(t *testing.T) {
 	tests := map[string]struct {
 		ids  []string
@@ -278,13 +309,17 @@ func TestPrepareWindowSnapshot(t *testing.T) {
 			var calls int
 			lookup := func(string) (string, bool) {
 				calls++
-				windows["grok"] = policy.Setting{Value: config.ContextWindow{Tokens: 200000}, CompactAt: 195000}
+				if calls == 1 {
+					// Change both values before the second model's window and note are read.
+					windows["grok"] = policy.Setting{Value: config.ContextWindow{Tokens: 200000}, CompactAt: 195000}
+				}
 				return "", false
 			}
 			prepared, err := catalog.Prepare(tc.ids, catalog.Inputs{}, policy.ResolverInputs{Windows: windows}, lookup)
 			if err != nil {
 				t.Fatal(err)
 			}
+			delete(windows, "grok")
 			models := prepared.Build(t.Context()).Models
 			if calls != len(tc.ids) || len(models) != len(tc.ids) {
 				t.Fatalf("lookup calls = %d, models = %d; want %d each", calls, len(models), len(tc.ids))
@@ -306,7 +341,8 @@ func TestProviderPropertyNames(t *testing.T) {
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
-			// JavaScript property-name collisions select the flat checks or an inherited constructor instead.
+			// The JavaScript property collisions select the flat checks or inherited constructor,
+			// so both providers get state "unavailable" instead of the shared check's failure.
 			probe := new(observations)
 			got := catalog.Build(t.Context(), []string{"claude-example"}, catalog.Inputs{
 				SharedChecks: &catalog.Checks{}, Fallback: probe,
