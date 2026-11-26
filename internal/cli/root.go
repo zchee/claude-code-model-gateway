@@ -37,8 +37,8 @@ import (
 )
 
 // Process holds the facts about the running process that the commands may need. A nil function stands for a fact
-// the caller cannot supply: the environment list is then empty, and a command that needs a missing working directory
-// or executable fails with an ordinary error.
+// the caller cannot supply: the environment list is then empty, and a command that needs a missing home directory,
+// working directory or executable fails with an ordinary error.
 type Process struct {
 	Lookup     func(string) (string, bool)
 	Environ    func() []string
@@ -72,9 +72,20 @@ func run(argv []string, stdin io.Reader, stdout, stderr io.Writer, lookup func(s
 	return runProcess(argv, stdin, stdout, stderr, Process{Lookup: lookup, Environ: environ, Home: home}, commands)
 }
 
+var (
+	errNoHome = errors.New("home directory is not available")
+	errNoCwd  = errors.New("working directory is not available")
+)
+
 func runProcess(argv []string, stdin io.Reader, stdout, stderr io.Writer, p Process, commands []sourceCommand) int {
 	if p.Lookup == nil {
 		p.Lookup = func(string) (string, bool) { return "", false }
+	}
+	if p.Home == nil {
+		p.Home = func() (string, error) { return "", errNoHome }
+	}
+	if p.Cwd == nil {
+		p.Cwd = func() (string, error) { return "", errNoCwd }
 	}
 	lookup, home := p.Lookup, p.Home
 	name := commandName(argv)
