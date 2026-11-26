@@ -15,6 +15,7 @@
 package policy
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -71,6 +72,8 @@ func EffectiveSentry(model *Model, env float64, cap, compactAt int64) (*Sentry, 
 }
 
 // CompactTrigger returns the capped direct maximum or the cap less its reserve; zero means absent.
+// It accepts validated settings: cap is at most 1,000,000 and compactAt is at most 2^53-1.
+// Neither may be negative.
 func CompactTrigger(cap, compactAt int64) int64 {
 	if cap == 0 {
 		return compactAt
@@ -131,9 +134,16 @@ func (w Windows) Report(auto *AutoCompact, lookup config.LookupEnv) []string {
 	return lines
 }
 
-// WindowNote formats compaction and billing information for a resolved backend row.
-// A direct compaction maximum requires a valid synthetic sentry; otherwise WindowNote panics.
+// WindowNote formats compaction and billing information, returning an empty note on failure.
+// Callers that must report failure, including catalog refresh, must use CheckedWindowNote.
 func WindowNote(backend string, cap, compactAt int64, model *Model, lookup config.LookupEnv) string {
+	note, _ := CheckedWindowNote(backend, cap, compactAt, model, lookup)
+	return note
+}
+
+// CheckedWindowNote formats compaction and billing information for a resolved backend row.
+// A direct compaction maximum requires a valid synthetic sentry.
+func CheckedWindowNote(backend string, cap, compactAt int64, model *Model, lookup config.LookupEnv) (string, error) {
 	var notes []string
 	if compactAt != 0 {
 		if model == nil {
@@ -147,10 +157,10 @@ func WindowNote(backend string, cap, compactAt int64, model *Model, lookup confi
 		env, raw, set := config.CompactTrigger.Read(lookup)
 		s, err := EffectiveSentry(model, env, cap, compactAt)
 		if err != nil {
-			panic(err)
+			return "", err
 		}
 		if s == nil {
-			panic("Cannot read properties of null (reading 'backendWindow')")
+			return "", errors.New("cannot format a direct compaction maximum without a synthetic sentry")
 		}
 		row := ""
 		if model.BackendID != "" && model.BackendID != "default" {
@@ -167,5 +177,5 @@ func WindowNote(backend string, cap, compactAt int64, model *Model, lookup confi
 	if backend == "codex" {
 		notes = append(notes, BillingNote(cap, compactAt))
 	}
-	return strings.Join(notes, "; ")
+	return strings.Join(notes, "; "), nil
 }

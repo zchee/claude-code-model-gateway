@@ -125,9 +125,26 @@ func validateCompact(v jsonx.WireValue) error {
 	return nil
 }
 
-func savedWindow(backend string, v jsonx.WireValue) config.ContextWindow {
+// JavaScript array coercion stringifies every element, even if the result cannot be numeric.
+// For JSON objects, an own toString is never callable and valueOf cannot return a primitive.
+func canCoerceWindow(v jsonx.WireValue) bool {
+	if v.Kind == '{' {
+		return member(v, "toString").Kind == 0
+	}
+	for _, element := range v.Elements {
+		if !canCoerceWindow(element) {
+			return false
+		}
+	}
+	return true
+}
+
+func savedWindow(backend string, v jsonx.WireValue) (config.ContextWindow, error) {
+	if !canCoerceWindow(v) {
+		return config.ContextWindow{}, fmt.Errorf("cannot convert %s context window to a number", backend)
+	}
 	if v.Kind == '"' {
-		return parseWindow(backend, string(utf16.Decode(v.Text)))
+		return parseWindow(backend, string(utf16.Decode(v.Text))), nil
 	}
 	// Only singleton arrays can stringify to a numeric spelling within the allowed range.
 	for v.Kind == '[' && len(v.Elements) == 1 {
@@ -135,20 +152,34 @@ func savedWindow(backend string, v jsonx.WireValue) config.ContextWindow {
 	}
 	switch v.Kind {
 	case '0':
-		return parseWindow(backend, v.Number)
+		return parseWindow(backend, v.Number), nil
 	case '"':
-		return parseWindow(backend, config.JSNumber(string(utf16.Decode(v.Text))))
+		return parseWindow(backend, config.JSNumber(string(utf16.Decode(v.Text)))), nil
 	default:
-		return config.ContextWindow{}
+		return config.ContextWindow{}, nil
 	}
 }
 
+func checkWindowsPath(path string) error {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return fmt.Errorf("context window path must be clean and absolute: %s", path)
+	}
+	return nil
+}
+
 // ReadWindows resolves saved settings, the supplied environment and backend defaults, in that order.
+// The caller must supply a clean, absolute path.
 func ReadWindows(path string, lookup config.LookupEnv) (Windows, error) {
-	// A missing, unreadable or malformed file has no saved settings.
+	if err := checkWindowsPath(path); err != nil {
+		return nil, err
+	}
+	// A missing, unreadable or malformed file has no saved settings. The depth limit is an explicit refusal.
 	var root jsonx.WireValue
 	if data, err := os.ReadFile(path); err == nil {
-		root, _ = jsonx.DecodeWire(data)
+		root, err = jsonx.DecodeWire(data)
+		if depth, ok := errors.AsType[*jsonx.WireDepthError](err); ok {
+			return nil, depth
+		}
 	}
 	compact := member(root, "compactAt")
 	if err := validateCompact(compact); err != nil {
@@ -156,7 +187,10 @@ func ReadWindows(path string, lookup config.LookupEnv) (Windows, error) {
 	}
 	w := Windows{}
 	for _, backend := range []string{"claude", "codex", "grok"} {
-		value := savedWindow(backend, member(root, backend))
+		value, err := savedWindow(backend, member(root, backend))
+		if err != nil {
+			return nil, err
+		}
 		source := "saved"
 		if value == (config.ContextWindow{}) && backend == "codex" {
 			value = config.CodexContextWindow.Get(lookup)
@@ -176,7 +210,11 @@ func ReadWindows(path string, lookup config.LookupEnv) (Windows, error) {
 }
 
 // WriteWindows validates the persisted JSON object before creating its directory and writing it atomically.
+// The caller must supply a clean, absolute path.
 func WriteWindows(path string, values jsontext.Value) error {
+	if err := checkWindowsPath(path); err != nil {
+		return err
+	}
 	root, err := jsonx.DecodeWire(values)
 	if err != nil {
 		return err
@@ -186,9 +224,6 @@ func WriteWindows(path string, values jsontext.Value) error {
 	}
 	if err := validateCompact(member(root, "compactAt")); err != nil {
 		return err
-	}
-	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
-		return fmt.Errorf("context window path must be clean and absolute: %s", path)
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o777); err != nil {
 		return err
