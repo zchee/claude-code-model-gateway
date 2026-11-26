@@ -119,7 +119,10 @@ results check. The checker only compares run identifiers across its inputs.
 )
 ```
 
-Add `--census` and `--launches` for phases with due conformance cases. Reject
+For phases with due conformance cases, take `--census` and `--launches` together from the verified phase export,
+not from individual diagnostics. The export contract in [the work plan, §6](model-gateway-go-port.md#6-verification-steps)
+requires a producer manifest and a full passing binary run through that phase; matching metadata lines alone do not
+establish either. For the hosted run above, reject
 files for a different commit or a different run ID (`gha-<run>-<attempt>`),
 a single-job rerun, and concatenated or edited files. Suite failures may still
 produce artifacts; they do not count as passing evidence.
