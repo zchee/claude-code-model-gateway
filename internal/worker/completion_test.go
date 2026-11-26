@@ -153,8 +153,24 @@ func TestModelsHookFailure(t *testing.T) {
 			}})
 			w := httptest.NewRecorder()
 			w.Code = 0 // Distinguish no write from an explicit HTTP 200.
-			h.ServeHTTP(w, httptest.NewRequestWithContext(ctx, http.MethodGet, "/v1/models", nil))
+			r := httptest.NewRequestWithContext(ctx, http.MethodGet, "/v1/models", nil)
+			var aborted bool
+			func() {
+				defer func() {
+					if v := recover(); v != nil {
+						if !tt.cancelClient || v != http.ErrAbortHandler { //nolint:errorlint // Only this exact panic is handled silently by net/http.
+							panic(v)
+						}
+						aborted = true
+					}
+				}()
+				h.ServeHTTP(w, r)
+			}()
 			equal(t, 1, calls)
+			equal(t, tt.cancelClient, aborted)
+			if strings.Contains(w.Body.String(), tt.err.Error()) {
+				t.Error("catalog error response leaked raw hook error detail")
+			}
 			if tt.cancelClient {
 				if w.Code != 0 || w.Body.Len() != 0 {
 					t.Errorf("departed client received status=%d and %d bytes", w.Code, w.Body.Len())
@@ -163,9 +179,6 @@ func TestModelsHookFailure(t *testing.T) {
 			}
 			if w.Code < 500 || w.Code >= 600 || strings.Contains(w.Body.String(), `"data"`) {
 				t.Errorf("catalog hook failed; status=%d, listing returned=%t", w.Code, strings.Contains(w.Body.String(), `"data"`))
-			}
-			if strings.Contains(w.Body.String(), "private-catalog-detail") {
-				t.Error("catalog error response leaked raw hook error detail")
 			}
 		})
 	}
