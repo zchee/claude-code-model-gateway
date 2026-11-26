@@ -15,7 +15,15 @@
 // Package proxyconfig resolves provider settings from the proxy configuration and environment.
 package proxyconfig
 
-import "github.com/zchee/claude-code-model-gateway/internal/config"
+import (
+	"cmp"
+	"os"
+	"path/filepath"
+	"unicode/utf16"
+
+	"github.com/zchee/claude-code-model-gateway/internal/config"
+	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
+)
 
 // InvalidSetting names the source of an invalid setting and the reason for rejecting it.
 type InvalidSetting struct {
@@ -34,4 +42,82 @@ type StudioSettings struct {
 // ReadStudio resolves LM Studio settings from the environment and config.json in configDir.
 // configDir must be a resolved absolute path. The caller resolves a relative directory override
 // against its injected working directory.
-func ReadStudio(env config.LookupEnv, configDir string) StudioSettings { return StudioSettings{} }
+func ReadStudio(env config.LookupEnv, configDir string) StudioSettings {
+	file := readStudioFile(configDir)
+	if !*cmp.Or(config.LMStudioEnabled.Get(env), file.enabled, new(true)) {
+		return StudioSettings{}
+	}
+
+	const defaultOrigin = "http://127.0.0.1:1234"
+	setting := "CCP_LMSTUDIO_BASE_URL"
+	origin := config.LMStudioBaseURL.Get(env)
+	if origin == (config.LMOrigin{}) {
+		setting = "lmstudio.baseUrl in config.json"
+		origin = config.LMStudioBaseURL.Get(func(string) (string, bool) { return file.baseURL, true })
+	}
+	if origin.Reason != "" {
+		return StudioSettings{Enabled: true, Invalid: &InvalidSetting{Setting: setting, Reason: origin.Reason}}
+	}
+	key := config.LMStudioAPIKey.Get(env)
+	if key == "" {
+		key = config.LMToken.Get(env)
+	}
+	if key == "" {
+		key = config.LMStudioAPIKey.Get(func(string) (string, bool) { return file.apiKey, true })
+	}
+	return StudioSettings{Enabled: true, BaseURL: cmp.Or(origin.Origin, defaultOrigin), APIKey: key}
+}
+
+type studioFile struct {
+	enabled *bool
+	baseURL string
+	apiKey  string
+}
+
+func readStudioFile(dir string) studioFile {
+	if !filepath.IsAbs(dir) || filepath.Clean(dir) != dir {
+		return studioFile{}
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "config.json"))
+	if err != nil {
+		return studioFile{}
+	}
+	root, err := jsonx.DecodeWire(data)
+	if err != nil {
+		return studioFile{}
+	}
+	for _, member := range root.Members {
+		if string(utf16.Decode(member.Name)) == "lmstudio" {
+			return parseStudioSection(member.Value)
+		}
+	}
+	return studioFile{}
+}
+
+func parseStudioSection(section jsonx.WireValue) studioFile {
+	var file studioFile
+	for _, field := range section.Members {
+		value := field.Value
+		if value.Kind == 'n' {
+			continue
+		}
+		switch string(utf16.Decode(field.Name)) {
+		case "enabled":
+			if value.Kind != 't' && value.Kind != 'f' {
+				return studioFile{}
+			}
+			file.enabled = new(value.Kind == 't')
+		case "baseUrl":
+			if value.Kind != '"' {
+				return studioFile{}
+			}
+			file.baseURL = string(utf16.Decode(value.Text))
+		case "apiKey":
+			if value.Kind != '"' {
+				return studioFile{}
+			}
+			file.apiKey = string(utf16.Decode(value.Text))
+		}
+	}
+	return file
+}

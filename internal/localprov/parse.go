@@ -15,10 +15,23 @@
 // Package localprov interprets local provider responses without issuing requests.
 package localprov
 
-import "errors"
+import (
+	"errors"
+	"math"
+	"slices"
+	"unicode/utf16"
+
+	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
+)
 
 // LlamaWindow returns the per-slot context from a llama-server props response, or zero if unknown.
-func LlamaWindow(body []byte) int64 { return 0 }
+func LlamaWindow(body []byte) int64 {
+	props, err := jsonx.DecodeWire(body)
+	if err != nil {
+		return 0
+	}
+	return contextWindow(property(property(props, "default_generation_settings"), "n_ctx"))
+}
 
 // Model describes a downloaded LM Studio model. A zero window means no context was measured.
 type Model struct {
@@ -29,4 +42,69 @@ type Model struct {
 
 // StudioModels returns models in catalog order, or an error when the response has no list.
 // A repeated key updates the model at its first position.
-func StudioModels(body []byte) ([]Model, error) { return nil, errors.New("not implemented") }
+func StudioModels(body []byte) ([]Model, error) {
+	catalog, err := jsonx.DecodeWire(body)
+	list := property(catalog, "models")
+	if err != nil || list.Kind != '[' {
+		return nil, errors.New("GET /api/v1/models returned no model list")
+	}
+
+	models := make([]Model, 0, len(list.Elements))
+	positions := make(map[string]int, len(list.Elements))
+	for _, entry := range list.Elements {
+		kind := property(entry, "type")
+		key := property(entry, "key")
+		if !asciiEqual(kind.Text, "llm") || key.Kind != '"' || len(key.Text) == 0 {
+			continue
+		}
+		instances := property(entry, "loaded_instances").Elements
+		model := Model{
+			Key:           string(utf16.Decode(key.Text)),
+			Loaded:        len(instances) > 0,
+			ContextWindow: modelWindow(key.Text, instances),
+		}
+		if pos, ok := positions[model.Key]; ok {
+			models[pos] = model
+			continue
+		}
+		positions[model.Key] = len(models)
+		models = append(models, model)
+	}
+	return models, nil
+}
+
+func modelWindow(key []uint16, instances []jsonx.WireValue) int64 {
+	var smallest int64
+	for _, instance := range instances {
+		window := contextWindow(property(property(instance, "config"), "context_length"))
+		if slices.Equal(property(instance, "id").Text, key) {
+			// The named instance wins even if its context is unknown.
+			return window
+		}
+		if window > 0 && (smallest == 0 || window < smallest) {
+			smallest = window
+		}
+	}
+	return smallest
+}
+
+func contextWindow(value jsonx.WireValue) int64 {
+	n := value.Number
+	if n > 0 && n <= 1<<53-1 && math.Trunc(n) == n {
+		return int64(n)
+	}
+	return 0
+}
+
+func property(value jsonx.WireValue, name string) jsonx.WireValue {
+	for _, member := range value.Members {
+		if asciiEqual(member.Name, name) {
+			return member.Value
+		}
+	}
+	return jsonx.WireValue{}
+}
+
+func asciiEqual(units []uint16, text string) bool {
+	return slices.EqualFunc(units, []byte(text), func(unit uint16, b byte) bool { return unit == uint16(b) })
+}
