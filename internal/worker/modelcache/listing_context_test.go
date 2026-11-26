@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
+	"errors"
 	"io"
 	"maps"
 	"net/http"
@@ -324,17 +325,26 @@ type listingRoundTrip func(*http.Request) (*http.Response, error)
 
 func (f listingRoundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
-type witnessedListing struct {
-	body     *bytes.Buffer
-	consumed *atomic.Bool
+type witnessedBody struct {
+	body      io.ReadCloser
+	remaining int64
+	eof       *atomic.Bool
+	closed    *atomic.Bool
 }
 
-func (w *witnessedListing) Read(p []byte) (int, error) {
+func (w *witnessedBody) Read(p []byte) (int, error) {
 	n, err := w.body.Read(p)
-	if w.body.Len() == 0 {
-		w.consumed.Store(true)
+	w.remaining -= int64(n)
+	if w.remaining <= 0 || errors.Is(err, io.EOF) {
+		w.eof.Store(true)
 	}
 	return n, err
+}
+
+func (w *witnessedBody) Close() error {
+	err := w.body.Close()
+	w.closed.Store(true)
+	return err
 }
 
 func TestDiscoveryCacheDuringRefresh(t *testing.T) {
@@ -366,22 +376,28 @@ func TestDiscoveryCacheDuringRefresh(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				initial := proxyListingHandler(t, tt.initial)
 				replacement := proxyListingHandler(t, tt.replacement)
-				var replacing bool
-				var consumed atomic.Bool
+				var replacing, listingEOF, listingClosed atomic.Bool
 				paused, release := make(chan bool, 1), make(chan struct{})
-				signalPause := sync.OnceFunc(func() { paused <- consumed.Load() })
+				signalPause := sync.OnceFunc(func() { paused <- listingEOF.Load() && listingClosed.Load() })
 				resume := sync.OnceFunc(func() { close(release) })
 				transport := listingRoundTrip(func(r *http.Request) (*http.Response, error) {
-					if replacing && r.Method == http.MethodGet && r.URL.String() == listingProxyURL+"/v1/models" {
+					if !replacing.Load() {
+						return handlerTransport{handler: initial}.RoundTrip(r)
+					}
+					if r.Method == http.MethodGet && r.URL.String() == listingProxyURL+"/v1/models" {
 						rec := httptest.NewRecorder()
 						replacement(rec, r)
-						return &http.Response{
-							StatusCode: rec.Code, Header: rec.Header(), Request: r,
-							Body: io.NopCloser(&witnessedListing{body: rec.Body, consumed: &consumed}),
-						}, nil
+						if err := r.Context().Err(); err != nil {
+							return nil, err
+						}
+						remaining := int64(rec.Body.Len())
+						resp := rec.Result()
+						resp.Request = r
+						resp.Body = &witnessedBody{body: resp.Body, remaining: remaining, eof: &listingEOF, closed: &listingClosed}
+						return resp, nil
 					}
-					if !replacing || r.Method != http.MethodGet || r.URL.String() != "http://127.0.0.1:19992/props" {
-						return handlerTransport{handler: initial}.RoundTrip(r)
+					if r.Method != http.MethodGet || r.URL.String() != "http://127.0.0.1:19992/props" {
+						return handlerTransport{handler: replacement}.RoundTrip(r)
 					}
 					signalPause()
 					select {
@@ -392,25 +408,33 @@ func TestDiscoveryCacheDuringRefresh(t *testing.T) {
 					rec := httptest.NewRecorder()
 					rec.Header().Set("Content-Type", "application/json")
 					_, _ = rec.WriteString(`{"default_generation_settings":{"n_ctx":65536}}`)
-					return rec.Result(), nil
+					resp := rec.Result()
+					resp.Request = r
+					return resp, nil
 				})
 				home, lookup, resolver := newTestPaths(t, map[string]string{"CCP_LLAMA_PORT": "19992"})
 				nowMs := int64(1700000000000)
 				routes := &route.Store{}
 				publisher := &observingRoutes{
-					store: routes, mu: new(sync.Mutex), events: new([]pubEvent),
+					store:  routes,
+					mu:     new(sync.Mutex),
+					events: new([]pubEvent),
 					onPublish: func(route.Snapshot) {
-						if !replacing {
+						if !replacing.Load() {
 							return
 						}
 						raw, err := os.ReadFile(filepath.Join(home, ".claude", "cache", "gateway-models.json"))
 						var doc struct {
-							Models []idDisplay `json:"models"`
+							BaseURL   string      `json:"baseUrl"`
+							FetchedAt int64       `json:"fetchedAt"`
+							Models    []idDisplay `json:"models"`
 						}
 						if err != nil {
 							t.Errorf("before route publication: read discovery: %v", err)
-						} else if err := json.Unmarshal(raw, &doc); err != nil {
+						} else if err := json.Unmarshal(raw, &doc, json.RejectUnknownMembers(true)); err != nil {
 							t.Errorf("before route publication: decode discovery: %v", err)
+						} else if doc.BaseURL != listingGatewayURL {
+							t.Errorf("before route publication: discovery baseUrl = %q, want %q", doc.BaseURL, listingGatewayURL)
 						} else if diff := gocmp.Diff(tt.wantInitial, doc.Models); diff != "" {
 							t.Errorf("before route publication: discovery models mismatch (-want +got):\n%s", diff)
 						}
@@ -431,40 +455,38 @@ func TestDiscoveryCacheDuringRefresh(t *testing.T) {
 				if err != nil {
 					t.Fatalf("New: %v", err)
 				}
+				checkSnapshot := func(stage, surface string, snapshot route.Snapshot, wantRows []idDisplay, wantBackend string) {
+					t.Helper()
+					source, raw := snapshot.Catalog()
+					if source != "proxy" {
+						t.Errorf("%s: %s catalog source = %q, want proxy", stage, surface, source)
+					}
+					var published []idDisplay
+					if err := json.Unmarshal(raw, &published); err != nil {
+						t.Errorf("%s: decode %s catalog: %v", stage, surface, err)
+						return
+					}
+					if diff := gocmp.Diff(wantRows, published); diff != "" {
+						t.Errorf("%s: %s catalog mismatch (-want +got):\n%s", stage, surface, diff)
+					}
+					owner, ok := snapshot.ProxyID("claude-vertex/anthropic/fable-5-2[1m]")
+					if !ok || owner.ID != wantBackend || owner.Provider != "vertex" {
+						t.Errorf("%s: %s alias route = %+v, %t; want vertex backend %q", stage, surface, owner, ok, wantBackend)
+					}
+				}
 				if err := cache.Refresh(t.Context()); err != nil {
 					t.Fatalf("initial Refresh: %v", err)
 				}
 				checkListingDiscovery(t, home, "after initial Refresh", 1700000000000, tt.wantInitial)
-				checkPublication := func(stage string, wantRows []idDisplay, wantBackend string) {
-					t.Helper()
-					stored, ok := routes.Load()
-					if !ok {
-						t.Errorf("%s: route store is empty", stage)
-						return
-					}
-					cached, _ := cache.Snapshot()
-					for surface, snapshot := range map[string]route.Snapshot{"route store": stored, "cache": cached} {
-						source, raw := snapshot.Catalog()
-						var published []idDisplay
-						if source != "proxy" {
-							t.Errorf("%s: %s catalog source = %q, want proxy", stage, surface, source)
-						}
-						if err := json.Unmarshal(raw, &published); err != nil {
-							t.Errorf("%s: decode %s catalog: %v", stage, surface, err)
-							continue
-						}
-						if diff := gocmp.Diff(wantRows, published); diff != "" {
-							t.Errorf("%s: %s catalog mismatch (-want +got):\n%s", stage, surface, diff)
-						}
-						owner, ok := snapshot.ProxyID("claude-vertex/anthropic/fable-5-2[1m]")
-						if !ok || owner.ID != wantBackend || owner.Provider != "vertex" {
-							t.Errorf("%s: %s alias route = %+v, %t; want vertex backend %q", stage, surface, owner, ok, wantBackend)
-						}
-					}
+				stored, ok := routes.Load()
+				if !ok {
+					t.Fatal("after initial Refresh: route store is empty")
 				}
-				checkPublication("after initial Refresh", tt.wantInitial, "vertex/anthropic/fable-5-2")
+				checkSnapshot("after initial Refresh", "route store", stored, tt.wantInitial, "vertex/anthropic/fable-5-2")
+				cached, _ := cache.Snapshot()
+				checkSnapshot("after initial Refresh", "cache", cached, tt.wantInitial, "vertex/anthropic/fable-5-2")
 
-				replacing = true
+				replacing.Store(true)
 				nowMs = 1700000005000
 				done := make(chan struct{})
 				var refreshErr error
@@ -478,38 +500,70 @@ func TestDiscoveryCacheDuringRefresh(t *testing.T) {
 					calls.Wait()
 				}()
 				select {
-				case read := <-paused:
-					if !read {
-						t.Fatal("local probe arrived before the replacement listing was consumed")
+				case consumed := <-paused:
+					if !consumed {
+						t.Fatal("local probe arrived before the replacement listing response was read and closed")
 					}
 				case <-done:
 					t.Fatalf("replacement Refresh returned before the local probe: %v", refreshErr)
 				}
+
 				checkListingDiscovery(t, home, "before forced write", 1700000000000, tt.wantInitial)
-				var forced modelcache.DiscoverySyncResult
-				var writeErr error
-				writeDone := make(chan struct{})
+				stored, ok = routes.Load()
+				if !ok {
+					t.Fatal("during local probe: route store is empty")
+				}
+				checkSnapshot("during local probe", "route store", stored, tt.wantInitial, "vertex/anthropic/fable-5-2")
+
+				snapCh := make(chan route.Snapshot, 1)
 				calls.Go(func() {
-					defer close(writeDone)
-					checkPublication("during local probe", tt.wantInitial, "vertex/anthropic/fable-5-2")
-					forced, writeErr = cache.SyncDiscoveryCache(true)
+					snap, _ := cache.Snapshot()
+					snapCh <- snap
 				})
+				// synctest.Wait reports a regression cleanly when a call blocks on a durable
+				// bubble primitive (channel, timer, or in-memory transport); a plain mutex
+				// held across the probe is not durable blocking and surfaces as a test timeout.
 				synctest.Wait()
 				select {
-				case <-writeDone:
-					if writeErr != nil || forced.State != "wrote" {
-						t.Fatalf("forced discovery sync during local probe = %+v, %v; want wrote", forced, writeErr)
-					}
+				case pausedSnap := <-snapCh:
+					checkSnapshot("during local probe", "cache", pausedSnap, tt.wantInitial, "vertex/anthropic/fable-5-2")
 				default:
-					t.Fatal("forced discovery sync and snapshot read did not finish during the local probe")
+					t.Fatal("cache Snapshot did not finish while refresh was paused at the local probe")
+				}
+
+				type syncOutcome struct {
+					result modelcache.DiscoverySyncResult
+					err    error
+				}
+				syncCh := make(chan syncOutcome, 1)
+				calls.Go(func() {
+					res, err := cache.SyncDiscoveryCache(true)
+					syncCh <- syncOutcome{result: res, err: err}
+				})
+				synctest.Wait()
+				var forced syncOutcome
+				select {
+				case forced = <-syncCh:
+				default:
+					t.Fatal("forced discovery sync did not finish while refresh was paused at the local probe")
+				}
+				if forced.err != nil || forced.result.State != "wrote" {
+					t.Fatalf("forced discovery sync during local probe = %+v, %v; want wrote", forced.result, forced.err)
 				}
 				checkListingDiscovery(t, home, "after forced write", 1700000005000, tt.wantInitial)
+
 				resume()
 				<-done
 				if refreshErr != nil {
 					t.Fatalf("replacement Refresh: %v", refreshErr)
 				}
-				checkPublication("after replacement Refresh", tt.wantReplacement, "vertex/anthropic/claude-fable-5-2")
+				stored, ok = routes.Load()
+				if !ok {
+					t.Fatal("after replacement Refresh: route store is empty")
+				}
+				checkSnapshot("after replacement Refresh", "route store", stored, tt.wantReplacement, "vertex/anthropic/claude-fable-5-2")
+				cached, _ = cache.Snapshot()
+				checkSnapshot("after replacement Refresh", "cache", cached, tt.wantReplacement, "vertex/anthropic/claude-fable-5-2")
 				checkListingDiscovery(t, home, "after replacement Refresh", 1700000005000, tt.wantReplacement)
 			})
 		})
