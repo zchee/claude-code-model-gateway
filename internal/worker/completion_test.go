@@ -34,13 +34,15 @@ import (
 func TestBodyCompletion(t *testing.T) {
 	tests := map[string]struct {
 		body                                                        string
+		readErr                                                     error
 		cancelOnRead, cancelBeforeAdmission, inputFailure, noBranch bool
 	}{
 		"error: client leaves before classifier refusal":  {body: `{"model":"claude-grok-test\ud800"}`, cancelOnRead: true},
 		"error: client leaves before unconfigured branch": {cancelOnRead: true, noBranch: true},
 		"error: client leaves before branch selection":    {cancelOnRead: true},
 		"error: client leaves before admission callback":  {cancelBeforeAdmission: true},
-		"error: body fails while client remains":          {inputFailure: true},
+		"error: body fails while client remains":          {readErr: errors.New("corrupt chunk length"), inputFailure: true},
+		"error: body ends early before context cancels":   {readErr: io.ErrUnexpectedEOF},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -74,8 +76,8 @@ func TestBodyCompletion(t *testing.T) {
 			}
 			h := handler(t, opts)
 			r := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/messages", readFunc(func(p []byte) (int, error) {
-				if tt.inputFailure {
-					return 0, io.ErrUnexpectedEOF
+				if tt.readErr != nil {
+					return 0, tt.readErr
 				}
 				if tt.cancelOnRead {
 					cancel()
@@ -101,6 +103,20 @@ func TestBodyCompletion(t *testing.T) {
 			}
 			if !tt.inputFailure && (w.Code != 0 || w.Body.Len() != 0 || diagnostics.Len() != 0) {
 				t.Errorf("wrote status %d, %d body bytes, %d diagnostic bytes after cancellation", w.Code, w.Body.Len(), diagnostics.Len())
+			}
+			if tt.inputFailure {
+				equal(t, http.StatusBadRequest, gotTerminals[0].Status)
+				equal(t, http.StatusBadRequest, w.Code)
+				equal(t, "application/json", w.Header().Get("Content-Type"))
+				equal(t, map[string]any{
+					"type":  "error",
+					"error": map[string]any{"type": "invalid_request_error", "message": "model-gateway could not read the request body"},
+				}, jsonObject(t, w.Body.String()))
+				for word := range strings.FieldsSeq(tt.readErr.Error()) {
+					if strings.Contains(strings.ToLower(w.Body.String()), word) || strings.Contains(strings.ToLower(diagnostics.String()), word) {
+						t.Errorf("response body %q or diagnostics %q leaked %q from read error", w.Body.String(), diagnostics.String(), word)
+					}
+				}
 			}
 			if (tt.cancelBeforeAdmission && forwarded != 1) || (!tt.cancelBeforeAdmission && forwarded != 0) || audits != 0 || refreshes != 0 {
 				t.Errorf("forward calls=%d, admission audits=%d, refresh calls=%d", forwarded, audits, refreshes)
