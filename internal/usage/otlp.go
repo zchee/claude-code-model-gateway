@@ -51,7 +51,9 @@ func otlpValue(value any) (jsonx.WireValue, error) {
 	case reflect.String:
 		return stringValue(v.String()), nil
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		n = float64(v.Int())
+		// A binary64 rounds integers beyond 2^53; the largest int64 would become 2^63, which is
+		// outside the signed 64-bit range of intValue.
+		return object(member("intValue", wireString(strconv.FormatInt(v.Int(), 10)))), nil
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		n = float64(v.Uint())
 	case reflect.Float32, reflect.Float64:

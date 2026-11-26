@@ -270,14 +270,6 @@ func (b *Builder) primary(req Request, ev *requestEvidence) (Record, identity, [
 			return Record{}, identity{}, nil, false
 		}
 		maps.Copy(a, exact)
-		counts, measures := ev.counts, slices.Clone(ev.servers) // attribute fills and reorders the servers in place.
-		if !ev.fixed {
-			counts, measures = measureInput(req.Body, req.BodyBytes)
-		}
-		for k, v := range counts {
-			a[k] = v
-		}
-		servers = attribute(a, counts, measures)
 		event = tokenUsageEvent
 	} else if len(limits) == 0 {
 		return Record{}, identity{}, nil, false
@@ -302,11 +294,6 @@ func (b *Builder) primary(req Request, ev *requestEvidence) (Record, identity, [
 	r.add("client_request_id", nullable(cmp.Or(identifierHeader(req.Headers, "x-claude-code-request-id"), identifierHeader(req.Headers, "x-request-id"))))
 	r.add("session_id", nullable(key.session))
 	r.add("project_name", nullable(b.projectName(key.session)))
-	elapsed := req.Elapsed
-	if ev.fixed {
-		// The source measures the duration after the project lookup.
-		elapsed = time.Since(ev.started)
-	}
 	r.add("agent_id", nullable(key.agent))
 	r.add("parent_agent_id", nullable(key.parent))
 	role := "orchestrator"
@@ -321,6 +308,22 @@ func (b *Builder) primary(req Request, ev *requestEvidence) (Record, identity, [
 	r.add("model", nullable(cmp.Or(route, response)))
 	r.add("requested_model", nullable(safeID(cmp.Or(req.RequestedModel, req.SelectedModel))))
 	r.add("backend", nullable(safeID(req.Backend)))
+	elapsed := req.Elapsed
+	if ev.fixed {
+		// The source measures the duration after the source event ID and the project and model
+		// resolution, and before the input attribution.
+		elapsed = time.Since(ev.started)
+	}
+	if success {
+		counts, measures := ev.counts, slices.Clone(ev.servers) // attribute fills and reorders the servers in place.
+		if !ev.fixed {
+			counts, measures = measureInput(req.Body, req.BodyBytes)
+		}
+		for k, v := range counts {
+			a[k] = v
+		}
+		servers = attribute(a, counts, measures)
+	}
 	var effort any
 	switch req.Effort {
 	case "low", "medium", "high", "xhigh", "max":

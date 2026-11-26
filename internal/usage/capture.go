@@ -57,8 +57,13 @@ type Capture struct {
 // A zero maxResponseBytes selects the default bound; any bound below 1024 bytes is raised to 1024.
 // The response fields of req are replaced by the observations. The request evidence is fixed here:
 // changing the body, the headers or the sequence of req afterwards does not change the record.
-// A standalone capture reports no sequence unless req supplies one, and it derives no records and
-// changes neither the builder's numbering nor its tool-result baseline.
+// The capture reports no sequence unless req supplies one, as an Emitter's captures do. It derives
+// no footprint or tool-result records, which an Emitter derives in its emit callback, and it leaves
+// the builder's request numbering and tool-result baseline unchanged. It shares the builder's
+// project lookup cache and random source, as the source's captures share a project resolver and
+// the process's randomness: a project name it resolves is cached for later Build calls, and its
+// identifiers are read from Options.Random when that is set. The identifiers fixed here are drawn
+// even when Finish builds no record.
 func NewCapture(builder *Builder, req Request, maxResponseBytes int, emit func(Record)) *Capture {
 	if maxResponseBytes == 0 {
 		maxResponseBytes = defaultMaxResponseBytes
@@ -82,7 +87,8 @@ func (c *Capture) SetResponse(status int, headers http.Header) {
 	c.status, c.headers = status, headers
 }
 
-// ObserveJSON observes and counts a complete JSON response.
+// ObserveJSON observes and counts a complete JSON response. The caller may reuse body after
+// this call returns.
 func (c *Capture) ObserveJSON(body []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -141,7 +147,9 @@ func (c *Capture) ObserveChunk(chunk []byte) {
 	c.retainedBytes += len(chunk)
 }
 
-// ObserveEvent merges usage from a decoded SSE event without counting wire bytes.
+// ObserveEvent merges usage from a decoded SSE event without counting wire bytes. The capture
+// keeps no storage of event: the caller may change or reuse it, including its member names,
+// after this call returns.
 func (c *Capture) ObserveEvent(event jsonx.WireValue) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -239,9 +247,13 @@ func (c *Capture) Finish() *Record {
 	req.Incomplete, req.Overflowed = c.incomplete, c.overflowed
 	c.mu.Unlock()
 	evidence := c.evidence
-	c.builder.mu.Lock()
-	record, _, _, ok := c.builder.primary(req, &evidence)
-	c.builder.mu.Unlock()
+	// The deferred unlock keeps the builder usable after a panic in its clock or random source.
+	record, ok := func() (Record, bool) {
+		c.builder.mu.Lock()
+		defer c.builder.mu.Unlock()
+		r, _, _, ok := c.builder.primary(req, &evidence)
+		return r, ok
+	}()
 	if !ok {
 		return nil
 	}
