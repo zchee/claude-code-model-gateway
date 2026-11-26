@@ -62,8 +62,10 @@ type UsageCapture interface {
 
 // OverflowResponder writes a normalized 413 response when LM Studio first-event peeking
 // detects an engine context overflow before headers are committed. RelayProxy calls it even when
-// the client is already gone, because the refusal must still reach the sentry; w is then a writer
-// that discards everything, so no head, body byte or flush reaches the client.
+// the client is already gone or the service has ended, because the refusal must still reach the
+// sentry. Each WriteHeader, Write and Flush on w first checks that the client is still there and
+// reaches the client only if it is; once the client is gone, w discards everything and its Header
+// map is its own. When the service has ended, w keeps nothing and the result is not used.
 type OverflowResponder func(w http.ResponseWriter, upstreamStatus int, counts sentry.Counts) (outcome.Result, error)
 
 // Attempt tracks SSE turn structure, upstream errors, and cumulative usage for one proxy stream attempt.

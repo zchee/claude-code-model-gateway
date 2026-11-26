@@ -141,7 +141,8 @@ type peekOutcome struct {
 // or the end of the body. On an overflow or an abnormal end it closes r; otherwise r stays open
 // and may still have the read that was in flight when the wait ran out. A service context that
 // has ended closes r and returns its error: on entry (whatever the wait), before each read, and
-// over a read error, since closing the transport on shutdown also fails the read in flight.
+// over a read that failed, before any byte it delivered is looked at, since closing the transport
+// on shutdown also fails the read in flight.
 func peekFirst(ctx context.Context, r *asyncReader, wait time.Duration) (peekOutcome, error) {
 	if err := ctx.Err(); err != nil {
 		_ = r.close()
@@ -168,6 +169,12 @@ func peekFirst(ctx context.Context, r *asyncReader, wait time.Duration) (peekOut
 		select {
 		case res := <-r.results:
 			r.got(res)
+			// A read that failed because the service ended may still have delivered bytes; the
+			// shutdown wins before any of them is looked at.
+			if res.err != nil && !errors.Is(res.err, io.EOF) && ctx.Err() != nil {
+				_ = r.close()
+				return peekOutcome{}, ctx.Err()
+			}
 			prefix = append(prefix, res.data...)
 			if event, decided := firstDataEvent(scanner.Feed(res.data)); decided {
 				if counts, ok := engineOverflow(event); ok {
@@ -181,9 +188,6 @@ func peekFirst(ctx context.Context, r *asyncReader, wait time.Duration) (peekOut
 				return peekOutcome{prefix: prefix, termErr: res.err}, nil
 			case res.err != nil:
 				_ = r.close()
-				if err := ctx.Err(); err != nil {
-					return peekOutcome{}, err
-				}
 				return peekOutcome{earlyEnd: overrideAborted}, nil
 			}
 		case <-timer.C:
@@ -275,7 +279,8 @@ func (b *replayBody) Close() error { return b.r.close() }
 // racing a second reader; the single reader transfers to the returned Body whose Close unblocks and
 // joins it. On ctx cancellation, PeekFirstEvent closes body, joins its reader goroutine, and returns
 // ctx.Err(); so does a ctx that has already ended on entry (whatever the wait), and a ctx that has
-// ended by the time a read error arrives, which then reports no EarlyEndOverride.
+// ended by the time a read fails with an error other than io.EOF, whatever bytes that read
+// delivered: no Body, no Overflow and no EarlyEndOverride.
 func PeekFirstEvent(ctx context.Context, body io.ReadCloser, wait time.Duration) (PeekResult, error) {
 	if body == nil {
 		return PeekResult{}, errNilBody

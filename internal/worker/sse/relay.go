@@ -83,24 +83,85 @@ func relayHeader(resp *upstream.Response, name string) string {
 	return strings.Join(resp.Header.Values(name), ", ")
 }
 
-// discardWriter stands in for a client that has gone: it accepts a head, body bytes and flushes,
-// and sends nothing anywhere. It holds no reference to the real writer.
-type discardWriter struct {
-	header http.Header
+// clientWriter is the only path from a relay to the client. Each WriteHeader, Write and flush
+// checks, without blocking, that the client is still there immediately before it runs, so no output
+// races a disconnect that a caller has not yet seen; an operation already running is not retracted.
+// Once the client is gone, by its done signal or by a failed write or flush, it keeps nothing:
+// Header returns a map of its own, WriteHeader and Flush do nothing, and Write reports the bytes
+// as written. It deliberately has no Unwrap, so a ResponseController cannot reach past it.
+type clientWriter struct {
+	w       http.ResponseWriter
+	rc      *http.ResponseController
+	done    <-chan struct{}
+	gone    bool
+	discard http.Header
 }
 
-func (d *discardWriter) Header() http.Header {
-	if d.header == nil {
-		d.header = make(http.Header)
+// newClientWriter gates w on done; a nil done never reports a departure by itself.
+func newClientWriter(w http.ResponseWriter, done <-chan struct{}) *clientWriter {
+	return &clientWriter{w: w, rc: http.NewResponseController(w), done: done}
+}
+
+// nothingWriter returns a writer that keeps nothing and reaches no client.
+func nothingWriter() *clientWriter {
+	return &clientWriter{gone: true}
+}
+
+// clientGone reports whether the client is gone, latching a closed done signal.
+func (c *clientWriter) clientGone() bool {
+	if !c.gone && closed(c.done) {
+		c.gone = true
 	}
-	return d.header
+	return c.gone
 }
 
-func (*discardWriter) Write(b []byte) (int, error) { return len(b), nil }
+// Header returns the client's header map while the client is there, and a private map after.
+func (c *clientWriter) Header() http.Header {
+	if c.clientGone() {
+		if c.discard == nil {
+			c.discard = make(http.Header)
+		}
+		return c.discard
+	}
+	return c.w.Header()
+}
 
-func (*discardWriter) WriteHeader(int) {}
+// WriteHeader sends the status line unless the client is gone.
+func (c *clientWriter) WriteHeader(code int) {
+	if c.clientGone() {
+		return
+	}
+	c.w.WriteHeader(code)
+}
 
-func (*discardWriter) Flush() {}
+// Write sends b unless the client is gone. A failed write marks the client gone, except one
+// refused because the response status allows no body.
+func (c *clientWriter) Write(b []byte) (int, error) {
+	if c.clientGone() {
+		return len(b), nil
+	}
+	n, err := c.w.Write(b)
+	if err != nil && !errors.Is(err, http.ErrBodyNotAllowed) {
+		c.gone = true
+	}
+	return n, err
+}
+
+// FlushError pushes written bytes to the client unless it is gone. A failed flush marks the client
+// gone; a client writer that cannot flush reports http.ErrNotSupported and stays usable.
+func (c *clientWriter) FlushError() error {
+	if c.clientGone() {
+		return nil
+	}
+	err := c.rc.Flush()
+	if err != nil && !errors.Is(err, http.ErrNotSupported) {
+		c.gone = true
+	}
+	return err
+}
+
+// Flush is FlushError for callers that assert http.Flusher.
+func (c *clientWriter) Flush() { _ = c.FlushError() }
 
 // heartbeatInterval resolves a configured interval: zero is the default, negative disables.
 func heartbeatInterval(d time.Duration) time.Duration {
@@ -113,13 +174,11 @@ func heartbeatInterval(d time.Duration) time.Duration {
 	return d
 }
 
-// streamer writes one relayed response and keeps its heartbeat. Once the client is gone, by
-// ClientDone or by a failed write, it writes nothing more and its heartbeat stays stopped.
+// streamer writes one relayed response through its client writer and keeps its heartbeat. Once
+// the client is gone the writer keeps nothing and the heartbeat stays stopped.
 type streamer struct {
-	w          http.ResponseWriter
-	rc         *http.ResponseController
+	out        *clientWriter
 	clientDone <-chan struct{}
-	gone       bool
 	unflushed  bool
 	interval   time.Duration
 	heartbeat  *time.Timer
@@ -127,7 +186,7 @@ type streamer struct {
 
 // newStreamer starts the heartbeat only for a client that is still there.
 func newStreamer(w http.ResponseWriter, clientDone <-chan struct{}, interval time.Duration) *streamer {
-	s := &streamer{w: w, rc: http.NewResponseController(w), clientDone: clientDone, interval: interval}
+	s := &streamer{out: newClientWriter(w, clientDone), clientDone: clientDone, interval: interval}
 	if s.clientGone() {
 		return s
 	}
@@ -162,7 +221,7 @@ func (s *streamer) stop() {
 
 // markGone records that the client can no longer be written to.
 func (s *streamer) markGone() {
-	s.gone = true
+	s.out.gone = true
 	s.clientDone = nil
 	s.stop()
 }
@@ -177,17 +236,21 @@ func closed(done <-chan struct{}) bool {
 	}
 }
 
-// clientGone reports whether the client is gone, checking ClientDone without blocking so that
-// no write races a disconnect the select loop has not yet seen.
+// clientGone reports whether the client is gone and, if so, stops the heartbeat and the wait on
+// ClientDone.
 func (s *streamer) clientGone() bool {
-	if s.gone {
-		return true
+	if !s.out.clientGone() {
+		return false
 	}
-	if closed(s.clientDone) {
-		s.markGone()
-		return true
-	}
-	return false
+	s.markGone()
+	return true
+}
+
+// head copies the relay headers and writes the status line; each step is gated on the client.
+func (s *streamer) head(resp *upstream.Response, status int, dropContentLength bool) {
+	copyRelayHeaders(s.out.Header(), resp, dropContentLength)
+	s.out.WriteHeader(status)
+	s.clientGone()
 }
 
 // write sends b to the client unless the client is gone. A response status that allows no body
@@ -196,24 +259,20 @@ func (s *streamer) write(b []byte) {
 	if len(b) == 0 || s.clientGone() {
 		return
 	}
-	if _, err := s.w.Write(b); err != nil {
-		if !errors.Is(err, http.ErrBodyNotAllowed) {
-			s.markGone()
-		}
-		return
+	_, err := s.out.Write(b)
+	if !s.clientGone() && err == nil {
+		s.unflushed = true
 	}
-	s.unflushed = true
 }
 
 // flush pushes written bytes to the client; nothing is flushed before the first write.
 func (s *streamer) flush() {
-	if !s.unflushed || s.clientGone() {
+	if !s.unflushed {
 		return
 	}
 	s.unflushed = false
-	if err := s.rc.Flush(); err != nil && !errors.Is(err, http.ErrNotSupported) {
-		s.markGone()
-	}
+	_ = s.out.FlushError()
+	s.clientGone()
 }
 
 // beat writes one heartbeat comment and re-arms the interval while the client is there.
@@ -223,7 +282,7 @@ func (s *streamer) beat() {
 	}
 	s.write([]byte(HeartbeatComment))
 	s.flush()
-	if !s.gone {
+	if !s.clientGone() {
 		s.arm()
 	}
 }
@@ -267,15 +326,20 @@ func brokenResult(status int, clientGone bool) (outcome.Result, error) {
 // It copies relay headers from resp.RelayHeader (or resp.Header if RelayHeader is nil) minus
 // hop-by-hop and Content-Length headers without mutating resp.Header or resp.RelayHeader.
 // It takes ownership of resp.Body and closes it before returning.
-// A client that is already gone when the head would be written gets nothing, not even the head
-// (no early-end 502 either), and no heartbeat. A ctx that has ended before RelayProxy writes the
-// head closes resp.Body and returns ctx.Err() (nil once the client is gone); with HeadWritten it
-// returns the abort described next. ctx is checked again before every upstream read.
+// Every WriteHeader, Write and Flush on w, including the early-end 502 and those of OnOverflow,
+// first checks ClientDone without blocking and is skipped once the client is gone; one already
+// running is not retracted. A client that is already gone when the head would be written gets
+// nothing, not even the head (no early-end 502 either), and no heartbeat. A ctx that has ended
+// before RelayProxy writes the head, including one that ended while the first-event peek decided,
+// closes resp.Body and returns ctx.Err() (nil once the client is gone); with HeadWritten it returns
+// the abort described next. ctx is checked again before every upstream read.
 // If the upstream breaks after response headers are committed, RelayProxy returns the terminal
 // outcome facts alongside http.ErrAbortHandler rather than panicking.
 // When the first-event peek finds an engine overflow, OnOverflow is called even if the client is
-// already gone, because the refusal must still reach the sentry; it is then given a writer that
-// discards everything, so no head, body byte or flush reaches w.
+// already gone or ctx has ended, because the refusal must still reach the sentry. Its writer gates
+// each operation on the client as above, so for a client already gone no head, body byte or flush
+// reaches w. After a ctx that ended during the peek, OnOverflow gets a writer that keeps nothing,
+// its result is dropped, and RelayProxy returns as for any shutdown before the head.
 func RelayProxy(ctx context.Context, w http.ResponseWriter, resp *upstream.Response, opts ProxyOptions) (outcome.Result, error) {
 	if resp == nil || resp.Body == nil {
 		return outcome.Result{}, errNilResponse
@@ -291,23 +355,28 @@ func RelayProxy(ctx context.Context, w http.ResponseWriter, resp *upstream.Respo
 			opts.OnPeek()
 		}
 		peeked, err := peekFirst(ctx, body, opts.FirstEventWait)
-		switch {
-		case err != nil:
+		if err != nil {
 			return shutdownBeforeHead(ctx, status, closed(opts.ClientDone))
+		}
+		// The service may have ended while the peek decided, for example by closing the body.
+		if ctx.Err() != nil {
+			_ = body.close()
+			if peeked.overflow != nil && opts.OnOverflow != nil {
+				_, _ = opts.OnOverflow(nothingWriter(), status, *peeked.overflow)
+			}
+			return shutdownBeforeHead(ctx, status, closed(opts.ClientDone))
+		}
+		switch {
 		case peeked.overflow != nil:
 			if opts.OnOverflow == nil {
 				return outcome.Result{Status: status}, errNoOverflowResponder
 			}
-			if closed(opts.ClientDone) {
-				return opts.OnOverflow(&discardWriter{}, status, *peeked.overflow)
-			}
-			return opts.OnOverflow(w, status, *peeked.overflow)
+			return opts.OnOverflow(newClientWriter(w, opts.ClientDone), status, *peeked.overflow)
 		case peeked.earlyEnd != "":
-			if !closed(opts.ClientDone) {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusBadGateway)
-				_, _ = io.WriteString(w, earlyEndBody)
-			}
+			out := newClientWriter(w, opts.ClientDone)
+			out.Header().Set("Content-Type", "application/json")
+			out.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(out, earlyEndBody)
 			return outcome.Result{Status: status, StatusOverride: peeked.earlyEnd}, nil
 		}
 		prefix, termErr = peeked.prefix, peeked.termErr
@@ -322,9 +391,8 @@ func RelayProxy(ctx context.Context, w http.ResponseWriter, resp *upstream.Respo
 		}
 		return shutdownBeforeHead(ctx, status, s.clientGone())
 	}
-	if !opts.HeadWritten && !s.clientGone() {
-		copyRelayHeaders(w.Header(), resp, true)
-		w.WriteHeader(status)
+	if !opts.HeadWritten {
+		s.head(resp, status, true)
 	}
 
 	var attempt Attempt
@@ -598,7 +666,8 @@ func (d *sideDecoder) abandon() {
 // returning. For 2xx SSE responses with Usage or eligible proxy Sentry set, it decodes gzip, deflate,
 // or br on a side branch subject to MaxObserveBytes without altering delivered bytes. When
 // opts.ClientDone closes or a write to w fails, RelayPassthrough stops heartbeats (if enabled) and
-// writes nothing more to w; Anthropic passthrough (ProxyProvider == "") never sends heartbeats, never
+// writes nothing more to w (each WriteHeader, Write and Flush first checks ClientDone without
+// blocking); Anthropic passthrough (ProxyProvider == "") never sends heartbeats, never
 // updates sentry state, and pauses reading resp.Body for back-pressure without eagerly closing the
 // provider until ctx is canceled. When ctx ends after the client is gone, RelayPassthrough closes
 // resp.Body and returns a nil error (neither ctx.Err() nor http.ErrAbortHandler). RelayPassthrough
@@ -628,10 +697,7 @@ func RelayPassthrough(ctx context.Context, w http.ResponseWriter, resp *upstream
 		_ = body.close()
 		return shutdownBeforeHead(ctx, status, s.clientGone())
 	}
-	if !s.clientGone() {
-		copyRelayHeaders(w.Header(), resp, false)
-		w.WriteHeader(status)
-	}
+	s.head(resp, status, false)
 
 	observer := newPassthroughObserver(resp, opts)
 	defer observer.abandon()
