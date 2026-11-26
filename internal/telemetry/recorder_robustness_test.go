@@ -18,9 +18,11 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/hex"
 	json "encoding/json/v2"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -72,6 +74,102 @@ func (c *traceCollector) received() [][]byte {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return slices.Clone(c.bodies)
+}
+
+// pipeTraceCollector serves every collector connection over an in-memory pipe. Created inside a
+// synctest bubble, it runs the export bound on virtual time, so host load cannot make a post miss
+// it and the counts it records are exact.
+type pipeTraceCollector struct {
+	mu     sync.Mutex
+	bodies [][]byte
+	errs   []error
+}
+
+// dial hands the exporter one side of a new pipe and answers on the other side.
+func (c *pipeTraceCollector) dial(context.Context, string, string) (net.Conn, error) {
+	peer, client := net.Pipe()
+	go c.serve(peer)
+	return client, nil
+}
+
+func (c *pipeTraceCollector) serve(peer net.Conn) {
+	defer func() { _ = peer.Close() }()
+	req, err := http.ReadRequest(bufio.NewReader(peer))
+	var body []byte
+	if err == nil {
+		body, err = io.ReadAll(req.Body)
+	}
+	if err == nil {
+		// Record the post before replying: the reply lets the exporter's Wait return.
+		c.mu.Lock()
+		c.bodies = append(c.bodies, body)
+		c.mu.Unlock()
+		_, err = io.WriteString(peer, "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+	}
+	if err != nil {
+		c.mu.Lock()
+		c.errs = append(c.errs, err)
+		c.mu.Unlock()
+	}
+}
+
+// recorder creates a recorder that exports route spans to this collector.
+func (c *pipeTraceCollector) recorder(opts Options) *Recorder { return newRecorder(opts, c.dial) }
+
+// env enables route spans; the address is never dialed.
+func (c *pipeTraceCollector) env() map[string]string {
+	return map[string]string{"CODEX_GATEWAY_TELEMETRY_ENDPOINT": "http://127.0.0.1:1/v1/traces", "CLAUDE_CODE_PROPAGATE_TRACEPARENT": "1"}
+}
+
+// received waits until every goroutine of the calling synctest bubble is blocked or has exited,
+// reports the collector's failures to t and returns the bodies it recorded.
+func (c *pipeTraceCollector) received(t *testing.T) [][]byte {
+	t.Helper()
+	synctest.Wait()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, err := range c.errs {
+		t.Errorf("pipe collector: %v", err)
+	}
+	return slices.Clone(c.bodies)
+}
+
+// blockIdentity returns the identifiers an unlinked span draws from 40 random bytes of value v:
+// the trace identifier, the span identifier and the version 4 route identifier, in that order.
+func blockIdentity(v byte) spanIdentity {
+	route := bytes.Repeat([]byte{v}, 16)
+	route[6] = route[6]&0x0f | 0x40
+	route[8] = route[8]&0x3f | 0x80
+	h := hex.EncodeToString(route)
+	return spanIdentity{
+		TraceID: strings.Repeat(hex.EncodeToString([]byte{v}), 16),
+		SpanID:  strings.Repeat(hex.EncodeToString([]byte{v}), 8),
+		RouteID: h[:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:],
+	}
+}
+
+// checkBlockIdentities requires every span's trace, span and route identifiers to come whole from
+// one 40-byte block of the source, each block at most once, and returns the block values seen.
+func checkBlockIdentities(t *testing.T, ids []spanIdentity) map[byte]bool {
+	t.Helper()
+	blocks := map[byte]bool{}
+	for _, id := range ids {
+		raw, err := hex.DecodeString(id.SpanID)
+		if err != nil || len(raw) == 0 {
+			t.Errorf("span identifier %q is not hexadecimal", id.SpanID)
+			continue
+		}
+		want := blockIdentity(raw[0])
+		want.SessionID = id.SessionID
+		if d := gocmp.Diff(want, id); d != "" {
+			t.Errorf("span identifiers are not one whole draw of block %#02x (-want +got):\n%s", raw[0], d)
+		}
+		if blocks[raw[0]] {
+			t.Errorf("block %#02x was drawn by more than one span", raw[0])
+		}
+		blocks[raw[0]] = true
+	}
+	return blocks
 }
 
 // spanIdentity holds the identifiers of one exported route span.
@@ -137,31 +235,39 @@ func routeLogRows(t *testing.T, raw []byte) []map[string]any {
 	return rows
 }
 
-// panicOnceReader panics on one chosen Read call and otherwise fills every buffer with 0x22.
-type panicOnceReader struct{ calls, panicAt int }
+// panicAtOffsetReader fills every buffer with 0x22. Once, on the read that would deliver the byte
+// at panicAt of its stream, it panics instead and delivers nothing.
+type panicAtOffsetReader struct {
+	offset, panicAt int
+	fired           bool
+}
 
-func (r *panicOnceReader) Read(p []byte) (int, error) {
-	r.calls++
-	if r.calls-1 == r.panicAt {
+func (r *panicAtOffsetReader) Read(p []byte) (int, error) {
+	if !r.fired && r.panicAt >= r.offset && r.panicAt < r.offset+len(p) {
+		r.fired = true
 		panic("random source failure")
 	}
 	for i := range p {
 		p[i] = 0x22
 	}
+	r.offset += len(p)
 	return len(p), nil
 }
 
 func TestStartAfterRandomSourcePanic(t *testing.T) {
+	// An unlinked Start draws the trace identifier from bytes 0 to 15, the span identifier from
+	// bytes 16 to 23 and the route identifier from bytes 24 to 39.
 	tests := map[string]struct{ panicAt int }{
 		"success: start completes after a panic while reading the trace identifier": {panicAt: 0},
-		"success: start completes after a panic while reading the span identifier":  {panicAt: 1},
-		"success: start completes after a panic while reading the route identifier": {panicAt: 2},
+		"success: start completes after a panic while reading the span identifier":  {panicAt: 16},
+		"success: start completes after a panic while reading the route identifier": {panicAt: 24},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			c := newTraceCollector(t)
 			opts := recorderOptions(c.env())
-			opts.Random = &panicOnceReader{panicAt: tt.panicAt}
+			random := &panicAtOffsetReader{panicAt: tt.panicAt}
+			opts.Random = random
 			r := NewRecorder(opts)
 			recovered := func() (v any) {
 				defer func() { v = recover() }()
@@ -171,13 +277,17 @@ func TestStartAfterRandomSourcePanic(t *testing.T) {
 			if recovered == nil {
 				t.Fatal("the random source's panic did not reach the caller of Start")
 			}
-			// A lock left held by the panic would block this Start forever; bound the wait.
+			if random.offset != tt.panicAt {
+				t.Fatalf("the panic came after %d bytes were drawn, want it on the read of byte %d", random.offset, tt.panicAt)
+			}
+			// A lock left held by the panic would block this Start forever; bound the wait
+			// generously so that only a lock that is never released trips it.
 			started := make(chan *Span, 1)
 			go func() { started <- r.Start(http.Header{}) }()
 			var span *Span
 			select {
 			case span = <-started:
-			case <-time.After(5 * time.Second):
+			case <-time.After(30 * time.Second):
 				t.Fatal("Start blocked after the caller recovered a panic of the random source")
 			}
 			span.Finish(Route{Backend: "codex"}, http.StatusOK, "")
@@ -294,85 +404,133 @@ func TestTraceExportFailureIsSilent(t *testing.T) {
 }
 
 func TestRecorderConcurrentUse(t *testing.T) {
-	tests := map[string]struct{ goroutines int }{
-		"success: two requests share one recorder":        {goroutines: 2},
-		"success: sixty-four requests share one recorder": {goroutines: 64},
+	tests := map[string]struct {
+		goroutines int
+		// loopback exports to a real loopback collector, where a loaded host may correctly drop
+		// a span at the export bound; only what cannot be lost is asserted on it.
+		loopback bool
+	}{
+		"success: two requests share one recorder":                      {goroutines: 2},
+		"success: sixty-four requests share one recorder":               {goroutines: 64},
+		"success: two requests share one recorder on a loopback socket": {goroutines: 2, loopback: true},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			c := newTraceCollector(t)
-			opts := recorderOptions(c.env())
-			// Each Start draws one 40-byte block: trace, span and route identifiers. Distinct
-			// blocks expose a draw torn between two concurrent Starts; bytes.Reader is not safe
-			// for concurrent use, so the race detector sees an unserialized draw.
-			random := make([]byte, 0, tt.goroutines*40)
-			for i := range tt.goroutines {
-				random = append(random, bytes.Repeat([]byte{byte(i + 1)}, 40)...)
-			}
-			opts.Random = bytes.NewReader(random)
-			opts.LogPath = filepath.Join(t.TempDir(), "logs", "request-routes.jsonl")
-			var diagnostics bytes.Buffer
-			opts.Diagnostics = &diagnostics
-			r := NewRecorder(opts)
-			begin := make(chan struct{})
-			var wg sync.WaitGroup
-			wantSessions := map[string]bool{}
-			for i := range tt.goroutines {
-				session := fmt.Sprintf("session-concurrent-%d", i)
-				wantSessions[session] = true
-				wg.Go(func() {
-					req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/messages?key=query-sentinel", nil)
-					req.Header.Set("X-Claude-Code-Session-Id", session)
-					<-begin
-					r.LogRoute(req, LogEntry{Backend: "codex", Model: new("gpt-5.6-sol")})
-					r.Start(req.Header).Finish(Route{Backend: "codex"}, http.StatusOK, "")
-				})
-			}
-			close(begin)
-			wg.Wait()
-			r.Wait()
-			if diagnostics.Len() != 0 {
-				t.Errorf("unexpected diagnostic: %q", diagnostics.String())
-			}
-			bodies := c.received()
-			if len(bodies) != tt.goroutines {
-				t.Fatalf("collector received %d spans, want %d", len(bodies), tt.goroutines)
-			}
-			traces, spans, routes, sessions := map[string]bool{}, map[string]bool{}, map[string]bool{}, map[string]bool{}
-			for _, body := range bodies {
-				id := exportedSpan(t, body)
-				if len(id.SpanID) != 16 || id.SpanID != strings.Repeat(id.SpanID[:2], 8) || id.TraceID != strings.Repeat(id.SpanID[:2], 16) {
-					t.Errorf("span identifiers come from more than one random draw: trace %q span %q", id.TraceID, id.SpanID)
+			// run starts every request from its own goroutine and returns the route log and the
+			// diagnostics once every export has finished.
+			run := func(t *testing.T, makeRecorder func(Options) *Recorder, env map[string]string) ([]byte, string, map[string]bool) {
+				opts := recorderOptions(env)
+				// Each Start draws one 40-byte block: trace, span and route identifiers. Distinct
+				// blocks expose a draw torn between two concurrent Starts; bytes.Reader is not safe
+				// for concurrent use, so the race detector sees an unserialized draw.
+				random := make([]byte, 0, tt.goroutines*40)
+				for i := range tt.goroutines {
+					random = append(random, bytes.Repeat([]byte{byte(i + 1)}, 40)...)
 				}
-				traces[id.TraceID], spans[id.SpanID], routes[id.RouteID], sessions[id.SessionID] = true, true, true, true
-			}
-			for kind, got := range map[string]map[string]bool{"trace": traces, "span": spans, "route": routes} {
-				if len(got) != tt.goroutines {
-					t.Errorf("%d distinct %s identifiers, want %d", len(got), kind, tt.goroutines)
+				opts.Random = bytes.NewReader(random)
+				opts.LogPath = filepath.Join(t.TempDir(), "logs", "request-routes.jsonl")
+				var diagnostics bytes.Buffer
+				opts.Diagnostics = &diagnostics
+				r := makeRecorder(opts)
+				wantSessions := map[string]bool{}
+				// Every request is made here: nothing that can stop the test runs in the goroutines.
+				requests := make([]*http.Request, tt.goroutines)
+				for i := range requests {
+					session := fmt.Sprintf("session-concurrent-%d", i)
+					wantSessions[session] = true
+					requests[i] = httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/messages?key=query-sentinel", nil)
+					requests[i].Header.Set("X-Claude-Code-Session-Id", session)
 				}
+				begin := make(chan struct{})
+				var wg sync.WaitGroup
+				for _, req := range requests {
+					wg.Go(func() {
+						<-begin
+						r.LogRoute(req, LogEntry{Backend: "codex", Model: new("gpt-5.6-sol")})
+						r.Start(req.Header).Finish(Route{Backend: "codex"}, http.StatusOK, "")
+					})
+				}
+				close(begin)
+				wg.Wait()
+				r.Wait()
+				raw, err := os.ReadFile(opts.LogPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return raw, diagnostics.String(), wantSessions
 			}
-			if d := gocmp.Diff(wantSessions, sessions); d != "" {
-				t.Errorf("span sessions (-want +got):\n%s", d)
-			}
-			raw, err := os.ReadFile(opts.LogPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			rows := routeLogRows(t, raw)
-			if len(rows) != tt.goroutines {
-				t.Fatalf("route log has %d lines, want %d", len(rows), tt.goroutines)
-			}
-			logged := map[string]bool{}
-			for _, row := range rows {
-				session, _ := row["sessionId"].(string)
-				logged[session] = true
-				if row["path"] != "/v1/messages" || row["backend"] != "codex" || row["model"] != "gpt-5.6-sol" {
-					t.Errorf("unexpected route log line: %v", row)
+			// checkLog checks what the recorder wrote locally, which host load cannot lose.
+			checkLog := func(t *testing.T, raw []byte, diagnostics string, wantSessions map[string]bool) {
+				if diagnostics != "" {
+					t.Errorf("unexpected diagnostic: %q", diagnostics)
+				}
+				rows := routeLogRows(t, raw)
+				if len(rows) != tt.goroutines {
+					t.Fatalf("route log has %d lines, want %d", len(rows), tt.goroutines)
+				}
+				logged := map[string]bool{}
+				for _, row := range rows {
+					session, _ := row["sessionId"].(string)
+					logged[session] = true
+					if row["path"] != "/v1/messages" || row["backend"] != "codex" || row["model"] != "gpt-5.6-sol" {
+						t.Errorf("unexpected route log line: %v", row)
+					}
+				}
+				if d := gocmp.Diff(wantSessions, logged); d != "" {
+					t.Errorf("route log sessions (-want +got):\n%s", d)
 				}
 			}
-			if d := gocmp.Diff(wantSessions, logged); d != "" {
-				t.Errorf("route log sessions (-want +got):\n%s", d)
+			identities := func(t *testing.T, bodies [][]byte) ([]spanIdentity, map[string]bool) {
+				ids := make([]spanIdentity, 0, len(bodies))
+				sessions := map[string]bool{}
+				for _, body := range bodies {
+					id := exportedSpan(t, body)
+					ids = append(ids, id)
+					sessions[id.SessionID] = true
+				}
+				return ids, sessions
 			}
+			if tt.loopback {
+				c := newTraceCollector(t)
+				raw, diagnostics, wantSessions := run(t, NewRecorder, c.env())
+				checkLog(t, raw, diagnostics, wantSessions)
+				bodies := c.received()
+				if len(bodies) > tt.goroutines {
+					t.Errorf("collector received %d spans, want at most %d", len(bodies), tt.goroutines)
+				}
+				ids, sessions := identities(t, bodies)
+				for block := range checkBlockIdentities(t, ids) {
+					if block < 1 || int(block) > tt.goroutines {
+						t.Errorf("span drawn from block %#02x, want a block of 1 to %d", block, tt.goroutines)
+					}
+				}
+				for session := range sessions {
+					if !wantSessions[session] {
+						t.Errorf("span carries unexpected session %q", session)
+					}
+				}
+				return
+			}
+			synctest.Test(t, func(t *testing.T) {
+				c := &pipeTraceCollector{}
+				raw, diagnostics, wantSessions := run(t, c.recorder, c.env())
+				checkLog(t, raw, diagnostics, wantSessions)
+				bodies := c.received(t)
+				if len(bodies) != tt.goroutines {
+					t.Fatalf("collector received %d spans, want %d", len(bodies), tt.goroutines)
+				}
+				ids, sessions := identities(t, bodies)
+				wantBlocks := map[byte]bool{}
+				for i := range tt.goroutines {
+					wantBlocks[byte(i+1)] = true
+				}
+				if d := gocmp.Diff(wantBlocks, checkBlockIdentities(t, ids)); d != "" {
+					t.Errorf("random blocks drawn by the spans (-want +got):\n%s", d)
+				}
+				if d := gocmp.Diff(wantSessions, sessions); d != "" {
+					t.Errorf("span sessions (-want +got):\n%s", d)
+				}
+			})
 		})
 	}
 }
@@ -384,27 +542,81 @@ func TestSpanConcurrentFinish(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			c := newTraceCollector(t)
-			r := NewRecorder(recorderOptions(c.env()))
-			h := http.Header{}
-			if tt.traceparent != "" {
-				h.Set("Traceparent", tt.traceparent)
-			}
-			span := r.Start(h)
-			begin := make(chan struct{})
-			var wg sync.WaitGroup
-			for i := range 32 {
-				wg.Go(func() {
-					<-begin
-					span.Finish(Route{Backend: "codex"}, http.StatusOK+i, "")
-				})
-			}
-			close(begin)
-			wg.Wait()
-			r.Wait()
-			if got := len(c.received()); got != 1 {
-				t.Errorf("collector received %d spans for one request, want 1", got)
-			}
+			synctest.Test(t, func(t *testing.T) {
+				c := &pipeTraceCollector{}
+				r := c.recorder(recorderOptions(c.env()))
+				h := http.Header{}
+				if tt.traceparent != "" {
+					h.Set("Traceparent", tt.traceparent)
+				}
+				span := r.Start(h)
+				begin := make(chan struct{})
+				var wg sync.WaitGroup
+				for i := range 32 {
+					wg.Go(func() {
+						<-begin
+						span.Finish(Route{Backend: "codex"}, http.StatusOK+i, "")
+					})
+				}
+				close(begin)
+				wg.Wait()
+				r.Wait()
+				if got := len(c.received(t)); got != 1 {
+					t.Errorf("collector received %d spans for one request, want 1", got)
+				}
+			})
+		})
+	}
+}
+
+func TestSpanIntegerAttributeExact(t *testing.T) {
+	tests := map[string]struct {
+		requestBytes int64
+		want         string
+	}{
+		"success: small request byte count is an exact decimal":         {requestBytes: 150, want: "150"},
+		"success: request byte count above two to the 53 is exact":      {requestBytes: 1<<53 + 1, want: "9007199254740993"},
+		"success: largest int64 request byte count is an exact decimal": {requestBytes: math.MaxInt64, want: "9223372036854775807"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				c := &pipeTraceCollector{}
+				r := c.recorder(recorderOptions(c.env()))
+				r.Start(nil).Finish(Route{Backend: "codex", Overflow: &Overflow{Phase: "first_turn", RefusedBy: "upstream", RequestBytes: tt.requestBytes}}, http.StatusRequestEntityTooLarge, "")
+				r.Wait()
+				bodies := c.received(t)
+				if len(bodies) != 1 {
+					t.Fatalf("collector received %d spans, want 1", len(bodies))
+				}
+				var doc struct {
+					ResourceSpans []struct {
+						ScopeSpans []struct {
+							Spans []struct {
+								Attributes []struct {
+									Key   string         `json:"key"`
+									Value map[string]any `json:"value"`
+								} `json:"attributes"`
+							} `json:"spans"`
+						} `json:"scopeSpans"`
+					} `json:"resourceSpans"`
+				}
+				if err := json.Unmarshal(bodies[0], &doc); err != nil {
+					t.Fatal(err)
+				}
+				if len(doc.ResourceSpans) != 1 || len(doc.ResourceSpans[0].ScopeSpans) != 1 || len(doc.ResourceSpans[0].ScopeSpans[0].Spans) != 1 {
+					t.Fatalf("invalid OTLP span envelope: %s", bodies[0])
+				}
+				var got []map[string]any
+				for _, attr := range doc.ResourceSpans[0].ScopeSpans[0].Spans[0].Attributes {
+					if attr.Key == "overflow_request_bytes" {
+						got = append(got, attr.Value)
+					}
+				}
+				if d := gocmp.Diff([]map[string]any{{"intValue": tt.want}}, got); d != "" {
+					t.Errorf("exported overflow_request_bytes (-want +got):\n%s", d)
+				}
+			})
 		})
 	}
 }
@@ -491,10 +703,12 @@ func TestTraceStalledReplyBody(t *testing.T) {
 						t.Error(err)
 						return
 					}
+					// The handler's own limit lets the server close even if the exporter never
+					// abandons the connection; it matches the test's watchdog.
 					select {
 					case <-r.Context().Done():
 						abandoned <- struct{}{}
-					case <-time.After(10 * time.Second):
+					case <-time.After(30 * time.Second):
 					}
 				}))
 				defer s.Close()
@@ -505,14 +719,14 @@ func TestTraceStalledReplyBody(t *testing.T) {
 				start := time.Now()
 				r.Start(nil).Finish(Route{Backend: "codex"}, http.StatusOK, "")
 				r.Wait()
-				// The deadline starts after Finish, so the wait lasts at least the bound; the upper
-				// limit leaves room for a loaded test machine.
-				if elapsed := time.Since(start); elapsed < 500*time.Millisecond || elapsed > 5*time.Second {
-					t.Errorf("Wait returned after %s, want the 500ms export bound", elapsed)
+				// The deadline starts after Finish, so the wait lasts at least the bound. A loaded
+				// host can only make it longer; the exact bound is checked on the pipe.
+				if elapsed := time.Since(start); elapsed < 500*time.Millisecond {
+					t.Errorf("Wait returned after %s, before the 500ms export bound", elapsed)
 				}
 				select {
 				case <-abandoned:
-				case <-time.After(5 * time.Second):
+				case <-time.After(30 * time.Second):
 					t.Error("exporter did not close the stalled collector connection")
 				}
 			}

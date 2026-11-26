@@ -24,10 +24,12 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
 	gocmp "github.com/google/go-cmp/cmp"
+	"golang.org/x/sys/unix"
 )
 
 const routeLogDiagnostic = "model-gateway: could not write request route log: "
@@ -80,7 +82,9 @@ func TestRouteLogPathSafety(t *testing.T) {
 		setup func(t *testing.T, root string) string
 		// written reports whether both appends must land in the file at the log path.
 		written bool
-		check   func(t *testing.T, root string)
+		// prior holds the rows the file at the log path has before the appends.
+		prior []map[string]any
+		check func(t *testing.T, root string)
 	}{
 		"success: missing parent directories are created private": {
 			setup:   func(t *testing.T, root string) string { return root + "/state/logs/request-routes.jsonl" },
@@ -102,6 +106,7 @@ func TestRouteLogPathSafety(t *testing.T) {
 				return root + "/logs/request-routes.jsonl"
 			},
 			written: true,
+			prior:   []map[string]any{{"prior": true}},
 			check: func(t *testing.T, root string) {
 				raw, err := os.ReadFile(root + "/logs/request-routes.jsonl")
 				if err != nil {
@@ -205,6 +210,10 @@ func TestRouteLogPathSafety(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
+			// The test owns the creation mask, so the modes it checks are the modes the recorder
+			// requested and not the host's default mask. No test of this package runs in parallel.
+			previous := unix.Umask(0)
+			defer unix.Umask(previous)
 			root := t.TempDir()
 			opts := recorderOptions(nil)
 			opts.LogPath = tt.setup(t, root)
@@ -224,13 +233,10 @@ func TestRouteLogPathSafety(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				rows := routeLogRows(t, raw)
-				want := map[string]any{"at": "1970-01-01T00:00:01.000Z", "backend": "anthropic", "model": "claude-fable-5", "path": "/v1/messages", "sessionId": "header-session"}
-				if len(rows) < 2 {
-					t.Fatalf("route log has %d lines, want the two appended entries at its end", len(rows))
-				}
-				if d := gocmp.Diff([]map[string]any{want, want}, rows[len(rows)-2:]); d != "" {
-					t.Errorf("appended entries (-want +got):\n%s", d)
+				entry := map[string]any{"at": "1970-01-01T00:00:01.000Z", "backend": "anthropic", "model": "claude-fable-5", "path": "/v1/messages", "sessionId": "header-session"}
+				want := append(slices.Clone(tt.prior), entry, entry)
+				if d := gocmp.Diff(want, routeLogRows(t, raw)); d != "" {
+					t.Errorf("whole route log (-want +got):\n%s", d)
 				}
 			} else {
 				checkRouteLogDiagnostics(t, diagnostics.String(), root, 2)

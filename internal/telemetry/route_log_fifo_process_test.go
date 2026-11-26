@@ -49,13 +49,15 @@ func TestRouteLogFIFO(t *testing.T) {
 			var diagnostics bytes.Buffer
 			opts.Diagnostics = &diagnostics
 			r := NewRecorder(opts)
+			// Every request is made here: nothing that can stop the test runs in the goroutines.
+			requests := make([]*http.Request, tt.callers)
+			for i := range requests {
+				requests[i] = httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/messages?key=query-sentinel", nil)
+				requests[i].Header.Set("X-Claude-Code-Session-Id", "header-session")
+			}
 			var wg sync.WaitGroup
-			for range tt.callers {
-				wg.Go(func() {
-					req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/messages?key=query-sentinel", nil)
-					req.Header.Set("X-Claude-Code-Session-Id", "header-session")
-					r.LogRoute(req, LogEntry{Backend: "anthropic", Model: new("claude-fable-5")})
-				})
+			for _, req := range requests {
+				wg.Go(func() { r.LogRoute(req, LogEntry{Backend: "anthropic", Model: new("claude-fable-5")}) })
 			}
 			returned := make(chan struct{})
 			go func() {
@@ -64,16 +66,21 @@ func TestRouteLogFIFO(t *testing.T) {
 			}()
 			select {
 			case <-returned:
-			case <-time.After(5 * time.Second):
+			case <-time.After(30 * time.Second):
 				t.Error("LogRoute blocked on a FIFO at the log path")
 				// Release the blocked writers by holding the read side open until they return, so the
 				// appending goroutines finish before the test ends. Their few short lines fit in the
-				// pipe buffer, so nothing needs to read them.
+				// pipe buffer, so nothing needs to read them. The wait is bounded as well: a writer
+				// that a reader cannot release is reported, not waited for.
 				reader, err := os.OpenFile(path, os.O_RDONLY|unix.O_NONBLOCK, 0)
 				if err != nil {
 					t.Fatalf("could not open the FIFO to release a blocked LogRoute: %v", err)
 				}
-				<-returned
+				select {
+				case <-returned:
+				case <-time.After(30 * time.Second):
+					t.Error("LogRoute stayed blocked after a reader opened the FIFO")
+				}
 				_ = reader.Close()
 				return
 			}

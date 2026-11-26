@@ -16,8 +16,11 @@ package usage_test
 
 import (
 	"bytes"
+	"encoding/hex"
+	"io"
 	"math"
 	"net/http"
+	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -267,6 +270,124 @@ func TestCaptureFinishConcurrent(t *testing.T) {
 			}
 			if got := calls.Load(); got != 1 {
 				t.Errorf("emit call count after trailing Finish = %d, want 1", got)
+			}
+		})
+	}
+}
+
+// offsetRandom fills every buffer with the low byte of each byte's offset in its stream. Once, on
+// the read that would deliver the byte at panicAt, it panics instead and delivers nothing; a
+// negative panicAt never panics.
+type offsetRandom struct {
+	mu      sync.Mutex
+	offset  int
+	panicAt int
+	fired   bool
+}
+
+func (r *offsetRandom) Read(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.fired && r.panicAt >= r.offset && r.panicAt < r.offset+len(p) {
+		r.fired = true
+		panic("injected random panic")
+	}
+	for i := range p {
+		p[i] = byte(r.offset + i)
+	}
+	r.offset += len(p)
+	return len(p), nil
+}
+
+// offsetIdentifier spells the version 4 identifier an offsetRandom delivers from offset start.
+func offsetIdentifier(start int) string {
+	var id [16]byte
+	for i := range id {
+		id[i] = byte(start + i)
+	}
+	id[6] = id[6]&0x0f | 0x40
+	id[8] = id[8]&0x3f | 0x80
+	h := hex.EncodeToString(id[:])
+	return h[:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:]
+}
+
+func TestFinishPanicOutsideCallerCallback(t *testing.T) {
+	// One MCP server makes the emitter derive one footprint record after the primary record.
+	const mcpBody = `{"tools":[{"name":"mcp__alpha__one","description":"alpha schema"}],"messages":[{"role":"user","content":"hello"}]}`
+	const response = `{"usage":{"input_tokens":100,"output_tokens":5}}`
+	tests := map[string]struct {
+		// emitter starts the capture from an emitter whose random source panics on the first
+		// byte after the primary record's identifiers; otherwise the capture is standalone and
+		// its caller's callback panics.
+		emitter bool
+	}{
+		"error: random source panic while the emitter derives a record reaches the caller of Finish": {emitter: true},
+		"success: panicking caller callback on a standalone capture still returns its record":        {},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			if !tt.emitter {
+				var calls atomic.Int32
+				c := usage.NewCapture(usage.NewBuilder(newTestOptions(t)), usage.Request{Body: decodeWire(t, mcpBody)}, 0, func(usage.Record) {
+					calls.Add(1)
+					panic("callback failure")
+				})
+				c.SetResponse(http.StatusOK, nil)
+				c.ObserveJSON([]byte(response))
+				rec, panicked := callFinishGuarded(c)
+				if panicked != nil {
+					t.Errorf("Finish panicked with the caller callback's panic: %v", panicked)
+				}
+				if rec == nil || rec.EventName != "gateway.token.usage" {
+					t.Errorf("Finish returned %+v, want the gateway.token.usage record", rec)
+				}
+				if got := calls.Load(); got != 1 {
+					t.Errorf("callback calls = %d, want 1", got)
+				}
+				return
+			}
+			collector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.Copy(io.Discard, r.Body)
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer collector.Close()
+			endpoint := collector.URL + "/v1/logs"
+			lookup := func(k string) (string, bool) { return endpoint, k == "CODEX_GATEWAY_USAGE_ENDPOINT" }
+			finish := func(random *offsetRandom) (*usage.Record, any) {
+				opts := newTestOptions(t)
+				opts.Random = random
+				e := usage.NewEmitter(lookup, usage.NewBuilder(opts))
+				defer e.Wait()
+				c := e.Start(usage.Request{Body: decodeWire(t, mcpBody)})
+				c.SetResponse(http.StatusOK, nil)
+				c.ObserveJSON([]byte(response))
+				return callFinishGuarded(c)
+			}
+
+			// Without a panic, the start draws bytes 0 to 15 and the primary record bytes 16 to
+			// 31, so the read of byte 32 belongs to the derived footprint record.
+			control := &offsetRandom{panicAt: -1}
+			rec, panicked := finish(control)
+			if panicked != nil || rec == nil {
+				t.Fatalf("Finish without a panicking source = (%+v, panic=%v), want the primary record", rec, panicked)
+			}
+			if diff := gocmp.Diff(any("gateway-usage-"+offsetIdentifier(16)), rec.Attributes["source_event_id"]); diff != "" {
+				t.Fatalf("primary record identifier is not drawn from bytes 16 to 31 (-want +got):\n%s", diff)
+			}
+			if control.offset <= 32 {
+				t.Fatalf("the emitter drew %d random bytes, want a derived record drawn after byte 32", control.offset)
+			}
+
+			random := &offsetRandom{panicAt: 32}
+			rec, panicked = finish(random)
+			if !random.fired {
+				t.Fatal("the random source never reached byte 32")
+			}
+			if diff := gocmp.Diff(any("injected random panic"), panicked); diff != "" {
+				t.Errorf("panic reaching the caller of Finish (-want +got):\n%s", diff)
+			}
+			if rec != nil {
+				t.Errorf("Finish returned %+v while its emitter panicked, want the panic", rec)
 			}
 		})
 	}

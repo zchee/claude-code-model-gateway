@@ -87,7 +87,9 @@ func overwriteBytes(buf []byte) {
 }
 
 func TestCaptureFinishPanicUnlocksBuilder(t *testing.T) {
-	const lockTimeout = 2 * time.Second
+	// The watchdogs only bound a lock left held by the recovered panic; they are generous so that
+	// a loaded host cannot trip them.
+	const lockTimeout = 30 * time.Second
 	tests := map[string]struct {
 		panicRandom bool
 		wantPanic   string
@@ -131,15 +133,24 @@ func TestCaptureFinishPanicUnlocksBuilder(t *testing.T) {
 			if got := emitCalls.Load(); got != 0 {
 				t.Errorf("emit call count = %d, want 0 when primary construction panicked", got)
 			}
+			// The panic consumed the capture: a second Finish neither builds nor emits.
+			again, againPanic := callFinishGuarded(c1)
+			if againPanic != nil || again != nil {
+				t.Errorf("second Finish after the recovered panic = (%+v, panic=%v), want (nil, nil)", again, againPanic)
+			}
+			if got := emitCalls.Load(); got != 0 {
+				t.Errorf("emit call count after the second Finish = %d, want 0", got)
+			}
 
+			// Decode every fixture here: nothing that can stop the test runs in the goroutines below.
+			buildReq := usage.Request{
+				Body:       decodeWire(t, `{}`),
+				StatusCode: http.StatusOK,
+				Usage:      map[string]any{"input_tokens": 25, "output_tokens": 4},
+			}
+			laterBody := decodeWire(t, `{}`)
 			buildDone := make(chan []usage.Record, 1)
-			go func() {
-				buildDone <- b.Build(usage.Request{
-					Body:       decodeWire(t, `{}`),
-					StatusCode: http.StatusOK,
-					Usage:      map[string]any{"input_tokens": 25, "output_tokens": 4},
-				})
-			}()
+			go func() { buildDone <- b.Build(buildReq) }()
 			buildTimer := time.NewTimer(lockTimeout)
 			defer buildTimer.Stop()
 			var built []usage.Record
@@ -158,7 +169,7 @@ func TestCaptureFinishPanicUnlocksBuilder(t *testing.T) {
 
 			captureDone := make(chan *usage.Record, 1)
 			go func() {
-				c2 := usage.NewCapture(b, usage.Request{Body: decodeWire(t, `{}`)}, 0, nil)
+				c2 := usage.NewCapture(b, usage.Request{Body: laterBody}, 0, nil)
 				c2.SetResponse(http.StatusOK, nil)
 				c2.ObserveJSON([]byte(`{"id":"msg-after","usage":{"input_tokens":31,"output_tokens":6}}`))
 				captureDone <- c2.Finish()
