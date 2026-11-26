@@ -84,6 +84,9 @@ func RegistryDirectories(registries []string) []string {
 }
 
 // ReadEntries reads matching installs in registry order. A bare name matches any marketplace.
+// Like Node, the decoder replaces invalid UTF-8 bytes with U+FFFD, so those keys
+// match literal U+FFFD. Entries with escaped unpaired surrogates in the plugin
+// ID or install path are dropped, as are individual member names containing them.
 func ReadEntries(registries []string, pluginID string) []map[string]any {
 	entries := []map[string]any{}
 	exact := strings.ContainsRune(pluginID, '@')
@@ -126,6 +129,11 @@ func ReadEntries(registries []string, pluginID string) []map[string]any {
 }
 
 func registryEntry(item jsonx.WireValue) map[string]any {
+	for _, member := range item.Members {
+		if member.Value.Kind == '"' && !wellFormedUTF16(member.Value.Text) && string(utf16.Decode(member.Name)) == "installPath" {
+			return nil
+		}
+	}
 	value := jsonValue(item)
 	if !truthy(value) {
 		return nil
@@ -299,7 +307,9 @@ func IsCacheParent(directory string, registryDirs []string) bool {
 }
 
 // CacheIdentity returns the common identity of sibling version directories, or the empty string.
-// The identity is only a comparison key, not authority to signal a process or delete a path.
+// A capital sigma followed by more than 30 combining marks may lowercase differently
+// from JavaScript. The identity is only a comparison key, not authority to signal a
+// process or delete a path.
 func CacheIdentity(installRoot string, registryDirs []string) string {
 	if !filepath.IsAbs(installRoot) || filepath.Clean(installRoot) != installRoot {
 		return ""

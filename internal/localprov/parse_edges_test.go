@@ -37,9 +37,11 @@ func TestCatalogIgnoresIllFormedKeys(t *testing.T) {
 				{"type":"llm","key":"last"}]}`,
 			want: []localprov.Model{{Key: "first"}, {Key: "�"}, {Key: "🐟"}, {Key: "last"}},
 		},
-		"success: replace raw invalid UTF-8 before parsing": {
-			body: `{"models":[{"type":"llm","key":"a` + "\xff" + `b"}]}`,
-			want: []localprov.Model{{Key: "a�b"}},
+		"success: replaced raw bytes match a literal replacement key": {
+			body: `{"models":[{"type":"llm","key":"a` + "\xff" + `b"},
+				{"type":"llm","key":"other"},
+				{"type":"llm","key":"a�b","loaded_instances":[{}]}]}`,
+			want: []localprov.Model{{Key: "a�b", Loaded: true}, {Key: "other"}},
 		},
 		"success: prefer last duplicate JSON member": {
 			body: `{"models":false,"models":[{"type":"embedding","type":"llm","key":"first","key":"last"}]}`,

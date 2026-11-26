@@ -41,7 +41,9 @@ type Model struct {
 }
 
 // StudioModels returns models in catalog order, or an error when the response has no list.
-// A repeated key updates the model at its first position.
+// A repeated key updates the model at its first position. Like Node, the decoder
+// replaces invalid UTF-8 bytes with U+FFFD, so those keys match literal U+FFFD.
+// Keys containing escaped unpaired surrogates are dropped.
 func StudioModels(body []byte) ([]Model, error) {
 	catalog, err := jsonx.DecodeWire(body)
 	list := property(catalog, "models")

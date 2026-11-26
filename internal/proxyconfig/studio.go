@@ -80,8 +80,7 @@ func readStudioFile(dir string) studioFile {
 		return studioFile{}
 	}
 	data, err := os.ReadFile(filepath.Join(dir, "config.json"))
-	// Do not use a token that decoding would silently change.
-	if err != nil || !utf8.Valid(data) {
+	if err != nil {
 		return studioFile{}
 	}
 	root, err := jsonx.DecodeWire(data)

@@ -35,9 +35,13 @@ func TestStudioFileUnicodeAndDuplicateMembers(t *testing.T) {
 			file: `{"lmstudio":{"enabled":false,"baseUrl":"` + fileOrigin + `","apiKey":"prefix\ud800suffix"}}`,
 			want: proxyconfig.StudioSettings{Enabled: true, BaseURL: defaultOrigin},
 		},
-		"error: invalid UTF-8 rejects file": {
-			file: `{"lmstudio":{"enabled":false,"apiKey":"prefix` + "\xff" + `suffix"}}`,
-			want: proxyconfig.StudioSettings{Enabled: true, BaseURL: defaultOrigin},
+		"success: invalid UTF-8 in unused field keeps provider disabled": {
+			file: `{"lmstudio":{"enabled":false},"unused":"` + "\xff" + `"}`,
+			want: proxyconfig.StudioSettings{},
+		},
+		"success: raw invalid UTF-8 in token is replaced on decode": {
+			file: `{"lmstudio":{"apiKey":"prefix` + "\xff" + `suffix"}}`,
+			want: proxyconfig.StudioSettings{Enabled: true, BaseURL: defaultOrigin, APIKey: "prefix�suffix"},
 		},
 		"success: well-formed token with replacement rune and surrogate pair": {
 			file: `{"lmstudio":{"apiKey":"�🐟"}}`,

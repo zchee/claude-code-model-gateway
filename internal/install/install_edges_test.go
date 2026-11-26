@@ -109,8 +109,16 @@ func TestReadEntriesMalformedNamesAndMembers(t *testing.T) {
 			pluginID: "model-gateway@�",
 			want:     []map[string]any{},
 		},
-		"success: replacement of raw invalid UTF-8": {
-			first:    `{"plugins":{"model-gateway@` + "\xff" + `":[{"scope":"kept"}]}}`,
+		"success: drop invalid install path and keep literal replacement": {
+			first: `{"plugins":{"model-gateway@market":[
+				{"version":"9.0.0","installPath":"/cache/\ud800"},
+				{"version":"1.0.0","installPath":"/cache/�"}]}}`,
+			pluginID: "model-gateway",
+			want:     []map[string]any{{"version": "1.0.0", "installPath": "/cache/�"}},
+		},
+		"success: replaced raw bytes match a literal replacement plugin ID": {
+			first: `{"plugins":{"model-gateway@` + "\xff" + `":[{"scope":"not kept"}],
+				"model-gateway@�":[{"scope":"kept"}]}}`,
 			pluginID: "model-gateway@�",
 			want:     []map[string]any{{"scope": "kept"}},
 		},
