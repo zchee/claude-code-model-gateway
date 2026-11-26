@@ -1353,7 +1353,16 @@ func TestTransportIdleTimeout(t *testing.T) {
 				t.Fatal("NewTransport returned nil")
 			}
 
+			var serverConns sync.WaitGroup
 			srv := &http.Server{
+				ConnState: func(_ net.Conn, state http.ConnState) {
+					switch state {
+					case http.StateNew:
+						serverConns.Add(1)
+					case http.StateClosed, http.StateHijacked:
+						serverConns.Done()
+					}
+				},
 				Handler: http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 					// Drain every segment the client writes while sending no response bytes so
 					// socket activity stops once the request body stops yielding data.
@@ -1390,6 +1399,9 @@ func TestTransportIdleTimeout(t *testing.T) {
 				_ = ln.Close()
 				reqWG.Wait()
 				<-serveDone
+				// Wait for the server connection goroutine to finish its delayed close after
+				// a truncated chunked request body before the bubble's main goroutine exits.
+				serverConns.Wait()
 				synctest.Wait()
 			}()
 
