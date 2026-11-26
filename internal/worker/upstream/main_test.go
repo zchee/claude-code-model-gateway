@@ -15,6 +15,7 @@
 package upstream_test
 
 import (
+	"os"
 	"testing"
 
 	"go.uber.org/goleak"
@@ -22,7 +23,20 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/venue"
 )
 
+const (
+	testEnvProxyHost = "env-proxy.invalid:3128"
+	testEnvProxyURL  = "http://" + testEnvProxyHost
+)
+
 func TestMain(m *testing.M) {
 	venue.Require()
+	// Seed proxy environment variables before any net/http transport can cache
+	// ProxyFromEnvironment through its process-wide sync.Once.
+	_ = os.Setenv("HTTP_PROXY", testEnvProxyURL)
+	_ = os.Setenv("HTTPS_PROXY", testEnvProxyURL)
+	_ = os.Setenv("http_proxy", testEnvProxyURL)
+	_ = os.Setenv("https_proxy", testEnvProxyURL)
+	_ = os.Setenv("NO_PROXY", "")
+	_ = os.Setenv("no_proxy", "")
 	goleak.VerifyTestMain(m)
 }

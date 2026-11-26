@@ -18,11 +18,15 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -42,10 +46,11 @@ func (a pipeAddr) Network() string { return "tcp" }
 func (a pipeAddr) String() string  { return string(a) }
 
 type pipeListener struct {
-	addr   net.Addr
-	conns  chan net.Conn
-	closed chan struct{}
-	once   sync.Once
+	addr     net.Addr
+	conns    chan net.Conn
+	closed   chan struct{}
+	once     sync.Once
+	accepted atomic.Int32
 }
 
 func newPipeListener(addr string) *pipeListener {
@@ -59,6 +64,7 @@ func newPipeListener(addr string) *pipeListener {
 func (l *pipeListener) Accept() (net.Conn, error) {
 	select {
 	case c := <-l.conns:
+		l.accepted.Add(1)
 		return c, nil
 	case <-l.closed:
 		return nil, net.ErrClosed
@@ -201,7 +207,7 @@ func TestTransportNoAutoDecompression(t *testing.T) {
 			if diff := gocmp.Diff("gzip", resp.Header.Get("Content-Encoding")); diff != "" {
 				t.Errorf("Header Content-Encoding (-want +got):\n%s", diff)
 			}
-			if diff := gocmp.Diff("gzip", resp.RelayHeader.Get("Content-Encoding")); diff != "" {
+			if diff := gocmp.Diff([]string{"gzip"}, headerValuesCI(t, resp.RelayHeader, "Content-Encoding")); diff != "" {
 				t.Errorf("RelayHeader Content-Encoding (-want +got):\n%s", diff)
 			}
 			if diff := gocmp.Diff(wantBytes, gotBytes); diff != "" {
@@ -247,47 +253,151 @@ func TestTransportHTTP11Only(t *testing.T) {
 }
 
 func TestTransportIgnoresEnvProxy(t *testing.T) {
-	var decoyHits atomic.Int32
-	decoy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		decoyHits.Add(1)
-		http.Error(w, "decoy proxy must never be dialed", http.StatusBadGateway)
+	var decoyProxyHits atomic.Int32
+	decoyProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		decoyProxyHits.Add(1)
+		http.Error(w, "environment proxy must never be dialed", http.StatusBadGateway)
 	}))
-	t.Cleanup(decoy.Close)
+	t.Cleanup(decoyProxy.Close)
 
-	target, captured := startCaptureServer(t, http.StatusOK, `{"direct":true}`)
+	var httpHits, httpsHits atomic.Int32
+	var httpHost, httpsHost string
+	var mu sync.Mutex
 
-	t.Setenv("HTTP_PROXY", decoy.URL)
-	t.Setenv("HTTPS_PROXY", decoy.URL)
-	t.Setenv("http_proxy", decoy.URL)
-	t.Setenv("https_proxy", decoy.URL)
-	t.Setenv("NO_PROXY", "")
-	t.Setenv("no_proxy", "")
+	httpTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		httpHits.Add(1)
+		mu.Lock()
+		httpHost = r.Host
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"direct":"http"}`)
+	}))
+	t.Cleanup(httpTarget.Close)
 
-	client := upstream.NewClient(upstream.Options{})
-	t.Cleanup(func() { _ = client.Close() })
+	httpsTarget := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		httpsHits.Add(1)
+		mu.Lock()
+		httpsHost = r.Host
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"direct":"https"}`)
+	}))
+	t.Cleanup(httpsTarget.Close)
 
-	resp, err := client.Do(t.Context(), upstream.Request{
-		Target:     upstream.TargetAnthropic,
-		BaseURL:    target.URL,
-		Method:     http.MethodPost,
-		RequestURI: "/v1/messages",
-		Body:       []byte(`{"model":"claude-sonnet-4-6"}`),
-	})
-	if err != nil {
-		t.Fatalf("Do returned error: %v", err)
+	tlsCfg := httpsTarget.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	tlsCfg.ServerName = "127.0.0.1"
+
+	tests := map[string]struct {
+		baseURL   string
+		wantHost  string
+		tlsConfig *tls.Config
+		hits      *atomic.Int32
+		gotHost   func() string
+	}{
+		"success: HTTP request to non-loopback host ignores environment proxy": {
+			baseURL:  "http://upstream.invalid:8080",
+			wantHost: "upstream.invalid:8080",
+			hits:     &httpHits,
+			gotHost: func() string {
+				mu.Lock()
+				defer mu.Unlock()
+				return httpHost
+			},
+		},
+		"success: HTTPS request to non-loopback host ignores environment proxy": {
+			baseURL:   "https://upstream.invalid:8443",
+			wantHost:  "upstream.invalid:8443",
+			tlsConfig: tlsCfg,
+			hits:      &httpsHits,
+			gotHost: func() string {
+				mu.Lock()
+				defer mu.Unlock()
+				return httpsHost
+			},
+		},
 	}
-	defer func() { _ = resp.Body.Close() }()
-	if _, err := io.ReadAll(resp.Body); err != nil {
-		t.Fatalf("reading response body: %v", err)
-	}
-	if diff := gocmp.Diff(http.StatusOK, resp.StatusCode); diff != "" {
-		t.Fatalf("status (-want +got):\n%s", diff)
-	}
-	if decoyHits.Load() != 0 {
-		t.Fatalf("env proxy received %d hits, want 0", decoyHits.Load())
-	}
-	if len(captured()) != 1 {
-		t.Fatalf("target received %d requests, want 1", len(captured()))
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			// Verify the test precondition: Go's process-cached ProxyFromEnvironment would route
+			// this non-loopback host through the decoy proxy seeded in TestMain.
+			probeReq, err := http.NewRequestWithContext(t.Context(), http.MethodPost, tt.baseURL+"/v1/messages", nil)
+			if err != nil {
+				t.Fatalf("NewRequestWithContext: %v", err)
+			}
+			envProxy, err := http.ProxyFromEnvironment(probeReq)
+			if err != nil || envProxy == nil || envProxy.Host != testEnvProxyHost {
+				t.Fatalf("test precondition failed: ProxyFromEnvironment(%q) = (%v, %v), want host %q", tt.baseURL, envProxy, err, testEnvProxyHost)
+			}
+
+			var decoyDialHits atomic.Int32
+			var dialer net.Dialer
+			dialCtx := func(ctx context.Context, network, addr string) (net.Conn, error) {
+				switch addr {
+				case "upstream.invalid:8080":
+					return dialer.DialContext(ctx, network, httpTarget.Listener.Addr().String())
+				case "upstream.invalid:8443":
+					return dialer.DialContext(ctx, network, httpsTarget.Listener.Addr().String())
+				case testEnvProxyHost:
+					decoyDialHits.Add(1)
+					return dialer.DialContext(ctx, network, decoyProxy.Listener.Addr().String())
+				default:
+					t.Errorf("attempted dial to unapproved address %q", addr)
+					return nil, fmt.Errorf("blocked unapproved dial to %q", addr)
+				}
+			}
+
+			control := &http.Transport{Proxy: http.ProxyFromEnvironment, DialContext: dialCtx}
+			proxied, proxyErr := control.RoundTrip(probeReq)
+			if proxied != nil {
+				_ = proxied.Body.Close()
+			}
+			control.CloseIdleConnections()
+			if decoyDialHits.Swap(0) != 1 || (proxyErr == nil && proxied.StatusCode != http.StatusBadGateway) {
+				t.Fatalf("environment-proxy control missed decoy: response=%v err=%v", proxied, proxyErr)
+			}
+
+			beforeHits := tt.hits.Load()
+			beforeDecoy := decoyProxyHits.Load()
+
+			client := upstream.NewClient(upstream.Options{
+				DialContext: dialCtx,
+				TLSConfig:   tt.tlsConfig,
+			})
+			t.Cleanup(func() { _ = client.Close() })
+
+			resp, err := client.Do(t.Context(), upstream.Request{
+				Target:     upstream.TargetAnthropic,
+				BaseURL:    tt.baseURL,
+				Method:     http.MethodPost,
+				RequestURI: "/v1/messages",
+				Body:       []byte(`{"model":"claude-sonnet-4-6"}`),
+			})
+			if err != nil {
+				t.Fatalf("Do returned error: %v", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			if _, err := io.ReadAll(resp.Body); err != nil {
+				t.Fatalf("reading response body: %v", err)
+			}
+			if diff := gocmp.Diff(http.StatusOK, resp.StatusCode); diff != "" {
+				t.Fatalf("status (-want +got):\n%s", diff)
+			}
+			if decoyDialHits.Load() != 0 {
+				t.Fatalf("transport dialed environment proxy %d time(s), want 0", decoyDialHits.Load())
+			}
+			if decoyProxyHits.Load() != beforeDecoy {
+				t.Fatalf("environment proxy received %d hit(s), want 0", decoyProxyHits.Load()-beforeDecoy)
+			}
+			if got := tt.hits.Load() - beforeHits; got != 1 {
+				t.Fatalf("target received %d request(s), want 1", got)
+			}
+			if diff := gocmp.Diff(tt.wantHost, tt.gotHost()); diff != "" {
+				t.Fatalf("target Host (-want +got):\n%s", diff)
+			}
+		})
 	}
 }
 
@@ -319,9 +429,12 @@ func TestTransportConnectionPoolingAndLimit(t *testing.T) {
 				t.Fatalf("Do returned error: %v", err)
 			}
 			_, err = io.ReadAll(resp.Body)
-			_ = resp.Body.Close()
+			closeErr := resp.Body.Close()
 			if err != nil {
 				t.Fatalf("reading response body: %v", err)
+			}
+			if closeErr != nil {
+				t.Fatalf("closing response body: %v", closeErr)
 			}
 		}
 
@@ -335,41 +448,70 @@ func TestTransportConnectionPoolingAndLimit(t *testing.T) {
 		}
 	})
 
-	t.Run("success: default pool caps concurrent connections at 64 per host", func(t *testing.T) {
+	t.Run("success: pool caps concurrent connections at 64 per host while allowing a second origin", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
-			const totalRequests = upstream.DefaultMaxConnsPerHost + 1
+			const (
+				maxPerHost    = 64
+				totalRequests = 65
+				originAAddr   = "127.0.0.1:12345"
+				originBAddr   = "127.0.0.1:12346"
+			)
 
-			ln := newPipeListener("127.0.0.1:12345")
+			lnA := newPipeListener(originAAddr)
+			lnB := newPipeListener(originBAddr)
 			release := make(chan struct{})
-			var active, maxActive, total atomic.Int32
+			var activeA, maxActiveA, totalA, totalB atomic.Int32
 
-			srv := &http.Server{
+			srvA := &http.Server{
 				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					cur := active.Add(1)
+					cur := activeA.Add(1)
 					for {
-						prev := maxActive.Load()
-						if cur <= prev || maxActive.CompareAndSwap(prev, cur) {
+						prev := maxActiveA.Load()
+						if cur <= prev || maxActiveA.CompareAndSwap(prev, cur) {
 							break
 						}
 					}
-					total.Add(1)
-					defer active.Add(-1)
+					totalA.Add(1)
+					defer activeA.Add(-1)
 					select {
 					case <-release:
 					case <-r.Context().Done():
 						return
 					}
 					w.WriteHeader(http.StatusOK)
-					_, _ = io.WriteString(w, "ok")
+					_, _ = io.WriteString(w, "ok-a")
 				}),
 			}
-			serveDone := make(chan struct{})
+			srvB := &http.Server{
+				Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					totalB.Add(1)
+					w.WriteHeader(http.StatusOK)
+					_, _ = io.WriteString(w, "ok-b")
+				}),
+			}
+			serveDoneA := make(chan struct{})
 			go func() {
-				defer close(serveDone)
-				_ = srv.Serve(ln)
+				defer close(serveDoneA)
+				_ = srvA.Serve(lnA)
+			}()
+			serveDoneB := make(chan struct{})
+			go func() {
+				defer close(serveDoneB)
+				_ = srvB.Serve(lnB)
 			}()
 
-			client := upstream.NewClient(upstream.Options{DialContext: ln.DialContext})
+			dialCtx := func(ctx context.Context, network, addr string) (net.Conn, error) {
+				switch addr {
+				case originAAddr:
+					return lnA.DialContext(ctx, network, addr)
+				case originBAddr:
+					return lnB.DialContext(ctx, network, addr)
+				default:
+					return nil, fmt.Errorf("unexpected dial addr %q", addr)
+				}
+			}
+
+			client := upstream.NewClient(upstream.Options{DialContext: dialCtx})
 			released := false
 			releaseAll := func() {
 				if !released {
@@ -377,54 +519,104 @@ func TestTransportConnectionPoolingAndLimit(t *testing.T) {
 					close(release)
 				}
 			}
+			var wgA, wgB sync.WaitGroup
 			defer func() {
 				releaseAll()
 				_ = client.Close()
-				_ = srv.Close()
-				_ = ln.Close()
-				<-serveDone
+				_ = srvA.Close()
+				_ = srvB.Close()
+				_ = lnA.Close()
+				_ = lnB.Close()
+				wgA.Wait()
+				wgB.Wait()
+				<-serveDoneA
+				<-serveDoneB
 				synctest.Wait()
 			}()
 
-			errs := make([]error, totalRequests)
-			var wg sync.WaitGroup
+			errsA := make([]error, totalRequests)
 			for i := range totalRequests {
-				wg.Go(func() {
+				wgA.Go(func() {
 					resp, err := client.Do(t.Context(), upstream.Request{
 						Target:     upstream.TargetAnthropic,
-						BaseURL:    "http://127.0.0.1:12345",
+						BaseURL:    "http://" + originAAddr,
 						Method:     http.MethodPost,
 						RequestURI: "/v1/messages",
 						Body:       []byte(`{"model":"claude-sonnet-4-6"}`),
 					})
 					if err != nil {
-						errs[i] = err
+						errsA[i] = err
 						return
 					}
 					_, readErr := io.ReadAll(resp.Body)
 					closeErr := resp.Body.Close()
-					errs[i] = errors.Join(readErr, closeErr)
+					errsA[i] = errors.Join(readErr, closeErr)
 				})
 			}
 
 			synctest.Wait()
-			gotActive := active.Load()
-			releaseAll()
-			wg.Wait()
+			gotActiveA := activeA.Load()
+			gotAcceptedA := lnA.accepted.Load()
+			if gotActiveA != maxPerHost || gotAcceptedA != maxPerHost {
+				releaseAll()
+				wgA.Wait()
+				for i, err := range errsA {
+					if err != nil {
+						t.Fatalf("request %d failed: %v", i, err)
+					}
+				}
+				t.Fatalf("while origin A is saturated: active=%d accepted=%d, want %d and %d", gotActiveA, gotAcceptedA, maxPerHost, maxPerHost)
+			}
 
-			for i, err := range errs {
+			// While all 64 connections to origin A are held and the 65th is queued,
+			// a second origin must still make progress without waiting on origin A.
+			beforeB := time.Now()
+			originBDone := make(chan error, 1)
+			wgB.Go(func() {
+				resp, err := client.Do(t.Context(), upstream.Request{
+					Target:     upstream.TargetAnthropic,
+					BaseURL:    "http://" + originBAddr,
+					Method:     http.MethodPost,
+					RequestURI: "/v1/messages",
+					Body:       []byte(`{"model":"claude-sonnet-4-6"}`),
+				})
+				if err != nil {
+					originBDone <- err
+					return
+				}
+				_, readErr := io.ReadAll(resp.Body)
+				closeErr := resp.Body.Close()
+				originBDone <- errors.Join(readErr, closeErr)
+			})
+			synctest.Wait()
+			if !time.Now().Equal(beforeB) {
+				t.Fatalf("second origin request advanced virtual clock by %v", time.Since(beforeB))
+			}
+			select {
+			case err := <-originBDone:
+				if err != nil {
+					t.Fatalf("second origin request failed while origin A was saturated: %v", err)
+				}
+			default:
+				t.Fatal("second origin request blocked while origin A held 64 connections (cap is not per-host)")
+			}
+			if diff := gocmp.Diff(int32(1), totalB.Load()); diff != "" {
+				t.Fatalf("origin B completed requests (-want +got):\n%s", diff)
+			}
+
+			releaseAll()
+			wgA.Wait()
+
+			for i, err := range errsA {
 				if err != nil {
 					t.Fatalf("request %d failed: %v", i, err)
 				}
 			}
-			if diff := gocmp.Diff(int32(upstream.DefaultMaxConnsPerHost), gotActive); diff != "" {
-				t.Fatalf("active concurrent connections while blocked (-want +got):\n%s", diff)
+			if diff := gocmp.Diff(int32(maxPerHost), maxActiveA.Load()); diff != "" {
+				t.Fatalf("maximum concurrent connections on origin A (-want +got):\n%s", diff)
 			}
-			if diff := gocmp.Diff(int32(upstream.DefaultMaxConnsPerHost), maxActive.Load()); diff != "" {
-				t.Fatalf("maximum concurrent connections (-want +got):\n%s", diff)
-			}
-			if diff := gocmp.Diff(int32(totalRequests), total.Load()); diff != "" {
-				t.Fatalf("total completed requests (-want +got):\n%s", diff)
+			if diff := gocmp.Diff(int32(totalRequests), totalA.Load()); diff != "" {
+				t.Fatalf("total completed requests on origin A (-want +got):\n%s", diff)
 			}
 		})
 	})
@@ -451,15 +643,22 @@ func TestTransportNoAutoReplayWithBody(t *testing.T) {
 
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			var probeAttempts atomic.Int32
+			var mu sync.Mutex
+			var warmAddr string
+			var probeAddrs []string
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				_, _ = io.ReadAll(r.Body)
 				if r.URL.Path == "/warmup" {
+					mu.Lock()
+					warmAddr = r.RemoteAddr
+					mu.Unlock()
 					w.WriteHeader(http.StatusOK)
 					_, _ = io.WriteString(w, "warm")
 					return
 				}
-				probeAttempts.Add(1)
+				mu.Lock()
+				probeAddrs = append(probeAddrs, r.RemoteAddr)
+				mu.Unlock()
 				if hj, ok := w.(http.Hijacker); ok {
 					if conn, _, err := hj.Hijack(); err == nil {
 						_ = conn.Close()
@@ -481,8 +680,14 @@ func TestTransportNoAutoReplayWithBody(t *testing.T) {
 			if err != nil {
 				t.Fatalf("warmup Do failed: %v", err)
 			}
-			_, _ = io.ReadAll(warm.Body)
-			_ = warm.Body.Close()
+			_, readErr := io.ReadAll(warm.Body)
+			closeErr := warm.Body.Close()
+			if readErr != nil {
+				t.Fatalf("reading warmup response body: %v", readErr)
+			}
+			if closeErr != nil {
+				t.Fatalf("closing warmup response body: %v", closeErr)
+			}
 
 			resp, err := client.Do(t.Context(), upstream.Request{
 				Target:        upstream.TargetAnthropic,
@@ -498,8 +703,23 @@ func TestTransportNoAutoReplayWithBody(t *testing.T) {
 			if err == nil {
 				t.Fatal("expected transport error when server closed connection, got nil")
 			}
-			if diff := gocmp.Diff(int32(1), probeAttempts.Load()); diff != "" {
-				t.Fatalf("upstream received replayed request (-want +got):\n%s", diff)
+
+			mu.Lock()
+			gotWarm := warmAddr
+			gotProbes := slices.Clone(probeAddrs)
+			mu.Unlock()
+
+			if gotWarm == "" {
+				t.Fatal("warmup request did not record a remote address")
+			}
+			if len(gotProbes) == 0 {
+				t.Fatal("probe request never reached upstream server")
+			}
+			if diff := gocmp.Diff(gotWarm, gotProbes[0]); diff != "" {
+				t.Fatalf("probe did not reuse warmed connection (-warm +probe):\n%s", diff)
+			}
+			if diff := gocmp.Diff(1, len(gotProbes)); diff != "" {
+				t.Fatalf("upstream received replayed request (attempts=%v) (-want +got):\n%s", gotProbes, diff)
 			}
 		})
 	}
@@ -528,21 +748,23 @@ func TestTransportIdleTimeout(t *testing.T) {
 			}()
 
 			client := upstream.NewClient(upstream.Options{DialContext: ln.DialContext})
-			defer func() {
-				close(release)
-				_ = client.Close()
-				_ = srv.Close()
-				_ = ln.Close()
-				<-serveDone
-				synctest.Wait()
-			}()
-
 			type outcome struct {
 				resp *upstream.Response
 				err  error
 			}
 			done := make(chan outcome, 1)
-			go func() {
+			var reqWG sync.WaitGroup
+			defer func() {
+				close(release)
+				_ = client.Close()
+				_ = srv.Close()
+				_ = ln.Close()
+				reqWG.Wait()
+				<-serveDone
+				synctest.Wait()
+			}()
+
+			reqWG.Go(func() {
 				resp, err := client.Do(t.Context(), upstream.Request{
 					Target:     upstream.TargetAnthropic,
 					BaseURL:    "http://127.0.0.1:12346",
@@ -551,7 +773,7 @@ func TestTransportIdleTimeout(t *testing.T) {
 					Body:       []byte(`{"model":"claude-sonnet-4-6"}`),
 				})
 				done <- outcome{resp: resp, err: err}
-			}()
+			})
 
 			select {
 			case <-entered:
@@ -562,7 +784,7 @@ func TestTransportIdleTimeout(t *testing.T) {
 				t.Fatalf("Do returned before server received request: err=%v", res.err)
 			}
 
-			time.Sleep(upstream.DefaultIdleTimeout - time.Second)
+			time.Sleep(time.Hour - time.Nanosecond)
 			synctest.Wait()
 			select {
 			case res := <-done:
@@ -573,20 +795,25 @@ func TestTransportIdleTimeout(t *testing.T) {
 			default:
 			}
 
-			time.Sleep(2 * time.Second)
+			time.Sleep(time.Nanosecond)
 			synctest.Wait()
-			res := <-done
-			if res.resp != nil && res.resp.Body != nil {
-				_ = res.resp.Body.Close()
-			}
-			if !errors.Is(res.err, upstream.ErrTimeout) {
-				t.Fatalf("expected ErrTimeout after 1 hour silence, got %v", res.err)
+			select {
+			case res := <-done:
+				if res.resp != nil && res.resp.Body != nil {
+					_ = res.resp.Body.Close()
+				}
+				if !errors.Is(res.err, upstream.ErrTimeout) {
+					t.Fatalf("expected ErrTimeout after 1 hour silence, got %v", res.err)
+				}
+			default:
+				t.Fatal("Do did not time out once 1 hour of silence elapsed")
 			}
 		})
 	})
 
 	t.Run("error: 1 hour silence mid-stream times out", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
+			const firstFrame = "event: message_start\ndata: {}\n\n"
 			ln := newPipeListener("127.0.0.1:12347")
 			release := make(chan struct{})
 
@@ -594,7 +821,7 @@ func TestTransportIdleTimeout(t *testing.T) {
 				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					w.Header().Set("Content-Type", "text/event-stream")
 					w.WriteHeader(http.StatusOK)
-					_, _ = io.WriteString(w, "event: message_start\ndata: {}\n\n")
+					_, _ = io.WriteString(w, firstFrame)
 					if f, ok := w.(http.Flusher); ok {
 						f.Flush()
 					}
@@ -611,11 +838,13 @@ func TestTransportIdleTimeout(t *testing.T) {
 			}()
 
 			client := upstream.NewClient(upstream.Options{DialContext: ln.DialContext})
+			var readWG sync.WaitGroup
 			defer func() {
 				close(release)
 				_ = client.Close()
 				_ = srv.Close()
 				_ = ln.Close()
+				readWG.Wait()
 				<-serveDone
 				synctest.Wait()
 			}()
@@ -632,20 +861,22 @@ func TestTransportIdleTimeout(t *testing.T) {
 			}
 			defer func() { _ = resp.Body.Close() }()
 
-			first := make([]byte, 64)
-			n, err := resp.Body.Read(first)
-			if err != nil || n == 0 {
-				t.Fatalf("initial stream read = (%d, %v), want data", n, err)
+			gotFirst := make([]byte, len(firstFrame))
+			if _, err := io.ReadFull(resp.Body, gotFirst); err != nil {
+				t.Fatalf("reading first stream frame: %v", err)
+			}
+			if diff := gocmp.Diff(firstFrame, string(gotFirst)); diff != "" {
+				t.Fatalf("first stream frame mismatch (-want +got):\n%s", diff)
 			}
 
 			readErr := make(chan error, 1)
-			go func() {
+			readWG.Go(func() {
 				buf := make([]byte, 64)
 				_, err := resp.Body.Read(buf)
 				readErr <- err
-			}()
+			})
 
-			time.Sleep(upstream.DefaultIdleTimeout - time.Second)
+			time.Sleep(time.Hour - time.Nanosecond)
 			synctest.Wait()
 			select {
 			case err := <-readErr:
@@ -653,10 +884,15 @@ func TestTransportIdleTimeout(t *testing.T) {
 			default:
 			}
 
-			time.Sleep(2 * time.Second)
+			time.Sleep(time.Nanosecond)
 			synctest.Wait()
-			if err := <-readErr; !errors.Is(err, upstream.ErrTimeout) {
-				t.Fatalf("expected ErrTimeout after 1 hour mid-stream silence, got %v", err)
+			select {
+			case err := <-readErr:
+				if !errors.Is(err, upstream.ErrTimeout) {
+					t.Fatalf("expected ErrTimeout after 1 hour mid-stream silence, got %v", err)
+				}
+			default:
+				t.Fatal("stream read did not time out once 1 hour of mid-stream silence elapsed")
 			}
 		})
 	})
@@ -724,6 +960,21 @@ func TestTransportIdleTimeout(t *testing.T) {
 	})
 }
 
+func requireImmediateClose(t *testing.T, client *upstream.Client) {
+	t.Helper()
+	closed := make(chan error, 1)
+	go func() { closed <- client.Close() }()
+	synctest.Wait()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Client.Close returned error: %v", err)
+		}
+	default:
+		t.Fatal("Client.Close did not return without advancing virtual time")
+	}
+}
+
 func TestTransportShutdownBoundsRequest(t *testing.T) {
 	t.Run("error: Client.Close aborts in-flight request waiting for headers", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
@@ -747,17 +998,19 @@ func TestTransportShutdownBoundsRequest(t *testing.T) {
 			}()
 
 			client := upstream.NewClient(upstream.Options{DialContext: ln.DialContext})
+			var reqWG sync.WaitGroup
 			defer func() {
 				close(release)
 				_ = client.Close()
 				_ = srv.Close()
 				_ = ln.Close()
+				reqWG.Wait()
 				<-serveDone
 				synctest.Wait()
 			}()
 
 			done := make(chan error, 1)
-			go func() {
+			reqWG.Go(func() {
 				resp, err := client.Do(t.Context(), upstream.Request{
 					Target:     upstream.TargetAnthropic,
 					BaseURL:    "http://127.0.0.1:12349",
@@ -769,7 +1022,7 @@ func TestTransportShutdownBoundsRequest(t *testing.T) {
 					_ = resp.Body.Close()
 				}
 				done <- err
-			}()
+			})
 
 			select {
 			case <-entered:
@@ -777,18 +1030,21 @@ func TestTransportShutdownBoundsRequest(t *testing.T) {
 				t.Fatalf("Do returned before server received request: %v", err)
 			}
 
-			if err := client.Close(); err != nil {
-				t.Fatalf("Client.Close returned error: %v", err)
-			}
-			synctest.Wait()
-			if err := <-done; err == nil {
-				t.Fatal("expected error when Client.Close aborted in-flight request")
+			requireImmediateClose(t, client)
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("expected error when Client.Close aborted in-flight request")
+				}
+			default:
+				t.Fatal("Client.Close did not immediately abort in-flight request")
 			}
 		})
 	})
 
 	t.Run("error: Client.Close aborts active response stream", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
+			const firstFrame = "data: first\n\n"
 			ln := newPipeListener("127.0.0.1:12350")
 			release := make(chan struct{})
 
@@ -796,7 +1052,7 @@ func TestTransportShutdownBoundsRequest(t *testing.T) {
 				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					w.Header().Set("Content-Type", "text/event-stream")
 					w.WriteHeader(http.StatusOK)
-					_, _ = io.WriteString(w, "data: first\n\n")
+					_, _ = io.WriteString(w, firstFrame)
 					if f, ok := w.(http.Flusher); ok {
 						f.Flush()
 					}
@@ -813,11 +1069,13 @@ func TestTransportShutdownBoundsRequest(t *testing.T) {
 			}()
 
 			client := upstream.NewClient(upstream.Options{DialContext: ln.DialContext})
+			var readWG sync.WaitGroup
 			defer func() {
 				close(release)
 				_ = client.Close()
 				_ = srv.Close()
 				_ = ln.Close()
+				readWG.Wait()
 				<-serveDone
 				synctest.Wait()
 			}()
@@ -834,24 +1092,30 @@ func TestTransportShutdownBoundsRequest(t *testing.T) {
 			}
 			defer func() { _ = resp.Body.Close() }()
 
-			buf := make([]byte, 64)
-			if n, err := resp.Body.Read(buf); err != nil || n == 0 {
-				t.Fatalf("first read = (%d, %v), want data", n, err)
+			gotFirst := make([]byte, len(firstFrame))
+			if _, err := io.ReadFull(resp.Body, gotFirst); err != nil {
+				t.Fatalf("reading first stream frame: %v", err)
+			}
+			if diff := gocmp.Diff(firstFrame, string(gotFirst)); diff != "" {
+				t.Fatalf("first stream frame mismatch (-want +got):\n%s", diff)
 			}
 
 			readErr := make(chan error, 1)
-			go func() {
+			readWG.Go(func() {
+				buf := make([]byte, 64)
 				_, err := resp.Body.Read(buf)
 				readErr <- err
-			}()
+			})
 			synctest.Wait()
 
-			if err := client.Close(); err != nil {
-				t.Fatalf("Client.Close returned error: %v", err)
-			}
-			synctest.Wait()
-			if err := <-readErr; err == nil {
-				t.Fatal("expected stream read error after Client.Close")
+			requireImmediateClose(t, client)
+			select {
+			case err := <-readErr:
+				if err == nil {
+					t.Fatal("expected stream read error after Client.Close")
+				}
+			default:
+				t.Fatal("Client.Close did not immediately abort active response stream")
 			}
 		})
 	})
@@ -878,11 +1142,13 @@ func TestTransportShutdownBoundsRequest(t *testing.T) {
 			}()
 
 			client := upstream.NewClient(upstream.Options{DialContext: ln.DialContext})
+			var reqWG sync.WaitGroup
 			defer func() {
 				close(release)
 				_ = client.Close()
 				_ = srv.Close()
 				_ = ln.Close()
+				reqWG.Wait()
 				<-serveDone
 				synctest.Wait()
 			}()
@@ -891,7 +1157,7 @@ func TestTransportShutdownBoundsRequest(t *testing.T) {
 			defer cancel()
 
 			done := make(chan error, 1)
-			go func() {
+			reqWG.Go(func() {
 				resp, err := client.Do(ctx, upstream.Request{
 					Target:     upstream.TargetAnthropic,
 					BaseURL:    "http://127.0.0.1:12351",
@@ -903,7 +1169,7 @@ func TestTransportShutdownBoundsRequest(t *testing.T) {
 					_ = resp.Body.Close()
 				}
 				done <- err
-			}()
+			})
 
 			select {
 			case <-entered:
@@ -911,10 +1177,19 @@ func TestTransportShutdownBoundsRequest(t *testing.T) {
 				t.Fatalf("Do returned before server received request: %v", err)
 			}
 
+			beforeCancel := time.Now()
 			cancel()
 			synctest.Wait()
-			if err := <-done; !errors.Is(err, context.Canceled) {
-				t.Fatalf("expected context.Canceled, got %v", err)
+			if !time.Now().Equal(beforeCancel) {
+				t.Fatalf("context cancel advanced virtual clock by %v", time.Since(beforeCancel))
+			}
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("expected context.Canceled, got %v", err)
+				}
+			default:
+				t.Fatal("canceling request context did not immediately abort in-flight request")
 			}
 		})
 	})
@@ -993,40 +1268,100 @@ func TestTransportInvalidRequests(t *testing.T) {
 	}
 }
 
+func TestTransportChunkedTrailerPreserved(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("Trailer", "X-Checksum")
+		w.Header().Set("Keep-Alive", "timeout=5")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "chunked-payload")
+		w.Header().Set("X-Checksum", "sha256=deadbeef")
+	}))
+	t.Cleanup(srv.Close)
+
+	client := upstream.NewClient(upstream.Options{})
+	t.Cleanup(func() { _ = client.Close() })
+
+	resp, err := client.Do(t.Context(), upstream.Request{
+		Target:     upstream.TargetAnthropic,
+		BaseURL:    srv.URL,
+		Method:     http.MethodPost,
+		RequestURI: "/v1/messages",
+		Body:       []byte(`{"model":"claude-sonnet-4-6"}`),
+	})
+	if err != nil {
+		t.Fatalf("Do returned error: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if diff := gocmp.Diff(http.StatusOK, resp.StatusCode); diff != "" {
+		t.Fatalf("status (-want +got):\n%s", diff)
+	}
+	if vals := headerValuesCI(t, resp.RelayHeader, "Transfer-Encoding"); len(vals) != 0 {
+		t.Errorf("RelayHeader kept Transfer-Encoding: %v", vals)
+	}
+	if vals := headerValuesCI(t, resp.RelayHeader, "Keep-Alive"); len(vals) != 0 {
+		t.Errorf("RelayHeader kept Keep-Alive: %v", vals)
+	}
+	if diff := gocmp.Diff([]string{"X-Checksum"}, headerValuesCI(t, resp.RelayHeader, "Trailer")); diff != "" {
+		t.Errorf("RelayHeader Trailer declaration (-want +got):\n%s", diff)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading chunked body: %v", err)
+	}
+	if diff := gocmp.Diff("chunked-payload", string(body)); diff != "" {
+		t.Fatalf("chunked body (-want +got):\n%s", diff)
+	}
+}
+
 func TestLiveUpstreamHeadersToUpstreamState(t *testing.T) {
 	now := time.Date(2026, 9, 28, 10, 0, 0, 0, time.UTC)
 
 	tests := map[string]struct {
-		headers http.Header
-		wantExp string
+		headers          http.Header
+		wantExp          string
+		wantCaptureRetry []string
+		wantRelayRetry   []string
+		wantCaptureReset []string
+		wantRelayReset   []string
 	}{
-		"success: repeated Retry-After uses first occurrence": {
+		"success: repeated Retry-After stays unjoined in Header, first-only in RelayHeader": {
 			headers: http.Header{
 				"X-Openai-Request-Id": {"req_1"},
 				"Retry-After":         {"30", "120"},
 			},
-			wantExp: "2026-09-28T10:00:30.000Z",
+			wantExp:          "2026-09-28T10:00:30.000Z",
+			wantCaptureRetry: []string{"30", "120"},
+			wantRelayRetry:   []string{"30"},
 		},
 		"success: IMF-fixdate Retry-After parses exact instant": {
 			headers: http.Header{
 				"X-Openai-Request-Id": {"req_2"},
 				"Retry-After":         {"Mon, 28 Sep 2026 10:05:00 GMT"},
 			},
-			wantExp: "2026-09-28T10:05:00.000Z",
+			wantExp:          "2026-09-28T10:05:00.000Z",
+			wantCaptureRetry: []string{"Mon, 28 Sep 2026 10:05:00 GMT"},
+			wantRelayRetry:   []string{"Mon, 28 Sep 2026 10:05:00 GMT"},
 		},
 		"success: single reset header sets epoch expiry": {
 			headers: http.Header{
 				"X-Openai-Request-Id":               {"req_3"},
 				"Anthropic-Ratelimit-Unified-Reset": {"1790597700"},
 			},
-			wantExp: "2026-09-28T12:15:00.000Z",
+			wantExp:          "2026-09-28T12:15:00.000Z",
+			wantCaptureReset: []string{"1790597700"},
+			wantRelayReset:   []string{"1790597700"},
 		},
-		"success: duplicate reset headers stay intact and join to default 60s": {
+		"success: duplicate reset headers stay unjoined in Header and join with comma-space in RelayHeader": {
 			headers: http.Header{
 				"X-Openai-Request-Id":               {"req_4"},
 				"Anthropic-Ratelimit-Unified-Reset": {"1790597700", "1790597715"},
 			},
-			wantExp: "2026-09-28T10:01:00.000Z",
+			wantExp:          "2026-09-28T10:01:00.000Z",
+			wantCaptureReset: []string{"1790597700", "1790597715"},
+			wantRelayReset:   []string{"1790597700, 1790597715"},
 		},
 	}
 
@@ -1041,6 +1376,8 @@ func TestLiveUpstreamHeadersToUpstreamState(t *testing.T) {
 				w.Header().Set("Content-Type", "application/json")
 				w.Header().Set("Keep-Alive", "timeout=5")
 				w.Header().Set("Upgrade", "websocket")
+				w.Header().Add("Set-Cookie", "a=1")
+				w.Header().Add("Set-Cookie", "b=2")
 				w.WriteHeader(http.StatusTooManyRequests)
 				_, _ = io.WriteString(w, `{"type":"error","error":{"type":"rate_limit_error","message":"limit"}}`)
 			}))
@@ -1060,22 +1397,59 @@ func TestLiveUpstreamHeadersToUpstreamState(t *testing.T) {
 				t.Fatalf("Do returned error: %v", err)
 			}
 			defer func() { _ = resp.Body.Close() }()
-			if _, err := io.ReadAll(resp.Body); err != nil {
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
 				t.Fatalf("reading response body: %v", err)
 			}
 			if diff := gocmp.Diff(http.StatusTooManyRequests, resp.StatusCode); diff != "" {
 				t.Fatalf("status (-want +got):\n%s", diff)
 			}
 
-			// RelayHeader strips Keep-Alive but keeps non-stripped headers like Upgrade.
-			if vals := resp.RelayHeader.Values("Keep-Alive"); len(vals) != 0 {
+			relay := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				maps.Copy(w.Header(), resp.RelayHeader)
+				w.WriteHeader(resp.StatusCode)
+				_, _ = w.Write(body)
+			}))
+			t.Cleanup(relay.Close)
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, relay.URL, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			received, err := relay.Client().Do(req)
+			if err != nil {
+				t.Fatalf("receiving relay response: %v", err)
+			}
+			defer func() { _ = received.Body.Close() }()
+			if vals := received.Header.Values("Keep-Alive"); len(vals) != 0 {
 				t.Errorf("RelayHeader kept Keep-Alive: %v", vals)
 			}
-			if diff := gocmp.Diff("websocket", resp.RelayHeader.Get("Upgrade")); diff != "" {
+			if diff := gocmp.Diff([]string{"websocket"}, headerValuesCI(t, resp.RelayHeader, "Upgrade")); diff != "" {
 				t.Errorf("RelayHeader Upgrade (-want +got):\n%s", diff)
 			}
+			if diff := gocmp.Diff([]string{"a=1", "b=2"}, received.Header.Values("Set-Cookie")); diff != "" {
+				t.Errorf("RelayHeader Set-Cookie (-want +got):\n%s", diff)
+			}
+			if diff := gocmp.Diff([]string{"a=1", "b=2"}, resp.Header.Values("Set-Cookie")); diff != "" {
+				t.Errorf("Header Set-Cookie (-want +got):\n%s", diff)
+			}
+			if tt.wantCaptureRetry != nil {
+				if diff := gocmp.Diff(tt.wantCaptureRetry, resp.Header.Values("Retry-After")); diff != "" {
+					t.Errorf("Header Retry-After (-want +got):\n%s", diff)
+				}
+				if diff := gocmp.Diff(tt.wantRelayRetry, received.Header.Values("Retry-After")); diff != "" {
+					t.Errorf("RelayHeader Retry-After (-want +got):\n%s", diff)
+				}
+			}
+			if tt.wantCaptureReset != nil {
+				if diff := gocmp.Diff(tt.wantCaptureReset, resp.Header.Values("Anthropic-Ratelimit-Unified-Reset")); diff != "" {
+					t.Errorf("Header Anthropic-Ratelimit-Unified-Reset (-want +got):\n%s", diff)
+				}
+				if diff := gocmp.Diff(tt.wantRelayReset, received.Header.Values("Anthropic-Ratelimit-Unified-Reset")); diff != "" {
+					t.Errorf("RelayHeader Anthropic-Ratelimit-Unified-Reset (-want +got):\n%s", diff)
+				}
+			}
 
-			// Raw Header passed directly to upstreamstate must preserve exact wire occurrences.
+			// Parsed Header passed directly to upstreamstate must preserve exact occurrences.
 			store := upstreamstate.Store{
 				Dir: t.TempDir(),
 				Now: func() time.Time { return now },
