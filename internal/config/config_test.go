@@ -169,7 +169,6 @@ func TestEveryVariable(t *testing.T) {
 			checkKey(LMStudioEnabled, " yES ", "sometimes", [4]*bool{nil, nil, new(true), nil}),
 		}},
 		"success: numeric variables": {[]envCheck{
-			checkKey(CompatPort, "0x50", "80x", [4]float64{80, 80, 80, math.NaN()}),
 			checkKey(PublicPort, " 0x10 ", "16x", [4]float64{18764, 18764, 16, math.NaN()}),
 			checkKey(ProxyPort, "1.8e4", "18k", [4]float64{18765, 18765, 18000, math.NaN()}),
 			checkKey(CompactMax, "2048", "Infinity", [4]float64{16777216, 16777216, 2048, 16777216}),

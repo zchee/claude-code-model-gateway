@@ -198,7 +198,8 @@ func (r Resolver) SocketPath() (string, error) {
 	return r.childPath(config.SocketPath.Get(r.env), r.StateDir, "gateway.sock")
 }
 
-// HostsFile resolves the system hosts file, allowing the source's explicit test override.
+// HostsFile resolves the path doctor and the migration check read to detect a block written by the Node gateway.
+// The Go gateway never writes the hosts file.
 func (r Resolver) HostsFile() string {
 	if file := config.HostsFile.Get(r.env); file != "" {
 		return file

@@ -41,14 +41,6 @@ func (a Args) Len() int {
 	return len(a.tokens)
 }
 
-// First returns the first raw argument and whether it exists; a flag-looking token is not skipped.
-func (a Args) First() (string, bool) {
-	if len(a.tokens) == 0 {
-		return "", false
-	}
-	return a.tokens[0], true
-}
-
 // Pair holds an option token and its following value, if one exists.
 type Pair struct {
 	Option   string

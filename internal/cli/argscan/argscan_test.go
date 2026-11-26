@@ -37,7 +37,6 @@ func TestScan(t *testing.T) {
 		args      []string
 		flag      string
 		wantFlag  bool
-		wantFirst string
 		wantPairs []argscan.Pair
 	}{
 		// lib/commands.js:199-201,1001-1009,1088-1097: no tokens means nothing to update.
@@ -49,49 +48,29 @@ func TestScan(t *testing.T) {
 			wantFlag:  true,
 			wantPairs: []argscan.Pair{{}},
 		},
-		// lib/commands.js:199-201 and lib/remote-control.js:137-145,194: a preceding flag is the action token.
-		"success: unknown flag before action is not skipped": {
-			args:      []string{"--unknown", "enable", "--confirm"},
-			flag:      "--confirm",
-			wantFlag:  true,
-			wantFirst: "--unknown",
-			wantPairs: []argscan.Pair{{Option: "--unknown", Value: "enable", HasValue: true}, {Option: "--confirm"}},
-		},
-		// lib/commands.js:199-201 and lib/remote-control.js:137-145,194: later tokens do not replace the action.
-		"success: unknown flag after action leaves action intact": {
-			args:      []string{"enable", "--unknown", "--confirm"},
-			flag:      "--confirm",
-			wantFlag:  true,
-			wantFirst: "enable",
-			wantPairs: []argscan.Pair{{Option: "enable", Value: "--unknown", HasValue: true}, {Option: "--confirm"}},
-		},
 		// lib/commands.js:199-201,2078-2080: the presence check matches only the complete token.
 		"success: equals does not enable a presence flag": {
 			args:      []string{"--refresh=true"},
 			flag:      "--refresh",
-			wantFirst: "--refresh=true",
 			wantPairs: []argscan.Pair{{Option: "--refresh=true"}},
 		},
 		// lib/commands.js:1075-1098: equals stays part of an invalid option token, even with an empty suffix.
 		"success: equals with empty suffix is not a value": {
 			args:      []string{"--opus="},
 			flag:      "--opus",
-			wantFirst: "--opus=",
 			wantPairs: []argscan.Pair{{Option: "--opus="}},
 		},
 		// lib/commands.js:1001-1011 and lib/context-window.js:20-29: equals is not split into a valid option and value.
 		"success: equals with nonempty suffix is not a value": {
 			args:      []string{"--codex=272000", "--claude", "full"},
 			flag:      "--codex",
-			wantFirst: "--codex=272000",
 			wantPairs: []argscan.Pair{{Option: "--codex=272000", Value: "--claude", HasValue: true}, {Option: "full"}},
 		},
 		// lib/commands.js:199-201,1075-1098: keep ordered repeats and distinguish empty from missing.
 		"success: repeated value flags with empty and missing values": {
-			args:      []string{"--opus", "first", "--opus", "default", "--opus", "", "--opus"},
-			flag:      "--opus",
-			wantFlag:  true,
-			wantFirst: "--opus",
+			args:     []string{"--opus", "first", "--opus", "default", "--opus", "", "--opus"},
+			flag:     "--opus",
+			wantFlag: true,
 			wantPairs: []argscan.Pair{
 				{Option: "--opus", Value: "first", HasValue: true},
 				{Option: "--opus", Value: "default", HasValue: true},
@@ -101,10 +80,9 @@ func TestScan(t *testing.T) {
 		},
 		// lib/commands.js:199-201,215-218,1008-1011: -- does not consume or stop scanning; a flag can also be a value.
 		"success: no separator and no protection for option-like values": {
-			args:      []string{"--", "--grok", "--codex", "--json"},
-			flag:      "--json",
-			wantFlag:  true,
-			wantFirst: "--",
+			args:     []string{"--", "--grok", "--codex", "--json"},
+			flag:     "--json",
+			wantFlag: true,
 			wantPairs: []argscan.Pair{
 				{Option: "--", Value: "--grok", HasValue: true},
 				{Option: "--codex", Value: "--json", HasValue: true},
@@ -115,7 +93,6 @@ func TestScan(t *testing.T) {
 			args:      []string{"--refresh", "--refresh"},
 			flag:      "--refresh",
 			wantFlag:  true,
-			wantFirst: "--refresh",
 			wantPairs: []argscan.Pair{{Option: "--refresh", Value: "--refresh", HasValue: true}},
 		},
 	}
@@ -127,13 +104,6 @@ func TestScan(t *testing.T) {
 			}
 			if diff := gocmp.Diff(tt.wantFlag, a.Has(tt.flag)); diff != "" {
 				t.Errorf("presence of %q mismatch (-want +got):\n%s", tt.flag, diff)
-			}
-			first, found := a.First()
-			if diff := gocmp.Diff(tt.wantFirst, first); diff != "" {
-				t.Errorf("first token mismatch (-want +got):\n%s", diff)
-			}
-			if diff := gocmp.Diff(len(tt.args) > 0, found); diff != "" {
-				t.Errorf("first token presence mismatch (-want +got):\n%s", diff)
 			}
 			if diff := gocmp.Diff(tt.wantPairs, slices.Collect(a.Pairs())); diff != "" {
 				t.Errorf("pairs mismatch (-want +got):\n%s", diff)

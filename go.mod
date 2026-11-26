@@ -6,7 +6,6 @@ require (
 	github.com/andybalholm/brotli v1.3.0
 	github.com/dlclark/regexp2 v1.12.0
 	github.com/google/go-cmp v0.7.0
-	github.com/miekg/dns v1.1.73
 	github.com/rogpeppe/go-internal v1.16.0
 	github.com/shirou/gopsutil/v4 v4.26.10
 	github.com/spf13/cobra v1.10.2
@@ -26,6 +25,5 @@ require (
 	github.com/tklauser/go-sysconf v0.4.0 // indirect
 	github.com/tklauser/numcpus v0.12.0 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
-	golang.org/x/net v0.61.0 // indirect
 	golang.org/x/tools v0.52.0 // indirect
 )

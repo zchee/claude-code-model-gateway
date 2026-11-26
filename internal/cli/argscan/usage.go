@@ -65,9 +65,6 @@ const usage = `usage: %s <command>
                    (--write-project writes .claude/settings.local.json; --write-user
                    is an opt-in shared fallback in ~/.claude/settings.json)
   doctor           full health check, Anthropic catalog age/fallback, pin sources and newest ids
-  remote-control <enable|disable|doctor> [--confirm]
-                   manage the opt-in hosts-file compatibility mode; enable refuses an effective
-                   HTTPS api.anthropic.com process URL before hosts changes
   serve-shim       (internal) run the router in the foreground
 
   Request route logging (on by default; set CODEX_GATEWAY_REQUEST_LOG=0 to opt out):

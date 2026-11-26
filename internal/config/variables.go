@@ -33,7 +33,6 @@ var (
 	})
 	ClaudeBin      = key("CODEX_GATEWAY_CLAUDE_BIN", "claude", "Claude CLI for probes; a .cmd or .bat uses the Windows shell.", `Use a nonempty command without trimming. The source's test-mode probe checks the raw value: any nonempty override is truthy, even "claude".`, "lib/runtime.js:549–550; lib/pins.js:212–214,251–262; lib/picker-guard.js:32–35,94", func(s string, _ bool) string { return cmp.Or(s, "claude") })
 	ClaudeConfig   = candidate("CLAUDE_CONFIG_DIR", "home/.claude (global config: home/.claude.json)", "Claude config, registry, discovery cache and transcripts.", "Use any nonempty string without trimming; only the registry search makes it absolute.", "lib/runtime.js:15,552,682–693; lib/previous-picker-rows.js:13–17; lib/usage-observability.js:134; lib/commands.js:320; hooks/registry-writer.js:43–51")
-	CompatPort     = portKey("CODEX_GATEWAY_COMPAT_PORT", "Remote-control compatibility listener port.", "lib/runtime.js:45", "80")
 	CompactGuard   = toggle("CODEX_GATEWAY_COMPACT_STREAM_GUARD", "Buffer Codex compaction streams for retry before committing the response.", "lib/request-worker.js:305", true)
 	CompactMax     = numberKey("CODEX_GATEWAY_COMPACT_STREAM_MAX_BYTES", "Maximum buffered compaction response bytes.", "accept a finite positive value.", "lib/request-worker.js:314–317", 16*1024*1024, finitePositive)
 	CompactRetries = numberKey("CODEX_GATEWAY_COMPACT_STREAM_RETRIES", "Number of retries for a failed compaction stream.", "accept a nonnegative integer.", "lib/request-worker.js:306–309", 2, integerNonnegative)
@@ -60,7 +59,7 @@ var (
 	GrokEndpoint       = stringKey("CODEX_GATEWAY_GROK_ENDPOINT", "https://cli-chat-proxy.grok.com/v1/responses", "Grok backend endpoint.", "lib/runtime.js:31; lib/commands.js:113; lib/grok-backend.js:8")
 	GrokHome           = candidate("CODEX_GATEWAY_GROK_HOME", "home/.grok", "Grok CLI state directory.", "Use any nonempty string without trimming.", "lib/grok-backend.js:18–20")
 	Home               = key("HOME", "injected account home lookup if unset", "POSIX user home and the test-runner settings diagnostic.", "Use the value as provided when nonempty. Unlike Node, which keeps an explicitly empty HOME and derives relative paths, the Go port reports an error naming HOME and does not look up the account's home.", "lib/runtime.js:15–16 (os.homedir); lib/settings-wiring.js:104; Node v24.11.1 deps/uv/src/unix/core.c:1195–1209", presentString)
-	HostsFile          = candidate("CODEX_GATEWAY_HOSTS_FILE", "Windows: SystemRoot/System32/drivers/etc/hosts; otherwise /etc/hosts", "Remote-control compatibility hosts file.", "Use any nonempty string without trimming.", "lib/remote-control.js:10–15")
+	HostsFile          = candidate("CODEX_GATEWAY_HOSTS_FILE", "Windows: SystemRoot/System32/drivers/etc/hosts; otherwise /etc/hosts", "Hosts file that doctor and the migration check read to detect a block written by the Node gateway. The Go gateway never writes this file.", "Use any nonempty string without trimming.", "internal/paths/paths.go (HostsFile)")
 	KeepPlanTools      = toggle("CODEX_GATEWAY_KEEP_PLAN_TOOLS", "Keep plan tools visible in adapted provider requests.", "lib/request-worker.js:2547", false)
 	ListDispatchModel  = toggle("CODEX_GATEWAY_LIST_DISPATCH_MODEL", "List the virtual auto dispatch model.", "lib/runtime.js:39; lib/commands.js:129", false)
 	LlamaServerPort    = key("CCP_LLAMA_PORT", "unset", "Local llama-server port.", "Distinguish unset from invalid; accept ASCII decimal digits with an optional leading plus and a value from 1 to 65535.", "lib/local-llama.js:13,17–22; lib/commands.js:1707", parseLlamaPort)
@@ -111,7 +110,7 @@ var (
 	SSEHeartbeatSeconds = numberKey("CODEX_GATEWAY_SSE_HEARTBEAT_S", "Stream heartbeat interval in seconds; zero disables heartbeats.", "accept a finite nonnegative value and convert seconds to milliseconds at the worker.", "lib/request-worker.js:268–271", 20, finiteNonnegative)
 	StartupGeneration   = rawKey("MODEL_GATEWAY_STARTUP_GENERATION", "Generation recorded in the supervisor failure diagnostic.", "Preserve an explicitly empty string; omit the field if unset.", "lib/commands.js:624")
 	StateDirectory      = candidate("MODEL_GATEWAY_STATE_DIR", "gateway home", "Go gateway state override; does not move the stable installation or Claude settings.", "Use any nonempty string without trimming.", "Go port only: internal/paths/paths.go")
-	SystemRoot          = key("SystemRoot", `C:\Windows for tar/hosts; windir fallback for temp`, "Windows system directory parent for tar.exe, hosts, and the default temporary directory.", `Use any nonempty value without trimming. The temporary directory uses the raw value or windir, then appends \temp.`, "lib/commands.js:460; lib/remote-control.js:13; Node v24.11.1 lib/os.js:180–194 (os.tmpdir)", func(s string, _ bool) string { return cmp.Or(s, `C:\Windows`) })
+	SystemRoot          = key("SystemRoot", `C:\Windows for tar and hosts; windir fallback for temp`, "Windows system directory parent for tar.exe, the hosts file read by doctor and the migration check, and the default temporary directory.", `Use any nonempty value without trimming. The temporary directory uses the raw value or windir, then appends \temp.`, "lib/commands.js:460; internal/paths/paths.go (HostsFile); Node v24.11.1 lib/os.js:180–194 (os.tmpdir)", func(s string, _ bool) string { return cmp.Or(s, `C:\Windows`) })
 	Temp                = tempPathKey("TEMP", `Windows: TMP, then SystemRoot or windir; POSIX: /tmp`, "First Windows temporary directory candidate; third on POSIX.")
 	Tmp                 = tempPathKey("TMP", `Windows: SystemRoot or windir; POSIX: TEMP, then /tmp`, "Second temporary directory candidate on each platform.")
 	TmpDir              = tempPathKey("TMPDIR", "TMP, then TEMP, then /tmp", "First POSIX temporary directory candidate; ignored on Windows.")
@@ -177,7 +176,7 @@ func Variables() []Variable {
 var variables = []Variable{
 	AnthropicBaseURL.variable, anthropicAPIKey, anthropicAuth, anthropicFable,
 	anthropicOpus, anthropicSonnet, AppData.variable, ClaudeAutoCompactWindow.variable,
-	ClaudeBin.variable, ClaudeConfig.variable, CompatPort.variable, CompactGuard.variable, CompactMax.variable,
+	ClaudeBin.variable, ClaudeConfig.variable, CompactGuard.variable, CompactMax.variable,
 	CompactRetries.variable, CompactDelay.variable, CompactTrigger.variable, CodexContextWindow.variable,
 	DispatchCachePath.variable, DispatchMax.variable, DispatchTTL.variable, DrainTimeout.variable,
 	GitHubToken.variable, GHToken.variable, GoogleCloudProject.variable, GrokEndpoint.variable, GrokHome.variable,

@@ -57,7 +57,6 @@ func TestRunStubs(t *testing.T) {
 		"error: context-window": {command: "context-window"},
 		"error: env":            {command: "env"},
 		"error: doctor":         {command: "doctor"},
-		"error: remote-control": {command: "remote-control"},
 		"error: serve-shim":     {command: "serve-shim"},
 		"error: serve-worker":   {command: "serve-worker"},
 	}
@@ -134,11 +133,7 @@ func TestSourceInvocations(t *testing.T) {
 				"--reconcile": false, "--remove": false, "--write-project": true, "--write-user": false, "--mode": true, "--show-mode": true,
 			}},
 		},
-		"success: doctor": {command: "doctor", wantScan: &commandScan{}},
-		"success: remote-control": {
-			command:  "remote-control",
-			wantScan: &commandScan{first: "--unknown-before", hasFirst: true, present: map[string]bool{"--confirm": true}},
-		},
+		"success: doctor":       {command: "doctor", wantScan: &commandScan{}},
 		"success: serve-shim":   {command: "serve-shim", wantScan: &commandScan{}},
 		"success: serve-worker": {command: "serve-worker", wantScan: &commandScan{}},
 	}
@@ -420,6 +415,34 @@ func TestInheritedObjectNamesAreUnknownCommands(t *testing.T) {
 	}
 }
 
+func TestRemoteControlIsUnknownCommand(t *testing.T) {
+	type result struct {
+		Status         int
+		Stdout, Stderr string
+	}
+	run := func(command string, args []string) result {
+		var stdout, stderr bytes.Buffer
+		argv := slices.Concat([]string{"model-gateway", command}, args)
+		status := Run(argv, strings.NewReader(""), &stdout, &stderr, testEnv(nil).lookup, testHome)
+		return result{Status: status, Stdout: stdout.String(), Stderr: stderr.String()}
+	}
+	tests := map[string]struct{ args []string }{
+		"error: no arguments":   {},
+		"error: with arguments": {args: []string{"enable", "--confirm"}},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			want := run("not-a-command", tt.args)
+			if want.Status != 1 || want.Stderr != "" || !strings.HasPrefix(want.Stdout, "usage: model-gateway <command>\n") {
+				t.Fatalf("unknown command returned status %d, stdout %q, stderr %q", want.Status, want.Stdout, want.Stderr)
+			}
+			if diff := gocmp.Diff(want, run("remote-control", tt.args)); diff != "" {
+				t.Errorf("unknown command mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
 func TestRunUsage(t *testing.T) {
 	tests := map[string]struct {
 		args       []string
@@ -533,7 +556,8 @@ func TestRunUsage(t *testing.T) {
 	}
 }
 
-// lib/commands.js:153-197, with substitutions for the name and paths, and the newline from bin/model-gateway.js:8.
+// Adapted from lib/commands.js:153-197, with the newline from bin/model-gateway.js:8.
+// The command list includes only commands carried over to Go.
 const sourceUsage = `usage: <program> <command>
 
   setup            download the claude-code-proxy binary (v-latest) into <bin>
@@ -570,9 +594,6 @@ const sourceUsage = `usage: <program> <command>
                    (--write-project writes .claude/settings.local.json; --write-user
                    is an opt-in shared fallback in ~/.claude/settings.json)
   doctor           full health check, Anthropic catalog age/fallback, pin sources and newest ids
-  remote-control <enable|disable|doctor> [--confirm]
-                   manage the opt-in hosts-file compatibility mode; enable refuses an effective
-                   HTTPS api.anthropic.com process URL before hosts changes
   serve-shim       (internal) run the router in the foreground
 
   Request route logging (on by default; set CODEX_GATEWAY_REQUEST_LOG=0 to opt out):

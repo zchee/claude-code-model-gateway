@@ -77,7 +77,7 @@ func NewEnv(home string, parent, overrides, isolatedOverrides map[string]string)
 		"CODEX_GATEWAY_PORT":                "0",
 		"CODEX_GATEWAY_PROXY_PORT":          "0",
 		"CODEX_GATEWAY_WORKER_PORT":         "0",
-		"CODEX_GATEWAY_COMPAT_PORT":         "0",
+		"CODEX_GATEWAY_COMPAT_PORT":         "0", // The pinned Node tests still need an isolated listener port.
 		"CODEX_GATEWAY_SOCKET_PATH":         socket,
 		"CODEX_GATEWAY_GROK_HOME":           filepath.Join(home, ".grok"),
 		"CODEX_GATEWAY_GROK_ENDPOINT":       "http://127.0.0.1:9/v1/responses",

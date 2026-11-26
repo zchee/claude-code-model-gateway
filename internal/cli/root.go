@@ -101,7 +101,6 @@ const (
 	scanNone scanMode = iota
 	scanPresence
 	scanPairs
-	scanFirst
 	scanStdin
 )
 
@@ -126,8 +125,6 @@ type commandScan struct {
 	present     map[string]bool
 	pairOptions []string
 	pairs       []argscan.Pair
-	first       string
-	hasFirst    bool
 }
 
 func sourceCommands() []sourceCommand {
@@ -166,8 +163,6 @@ func sourceCommands() []sourceCommand {
 		},
 		// bin/model-gateway.js:7 and lib/commands.js:1397,3037.
 		{name: "doctor", short: "Run a full gateway health check", mode: scanNone, handle: stubRun},
-		// lib/remote-control.js:137-145,194-198.
-		{name: "remote-control", short: "Manage opt-in remote-control compatibility mode", mode: scanFirst, flags: []string{"--confirm"}, handle: stubRun},
 		// lib/commands.js:2456-2905,3039.
 		{name: "serve-shim", short: "Run the router in the foreground (internal)", mode: scanNone, handle: stubRun},
 		// lib/commands.js:3040 and lib/request-worker.js:1208 onward.
@@ -199,14 +194,11 @@ func newRoot(name string, commands []sourceCommand, lookup func(string) (string,
 				scan := argscan.Scan(args)
 				call.streams = scan.Streams(stdout, stderr)
 				call.scan = &commandScan{}
-				if spec.mode == scanPresence || spec.mode == scanFirst {
+				if spec.mode == scanPresence {
 					call.scan.present = make(map[string]bool, len(spec.flags))
 					for _, flag := range spec.flags {
 						call.scan.present[flag] = scan.Has(flag)
 					}
-				}
-				if spec.mode == scanFirst {
-					call.scan.first, call.scan.hasFirst = scan.First()
 				}
 				if spec.mode == scanPairs {
 					// Keep unrecognized option tokens so that handlers can reject them.
