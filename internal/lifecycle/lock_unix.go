@@ -23,12 +23,14 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 	"uuid"
 
 	"golang.org/x/sys/unix"
 
+	"github.com/zchee/claude-code-model-gateway/internal/atomicfile"
 	"github.com/zchee/claude-code-model-gateway/internal/procinfo"
 )
 
@@ -36,6 +38,7 @@ const lockName = "lifecycle.lock"
 
 func openAt(dir *os.File, name string, flags int, mode uint32) (*os.File, error) {
 	fd, err := unix.Openat(int(dir.Fd()), name, flags|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, mode)
+	runtime.KeepAlive(dir)
 	if err != nil {
 		return nil, &os.PathError{Op: "openat", Path: name, Err: err}
 	}
@@ -68,7 +71,9 @@ func removeOwned(parent, dir *os.File, name, token string) {
 	if unix.Unlinkat(int(dir.Fd()), token, 0) == nil {
 		// Never remove a replacement owner's file, even if this release is delayed.
 		_ = unix.Unlinkat(int(parent.Fd()), name, unix.AT_REMOVEDIR)
+		runtime.KeepAlive(parent)
 	}
+	runtime.KeepAlive(dir)
 }
 
 func (l Lock) reap(ctx context.Context, parent *os.File) {
@@ -110,13 +115,11 @@ func (l Lock) Acquire(ctx context.Context) (release func(), err error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(l.StateDir, 0o777); err != nil {
-		return nil, err
-	}
-	parent, err := os.Open(l.StateDir)
+	parent, err := atomicfile.OpenDirectoryFile(l.StateDir, 0o777)
 	if err != nil {
 		return nil, err
 	}
+	defer runtime.KeepAlive(parent) // fd is borrowed across retries and candidate cleanup.
 	defer func() {
 		if release == nil {
 			_ = parent.Close()
