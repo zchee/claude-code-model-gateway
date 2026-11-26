@@ -194,18 +194,11 @@ func TestDiagnosticStateWriteFailure(t *testing.T) {
 			equal(t, ok.header, failed.header)
 			equal(t, ok.body, failed.body)
 
-			okLines := strings.SplitAfter(ok.lines, "\n")
-			var added []string
-			for line := range strings.SplitAfterSeq(failed.lines, "\n") {
-				if line != "" && !slices.Contains(okLines, line) {
-					added = append(added, line)
-				}
-			}
-			if len(added) == 0 {
-				t.Errorf("failed state write left no diagnostic line of its own: failed=%q succeeded=%q", failed.lines, ok.lines)
-			}
-			if failed.lines != "" && !strings.HasSuffix(failed.lines, "\n") {
-				t.Errorf("diagnostic output %q does not end with a newline", failed.lines)
+			// A failed write is reported by one line of its own, instead of the success line.
+			checkOneLine(t, ok.lines)
+			checkOneLine(t, failed.lines)
+			if failed.lines == ok.lines {
+				t.Errorf("failed state write reported the success line %q", failed.lines)
 			}
 			for _, lines := range []string{ok.lines, failed.lines} {
 				checkPayloadFree(t, lines, "private-header-value", "private-body-bytes", "private-prompt", writable, unwritable, blocker)
@@ -273,6 +266,150 @@ func TestNilDiagnosticsDiscards(t *testing.T) {
 			}))
 			equal(t, tc.wantCode, w.Code)
 			equal(t, tc.wantCode, result.Status)
+		})
+	}
+}
+
+// TestRejectionLineAcrossShapes checks that every attributed OpenAI rejection writes the same
+// single line whatever its status and its evidence (headers of different names, or the body
+// alone), and that a rejection whose upstream state cannot be written writes exactly one other
+// line instead, the same whatever made the write fail.
+func TestRejectionLineAcrossShapes(t *testing.T) {
+	const (
+		plain  = `{"error":{"message":"request refused"}}`
+		inBody = `{"error":{"message":"OpenAI refused the request"}}`
+	)
+	type stateDir int
+	const (
+		writable stateDir = iota
+		belowFile
+		relative
+	)
+	requestID := http.Header{"X-Openai-Request-Id": {"req-1"}}
+	processing := http.Header{"Content-Type": {"application/json"}, "Openai-Processing-Ms": {"12"}}
+	others := http.Header{"X-Openai-Organization": {"org"}, "X-Openai-Version": {"2"}}
+	// A Retry-After this far ahead puts the rate limit's expiry outside the supported dates.
+	farFuture := http.Header{"X-Openai-Request-Id": {"req-1"}, "Retry-After": {"9000000000000000"}}
+	tests := map[string]struct {
+		status int
+		header http.Header
+		body   string
+		dir    stateDir
+		failed bool
+	}{
+		"error: forbidden with a request id header":           {status: http.StatusForbidden, header: requestID, body: plain},
+		"error: unauthorized with a processing time header":   {status: http.StatusUnauthorized, header: processing, body: plain},
+		"error: rate limit with other OpenAI headers":         {status: http.StatusTooManyRequests, header: others, body: plain},
+		"error: forbidden with body evidence only":            {status: http.StatusForbidden, body: inBody},
+		"error: unauthorized with body evidence only":         {status: http.StatusUnauthorized, body: inBody},
+		"error: rate limit with body evidence only":           {status: http.StatusTooManyRequests, body: inBody},
+		"error: forbidden with state below a file":            {status: http.StatusForbidden, header: requestID, body: plain, dir: belowFile, failed: true},
+		"error: unauthorized with state below a file":         {status: http.StatusUnauthorized, header: processing, body: plain, dir: belowFile, failed: true},
+		"error: rate limit with state below a file":           {status: http.StatusTooManyRequests, header: others, body: plain, dir: belowFile, failed: true},
+		"error: body evidence with state below a file":        {status: http.StatusForbidden, body: inBody, dir: belowFile, failed: true},
+		"error: forbidden with a relative state directory":    {status: http.StatusForbidden, header: requestID, body: plain, dir: relative, failed: true},
+		"error: rate limit with an expiry out of date range":  {status: http.StatusTooManyRequests, header: farFuture, body: plain, failed: true},
+		"error: unauthorized with a relative state directory": {status: http.StatusUnauthorized, body: inBody, dir: relative, failed: true},
+	}
+	written := map[bool]map[string]string{false: {}, true: {}}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			switch tc.dir {
+			case belowFile:
+				blocker := filepath.Join(dir, "state-is-a-file")
+				if err := os.WriteFile(blocker, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				dir = filepath.Join(blocker, "codex")
+			case relative:
+				dir = filepath.Join("relative", "state")
+			}
+			store := &upstreamstate.Store{Dir: dir, Now: func() time.Time { return time.Unix(1000, 0) }}
+			req := reply.Request{Provider: "codex", AdvertisedModel: "shown", BackendModel: "engine", Body: []byte(`{}`), Upstream: store}
+			got := diagnose(t, req, tc.status, tc.header, tc.body)
+			equal(t, tc.status, got.code)
+			checkOneLine(t, got.lines)
+			if recorded := store.ReadBlocked() != nil; recorded == tc.failed {
+				t.Errorf("upstream state recorded = %v, want %v", recorded, !tc.failed)
+			}
+			written[tc.failed][name] = got.lines
+		})
+	}
+	same := func(kind string, lines map[string]string) string {
+		if len(lines) == 0 {
+			t.Fatalf("no %s line was collected", kind)
+		}
+		names := slices.Sorted(maps.Keys(lines))
+		reference := lines[names[0]]
+		for _, name := range names[1:] {
+			if lines[name] != reference {
+				t.Errorf("%s line differs across rejections:\n%s: %q\n%s: %q", kind, names[0], reference, name, lines[name])
+			}
+		}
+		return reference
+	}
+	success, failure := same("rejection", written[false]), same("state failure", written[true])
+	if success == failure {
+		t.Errorf("a failed state write reports the success line %q", success)
+	}
+}
+
+// writeRecorder records how diagnostic lines arrive: each Write call, and any WriteString call,
+// which would bypass the Write of a sink that offers both.
+type writeRecorder struct {
+	writes, stringWrites []string
+}
+
+func (w *writeRecorder) Write(p []byte) (int, error) {
+	w.writes = append(w.writes, string(p))
+	return len(p), nil
+}
+
+func (w *writeRecorder) WriteString(s string) (int, error) {
+	w.stringWrites = append(w.stringWrites, s)
+	return len(s), nil
+}
+
+// TestDiagnosticLineIsOneWrite checks that each diagnostic line reaches the writer as one Write
+// call carrying the whole line, even when the writer also implements WriteString.
+func TestDiagnosticLineIsOneWrite(t *testing.T) {
+	openAI := http.Header{"Content-Type": {"application/json"}, "X-Openai-Request-Id": {"req-1"}}
+	tests := map[string]struct {
+		status     int
+		header     http.Header
+		body       string
+		unwritable bool
+		wantCode   int
+	}{
+		"error: attributed rejection":            {http.StatusForbidden, openAI, `{"error":{"message":"refused"}}`, false, http.StatusForbidden},
+		"error: rejection with unwritable state": {http.StatusTooManyRequests, openAI, `{"error":{"message":"refused"}}`, true, http.StatusTooManyRequests},
+		"success: empty completion":              {http.StatusServiceUnavailable, nil, `{"message":"Codex completed without producing output"}`, false, http.StatusOK},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			if tc.unwritable {
+				blocker := filepath.Join(dir, "state-is-a-file")
+				if err := os.WriteFile(blocker, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				dir = filepath.Join(blocker, "codex")
+			}
+			store := &upstreamstate.Store{Dir: dir, Now: func() time.Time { return time.Unix(1000, 0) }}
+			sink := &writeRecorder{}
+			req := reply.Request{Provider: "codex", AdvertisedModel: "shown", Body: []byte(`{}`), Upstream: store}
+			w, _ := handle(t, withDiagnostics(req, sink), newProxy(t, func(w http.ResponseWriter, _ *http.Request) {
+				maps.Copy(w.Header(), tc.header)
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			equal(t, tc.wantCode, w.Code)
+			equal(t, []string(nil), sink.stringWrites)
+			if len(sink.writes) != 1 {
+				t.Fatalf("diagnostic Write calls = %q, want exactly one", sink.writes)
+			}
+			checkOneLine(t, sink.writes[0])
 		})
 	}
 }
