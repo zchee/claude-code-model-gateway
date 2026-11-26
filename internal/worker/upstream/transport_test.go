@@ -96,6 +96,137 @@ func (l *pipeListener) DialContext(ctx context.Context, _, _ string) (net.Conn, 
 	}
 }
 
+type writeObserverConn struct {
+	net.Conn
+	mu             sync.Mutex
+	completedCount int64
+	completedBytes int64
+	writeSignal    chan struct{}
+	writeEntered   chan struct{}
+	enterOnce      sync.Once
+	onClose        func()
+	closeOnce      sync.Once
+}
+
+func newWriteObserverConn(c net.Conn, onClose func()) *writeObserverConn {
+	return &writeObserverConn{
+		Conn:         c,
+		writeSignal:  make(chan struct{}, 1),
+		writeEntered: make(chan struct{}),
+		onClose:      onClose,
+	}
+}
+
+func (c *writeObserverConn) Write(p []byte) (int, error) {
+	if len(p) > 0 {
+		c.enterOnce.Do(func() { close(c.writeEntered) })
+	}
+	n, err := c.Conn.Write(p)
+	if n > 0 && err == nil {
+		c.mu.Lock()
+		c.completedCount++
+		c.completedBytes += int64(n)
+		c.mu.Unlock()
+		select {
+		case c.writeSignal <- struct{}{}:
+		default:
+		}
+	}
+	return n, err
+}
+
+func (c *writeObserverConn) Close() error {
+	c.closeOnce.Do(func() {
+		if c.onClose != nil {
+			c.onClose()
+		}
+	})
+	return c.Conn.Close()
+}
+
+func (c *writeObserverConn) stats() (int64, int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.completedCount, c.completedBytes
+}
+
+type gatedUploadBody struct {
+	segments <-chan []byte
+	waiting  chan struct{}
+	connDone <-chan struct{}
+	stop     <-chan struct{}
+	closed   chan struct{}
+	closeFn  func()
+	pending  []byte
+}
+
+func newGatedUploadBody(segments <-chan []byte, connDone, stop <-chan struct{}) *gatedUploadBody {
+	closed := make(chan struct{})
+	return &gatedUploadBody{
+		segments: segments,
+		waiting:  make(chan struct{}, 1),
+		connDone: connDone,
+		stop:     stop,
+		closed:   closed,
+		closeFn:  sync.OnceFunc(func() { close(closed) }),
+	}
+}
+
+func (b *gatedUploadBody) Read(p []byte) (int, error) {
+	if len(b.pending) > 0 {
+		n := copy(p, b.pending)
+		b.pending = b.pending[n:]
+		return n, nil
+	}
+	select {
+	case b.waiting <- struct{}{}:
+	default:
+	}
+	select {
+	case seg, ok := <-b.segments:
+		if !ok {
+			return 0, io.EOF
+		}
+		n := copy(p, seg)
+		if n < len(seg) {
+			b.pending = seg[n:]
+		}
+		return n, nil
+	case <-b.connDone:
+		return 0, io.EOF
+	case <-b.stop:
+		return 0, io.EOF
+	case <-b.closed:
+		return 0, io.EOF
+	}
+}
+
+func (b *gatedUploadBody) Close() error {
+	b.closeFn()
+	return nil
+}
+
+type roundTripOutcome struct {
+	statusCode int
+	body       []byte
+	err        error
+}
+
+func waitForCompletedWrite(t *testing.T, obs *writeObserverConn, beforeCount, minBytes int64, done <-chan roundTripOutcome) (int64, int64) {
+	t.Helper()
+	for {
+		count, written := obs.stats()
+		if count > beforeCount && written >= minBytes {
+			return count, written
+		}
+		select {
+		case <-obs.writeSignal:
+		case res := <-done:
+			t.Fatalf("RoundTrip returned before client write completed (writes=%d bytes=%d, want >%d and >=%d): status=%d err=%v", count, written, beforeCount, minBytes, res.statusCode, res.err)
+		}
+	}
+}
+
 func TestTransportNoRedirect(t *testing.T) {
 	tests := map[string]struct {
 		status int
@@ -998,255 +1129,383 @@ func TestTransportIdleTimeout(t *testing.T) {
 
 	t.Run("success: periodic request body write activity resets the 1 hour idle deadline", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
-			const (
-				segmentSize = 64 * 1024
-				totalSize   = 3 * segmentSize
-			)
-			payload := make([]byte, totalSize)
-			for i := range payload {
-				payload[i] = byte('a' + (i % 26))
-			}
+			seg1 := []byte("upload-segment-one\n")
+			seg2 := []byte("upload-segment-two\n")
+			seg3 := []byte("upload-segment-three\n")
+			wantPayload := slices.Concat(seg1, seg2, seg3)
 
-			readNext := make(chan struct{}, 2)
-			segDone := make(chan error, 3)
-			peerDone := make(chan error, 1)
-			stopPeer := make(chan struct{})
-			stopPeerOnce := sync.OnceFunc(func() { close(stopPeer) })
+			ln := newPipeListener("127.0.0.1:12355")
+			connClosed := make(chan struct{})
+			closeConnDone := sync.OnceFunc(func() { close(connClosed) })
+			connReady := make(chan *writeObserverConn, 1)
 
 			var connMu sync.Mutex
-			var serverConns []net.Conn
+			var clientConns []*writeObserverConn
 			var dialCount atomic.Int32
-			var peerWG sync.WaitGroup
 
-			dialCtx := func(_ context.Context, _, _ string) (net.Conn, error) {
+			dialCtx := func(ctx context.Context, network, addr string) (net.Conn, error) {
 				if dialCount.Add(1) > 1 {
 					return nil, errors.New("unexpected extra dial during segmented upload")
 				}
-				c1, c2 := net.Pipe()
+				c, err := ln.DialContext(ctx, network, addr)
+				if err != nil {
+					return nil, err
+				}
+				obs := newWriteObserverConn(c, closeConnDone)
 				connMu.Lock()
-				serverConns = append(serverConns, c2)
+				clientConns = append(clientConns, obs)
 				connMu.Unlock()
+				connReady <- obs
+				return obs, nil
+			}
 
-				peerWG.Go(func() {
-					defer func() { _ = c2.Close() }()
-					br := bufio.NewReaderSize(c2, 4096)
-					req, err := http.ReadRequest(br)
+			tr := upstream.NewTransport(upstream.Options{DialContext: dialCtx})
+			if tr == nil {
+				t.Fatal("NewTransport returned nil")
+			}
+
+			var peerMu sync.Mutex
+			var gotPayload []byte
+			var peerReadErr error
+			srv := &http.Server{
+				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					data, err := io.ReadAll(r.Body)
+					peerMu.Lock()
+					gotPayload = data
+					peerReadErr = err
+					peerMu.Unlock()
 					if err != nil {
-						segDone <- fmt.Errorf("peer ReadRequest: %w", err)
+						w.WriteHeader(http.StatusBadRequest)
 						return
 					}
-					defer func() { _ = req.Body.Close() }()
-
-					got := make([]byte, totalSize)
-					if _, err := io.ReadFull(req.Body, got[:segmentSize]); err != nil {
-						segDone <- fmt.Errorf("peer segment 1 read: %w", err)
-						return
-					}
-					segDone <- nil
-
-					select {
-					case <-readNext:
-					case <-stopPeer:
-						return
-					}
-					if _, err := io.ReadFull(req.Body, got[segmentSize:2*segmentSize]); err != nil {
-						segDone <- fmt.Errorf("peer segment 2 read: %w", err)
-						return
-					}
-					segDone <- nil
-
-					select {
-					case <-readNext:
-					case <-stopPeer:
-						return
-					}
-					if _, err := io.ReadFull(req.Body, got[2*segmentSize:]); err != nil {
-						peerDone <- fmt.Errorf("peer segment 3 read: %w", err)
-						return
-					}
-					var extra [1]byte
-					if n, err := req.Body.Read(extra[:]); n != 0 || !errors.Is(err, io.EOF) {
-						peerDone <- fmt.Errorf("peer expected EOF after request body, got n=%d err=%w", n, err)
-						return
-					}
-					if !bytes.Equal(payload, got) {
-						peerDone <- errors.New("peer received corrupted segmented request body")
-						return
-					}
-					_, err = io.WriteString(c2, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}")
-					peerDone <- err
-					<-stopPeer
-				})
-				return c1, nil
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusOK)
+					_, _ = io.WriteString(w, `{"ok":true}`)
+				}),
 			}
+			serveDone := make(chan struct{})
+			go func() {
+				defer close(serveDone)
+				_ = srv.Serve(ln)
+			}()
 
-			client := upstream.NewClient(upstream.Options{DialContext: dialCtx})
-			type outcome struct {
-				resp *upstream.Response
-				err  error
-			}
-			done := make(chan outcome, 1)
+			segments := make(chan []byte)
+			stopBody := make(chan struct{})
+			stopBodyOnce := sync.OnceFunc(func() { close(stopBody) })
+			body := newGatedUploadBody(segments, connClosed, stopBody)
+
+			done := make(chan roundTripOutcome, 1)
 			var reqWG sync.WaitGroup
 			defer func() {
-				stopPeerOnce()
+				stopBodyOnce()
 				connMu.Lock()
-				for _, c := range serverConns {
+				for _, c := range clientConns {
 					_ = c.Close()
 				}
 				connMu.Unlock()
-				_ = client.Close()
+				tr.CloseIdleConnections()
+				_ = srv.Close()
+				_ = ln.Close()
 				reqWG.Wait()
-				peerWG.Wait()
+				<-serveDone
 				synctest.Wait()
 			}()
 
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://127.0.0.1:12355/v1/messages", body)
+			if err != nil {
+				t.Fatalf("NewRequestWithContext: %v", err)
+			}
+			req.Header.Set("Content-Type", "application/octet-stream")
+
 			reqWG.Go(func() {
-				resp, err := client.Do(t.Context(), upstream.Request{
-					Target:        upstream.TargetAnthropic,
-					BaseURL:       "http://127.0.0.1:12355",
-					Method:        http.MethodPost,
-					RequestURI:    "/v1/messages",
-					ClientHeaders: http.Header{"Content-Type": {"application/octet-stream"}},
-					Body:          payload,
-				})
-				done <- outcome{resp: resp, err: err}
+				resp, rtErr := tr.RoundTrip(req)
+				if rtErr != nil {
+					if resp != nil && resp.Body != nil {
+						_ = resp.Body.Close()
+					}
+					done <- roundTripOutcome{err: rtErr}
+					return
+				}
+				respBody, readErr := io.ReadAll(resp.Body)
+				closeErr := resp.Body.Close()
+				if readErr != nil {
+					done <- roundTripOutcome{statusCode: resp.StatusCode, err: fmt.Errorf("reading response body: %w", readErr)}
+					return
+				}
+				if closeErr != nil {
+					done <- roundTripOutcome{statusCode: resp.StatusCode, err: fmt.Errorf("closing response body: %w", closeErr)}
+					return
+				}
+				done <- roundTripOutcome{statusCode: resp.StatusCode, body: respBody}
 			})
 
+			var obs *writeObserverConn
 			select {
-			case err := <-segDone:
-				if err != nil {
-					t.Fatalf("segment 1 failed: %v", err)
-				}
+			case obs = <-connReady:
 			case res := <-done:
-				if res.resp != nil && res.resp.Body != nil {
-					_ = res.resp.Body.Close()
-				}
-				t.Fatalf("Do returned before segment 1 completed: err=%v", res.err)
+				t.Fatalf("RoundTrip returned before dialing upstream: status=%d err=%v", res.statusCode, res.err)
 			}
+
+			waitBodyReady := func() {
+				t.Helper()
+				select {
+				case <-body.waiting:
+				case res := <-done:
+					t.Fatalf("RoundTrip returned before transport read next body segment: status=%d err=%v", res.statusCode, res.err)
+				}
+			}
+
+			sendSegment := func(seg []byte) {
+				t.Helper()
+				beforeCount, beforeBytes := obs.stats()
+				select {
+				case segments <- seg:
+				case res := <-done:
+					t.Fatalf("RoundTrip returned before accepting body segment: status=%d err=%v", res.statusCode, res.err)
+				}
+				waitForCompletedWrite(t, obs, beforeCount, beforeBytes+int64(len(seg)), done)
+				waitBodyReady()
+				synctest.Wait()
+			}
+
+			waitBodyReady()
+			sendSegment(seg1)
 
 			time.Sleep(40 * time.Minute)
 			synctest.Wait()
 			select {
 			case res := <-done:
-				if res.resp != nil && res.resp.Body != nil {
-					_ = res.resp.Body.Close()
-				}
-				t.Fatalf("Do returned after 40m upload pause: err=%v", res.err)
+				t.Fatalf("RoundTrip returned after 40m upload pause: status=%d err=%v", res.statusCode, res.err)
 			default:
 			}
 
-			readNext <- struct{}{}
-			select {
-			case err := <-segDone:
-				if err != nil {
-					t.Fatalf("segment 2 failed: %v", err)
-				}
-			case res := <-done:
-				if res.resp != nil && res.resp.Body != nil {
-					_ = res.resp.Body.Close()
-				}
-				t.Fatalf("Do returned before segment 2 completed: err=%v", res.err)
-			}
+			sendSegment(seg2)
 
-			// Total elapsed time reaches 80 minutes (> 1 hour) while each inter-write gap is 40 minutes (< 1 hour).
+			// Total elapsed time reaches 80 minutes (> 1 hour) while each gap between completed writes is 40 minutes (< 1 hour).
 			time.Sleep(40 * time.Minute)
 			synctest.Wait()
 			select {
 			case res := <-done:
-				if res.resp != nil && res.resp.Body != nil {
-					_ = res.resp.Body.Close()
-				}
-				t.Fatalf("Do timed out during progressing upload spanning 80m: err=%v", res.err)
+				t.Fatalf("RoundTrip timed out during progressing upload spanning 80m: status=%d err=%v", res.statusCode, res.err)
 			default:
 			}
 
-			readNext <- struct{}{}
+			sendSegment(seg3)
+			close(segments)
+
 			res := <-done
 			if res.err != nil {
-				select {
-				case peerErr := <-peerDone:
-					t.Fatalf("Do failed after 80m progressing upload: %v (peer: %v)", res.err, peerErr)
-				default:
-					t.Fatalf("Do failed after 80m progressing upload: %v", res.err)
-				}
+				t.Fatalf("RoundTrip failed after 80m progressing upload: %v", res.err)
 			}
-			defer func() { _ = res.resp.Body.Close() }()
-
-			body, err := io.ReadAll(res.resp.Body)
-			if err != nil {
-				t.Fatalf("reading response body after progressing upload: %v", err)
+			peerMu.Lock()
+			gotData := slices.Clone(gotPayload)
+			gotPeerErr := peerReadErr
+			peerMu.Unlock()
+			if gotPeerErr != nil {
+				t.Fatalf("peer reading request body: %v", gotPeerErr)
 			}
-			if peerErr := <-peerDone; peerErr != nil {
-				t.Fatalf("pipe peer error: %v", peerErr)
+			if diff := gocmp.Diff(wantPayload, gotData); diff != "" {
+				t.Fatalf("uploaded request body mismatch (-want +got):\n%s", diff)
 			}
-			if diff := gocmp.Diff(http.StatusOK, res.resp.StatusCode); diff != "" {
+			if diff := gocmp.Diff(http.StatusOK, res.statusCode); diff != "" {
 				t.Fatalf("status (-want +got):\n%s", diff)
 			}
-			if diff := gocmp.Diff(`{"ok":true}`, string(body)); diff != "" {
+			if diff := gocmp.Diff(`{"ok":true}`, string(res.body)); diff != "" {
 				t.Fatalf("response body (-want +got):\n%s", diff)
 			}
 		})
 	})
 
-	t.Run("error: 1 hour silence when peer stops accepting request body bytes times out", func(t *testing.T) {
+	t.Run("error: 1 hour silence after a completed request body write times out", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
-			const (
-				segmentSize = 64 * 1024
-				totalSize   = 3 * segmentSize
-			)
-			payload := bytes.Repeat([]byte("w"), totalSize)
+			seg1 := []byte("stalled-upload-segment-one\n")
+			seg2 := []byte("stalled-upload-segment-two\n")
 
-			readNext := make(chan struct{}, 2)
-			segDone := make(chan error, 3)
+			ln := newPipeListener("127.0.0.1:12356")
+			connClosed := make(chan struct{})
+			closeConnDone := sync.OnceFunc(func() { close(connClosed) })
+			connReady := make(chan *writeObserverConn, 1)
 			stopPeer := make(chan struct{})
 			stopPeerOnce := sync.OnceFunc(func() { close(stopPeer) })
 
 			var connMu sync.Mutex
-			var serverConns []net.Conn
+			var clientConns []*writeObserverConn
+			var dialCount atomic.Int32
+
+			dialCtx := func(ctx context.Context, network, addr string) (net.Conn, error) {
+				if dialCount.Add(1) > 1 {
+					return nil, errors.New("unexpected extra dial during stalled upload")
+				}
+				c, err := ln.DialContext(ctx, network, addr)
+				if err != nil {
+					return nil, err
+				}
+				obs := newWriteObserverConn(c, closeConnDone)
+				connMu.Lock()
+				clientConns = append(clientConns, obs)
+				connMu.Unlock()
+				connReady <- obs
+				return obs, nil
+			}
+
+			tr := upstream.NewTransport(upstream.Options{DialContext: dialCtx})
+			if tr == nil {
+				t.Fatal("NewTransport returned nil")
+			}
+
+			srv := &http.Server{
+				Handler: http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+					// Drain every segment the client writes while sending no response bytes so
+					// socket activity stops once the request body stops yielding data.
+					_, _ = io.Copy(io.Discard, r.Body)
+					select {
+					case <-stopPeer:
+					case <-r.Context().Done():
+					}
+				}),
+			}
+			serveDone := make(chan struct{})
+			go func() {
+				defer close(serveDone)
+				_ = srv.Serve(ln)
+			}()
+
+			segments := make(chan []byte)
+			stopBody := make(chan struct{})
+			stopBodyOnce := sync.OnceFunc(func() { close(stopBody) })
+			body := newGatedUploadBody(segments, connClosed, stopBody)
+
+			done := make(chan roundTripOutcome, 1)
+			var reqWG sync.WaitGroup
+			defer func() {
+				stopBodyOnce()
+				stopPeerOnce()
+				connMu.Lock()
+				for _, c := range clientConns {
+					_ = c.Close()
+				}
+				connMu.Unlock()
+				tr.CloseIdleConnections()
+				_ = srv.Close()
+				_ = ln.Close()
+				reqWG.Wait()
+				<-serveDone
+				synctest.Wait()
+			}()
+
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://127.0.0.1:12356/v1/messages", body)
+			if err != nil {
+				t.Fatalf("NewRequestWithContext: %v", err)
+			}
+			req.Header.Set("Content-Type", "application/octet-stream")
+
+			reqWG.Go(func() {
+				resp, rtErr := tr.RoundTrip(req)
+				status := 0
+				if resp != nil {
+					status = resp.StatusCode
+					if resp.Body != nil {
+						_ = resp.Body.Close()
+					}
+				}
+				done <- roundTripOutcome{statusCode: status, err: rtErr}
+			})
+
+			var obs *writeObserverConn
+			select {
+			case obs = <-connReady:
+			case res := <-done:
+				t.Fatalf("RoundTrip returned before dialing upstream: status=%d err=%v", res.statusCode, res.err)
+			}
+
+			waitBodyReady := func() {
+				t.Helper()
+				select {
+				case <-body.waiting:
+				case res := <-done:
+					t.Fatalf("RoundTrip returned before transport read next body segment: status=%d err=%v", res.statusCode, res.err)
+				}
+			}
+
+			sendSegment := func(seg []byte) {
+				t.Helper()
+				beforeCount, beforeBytes := obs.stats()
+				select {
+				case segments <- seg:
+				case res := <-done:
+					t.Fatalf("RoundTrip returned before accepting body segment: status=%d err=%v", res.statusCode, res.err)
+				}
+				waitForCompletedWrite(t, obs, beforeCount, beforeBytes+int64(len(seg)), done)
+				waitBodyReady()
+				synctest.Wait()
+			}
+
+			waitBodyReady()
+			sendSegment(seg1)
+
+			// Advance 30 minutes, then complete a second client write so the inactivity deadline
+			// must move to 90m rather than remaining fixed at 60m from request start.
+			time.Sleep(30 * time.Minute)
+			synctest.Wait()
+			select {
+			case res := <-done:
+				t.Fatalf("RoundTrip returned after 30m upload pause: status=%d err=%v", res.statusCode, res.err)
+			default:
+			}
+
+			sendSegment(seg2)
+
+			// Withhold all further request body segments while the peer writes nothing;
+			// the socket must stay alive until 1 hour after the completed segment-2 write.
+			time.Sleep(time.Hour - time.Nanosecond)
+			synctest.Wait()
+			select {
+			case res := <-done:
+				t.Fatalf("RoundTrip timed out before 1 hour of socket silence elapsed: status=%d err=%v", res.statusCode, res.err)
+			default:
+			}
+
+			time.Sleep(time.Nanosecond)
+			synctest.Wait()
+			select {
+			case res := <-done:
+				if !errors.Is(res.err, upstream.ErrTimeout) {
+					t.Fatalf("expected ErrTimeout after 1 hour of socket silence, got status=%d err=%v", res.statusCode, res.err)
+				}
+			default:
+				t.Fatal("RoundTrip did not time out once 1 hour of socket silence elapsed")
+			}
+		})
+	})
+
+	t.Run("error: 1 hour blocked request write when peer reads nothing times out", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			stopPeer := make(chan struct{})
+			stopPeerOnce := sync.OnceFunc(func() { close(stopPeer) })
+			connReady := make(chan *writeObserverConn, 1)
+
+			var connMu sync.Mutex
+			var allConns []net.Conn
 			var dialCount atomic.Int32
 			var peerWG sync.WaitGroup
 
 			dialCtx := func(_ context.Context, _, _ string) (net.Conn, error) {
 				if dialCount.Add(1) > 1 {
-					return nil, errors.New("unexpected extra dial during stalled upload")
+					return nil, errors.New("unexpected extra dial during blocked write")
 				}
 				c1, c2 := net.Pipe()
+				obs := newWriteObserverConn(c1, nil)
 				connMu.Lock()
-				serverConns = append(serverConns, c2)
+				allConns = append(allConns, obs, c2)
 				connMu.Unlock()
+				connReady <- obs
 
+				// Peer reads nothing from c2 so the client's very first Write blocks regardless of write size.
 				peerWG.Go(func() {
 					defer func() { _ = c2.Close() }()
-					br := bufio.NewReaderSize(c2, 4096)
-					req, err := http.ReadRequest(br)
-					if err != nil {
-						segDone <- fmt.Errorf("peer ReadRequest: %w", err)
-						return
-					}
-					defer func() { _ = req.Body.Close() }()
-
-					buf := make([]byte, segmentSize)
-					if _, err := io.ReadFull(req.Body, buf); err != nil {
-						segDone <- fmt.Errorf("peer segment 1 read: %w", err)
-						return
-					}
-					segDone <- nil
-
-					select {
-					case <-readNext:
-					case <-stopPeer:
-						return
-					}
-					if _, err := io.ReadFull(req.Body, buf); err != nil {
-						segDone <- fmt.Errorf("peer segment 2 read: %w", err)
-						return
-					}
-					segDone <- nil
-
-					// Stop accepting the final 64 KiB until teardown so socket write activity stalls.
 					<-stopPeer
 				})
-				return c1, nil
+				return obs, nil
 			}
 
 			client := upstream.NewClient(upstream.Options{DialContext: dialCtx})
@@ -1259,7 +1518,7 @@ func TestTransportIdleTimeout(t *testing.T) {
 			defer func() {
 				stopPeerOnce()
 				connMu.Lock()
-				for _, c := range serverConns {
+				for _, c := range allConns {
 					_ = c.Close()
 				}
 				connMu.Unlock()
@@ -1272,52 +1531,38 @@ func TestTransportIdleTimeout(t *testing.T) {
 			reqWG.Go(func() {
 				resp, err := client.Do(t.Context(), upstream.Request{
 					Target:        upstream.TargetAnthropic,
-					BaseURL:       "http://127.0.0.1:12356",
+					BaseURL:       "http://127.0.0.1:12357",
 					Method:        http.MethodPost,
 					RequestURI:    "/v1/messages",
-					ClientHeaders: http.Header{"Content-Type": {"application/octet-stream"}},
-					Body:          payload,
+					ClientHeaders: http.Header{"Content-Type": {"application/json"}},
+					Body:          []byte(`{"model":"claude-sonnet-4-6"}`),
 				})
 				done <- outcome{resp: resp, err: err}
 			})
 
+			var obs *writeObserverConn
 			select {
-			case err := <-segDone:
-				if err != nil {
-					t.Fatalf("segment 1 failed: %v", err)
-				}
+			case obs = <-connReady:
 			case res := <-done:
 				if res.resp != nil && res.resp.Body != nil {
 					_ = res.resp.Body.Close()
 				}
-				t.Fatalf("Do returned before segment 1 completed: err=%v", res.err)
+				t.Fatalf("Do returned before dialing upstream: err=%v", res.err)
 			}
 
-			// Advance 30 minutes, then accept a second segment so the inactivity deadline must
-			// move to 90m rather than remaining fixed at 60m from request start.
-			time.Sleep(30 * time.Minute)
-			synctest.Wait()
 			select {
+			case <-obs.writeEntered:
 			case res := <-done:
 				if res.resp != nil && res.resp.Body != nil {
 					_ = res.resp.Body.Close()
 				}
-				t.Fatalf("Do returned after 30m upload pause: err=%v", res.err)
-			default:
-			}
-			readNext <- struct{}{}
-			select {
-			case err := <-segDone:
-				if err != nil {
-					t.Fatalf("segment 2 failed: %v", err)
-				}
-			case res := <-done:
-				if res.resp != nil && res.resp.Body != nil {
-					_ = res.resp.Body.Close()
-				}
-				t.Fatalf("Do returned before segment 2 completed: err=%v", res.err)
+				t.Fatalf("Do returned before client attempted socket write: err=%v", res.err)
 			}
 			synctest.Wait()
+
+			if writes, written := obs.stats(); writes != 0 || written != 0 {
+				t.Fatalf("expected 0 completed writes while peer reads nothing, got writes=%d bytes=%d", writes, written)
+			}
 
 			time.Sleep(time.Hour - time.Nanosecond)
 			synctest.Wait()
@@ -1326,7 +1571,7 @@ func TestTransportIdleTimeout(t *testing.T) {
 				if res.resp != nil && res.resp.Body != nil {
 					_ = res.resp.Body.Close()
 				}
-				t.Fatalf("Do timed out before 1 hour of write silence elapsed: err=%v", res.err)
+				t.Fatalf("Do timed out before 1 hour of blocked write elapsed: err=%v", res.err)
 			default:
 			}
 
@@ -1338,10 +1583,14 @@ func TestTransportIdleTimeout(t *testing.T) {
 					_ = res.resp.Body.Close()
 				}
 				if !errors.Is(res.err, upstream.ErrTimeout) {
-					t.Fatalf("expected ErrTimeout after 1 hour of write silence, got %v", res.err)
+					t.Fatalf("expected ErrTimeout after 1 hour blocked write, got %v", res.err)
 				}
 			default:
-				t.Fatal("Do did not time out once 1 hour of write silence elapsed")
+				t.Fatal("Do did not time out once 1 hour of blocked write elapsed")
+			}
+
+			if writes, written := obs.stats(); writes != 0 || written != 0 {
+				t.Fatalf("expected 0 completed writes after blocked-write timeout, got writes=%d bytes=%d", writes, written)
 			}
 		})
 	})
@@ -2028,10 +2277,8 @@ func TestLiveUpstreamHeadersToUpstreamState(t *testing.T) {
 				}
 			}
 
-			// Mutating RelayHeader must not affect the parsed capture Header copy.
+			// Mutating RelayHeader slices and map keys must not affect the parsed capture Header copy.
 			headerSnapshot := resp.Header.Clone()
-			resp.RelayHeader.Set("Upgrade", "mutated")
-			resp.RelayHeader.Set("X-Relay-Only", "mutated")
 			mutatedCookies := false
 			for k, vals := range resp.RelayHeader {
 				if strings.EqualFold(k, "Set-Cookie") {
@@ -2048,7 +2295,12 @@ func TestLiveUpstreamHeadersToUpstreamState(t *testing.T) {
 				t.Fatal("RelayHeader missing Set-Cookie entry")
 			}
 			if diff := gocmp.Diff(headerSnapshot, resp.Header); diff != "" {
-				t.Fatalf("mutating RelayHeader altered Header (-want +got):\n%s", diff)
+				t.Fatalf("mutating RelayHeader slices altered Header (-want +got):\n%s", diff)
+			}
+			resp.RelayHeader.Set("Upgrade", "mutated")
+			resp.RelayHeader.Set("X-Relay-Only", "mutated")
+			if diff := gocmp.Diff(headerSnapshot, resp.Header); diff != "" {
+				t.Fatalf("mutating RelayHeader map keys altered Header (-want +got):\n%s", diff)
 			}
 
 			// Parsed Header passed directly to upstreamstate must preserve exact occurrences.
@@ -2723,9 +2975,15 @@ func TestSendAndContextOwnership(t *testing.T) {
 	})
 
 	t.Run("success: Send with bodyless GET on closed pooled connection performs one attempt or one transport retry", func(t *testing.T) {
+		type probeContact struct {
+			remoteAddr string
+			method     string
+			requestURI string
+			bodyLen    int
+		}
 		var mu sync.Mutex
 		var warmAddr string
-		var probeAddrs []string
+		var contacts []probeContact
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path == "/warmup" {
 				mu.Lock()
@@ -2735,9 +2993,15 @@ func TestSendAndContextOwnership(t *testing.T) {
 				_, _ = io.WriteString(w, "warm")
 				return
 			}
+			reqBody, _ := io.ReadAll(r.Body)
 			mu.Lock()
-			probeAddrs = append(probeAddrs, r.RemoteAddr)
-			attempt := len(probeAddrs)
+			contacts = append(contacts, probeContact{
+				remoteAddr: r.RemoteAddr,
+				method:     r.Method,
+				requestURI: r.RequestURI,
+				bodyLen:    len(reqBody),
+			})
+			attempt := len(contacts)
 			mu.Unlock()
 			if attempt == 1 {
 				if hj, ok := w.(http.Hijacker); ok {
@@ -2752,6 +3016,19 @@ func TestSendAndContextOwnership(t *testing.T) {
 			_, _ = io.WriteString(w, `{"data":[]}`)
 		}))
 		t.Cleanup(srv.Close)
+
+		checkBodylessGET := func(idx int, c probeContact) {
+			t.Helper()
+			if diff := gocmp.Diff(http.MethodGet, c.method); diff != "" {
+				t.Fatalf("contact %d method (-want +got):\n%s", idx, diff)
+			}
+			if diff := gocmp.Diff("/v1/models", c.requestURI); diff != "" {
+				t.Fatalf("contact %d request URI (-want +got):\n%s", idx, diff)
+			}
+			if diff := gocmp.Diff(0, c.bodyLen); diff != "" {
+				t.Fatalf("contact %d body length (-want +got):\n%s", idx, diff)
+			}
+		}
 
 		client := upstream.NewClient(upstream.Options{})
 		t.Cleanup(func() { _ = client.Close() })
@@ -2784,7 +3061,7 @@ func TestSendAndContextOwnership(t *testing.T) {
 		resp, err := send(t.Context())
 		mu.Lock()
 		gotWarm := warmAddr
-		afterFirst := slices.Clone(probeAddrs)
+		afterFirst := slices.Clone(contacts)
 		mu.Unlock()
 
 		if gotWarm == "" {
@@ -2806,11 +3083,13 @@ func TestSendAndContextOwnership(t *testing.T) {
 			if diff := gocmp.Diff(2, len(afterFirst)); diff != "" {
 				t.Fatalf("bodyless GET retry attempts (-want +got):\n%s", diff)
 			}
-			if diff := gocmp.Diff(gotWarm, afterFirst[0]); diff != "" {
+			checkBodylessGET(0, afterFirst[0])
+			checkBodylessGET(1, afterFirst[1])
+			if diff := gocmp.Diff(gotWarm, afterFirst[0].remoteAddr); diff != "" {
 				t.Fatalf("first bodyless GET attempt did not reuse warmed connection (-warm +probe):\n%s", diff)
 			}
-			if afterFirst[1] == gotWarm {
-				t.Fatalf("bodyless GET retry reused closed connection %q", afterFirst[1])
+			if afterFirst[1].remoteAddr == gotWarm {
+				t.Fatalf("bodyless GET retry reused closed connection %q", afterFirst[1].remoteAddr)
 			}
 			return
 		}
@@ -2824,7 +3103,8 @@ func TestSendAndContextOwnership(t *testing.T) {
 		if diff := gocmp.Diff(1, len(afterFirst)); diff != "" {
 			t.Fatalf("failed bodyless GET attempt count (-want +got):\n%s", diff)
 		}
-		if diff := gocmp.Diff(gotWarm, afterFirst[0]); diff != "" {
+		checkBodylessGET(0, afterFirst[0])
+		if diff := gocmp.Diff(gotWarm, afterFirst[0].remoteAddr); diff != "" {
 			t.Fatalf("bodyless GET did not reuse warmed connection (-warm +probe):\n%s", diff)
 		}
 
@@ -2832,13 +3112,26 @@ func TestSendAndContextOwnership(t *testing.T) {
 		if err != nil {
 			t.Fatalf("second explicit bodyless GET failed: %v", err)
 		}
-		_, rErr := io.ReadAll(resp2.Body)
+		body2, rErr := io.ReadAll(resp2.Body)
 		cErr := resp2.Body.Close()
 		if rErr != nil || cErr != nil {
 			t.Fatalf("draining second bodyless GET body: read=%v close=%v", rErr, cErr)
 		}
 		if diff := gocmp.Diff(http.StatusOK, resp2.StatusCode); diff != "" {
 			t.Fatalf("second bodyless GET status (-want +got):\n%s", diff)
+		}
+		if diff := gocmp.Diff(`{"data":[]}`, string(body2)); diff != "" {
+			t.Fatalf("second bodyless GET body (-want +got):\n%s", diff)
+		}
+		mu.Lock()
+		afterSecond := slices.Clone(contacts)
+		mu.Unlock()
+		if diff := gocmp.Diff(2, len(afterSecond)); diff != "" {
+			t.Fatalf("total bodyless GET contacts after second explicit Send (-want +got):\n%s", diff)
+		}
+		checkBodylessGET(1, afterSecond[1])
+		if afterSecond[1].remoteAddr == gotWarm {
+			t.Fatalf("second explicit bodyless GET reused closed connection %q", afterSecond[1].remoteAddr)
 		}
 	})
 
