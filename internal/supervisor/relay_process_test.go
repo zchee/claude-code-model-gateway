@@ -17,7 +17,9 @@
 package supervisor_test
 
 import (
+	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -25,12 +27,104 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	gocmp "github.com/google/go-cmp/cmp"
 
 	"github.com/zchee/claude-code-model-gateway/internal/gatewaytest"
 	"github.com/zchee/claude-code-model-gateway/internal/supervisor"
 )
+
+func TestListenerControlRequests(t *testing.T) {
+	var config net.ListenConfig
+	listener, err := config.Listen(t.Context(), "tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+	var calls atomic.Int32
+	env := gatewaytest.NewEnv(t.TempDir(), nil, nil, nil)
+	base := env.StartUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	u, err := url.Parse(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := strings.Repeat("cd", 32)
+	h, err := supervisor.NewHandler(listener.Addr().(*net.TCPAddr).Port, func() int { return port }, token, "1.2.3", 17)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		err := supervisor.Serve(ctx, listener, h)
+		if ctx.Err() == nil {
+			t.Errorf("public listener stopped before cancellation: %v", err)
+		}
+		_ = listener.Close()
+	}()
+	defer func() {
+		cancel()
+		_ = listener.Close()
+		<-done
+	}()
+	public := listener.Addr().String()
+	client := http.Client{Transport: &http.Transport{DisableKeepAlives: true}, Timeout: 3 * time.Second}
+	defer client.CloseIdleConnections()
+	tests := map[string]struct {
+		host, path, media string
+		origins           []string
+		status            int
+	}{
+		"success: control headers with mixed casing": {public, "/drain", "application/json", nil, http.StatusNoContent},
+		"error: repeated Origin on drain":            {public, "/drain", "application/json", []string{"", "null"}, http.StatusForbidden},
+		"error: repeated Origin on restart":          {public, "/restart", "application/json", []string{"", "null"}, http.StatusForbidden},
+		"error: media type with parameters":          {public, "/drain", "application/json; charset=utf-8", nil, http.StatusForbidden},
+		"error: incorrect port":                      {"127.0.0.1:0", "/drain", "application/json", nil, http.StatusForbidden},
+		"error: foreign Host":                        {"outside.invalid", "/sample", "", nil, http.StatusForbidden},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://"+public+tc.path, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Host = tc.host
+			if tc.media != "" {
+				req.Header["cOnTeNt-TyPe"] = []string{tc.media}
+				req.Header["x-model-gateway-control-token"] = []string{token}
+			}
+			if tc.origins != nil {
+				req.Header["oRiGiN"] = tc.origins
+			}
+			before := calls.Load()
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			b, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var wantCalls int32
+			if tc.status == http.StatusNoContent {
+				wantCalls = 1
+			}
+			if resp.StatusCode != tc.status || len(b) != 0 || calls.Load()-before != wantCalls {
+				t.Errorf("status=%d body bytes=%d worker calls=%d, want %d/0/%d", resp.StatusCode, len(b), calls.Load()-before, tc.status, wantCalls)
+			}
+		})
+	}
+}
 
 func TestRelayBoundary(t *testing.T) {
 	const public = "127.0.0.1:40001"
@@ -59,7 +153,7 @@ func TestRelayBoundary(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			var calls atomic.Int32
-			type observed struct{ Method, URI, Host, Marker, Body string }
+			type observed struct{ Method, URI, Host, Marker, Body, Credential string }
 			seen := make(chan observed, 1)
 			env := gatewaytest.NewEnv(t.TempDir(), nil, nil, nil)
 			base := env.StartUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -68,7 +162,7 @@ func TestRelayBoundary(t *testing.T) {
 					t.Error(err)
 				}
 				if calls.Add(1) == 1 {
-					seen <- observed{r.Method, r.RequestURI, r.Host, r.Header.Get("X-Fixture"), string(b)}
+					seen <- observed{r.Method, r.RequestURI, r.Host, r.Header.Get("X-Fixture"), string(b), r.Header.Get("X-Model-Gateway-Control-Token")}
 				}
 				w.Header().Set("X-Result", "worker")
 				w.WriteHeader(201)
@@ -112,7 +206,7 @@ func TestRelayBoundary(t *testing.T) {
 			if calls.Load() != 1 {
 				t.Fatalf("worker calls=%d, want one", calls.Load())
 			}
-			if diff := gocmp.Diff(observed{http.MethodPost, tc.path, u.Host, "marker", body}, <-seen); diff != "" {
+			if diff := gocmp.Diff(observed{http.MethodPost, tc.path, u.Host, "marker", body, tc.credential}, <-seen); diff != "" {
 				t.Error(diff)
 			}
 			if diff := gocmp.Diff([]string{"worker", reply}, []string{out.Header().Get("X-Result"), out.Body.String()}); diff != "" {

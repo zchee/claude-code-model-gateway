@@ -43,10 +43,15 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/controlauth"
 	"github.com/zchee/claude-code-model-gateway/internal/gatewaytest"
 	"github.com/zchee/claude-code-model-gateway/internal/lifecycle"
+	"github.com/zchee/claude-code-model-gateway/internal/procinfo"
 	"github.com/zchee/claude-code-model-gateway/internal/venue"
 )
 
-const fixtureVersion = "1.2.3"
+const (
+	fixtureVersion = "1.2.3"
+	workerStderr   = "fixture worker stderr"
+	fixtureStop    = "{\"type\":\"fixture-shutdown\"}\n"
+)
 
 func TestMain(m *testing.M) {
 	venue.Require()
@@ -66,8 +71,16 @@ func TestGatewayFixtureHelper(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := serveshim.Run(t.Context(), os.Environ(), exe, fixtureVersion, os.Stdout, os.Stderr); err != nil {
+		var output bytes.Buffer
+		opts := serveshim.Options{
+			Environment: os.Environ(), Home: os.UserHomeDir, Executable: exe, Version: fixtureVersion,
+			Stdout: io.MultiWriter(os.Stdout, &output), Stderr: os.Stderr,
+		}
+		if err := serveshim.Run(t.Context(), opts); err != nil {
 			t.Fatal(err)
+		}
+		if line, ok := strings.CutSuffix(output.String(), "\n"); !ok || strings.Contains(line, "\n") {
+			t.Error("supervisor stdout must contain exactly one complete readiness line")
 		}
 	}})
 }
@@ -102,6 +115,9 @@ func fixtureWorker() error {
 		return err
 	}
 	if _, err := fmt.Fprintf(os.Stdout, "model-gateway shim listening on 127.0.0.1:%d\n", port); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(os.Stderr, workerStderr); err != nil {
 		return err
 	}
 	srv := http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -175,7 +191,16 @@ func TestForegroundSupervisor(t *testing.T) {
 			finished := make(chan struct{})
 			var result error
 			go func() { result = env.RunFixtureWithin(cmd, 20*time.Second); _ = pw.Close(); close(finished) }()
-			defer func() { _ = send.Close(); <-finished; <-drained }()
+			defer func() {
+				select {
+				case <-finished:
+				default:
+					_, _ = io.WriteString(send, fixtureStop)
+				}
+				_ = send.Close()
+				<-finished
+				<-drained
+			}()
 			var port int
 			select {
 			case port = <-ready:
@@ -243,26 +268,34 @@ func TestForegroundSupervisor(t *testing.T) {
 				t.Fatalf("health (-want +got): %s", diff)
 			}
 			for {
-				if _, err := os.Stat(filepath.Join(state, "shim.pid.json")); err == nil {
+				// Read both entries without ReadRecord: its mirror repair would mask a missing write.
+				mirror, mirrorErr := os.ReadFile(filepath.Join(state, "shim.pid"))
+				raw, recordErr := os.ReadFile(filepath.Join(state, "shim.pid.json"))
+				var record procinfo.Record
+				if recordErr == nil {
+					recordErr = json.Unmarshal(raw, &record)
+				}
+				for _, err := range []error{mirrorErr, recordErr} {
+					if err != nil && !errors.Is(err, os.ErrNotExist) {
+						t.Fatal(err)
+					}
+				}
+				if string(mirror) == strconv.Itoa(int(child)) && record.PID == int(child) && int(record.Port) == int(childPort) {
 					break
-				} else if !errors.Is(err, os.ErrNotExist) {
-					t.Fatal(err)
 				}
 				select {
 				case <-ctx.Done():
-					t.Fatal("worker record was not published")
+					t.Fatalf("worker record never settled: mirror %q, record PID %d port %d; want PID %.0f port %.0f", mirror, record.PID, record.Port, child, childPort)
+				case <-finished:
+					t.Fatalf("supervisor exited before publishing worker record: %v", result)
 				case <-time.After(10 * time.Millisecond):
 				}
 			}
 			checkRecord(t, state, "shim", int(child), int(childPort))
-			workerLog, err := os.ReadFile(filepath.Join(state, "logs", "shim.log"))
-			if err != nil || !strings.Contains(string(workerLog), "model-gateway shim listening on 127.0.0.1:"+strconv.Itoa(int(childPort))+"\n") {
-				t.Fatalf("worker announcement missing from shim.log: %v", err)
-			}
 			if tc.signal != nil {
 				err = cmd.Process.Signal(tc.signal)
 			} else {
-				_, err = io.WriteString(send, "{\"type\":\"fixture-shutdown\"}\n")
+				_, err = io.WriteString(send, fixtureStop)
 			}
 			if err != nil {
 				t.Fatal(err)
@@ -270,6 +303,18 @@ func TestForegroundSupervisor(t *testing.T) {
 			<-finished
 			if result != nil {
 				t.Fatalf("stop: %v; stdout=%s stderr=%s", result, &stdout, &stderr)
+			}
+			workerLog, err := os.ReadFile(filepath.Join(state, "logs", "shim.log"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, line := range []string{"model-gateway shim listening on 127.0.0.1:" + strconv.Itoa(int(childPort)), workerStderr} {
+				if !slices.Contains(strings.Split(string(workerLog), "\n"), line) {
+					t.Errorf("shim.log missing %q", line)
+				}
+				if strings.Contains(stdout.String(), line) || strings.Contains(stderr.String(), line) {
+					t.Errorf("supervisor streams include worker output %q", line)
+				}
 			}
 			eof, err := os.ReadFile(filepath.Join(home, "worker-eof"))
 			if err != nil || string(eof) != strconv.Itoa(int(child)) {
@@ -286,20 +331,21 @@ func checkRecord(t *testing.T, state, name string, pid, port int) {
 	if err != nil || string(mirror) != strconv.Itoa(pid) {
 		t.Fatalf("%s PID mirror: %q (%v)", name, mirror, err)
 	}
-	raw, err := os.ReadFile(filepath.Join(state, name+".pid.json"))
+	rec, err := procinfo.ReadRecord(state, name)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("%s record: %v", name, err)
 	}
-	var rec struct {
-		PID, Port                                                int
-		StateRoot, Role, Generation, Version, Command, StartedAt string
-		Image                                                    struct{ Path string }
+	if rec.PID != pid || int(rec.Port) != port || rec.Version != fixtureVersion || (name == "guardian" && rec.Generation != "fixture-generation") {
+		t.Errorf("unexpected %s identity: %+v", name, rec)
 	}
-	if err = json.Unmarshal(raw, &rec, json.MatchCaseInsensitiveNames(true)); err != nil {
-		t.Fatal(err)
-	}
-	if rec.PID != pid || rec.StateRoot != state || rec.Role == "" || rec.Generation == "" || rec.Version != fixtureVersion || rec.StartedAt == "" || rec.Command == "" || rec.Image.Path == "" || (port != 0 && rec.Port != port) {
-		t.Fatalf("%s record missing process identity: %+v", name, rec)
+	for _, suffix := range []string{".pid", ".pid.json"} {
+		info, err := os.Lstat(filepath.Join(state, name+suffix))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !info.Mode().IsRegular() || info.Mode().Perm() & ^os.FileMode(0o600) != 0 {
+			t.Errorf("%s%s has mode %v; want private regular file", name, suffix, info.Mode())
+		}
 	}
 }
 
@@ -310,15 +356,17 @@ func checkLifecycle(t *testing.T, state string, parent, child int, signal string
 	want := []string{"supervisor-started", "worker-started", "supervisor-stop-requested", "worker-stop-requested", "worker-exit", "supervisor-exit"}
 	for _, raw := range files.Records() {
 		var rec struct {
-			Event, Component, Signal string
-			PID                      int
-			Child                    struct {
-				Component string
-				PID       int
-			}
-			ExitCode *int
+			Event     string `json:"event"`
+			Component string `json:"component"`
+			Signal    string `json:"signal"`
+			PID       int    `json:"pid"`
+			Child     struct {
+				Component string `json:"component"`
+				PID       int    `json:"pid"`
+			} `json:"child"`
+			ExitCode *int `json:"exitCode"`
 		}
-		if err := json.Unmarshal(raw, &rec, json.MatchCaseInsensitiveNames(true)); err != nil {
+		if err := json.Unmarshal(raw, &rec); err != nil {
 			t.Fatal(err)
 		}
 		if !slices.Contains(want, rec.Event) {

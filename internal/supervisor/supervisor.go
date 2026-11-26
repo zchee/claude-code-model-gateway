@@ -16,14 +16,21 @@
 package supervisor
 
 import (
+	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 )
 
 // NewHandler constructs a handler for an already bound public port. workerPort returns the current worker's port.
 func NewHandler(publicPort int, workerPort func() int, token, version string, pid int) (http.Handler, error) {
 	return nil, errors.New("not implemented")
+}
+
+// Serve dispatches requests received on the bound public listener until cancellation or listener failure.
+func Serve(ctx context.Context, listener net.Listener, handler http.Handler) error {
+	return errors.New("not implemented")
 }
 
 // FixtureShutdown consumes and closes the inherited fixture channel. Without a test guard it closes it unread.

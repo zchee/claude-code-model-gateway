@@ -21,7 +21,17 @@ import (
 	"io"
 )
 
-// Run serves until cancellation, an orderly stop, or a startup failure. The child runs executable with the supplied environment.
-func Run(ctx context.Context, environment []string, executable, version string, stdout, stderr io.Writer) error {
+// Options supplies the command's environment, home lookup, child executable, version and output streams.
+type Options struct {
+	Environment []string
+	Home        func() (string, error)
+	Executable  string
+	Version     string
+	Stdout      io.Writer
+	Stderr      io.Writer
+}
+
+// Run serves until cancellation, an orderly stop, or a startup failure.
+func Run(ctx context.Context, opts Options) error {
 	return errors.New("not implemented")
 }
