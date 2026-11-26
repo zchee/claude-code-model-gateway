@@ -15,6 +15,7 @@
 package reply
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -33,6 +34,10 @@ const lmStudioProvider = "lmstudio"
 // errAborted reports that the client connection must be dropped without a clean reply.
 var errAborted = fmt.Errorf("reply: upstream response failed after it could no longer be answered cleanly: %w", http.ErrAbortHandler)
 
+// errDeparted reports that the client left while an upstream response was being received; Handle
+// turns it into a result with nothing written.
+var errDeparted = errors.New("reply: client left before the upstream response was answered")
+
 const earlyEnd = `{"type":"error","error":{"type":"api_error","message":"model-gateway shim: upstream response ended early"}}`
 
 type noUsage struct{}
@@ -44,6 +49,7 @@ func (noUsage) SetResponseComplete(bool)     {}
 
 // turn holds one upstream response and the facts reported for it.
 type turn struct {
+	ctx    context.Context
 	w      http.ResponseWriter
 	req    Request
 	res    *upstream.Response
@@ -51,8 +57,18 @@ type turn struct {
 }
 
 // readBody buffers the whole upstream body and closes it. With note, every read is counted as
-// response bytes as it arrives, so a failed read still accounts for what was received.
+// response bytes as it arrives, so a failed read still accounts for what was received. The read
+// is not interrupted when the client leaves; errDeparted reports, once it has finished, that the
+// client is gone and nothing more may be answered or updated for it.
 func (t *turn) readBody(note bool) ([]byte, error) {
+	body, err := t.readAll(note)
+	if t.ctx.Err() != nil {
+		return nil, errDeparted
+	}
+	return body, err
+}
+
+func (t *turn) readAll(note bool) ([]byte, error) {
 	defer func() { _ = t.res.Body.Close() }()
 	var body []byte
 	buf := make([]byte, 32<<10)
@@ -167,6 +183,9 @@ func (t *turn) committed() error {
 	status := t.res.StatusCode
 	t.req.Usage.SetResponse(status, t.res.Header)
 	body, err := t.readBody(true)
+	if errors.Is(err, errDeparted) {
+		return err
+	}
 	if err != nil {
 		t.fail(status, err)
 	} else {
@@ -180,7 +199,7 @@ func (t *turn) committed() error {
 	}
 	kind, message := "api_error", upstreamErrorMessage(body, status)
 	if t.req.Provider == "codex" {
-		noteCodexRejection(t.req.Upstream, status, t.res.Header, body)
+		noteCodexRejection(t.req, status, t.res.Header, body)
 		if auth, ok := codexAuthFailure(body, status, t.req.CommandPath); ok {
 			kind, message = "authentication_error", auth
 		}
@@ -197,6 +216,9 @@ func (t *turn) committed() error {
 func (t *turn) forbidden(attempt, retries int) (Result, bool, error) {
 	status := t.res.StatusCode
 	body, err := t.readBody(true)
+	if errors.Is(err, errDeparted) {
+		return Result{}, false, err
+	}
 	if err != nil {
 		t.fail(status, err)
 		return Result{Result: t.result}, false, errAborted
@@ -204,7 +226,7 @@ func (t *turn) forbidden(attempt, retries int) (Result, bool, error) {
 	if !isUpgradeRejection(status, body) {
 		codex := t.req.Provider == "codex"
 		if codex {
-			noteCodexRejection(t.req.Upstream, status, t.res.Header, body)
+			noteCodexRejection(t.req, status, t.res.Header, body)
 		}
 		t.req.Usage.SetResponse(status, t.res.Header)
 		t.result.Status = status
@@ -226,6 +248,9 @@ func (t *turn) forbidden(attempt, retries int) (Result, bool, error) {
 // genuineOverflow answers a proxy's own 413 with the gateway's diagnostics appended.
 func (t *turn) genuineOverflow() error {
 	body, err := t.readBody(true)
+	if errors.Is(err, errDeparted) {
+		return err
+	}
 	if err != nil {
 		t.fail(http.StatusRequestEntityTooLarge, err)
 		writeJSON(t.w, http.StatusBadGateway, []byte(earlyEnd))
@@ -242,6 +267,9 @@ func (t *turn) genuineOverflow() error {
 func (t *turn) proxyFailure() error {
 	status := t.res.StatusCode
 	raw, err := t.readBody(true)
+	if errors.Is(err, errDeparted) {
+		return err
+	}
 	if err != nil {
 		t.fail(status, err)
 		writeJSON(t.w, http.StatusBadGateway, []byte(earlyEnd))
@@ -254,6 +282,7 @@ func (t *turn) proxyFailure() error {
 		if err != nil {
 			return err
 		}
+		diagnose(t.req.Diagnostics, emptyCompletionLine)
 		t.result.Status = http.StatusOK
 		t.w.Header().Set("Content-Type", contentType)
 		t.w.Header().Set("Content-Length", strconv.Itoa(len(answer)))
@@ -262,7 +291,7 @@ func (t *turn) proxyFailure() error {
 		return nil
 	}
 	if codex {
-		noteCodexRejection(t.req.Upstream, status, t.res.Header, body)
+		noteCodexRejection(t.req, status, t.res.Header, body)
 	}
 	if counts, ok := sentry.ParseOverflow(status, body); ok {
 		overflow, err := engineOverflow(t.w, t.req, status, counts)
@@ -298,6 +327,9 @@ func (t *turn) answerFailure(status int, detail, body []byte) error {
 func (t *turn) passFailure() error {
 	status := t.res.StatusCode
 	body, err := t.readBody(true)
+	if errors.Is(err, errDeparted) {
+		return err
+	}
 	if err != nil {
 		t.fail(status, err)
 		return errAborted
@@ -312,6 +344,9 @@ func (t *turn) passFailure() error {
 func (t *turn) successJSON() error {
 	status := t.res.StatusCode
 	body, err := t.readBody(false)
+	if errors.Is(err, errDeparted) {
+		return err
+	}
 	if err != nil {
 		t.fail(status, err)
 		return errAborted

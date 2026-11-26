@@ -15,6 +15,7 @@
 package reply
 
 import (
+	"io"
 	"math"
 	"net/http"
 	"regexp"
@@ -24,7 +25,6 @@ import (
 
 	"github.com/zchee/claude-code-model-gateway/internal/config"
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
-	"github.com/zchee/claude-code-model-gateway/internal/upstreamstate"
 )
 
 // ECMAScript \s: whitespace and line terminators, including no-break spaces and the BOM.
@@ -42,10 +42,26 @@ const (
 	loginReplacement      = "the model-gateway login command above"
 )
 
+// Diagnostic lines are fixed text: they never carry a status, header, path or body.
+const (
+	rejectionLine       = "model-gateway: Codex request had an unambiguous OpenAI rejection; readiness is upstream-blocked.\n"
+	rejectionFailedLine = "model-gateway: Codex request had an unambiguous OpenAI rejection, but the upstream state could not be written; readiness is unchanged.\n"
+	emptyCompletionLine = "model-gateway: Codex completed a turn with no output (claude-code-proxy empty_codex_completion); answered an empty end_turn instead of a retryable 503\n"
+)
+
+// diagnose writes one fixed line to w in a single Write call; a nil w discards it.
+func diagnose(w io.Writer, line string) {
+	if w != nil {
+		_, _ = io.WriteString(w, line)
+	}
+}
+
 // noteCodexRejection records an attributed OpenAI rejection so readiness reports the block.
 // The evidence names only headers, never their values. Header names are sorted because the
-// parsed header map does not keep their arrival order.
-func noteCodexRejection(store *upstreamstate.Store, status int, headers http.Header, body []byte) {
+// parsed header map does not keep their arrival order. A failed state write does not change
+// the client's reply; it is reported on the diagnostics writer instead of the rejection line.
+func noteCodexRejection(req Request, status int, headers http.Header, body []byte) {
+	store := req.Upstream
 	if store == nil || !HasOpenAIRejectionEvidence(status, headers, body) {
 		return
 	}
@@ -62,8 +78,11 @@ func noteCodexRejection(store *upstreamstate.Store, status int, headers http.Hea
 	if len(names) > 0 {
 		evidence = "headers:" + strings.Join(names, ",")
 	}
-	// A state write failure leaves readiness as it was; the client reply does not depend on it.
-	_, _ = store.SetBlocked(status, evidence, headers)
+	if _, err := store.SetBlocked(status, evidence, headers); err != nil {
+		diagnose(req.Diagnostics, rejectionFailedLine)
+		return
+	}
+	diagnose(req.Diagnostics, rejectionLine)
 }
 
 // errorDetail returns error.message or message when it is a non-empty string. With plainText,

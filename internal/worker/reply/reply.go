@@ -17,6 +17,8 @@ package reply
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -38,8 +40,12 @@ type UsageCapture interface {
 
 // Request describes one forwarded inference turn. Body contains the serialized upstream request.
 // SentryEnabled controls refusal normalization and learning separately from usage observation.
-// Nil retry settings select two retries separated by 250 milliseconds; explicit zero is respected.
+// Nil or negative retry settings select two retries separated by 250 milliseconds; explicit zero
+// is respected.
 // NewMessageID supplies the complete ID for a synthesized message.
+// Diagnostics receives fixed operator lines that carry no request or response content; nil
+// discards them. Each line is one Write call, so a writer shared between requests must be safe
+// for concurrent use.
 type Request struct {
 	Provider, AdvertisedModel, BackendModel, Session, CommandPath, Origin string
 	Body                                                                  []byte
@@ -52,6 +58,7 @@ type Request struct {
 	RetryDelay                                                            *time.Duration
 	NewMessageID                                                          func() string
 	Usage                                                                 UsageCapture
+	Diagnostics                                                           io.Writer
 }
 
 // Result carries terminal facts, or an unsettled response whose open body belongs to the caller.
@@ -66,15 +73,21 @@ type Result struct {
 // cancelled by it because Handle passes context.WithoutCancel(ctx) to forward. When Handle stops
 // because the client context is done, it writes nothing to w, closes any buffered body it holds,
 // and returns Stream nil, a nil error, Contacted as it happened, Status zero, and Cancelled false.
-// Otherwise it returns an untouched open response for the stream relay, or an error wrapping
-// http.ErrAbortHandler when the client connection must abort.
+// The client context is checked again when a send returns and after every buffered read, before
+// any reply is written and before the sentry or the upstream state is updated, so a client that
+// left while the upstream was answering gets the same result; a read in progress finishes first.
+// A response that arrives for a departed client is closed, a stream included. Otherwise it returns
+// an untouched open response for the stream relay, or an error wrapping http.ErrAbortHandler when
+// the client connection must abort.
 func Handle(ctx context.Context, w http.ResponseWriter, req Request, forward upstream.Send) (Result, error) {
 	retries, delay := defaultRetries, defaultRetryDelay
-	if req.Retries != nil {
-		retries = max(0, *req.Retries)
+	// A negative setting falls back to the default, as the source's configuration does.
+	if req.Retries != nil && *req.Retries >= 0 {
+		retries = *req.Retries
 	}
-	if req.RetryDelay != nil {
-		delay = max(0, *req.RetryDelay)
+	// An explicit zero delay retries immediately; it is not Node's minimum timer tick.
+	if req.RetryDelay != nil && *req.RetryDelay >= 0 {
+		delay = *req.RetryDelay
 	}
 	if req.Usage == nil {
 		req.Usage = noUsage{}
@@ -86,14 +99,20 @@ func Handle(ctx context.Context, w http.ResponseWriter, req Request, forward ups
 		}
 		res, err := forward(context.WithoutCancel(ctx))
 		facts.Contacted = true
-		if err != nil {
+		if err != nil || ctx.Err() != nil {
 			if res != nil && res.Body != nil {
 				_ = res.Body.Close()
 			}
+			if ctx.Err() != nil {
+				return Result{Result: facts}, nil
+			}
 			return transportFailure(w, req, err, facts)
 		}
-		t := &turn{w: w, req: req, res: res, result: facts}
+		t := &turn{ctx: ctx, w: w, req: req, res: res, result: facts}
 		out, retry, err := t.respond(attempt, retries)
+		if errors.Is(err, errDeparted) {
+			return Result{Result: facts}, nil
+		}
 		if !retry {
 			return out, err
 		}
