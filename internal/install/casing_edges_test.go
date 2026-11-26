@@ -23,9 +23,12 @@ import (
 
 func TestComparisonKeySigmaLookahead(t *testing.T) {
 	marks := strings.Repeat("́", 31)
+	prefix := "/" + strings.Repeat("a", 127)
 	tests := map[string]struct{ input, want string }{
 		// JavaScript looks through all combining marks and uses σ, not ς.
 		"success: bounded final sigma lookahead": {"ΟΣ" + marks + "A", "ος" + marks + "a"},
+		// JavaScript retains the word context and uses final sigma (ς).
+		"success: sigma at chunk boundary": {prefix + "Σ", prefix + "σ"},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {

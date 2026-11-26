@@ -307,9 +307,10 @@ func IsCacheParent(directory string, registryDirs []string) bool {
 }
 
 // CacheIdentity returns the common identity of sibling version directories, or the empty string.
-// A capital sigma followed by more than 30 combining marks may lowercase differently
-// from JavaScript. The identity is only a comparison key, not authority to signal a
-// process or delete a path.
+// A capital sigma may lowercase differently from JavaScript depending on its
+// position in the string and the combining marks that follow it. Compare the
+// key only with another key returned by CacheIdentity; it is never authority
+// to signal a process or delete a path.
 func CacheIdentity(installRoot string, registryDirs []string) string {
 	if !filepath.IsAbs(installRoot) || filepath.Clean(installRoot) != installRoot {
 		return ""
