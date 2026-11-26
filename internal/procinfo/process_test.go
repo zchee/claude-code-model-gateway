@@ -42,10 +42,33 @@ func startChild(t *testing.T, path string, files ...*os.File) int {
 	if err != nil {
 		t.Fatal(err)
 	}
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = in.Close(); _ = cmd.Wait() })
+	// Start can return before exec has published argv. An echo proves cat is running.
+	deadline := time.Now().Add(5 * time.Second)
+	for _, pipe := range []any{in, out} {
+		f, ok := pipe.(*os.File)
+		if !ok {
+			t.Fatal("child readiness: pipe cannot set a deadline")
+		}
+		if err := f.SetDeadline(deadline); err != nil {
+			t.Fatalf("child readiness: %v", err)
+		}
+	}
+	const marker = '?'
+	if n, err := in.Write([]byte{marker}); err != nil || n != 1 {
+		t.Fatalf("child readiness: wrote %d bytes: %v", n, err)
+	}
+	var echo [1]byte
+	if n, err := out.Read(echo[:]); err != nil || n != 1 || echo[0] != marker {
+		t.Fatalf("child readiness: read %q (%d bytes): %v", echo[:n], n, err)
+	}
 	return cmd.Process.Pid
 }
 
