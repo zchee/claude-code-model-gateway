@@ -102,7 +102,9 @@ func parseBlock(text string) (state, before, after string) {
 	return "invalid", text[:start], text[end:]
 }
 
-// BlockState classifies the first marker pair as absent, partial, valid or invalid.
+// BlockState classifies the block using the first occurrence of each marker
+// independently. If the first end marker precedes the first start marker, the
+// block is partial.
 func BlockState(text string) string {
 	state, _, _ := parseBlock(text)
 	return state
