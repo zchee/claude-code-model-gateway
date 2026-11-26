@@ -15,7 +15,9 @@
 package dispatch_test
 
 import (
+	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -125,6 +127,61 @@ func TestCacheEnvelopeRewrite(t *testing.T) {
 			path := storedCache(t, tt.stored+"\n")
 			dispatch.NewCache(path, 100, 1, func() time.Time { return time.UnixMilli(4) })
 			checkFile(t, path, tt.want)
+		})
+	}
+}
+
+func TestCachePersistenceDirectory(t *testing.T) {
+	tests := map[string]struct {
+		blockFirstOpen bool
+		renameParent   bool
+	}{
+		"success: construction leaves a missing parent alone": {},
+		"success: later writes follow the original directory": {renameParent: true},
+		"success: failed first open is retried":               {blockFirstOpen: true},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			parent := filepath.Join(root, "state")
+			path := filepath.Join(parent, "routes.json")
+			if tt.blockFirstOpen {
+				if err := os.WriteFile(parent, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cache := dispatch.NewCache(path, 100, 2, func() time.Time { return time.UnixMilli(1) })
+			if !tt.blockFirstOpen {
+				if _, err := os.Stat(parent); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("stat parent after construction: %v, want not exist", err)
+				}
+			}
+			cache.Set("first", dispatch.CachedRoute{Model: "first"})
+			if tt.blockFirstOpen {
+				if err := os.Remove(parent); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				checkFile(t, path, `{"version":1,"routes":[["first",{"model":"first","effort":null,"ticket":null,"lastUsedAt":1}]]}`)
+			}
+			wantPath := path
+			if tt.renameParent {
+				moved := filepath.Join(root, "moved")
+				if err := os.Rename(parent, moved); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(parent, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				wantPath = filepath.Join(moved, "routes.json")
+			}
+			cache.Set("second", dispatch.CachedRoute{Model: "second"})
+			checkFile(t, wantPath, `{"version":1,"routes":[["first",{"model":"first","effort":null,"ticket":null,"lastUsedAt":1}],["second",{"model":"second","effort":null,"ticket":null,"lastUsedAt":1}]]}`)
+			if tt.renameParent {
+				if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("stat route file in replacement parent: %v, want not exist", err)
+				}
+			}
 		})
 	}
 }

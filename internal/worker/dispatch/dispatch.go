@@ -16,6 +16,7 @@
 package dispatch
 
 import (
+	"cmp"
 	"container/list"
 	"encoding/json/jsontext"
 	"math"
@@ -131,6 +132,7 @@ type cacheEntry struct {
 type Cache struct {
 	mu          sync.Mutex
 	path        string
+	dir         *atomicfile.Dir // Held from the first successful open until the worker exits.
 	ttlMillis   float64
 	maxSessions int
 	now         func() time.Time
@@ -347,10 +349,13 @@ func (c *Cache) persist() {
 	if err != nil {
 		return
 	}
-	// Do not clean the parent separately: a symlink followed by .. is resolved by the filesystem.
-	parent, _ := filepath.Split(c.path)
-	if parent != "" && os.MkdirAll(parent, 0o777) != nil {
-		return
+	parent, name := filepath.Split(c.path)
+	if c.dir == nil {
+		dir, err := atomicfile.OpenDirCreate(cmp.Or(parent, "."), 0o777)
+		if err != nil {
+			return
+		}
+		c.dir = dir
 	}
-	_ = atomicfile.WriteFile(c.path, append(data, '\n'), 0o600)
+	_ = c.dir.WriteFile(name, append(data, '\n'), 0o600)
 }
