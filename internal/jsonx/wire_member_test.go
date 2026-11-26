@@ -15,6 +15,7 @@
 package jsonx_test
 
 import (
+	"encoding/json/jsontext"
 	"errors"
 	"strings"
 	"testing"
@@ -31,19 +32,23 @@ func objectWithMemberAtDepth(depth int, member string) []byte {
 }
 
 // TestDecodeWireMalformedMemberName checks that a non-string token in an object member-name position is rejected
-// before reading a value there, so it never triggers a container-depth error unless the enclosing object itself
-// already crossed the nesting limit.
+// with the tokenizer's structured *jsontext.SyntacticError wrapping jsontext.ErrNonStringName before reading a
+// value there, so it never triggers a container-depth error unless the enclosing object itself already crossed
+// the nesting limit.
 func TestDecodeWireMalformedMemberName(t *testing.T) {
 	const limit = 10000
 	tests := map[string]struct {
-		input         []byte
-		wantDepth     bool
-		wantMemberErr bool
+		input             []byte
+		wantDepth         bool
+		wantNonStringName bool
 	}{
+		"error: shallow numeric member name":                                {[]byte(`{0:1}`), false, true},
 		"error: array opener as member name at the nesting limit":           {objectWithMemberAtDepth(limit, "[0]"), false, true},
 		"error: object opener as member name at the nesting limit":          {objectWithMemberAtDepth(limit, `{"k":0}`), false, true},
 		"error: number as member name at the nesting limit":                 {objectWithMemberAtDepth(limit, "0"), false, true},
-		"error: literal as member name at the nesting limit":                {objectWithMemberAtDepth(limit, "true"), false, true},
+		"error: true literal as member name at the nesting limit":           {objectWithMemberAtDepth(limit, "true"), false, true},
+		"error: false literal as member name at the nesting limit":          {objectWithMemberAtDepth(limit, "false"), false, true},
+		"error: null literal as member name at the nesting limit":           {objectWithMemberAtDepth(limit, "null"), false, true},
 		"error: array opener as second member name at the nesting limit":    {[]byte(strings.Repeat("[", limit-1) + `{"k":0,[0]:1}` + strings.Repeat("]", limit-1)), false, true},
 		"error: truncated array opener as member name at the nesting limit": {[]byte(strings.Repeat("[", limit-1) + `{[`), false, true},
 		"error: over-limit array in a top-level member name":                {[]byte(`{` + strings.Repeat("[", limit+1) + strings.Repeat("]", limit+1) + `:1}`), false, true},
@@ -62,10 +67,15 @@ func TestDecodeWireMalformedMemberName(t *testing.T) {
 			if diff := gocmp.Diff(tt.wantDepth, gotDepth); diff != "" {
 				t.Errorf("WireDepthError (-want +got) for err=%v:\n%s", err, diff)
 			}
-			if tt.wantMemberErr {
-				if diff := gocmp.Diff("expected string for object member name", err.Error()); diff != "" {
-					t.Errorf("error message (-want +got):\n%s", diff)
-				}
+			synErr, gotSyntactic := errors.AsType[*jsontext.SyntacticError](err)
+			if diff := gocmp.Diff(tt.wantNonStringName, gotSyntactic); diff != "" {
+				t.Errorf("SyntacticError (-want +got) for err=%v:\n%s", err, diff)
+			}
+			if diff := gocmp.Diff(tt.wantNonStringName, errors.Is(err, jsontext.ErrNonStringName)); diff != "" {
+				t.Errorf("errors.Is(err, ErrNonStringName) (-want +got) for err=%v:\n%s", err, diff)
+			}
+			if tt.wantNonStringName && synErr.ByteOffset <= 0 {
+				t.Errorf("SyntacticError.ByteOffset = %d, want > 0", synErr.ByteOffset)
 			}
 		})
 	}

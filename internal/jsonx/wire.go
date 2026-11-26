@@ -97,11 +97,8 @@ func readWire(d *jsontext.Decoder) (WireValue, error) {
 			var name []uint16
 			if v.Kind == '{' {
 				if kind != '"' {
-					if kind == 0 {
-						_, err := d.ReadToken()
-						return WireValue{}, err
-					}
-					return WireValue{}, errors.New("expected string for object member name")
+					_, err := d.ReadToken()
+					return WireValue{}, cmp.Or(err, jsontext.ErrNonStringName)
 				}
 				key, err := d.ReadValue()
 				if err != nil {
