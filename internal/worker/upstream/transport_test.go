@@ -2986,7 +2986,7 @@ func TestSendAndContextOwnership(t *testing.T) {
 		}
 	})
 
-	t.Run("success: Send with bodyless GET on closed pooled connection performs one attempt or one transport retry", func(t *testing.T) {
+	t.Run("success: Send with bodyless GET on a pooled connection the upstream closed after reading the request is retried once on a fresh connection", func(t *testing.T) {
 		type probeContact struct {
 			remoteAddr string
 			method     string
@@ -3079,71 +3079,33 @@ func TestSendAndContextOwnership(t *testing.T) {
 		if gotWarm == "" {
 			t.Fatal("warmup request did not record a remote address")
 		}
-		if err == nil {
-			// Stock pooled net/http.Transport may retry a bodyless idempotent GET once on a fresh connection.
-			body, rErr := io.ReadAll(resp.Body)
-			cErr := resp.Body.Close()
-			if rErr != nil || cErr != nil {
-				t.Fatalf("draining retried GET body: read=%v close=%v", rErr, cErr)
-			}
-			if diff := gocmp.Diff(http.StatusOK, resp.StatusCode); diff != "" {
-				t.Fatalf("retried GET status (-want +got):\n%s", diff)
-			}
-			if diff := gocmp.Diff(`{"data":[]}`, string(body)); diff != "" {
-				t.Fatalf("retried GET body (-want +got):\n%s", diff)
-			}
-			if diff := gocmp.Diff(2, len(afterFirst)); diff != "" {
-				t.Fatalf("bodyless GET retry attempts (-want +got):\n%s", diff)
-			}
-			checkBodylessGET(0, afterFirst[0])
-			checkBodylessGET(1, afterFirst[1])
-			if diff := gocmp.Diff(gotWarm, afterFirst[0].remoteAddr); diff != "" {
-				t.Fatalf("first bodyless GET attempt did not reuse warmed connection (-warm +probe):\n%s", diff)
-			}
-			if afterFirst[1].remoteAddr == gotWarm {
-				t.Fatalf("bodyless GET retry reused closed connection %q", afterFirst[1].remoteAddr)
-			}
-			return
+		// The upstream closes the reused connection after reading the whole request, so bytes were
+		// written on it; net/http then replays only a request it treats as idempotent, which a
+		// bodyless GET is. One Send therefore reaches the upstream twice and succeeds.
+		if err != nil {
+			t.Fatalf("bodyless GET on a reused connection the upstream closed after reading the request was not retried: %v", err)
 		}
-
-		if resp != nil && resp.Body != nil {
-			_ = resp.Body.Close()
+		body, rErr := io.ReadAll(resp.Body)
+		cErr := resp.Body.Close()
+		if rErr != nil || cErr != nil {
+			t.Fatalf("draining retried GET body: read=%v close=%v", rErr, cErr)
 		}
-		if err.Error() == "not implemented" {
-			t.Fatalf("got stub error: %v", err)
+		if diff := gocmp.Diff(http.StatusOK, resp.StatusCode); diff != "" {
+			t.Fatalf("retried GET status (-want +got):\n%s", diff)
 		}
-		if diff := gocmp.Diff(1, len(afterFirst)); diff != "" {
-			t.Fatalf("failed bodyless GET attempt count (-want +got):\n%s", diff)
+		if diff := gocmp.Diff(`{"data":[]}`, string(body)); diff != "" {
+			t.Fatalf("retried GET body (-want +got):\n%s", diff)
+		}
+		if diff := gocmp.Diff(2, len(afterFirst)); diff != "" {
+			t.Fatalf("bodyless GET retry attempts (-want +got):\n%s", diff)
 		}
 		checkBodylessGET(0, afterFirst[0])
+		checkBodylessGET(1, afterFirst[1])
 		if diff := gocmp.Diff(gotWarm, afterFirst[0].remoteAddr); diff != "" {
-			t.Fatalf("bodyless GET did not reuse warmed connection (-warm +probe):\n%s", diff)
+			t.Fatalf("first bodyless GET attempt did not reuse warmed connection (-warm +probe):\n%s", diff)
 		}
-
-		resp2, err := send(t.Context())
-		if err != nil {
-			t.Fatalf("second explicit bodyless GET failed: %v", err)
-		}
-		body2, rErr := io.ReadAll(resp2.Body)
-		cErr := resp2.Body.Close()
-		if rErr != nil || cErr != nil {
-			t.Fatalf("draining second bodyless GET body: read=%v close=%v", rErr, cErr)
-		}
-		if diff := gocmp.Diff(http.StatusOK, resp2.StatusCode); diff != "" {
-			t.Fatalf("second bodyless GET status (-want +got):\n%s", diff)
-		}
-		if diff := gocmp.Diff(`{"data":[]}`, string(body2)); diff != "" {
-			t.Fatalf("second bodyless GET body (-want +got):\n%s", diff)
-		}
-		mu.Lock()
-		afterSecond := slices.Clone(contacts)
-		mu.Unlock()
-		if diff := gocmp.Diff(2, len(afterSecond)); diff != "" {
-			t.Fatalf("total bodyless GET contacts after second explicit Send (-want +got):\n%s", diff)
-		}
-		checkBodylessGET(1, afterSecond[1])
-		if afterSecond[1].remoteAddr == gotWarm {
-			t.Fatalf("second explicit bodyless GET reused closed connection %q", afterSecond[1].remoteAddr)
+		if afterFirst[1].remoteAddr == gotWarm {
+			t.Fatalf("bodyless GET retry reused closed connection %q", afterFirst[1].remoteAddr)
 		}
 	})
 

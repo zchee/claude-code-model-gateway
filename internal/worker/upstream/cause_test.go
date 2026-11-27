@@ -24,6 +24,8 @@ import (
 	"testing/synctest"
 	"time"
 
+	gocmp "github.com/google/go-cmp/cmp"
+
 	"github.com/zchee/claude-code-model-gateway/internal/worker/upstream"
 )
 
@@ -160,6 +162,109 @@ func TestDoKeepsCallerCause(t *testing.T) {
 				}
 				if got, want := err.Error(), errCallerCause.Error(); got != want {
 					t.Errorf("Do error text = %q, want the caller's cause %q", got, want)
+				}
+			})
+		})
+	}
+}
+
+// uncomparableCause is an error whose field holds a value of any type. Two of them compare without
+// a panic only while the field holds comparable values; holding a slice, == panics.
+type uncomparableCause struct {
+	detail any
+}
+
+func (e uncomparableCause) Error() string {
+	return "caller gave up with details"
+}
+
+func TestDoIgnoresUncomparableCallerCause(t *testing.T) {
+	// The cause holds a slice, so no two such values can be compared.
+	cause := uncomparableCause{detail: []string{"first reason", "second reason"}}
+
+	tests := map[string]struct {
+		// withCause derives the request context from parent; end makes it end with cause once the
+		// request holds a connection.
+		withCause func(parent context.Context, cause error) (ctx context.Context, end, release func())
+	}{
+		"error: a caller cancelling with a cause that cannot be compared gets the fixed response error": {
+			withCause: func(parent context.Context, cause error) (context.Context, func(), func()) {
+				ctx, cancel := context.WithCancelCause(parent)
+				return ctx, func() { cancel(cause) }, func() { cancel(nil) }
+			},
+		},
+		"error: a caller deadline with a cause that cannot be compared gets the fixed response error": {
+			withCause: func(parent context.Context, cause error) (context.Context, func(), func()) {
+				ctx, cancel := context.WithDeadlineCause(parent, time.Now().Add(time.Minute), cause)
+				return ctx, func() { time.Sleep(time.Minute) }, cancel
+			},
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				up := &pipeUpstream{mode: faultNone}
+				up.serve = func(peer net.Conn, _ *faultConn) { replyAfterFirstByte(peer, "") }
+				client := upstream.NewClient(upstream.Options{DialContext: up.DialContext})
+
+				ctx, end, release := tt.withCause(t.Context(), cause)
+				defer release()
+
+				// doResult is what Do returned, or the panic it raised.
+				type doResult struct {
+					err      error
+					panicked any
+				}
+				done := make(chan doResult, 1)
+				var reqWG sync.WaitGroup
+				defer func() {
+					_ = client.Close()
+					reqWG.Wait()
+					up.peers.Wait()
+				}()
+				reqWG.Go(func() {
+					var res doResult
+					defer func() {
+						if r := recover(); r != nil {
+							res.panicked = r
+						}
+						done <- res
+					}()
+					resp, err := client.Do(ctx, messagesRequest())
+					res.err = err
+					if resp != nil {
+						_ = resp.Body.Close()
+						res.err = errors.New("unexpected response")
+					}
+				})
+
+				// The request has written its bytes on a connection and waits for a reply.
+				synctest.Wait()
+				select {
+				case res := <-done:
+					t.Fatalf("Do returned before the caller ended the request: err=%v panic=%v", res.err, res.panicked)
+				default:
+				}
+				end()
+				synctest.Wait()
+
+				var res doResult
+				select {
+				case res = <-done:
+				default:
+					t.Fatal("Do still pending after the caller ended the request")
+				}
+				if res.panicked != nil {
+					t.Fatalf("Do panicked on a cause that cannot be compared: %v", res.panicked)
+				}
+				if res.err == nil {
+					t.Fatal("Do returned no error")
+				}
+				// The cause is never matched, so the failure is classified like any other after
+				// the connection was obtained.
+				if diff := gocmp.Diff([]string{responseFailureText}, errorTexts(res.err)); diff != "" {
+					t.Errorf("texts of the error of a request ended with a cause that cannot be compared (-want +got):\n%s", diff)
 				}
 			})
 		})

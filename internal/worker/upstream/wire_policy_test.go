@@ -465,6 +465,96 @@ func TestRelayTrailerAndPragmaNormalization(t *testing.T) {
 	}
 }
 
+// TestCaptureHeaderLosesFramingFields checks the framing fields the Go response parser removes before the capture
+// header is built, which the source's capture still sees: Transfer-Encoding, and on an HTTP/1.1 response a Connection
+// field naming the close token. Connection without close, Keep-Alive, and Connection: close on an HTTP/1.0 response
+// stay in the capture header. The relay header carries none of the three fields in any case.
+func TestCaptureHeaderLosesFramingFields(t *testing.T) {
+	const (
+		chunkedHello = "5\r\nhello\r\n0\r\n\r\n"
+		lengthHello  = "Content-Length: 5\r\n\r\nhello"
+	)
+	// framingFields are the response fields the relay header never carries.
+	framingFields := []string{"Transfer-Encoding", "Connection", "Keep-Alive"}
+
+	tests := map[string]struct {
+		response string
+		// wantCapture holds the capture header's value of each framing field; a missing name means
+		// the field is absent.
+		wantCapture map[string][]string
+	}{
+		"success: a chunked response's Transfer-Encoding is absent from the capture header": {
+			response: "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n" + chunkedHello,
+		},
+		"success: an HTTP/1.1 Connection: close is absent from the capture header": {
+			response: "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n" + lengthHello,
+		},
+		"success: an HTTP/1.1 Connection field naming close among other tokens is absent from the capture header": {
+			response: "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: x-hop, close\r\nX-Hop: 1\r\n" + lengthHello,
+		},
+		"success: an HTTP/1.1 Connection: keep-alive and its Keep-Alive hint stay in the capture header": {
+			response: "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5, max=100\r\n" + lengthHello,
+			wantCapture: map[string][]string{
+				"Connection": {"keep-alive"},
+				"Keep-Alive": {"timeout=5, max=100"},
+			},
+		},
+		"success: an HTTP/1.0 Connection: close stays in the capture header": {
+			response:    "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n" + lengthHello,
+			wantCapture: map[string][]string{"Connection": {"close"}},
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			base := startRawResponseServer(t, tt.response)
+			client := upstream.NewClient(upstream.Options{})
+			t.Cleanup(func() { _ = client.Close() })
+			resp, err := client.Do(t.Context(), upstream.Request{
+				Target:     upstream.TargetAnthropic,
+				BaseURL:    base,
+				Method:     http.MethodPost,
+				RequestURI: "/v1/messages",
+				Body:       []byte(`{"model":"claude-opus-5"}`),
+			})
+			if err != nil {
+				t.Fatalf("Do: %v", err)
+			}
+			body, readErr := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if readErr != nil {
+				t.Fatalf("reading the response: %v", readErr)
+			}
+			if diff := gocmp.Diff("hello", string(body)); diff != "" {
+				t.Errorf("body (-want +got):\n%s", diff)
+			}
+			got := map[string][]string{}
+			want := map[string][]string{}
+			for _, field := range framingFields {
+				if v := headerValuesCI(t, resp.Header, field); v != nil {
+					got["capture "+field] = v
+				}
+				if v := headerValuesCI(t, resp.RelayHeader, field); v != nil {
+					got["relay "+field] = v
+				}
+				if v, ok := tt.wantCapture[field]; ok {
+					want["capture "+field] = v
+				}
+			}
+			// A field the parser keeps reaches both maps unchanged.
+			for _, header := range []struct {
+				view string
+				h    http.Header
+			}{{"capture", resp.Header}, {"relay", resp.RelayHeader}} {
+				got[header.view+" Content-Type"] = headerValuesCI(t, header.h, "Content-Type")
+				want[header.view+" Content-Type"] = []string{"text/plain"}
+			}
+			if diff := gocmp.Diff(want, got); diff != "" {
+				t.Errorf("framing fields of the capture and relay headers (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
 // TestDefaultALPNOffer checks the exact ALPN list of every TLS handshake: only http/1.1, whether the caller's TLS
 // configuration names no protocols or other ones, for a client send and for a direct round trip, including a request
 // asking to upgrade the connection.

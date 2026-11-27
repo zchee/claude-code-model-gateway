@@ -48,10 +48,11 @@ const (
 	tlsDialName = "upstream.test"
 
 	// tlsFailureText is the whole text of the error Do returns for a failed TLS handshake,
-	// certificate verification included.
+	// certificate verification included. It restates the text tlsError.Error returns.
 	tlsFailureText = "upstream TLS connection failed"
 	// responseFailureText is the whole text of the error Do returns for another failure of an
-	// attempt that obtained a connection.
+	// attempt that obtained a connection. It restates the text of errResponseFailed, which wraps
+	// no other error.
 	responseFailureText = "upstream response failed"
 
 	// peerMarker is text only a fake peer supplies, in a certificate name or in an error its
@@ -485,8 +486,8 @@ func TestDoHidesBrokenTLSRecords(t *testing.T) {
 				}
 			},
 		},
-		// The decryption failure is reported by an alert of a type the TLS package does not
-		// export, so either fixed sentence is accepted here.
+		// The client's TLS layer reports the failed decryption as a local alert of a type the TLS
+		// package does not export, so Do reports the generic response failure, not the TLS one.
 		"error: a corrupted record inside the response head after a completed handshake": {
 			handle: func(t *testing.T, cert tls.Certificate) func(net.Conn) {
 				return afterHandshake(t, cert, func(raw net.Conn, tc *tls.Conn) error {
@@ -501,7 +502,12 @@ func TestDoHidesBrokenTLSRecords(t *testing.T) {
 					return err
 				})
 			},
-			wantTexts: []string{tlsFailureText, responseFailureText},
+			wantTexts: []string{responseFailureText},
+			check: func(t *testing.T, err error) {
+				if diff := gocmp.Diff([]string{responseFailureText}, errorTexts(err)); diff != "" {
+					t.Errorf("texts of the error for a corrupted record, which must wrap no TLS error (-want +got):\n%s", diff)
+				}
+			},
 		},
 	}
 

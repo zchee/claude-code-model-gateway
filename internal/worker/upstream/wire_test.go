@@ -120,6 +120,10 @@ func TestDoHidesMalformedUpstreamText(t *testing.T) {
 					t.Fatal("Do returned neither a response nor an error")
 				}
 				requireNoWireText(t, err)
+				// The fixed sentence alone, wrapping nothing that could carry the reply.
+				if diff := gocmp.Diff([]string{responseFailureText}, errorTexts(err)); diff != "" {
+					t.Errorf("texts of the error for a malformed reply (-want +got):\n%s", diff)
+				}
 			})
 		})
 	}

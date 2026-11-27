@@ -41,6 +41,10 @@ const (
 	okReply      = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}"
 	okReplyBody  = `{"ok":true}`
 	partialReply = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 64\r\n\r\ndata: first\n\n"
+
+	// clientClosedText restates the text of errClientClosed, the error of a request made on, or
+	// ended by, a closed Client; it wraps no other error.
+	clientClosedText = "upstream client closed"
 )
 
 // messagesRequest is a request with a body, which net/http never replays on another connection.
@@ -339,16 +343,23 @@ func TestClientCloseRacingDialClosesConnection(t *testing.T) {
 						racers.Wait()
 					}
 
+					var doErr error
 					select {
-					case <-done:
+					case doErr = <-done:
 					case <-time.After(time.Minute):
 						t.Errorf("iteration %d: Do still pending a minute after Client.Close", i)
 						releaseOnce()
-						<-done
+						doErr = <-done
 					}
 					releaseOnce()
 					reqWG.Wait()
 					synctest.Wait()
+
+					if doErr == nil {
+						t.Errorf("iteration %d: Do returned no error for a request Client.Close ended", i)
+					} else if diff := gocmp.Diff([]string{clientClosedText}, errorTexts(doErr)); diff != "" {
+						t.Errorf("iteration %d: texts of the error of a request Client.Close ended (-want +got):\n%s", i, diff)
+					}
 
 					connMu.Lock()
 					returned := slices.Clone(conns)
@@ -604,13 +615,43 @@ func TestCleanEndOfStreamAtInactivityExpiry(t *testing.T) {
 }
 
 func TestIdlePooledConnectionEviction(t *testing.T) {
+	// wantIdleTimeout restates idlePoolTimeout, the idle-pool timeout NewTransport sets.
+	const wantIdleTimeout = 55 * time.Minute
+	// keepAliveHintReply is okReply with a Keep-Alive hint far shorter than the idle-pool timeout;
+	// the source's agent would act on the hint, the transport ignores it.
+	const keepAliveHintReply = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\nContent-Length: 11\r\n\r\n{\"ok\":true}"
+
 	// NewClient uses the transport policy of NewTransport, whose idle timeout is visible.
 	idleTimeout := upstream.NewTransport(upstream.Options{}).IdleConnTimeout
 
 	tests := map[string]struct {
+		// warmReply answers the warm-up request; empty means okReply.
+		warmReply string
+		// hold is how long the warm-up response body stays unread after all of its bytes arrived,
+		// which delays the moment the connection is parked but not its last I/O.
+		hold time.Duration
+		// idle is how long the parked connection waits for the second request, given the expected
+		// idle-pool timeout.
 		idle      func(idleTimeout time.Duration) time.Duration
 		wantDials int32
+		// wantFirstClose, when set, is when the first connection must be closed for the first time,
+		// measured from the warm-up request, which is its last I/O.
+		wantFirstClose time.Duration
 	}{
+		"success: a connection whose upstream hinted a five-second Keep-Alive timeout is reused after just under the idle timeout": {
+			warmReply: keepAliveHintReply,
+			idle:      func(d time.Duration) time.Duration { return d - time.Nanosecond },
+			wantDials: 1,
+		},
+		// Parked at 10 minutes, the pool would evict the connection at 65 minutes; the inactivity
+		// deadline counts from the last I/O and closes it at 60 minutes, so the second request at
+		// 61 minutes needs a fresh connection.
+		"success: a connection parked after its response body was held for ten minutes closes one hour after its last I/O, before its idle timeout": {
+			hold:           10 * time.Minute,
+			idle:           func(time.Duration) time.Duration { return 51 * time.Minute },
+			wantDials:      2,
+			wantFirstClose: time.Hour,
+		},
 		"success: a connection idle for just under the idle timeout is reused": {
 			idle:      func(d time.Duration) time.Duration { return d - time.Nanosecond },
 			wantDials: 1,
@@ -631,13 +672,23 @@ func TestIdlePooledConnectionEviction(t *testing.T) {
 
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
+			if diff := gocmp.Diff(wantIdleTimeout, idleTimeout); diff != "" {
+				t.Fatalf("NewTransport IdleConnTimeout (-want +got):\n%s", diff)
+			}
 			if idleTimeout <= 0 || idleTimeout >= time.Hour {
 				t.Fatalf("NewTransport IdleConnTimeout = %v, want a period in (0, %v) so the transport evicts an idle connection before its socket inactivity deadline can close it under a new request", idleTimeout, time.Hour)
 			}
 			synctest.Test(t, func(t *testing.T) {
+				var served atomic.Int32
 				up := &pipeUpstream{mode: faultNone}
 				up.serve = func(peer net.Conn, _ *faultConn) {
-					serveHTTP(peer, func(*http.Request) string { return okReply })
+					serveHTTP(peer, func(*http.Request) string {
+						// The first request served is the warm-up.
+						if served.Add(1) == 1 && tt.warmReply != "" {
+							return tt.warmReply
+						}
+						return okReply
+					})
 				}
 				client := upstream.NewClient(upstream.Options{DialContext: up.DialContext})
 				defer func() {
@@ -645,19 +696,30 @@ func TestIdlePooledConnectionEviction(t *testing.T) {
 					up.peers.Wait()
 				}()
 
-				body, err := doAndDrain(t.Context(), client, messagesRequest())
+				start := time.Now()
+				warm, err := client.Do(t.Context(), messagesRequest())
 				if err != nil {
 					t.Fatalf("warm-up request failed: %v", err)
 				}
-				if diff := gocmp.Diff(okReplyBody, body); diff != "" {
+				// The whole reply arrives with its head, so a held body waits in the transport's
+				// buffer and the connection sees no I/O meanwhile.
+				time.Sleep(tt.hold)
+				warmBody, err := io.ReadAll(warm.Body)
+				if closeErr := warm.Body.Close(); err == nil {
+					err = closeErr
+				}
+				if err != nil {
+					t.Fatalf("reading the warm-up response body: %v", err)
+				}
+				if diff := gocmp.Diff(okReplyBody, string(warmBody)); diff != "" {
 					t.Fatalf("warm-up response body (-want +got):\n%s", diff)
 				}
 				// The transport's idle timer starts when the connection is parked.
 				synctest.Wait()
 
-				idle := tt.idle(idleTimeout)
+				idle := tt.idle(wantIdleTimeout)
 				time.Sleep(idle)
-				body, err = doAndDrain(t.Context(), client, messagesRequest())
+				body, err := doAndDrain(t.Context(), client, messagesRequest())
 				if err != nil {
 					t.Fatalf("request with a body after %v of idleness failed: %v (ErrTimeout: %t)", idle, err, errors.Is(err, upstream.ErrTimeout))
 				}
@@ -671,6 +733,15 @@ func TestIdlePooledConnectionEviction(t *testing.T) {
 					synctest.Wait()
 					if first := up.dialed()[0]; !first.isClosed() {
 						t.Errorf("connection idle for %v (idle timeout %v) is still open", idle, idleTimeout)
+					}
+				}
+				if tt.wantFirstClose > 0 {
+					closes := up.dialed()[0].closeTimes()
+					if len(closes) == 0 {
+						t.Fatalf("first connection was never closed, want a close %v after its last I/O", tt.wantFirstClose)
+					}
+					if diff := gocmp.Diff(tt.wantFirstClose, closes[0].Sub(start)); diff != "" {
+						t.Errorf("first close of the first connection, measured from its last I/O (-want +got):\n%s", diff)
 					}
 				}
 			})
@@ -916,13 +987,22 @@ func TestClientCloseStartsNoDial(t *testing.T) {
 					t.Errorf("round %d: %d dial(s) started after Client.Close was called", round, n)
 				}
 				var succeeded int
+				// otherTexts counts the error texts other than the closed-client text, by text.
+				otherTexts := map[string]int{}
 				for err := range errs {
 					if err == nil {
 						succeeded++
+						continue
+					}
+					if text := err.Error(); text != clientClosedText {
+						otherTexts[text]++
 					}
 				}
 				if succeeded != 0 {
 					t.Errorf("round %d: %d request(s) succeeded against a silent upstream after Client.Close", round, succeeded)
+				}
+				if diff := gocmp.Diff(map[string]int{}, otherTexts); diff != "" {
+					t.Errorf("round %d: errors of requests Client.Close ended whose text is not %q (-want +got):\n%s", round, clientClosedText, diff)
 				}
 			}
 		})
