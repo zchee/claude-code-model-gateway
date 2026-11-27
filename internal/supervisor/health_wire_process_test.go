@@ -21,7 +21,9 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"net/textproto"
 	"strconv"
+	"strings"
 	"testing"
 
 	gocmp "github.com/google/go-cmp/cmp"
@@ -32,6 +34,7 @@ type rawAnswer struct {
 	Status           int
 	WorkerResponse   string
 	ContentType      string
+	ETag             string
 	ContentLength    []string
 	TransferEncoding []string
 	// Rest is every byte after the head's blank line: the body, and anything written after it.
@@ -39,8 +42,10 @@ type rawAnswer struct {
 }
 
 // exchangeOnce writes one request that asks the public listener to close the connection after its answer, reads
-// everything the listener sends until the connection ends, and splits it at the first blank line. The head is parsed
-// for its status and fields; the bytes after it are returned as they arrived, whatever framing the head declares.
+// everything the listener sends until the connection ends, and splits it at the first blank line. The head's status
+// line and field lines are read as written, so every field on the wire is seen, Transfer-Encoding included, which an
+// HTTP response parser consumes for framing; the bytes after the head are returned as they arrived, whatever framing
+// the head declares.
 func exchangeOnce(t *testing.T, authority, method, target string) rawAnswer {
 	t.Helper()
 	conn, br := dialPublic(t, authority)
@@ -55,21 +60,31 @@ func exchangeOnce(t *testing.T, authority, method, target string) rawAnswer {
 	if !ok {
 		t.Fatalf("the connection ended without a complete response head: %q", wire)
 	}
-	// The head alone is parsed, as a response to HEAD, so that the parser takes no body bytes from it.
-	resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(append(head, "\r\n\r\n"...))), &http.Request{Method: http.MethodHead})
+	tp := textproto.NewReader(bufio.NewReader(bytes.NewReader(append(head, "\r\n\r\n"...))))
+	statusLine, err := tp.ReadLine()
 	if err != nil {
-		t.Fatalf("parse the response head %q: %v", head, err)
+		t.Fatalf("read the status line of %q: %v", head, err)
 	}
-	_ = resp.Body.Close()
+	proto, afterProto, _ := strings.Cut(statusLine, " ")
+	code, _, _ := strings.Cut(afterProto, " ")
+	status, err := strconv.Atoi(code)
+	if proto != "HTTP/1.1" || len(code) != 3 || err != nil {
+		t.Fatalf("status line %q is not HTTP/1.1 with a three-digit status", statusLine)
+	}
+	fields, err := tp.ReadMIMEHeader()
+	if err != nil {
+		t.Fatalf("read the field lines of %q: %v", head, err)
+	}
 	return rawAnswer{
-		Status: resp.StatusCode, WorkerResponse: resp.Header.Get("X-Worker-Response"), ContentType: resp.Header.Get("Content-Type"),
-		ContentLength: resp.Header.Values("Content-Length"), TransferEncoding: resp.Header.Values("Transfer-Encoding"), Rest: string(rest),
+		Status: status, WorkerResponse: fields.Get("X-Worker-Response"), ContentType: fields.Get("Content-Type"), ETag: fields.Get("ETag"),
+		ContentLength: fields.Values("Content-Length"), TransferEncoding: fields.Values("Transfer-Encoding"), Rest: string(rest),
 	}
 }
 
 // TestHealthBodylessOnTheWire checks the health path's answers that carry no body, as the public listener writes them:
-// a HEAD request, and a 204 or 304 answer to GET. They are relayed with the worker's status and fields, without the
-// supervisor's health fields, and nothing follows the head. A 204 carries no Content-Length even when the worker sent
+// a HEAD request, and a 204 or 304 answer to GET. They are relayed with the worker's status and fields, the 304's
+// validator among them, without the supervisor's health fields and without Transfer-Encoding, and nothing follows the
+// head. A 204 carries no Content-Length even when the worker sent
 // one (RFC 9110, section 8.6); a 304 and an answer to HEAD keep the length the worker declared for the representation.
 // The worker here writes its answer byte for byte, so the fields it sends reach the relay unchanged.
 func TestHealthBodylessOnTheWire(t *testing.T) {
@@ -86,7 +101,7 @@ func TestHealthBodylessOnTheWire(t *testing.T) {
 		"success: 304 to GET of the health path with a query keeps the declared length and carries no body": {
 			method: http.MethodGet, target: "/healthz?probe=1",
 			worker: "HTTP/1.1 304 Not Modified\r\nX-Worker-Response: yes\r\nETag: \"v1\"\r\nContent-Length: 17\r\nConnection: close\r\n\r\n",
-			want:   rawAnswer{Status: http.StatusNotModified, WorkerResponse: "yes", ContentLength: []string{"17"}},
+			want:   rawAnswer{Status: http.StatusNotModified, WorkerResponse: "yes", ETag: `"v1"`, ContentLength: []string{"17"}},
 		},
 		"success: HEAD of the health path keeps the worker's length and carries no body": {
 			method: http.MethodHead, target: "/healthz",

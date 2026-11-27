@@ -33,14 +33,19 @@ import (
 
 // TestReportTimeoutDecisionIsFinal checks, in virtual time and without a race against the scheduler, that a decided
 // report timeout is final until the supervisor stops. After the deadline passed without an eligible worker, a worker
-// whose report arrives later has its pid record published but never becomes the relay endpoint, and a respawn arms no
-// new deadline, so no second timeout is ever decided. The control case publishes the same report before the
-// deadline: the worker becomes the endpoint and no timeout follows. TestReportTimeoutIsFinal shows the same contract
-// through a running supervisor, and TestReportTimeoutAgainstStop the warning a timeout that loses to a stop leaves.
+// whose report arrives later never becomes the relay endpoint, and a respawn attempt arms no new report timer, so no
+// second timeout is ever decided. Whether the late report still writes the worker's pid record is not part of that
+// contract and is not checked. The control case delivers the same report before the deadline: the worker becomes
+// the endpoint, its pid record carries the reported port, and no timeout follows. TestReportTimeoutIsFinal shows the
+// same contract through a running supervisor, and TestReportTimeoutAgainstStop the warning a timeout that loses to a
+// stop leaves.
 //
 // The worker's launch is the one step replaced: the state directory has no logs directory, so every launch fails
 // before a process starts, and the test installs the worker a successful launch would have made current. Its pid
-// is this process, whose birth time and executable the pid record can carry.
+// is this process, whose birth time and executable the pid record can carry. The test reaches the supervisor through
+// these unexported names, which a rework of the supervisor must carry along or replace: the shim fields it
+// constructs, fatal (Run's inbox), mu, current and reportTimer, the methods startWorker, publish, port and stop, and
+// the workerProc fields pid, generation and exited.
 func TestReportTimeoutDecisionIsFinal(t *testing.T) {
 	// reportWait restates reportTimeout, the 5000 ms the supervisor gives a worker to report its listener.
 	const reportWait = 5 * time.Second
@@ -95,16 +100,23 @@ func TestReportTimeoutDecisionIsFinal(t *testing.T) {
 					time.Sleep(reportWait + time.Millisecond)
 					synctest.Wait()
 				}
+				// The worker's exit is what releases its stop below: a stop waits for the current worker to exit.
+				defer func() {
+					close(w.exited)
+					s.stop("")
+				}()
 				if err := s.publish(w, reportedPort, true); err != nil {
-					t.Fatalf("publish the worker's report: %v", err)
+					t.Fatalf("deliver the worker's report: %v", err)
 				}
-				record, err := procinfo.ReadRecord(state, "shim")
-				if err != nil {
-					t.Fatalf("read the worker pid record: %v", err)
-				}
-				// The record carries the reported port in both cases, so the publication passed its current-worker checks.
-				if diff := gocmp.Diff([]int{os.Getpid(), reportedPort}, []int{record.PID, int(record.Port)}); diff != "" {
-					t.Errorf("published worker pid record pid and port (-want +got):\n%s", diff)
+				if !tc.expire {
+					// The report reached the current worker's publication: its pid record carries the reported port.
+					record, err := procinfo.ReadRecord(state, "shim")
+					if err != nil {
+						t.Fatalf("read the worker pid record: %v", err)
+					}
+					if diff := gocmp.Diff([]int{os.Getpid(), reportedPort}, []int{record.PID, int(record.Port)}); diff != "" {
+						t.Errorf("published worker pid record pid and port (-want +got):\n%s", diff)
+					}
 				}
 				wantEndpoint := reportedPort
 				if tc.expire {
@@ -118,14 +130,20 @@ func TestReportTimeoutDecisionIsFinal(t *testing.T) {
 					// The worker exits and its replacement's launch is attempted, as the exit watcher does it.
 					s.mu.Lock()
 					s.current = nil
-					s.endpoint.Store(0)
 					s.mu.Unlock()
 					s.startWorker()
+					synctest.Wait()
+					// Checked before any virtual time passes: an armed timer would otherwise have fired and cleared itself.
+					s.mu.Lock()
+					armed := s.reportTimer != nil
+					s.mu.Unlock()
+					if armed {
+						t.Error("the respawn attempt after the decided timeout armed a report timer")
+					}
 				}
 				// Two whole report deadlines pass: a deadline still armed, or one the respawn armed, would expire.
 				time.Sleep(2 * reportWait)
 				synctest.Wait()
-				s.tasks.Wait()
 
 				if diff := gocmp.Diff(tc.want, takeFatal()); diff != "" {
 					t.Errorf("failure handed to Run (-want +got):\n%s", diff)
@@ -146,15 +164,10 @@ func TestReportTimeoutDecisionIsFinal(t *testing.T) {
 				if diff := gocmp.Diff(wantStderr, gotStderr); diff != "" {
 					t.Errorf("stderr lines, a launch failure shortened to its prefix (-want +got):\n%s\nstderr: %q", diff, stderr.String())
 				}
-
-				s.mu.Lock()
-				s.stopped = true
-				for _, timer := range []*time.Timer{s.respawn, s.reportTimer} {
-					if timer != nil {
-						timer.Stop()
-					}
+				// Two deadlines later the endpoint is still the one the report decided: a late report did not become eligible.
+				if diff := gocmp.Diff(wantEndpoint, s.port()); diff != "" {
+					t.Errorf("relay endpoint after two report deadlines (-want +got):\n%s", diff)
 				}
-				s.mu.Unlock()
 			})
 		})
 	}

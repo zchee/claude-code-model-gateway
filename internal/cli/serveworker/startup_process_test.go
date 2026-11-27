@@ -50,14 +50,20 @@ func TestWorkerStartupBoundaries(t *testing.T) {
 			wantOrigin: "https://upstream.invalid:8443",
 			forbidden:  []string{"alice", "secret-pass", "/v1/custom", "api_key", "tok", "frag"},
 		},
-		// Both branches of the fallback: a value url.Parse refuses, and one it accepts without a scheme and a host.
+		// Each condition of the fallback on its own: a value url.Parse refuses; one it parses with a scheme
+		// (fixture-user, the rest opaque) and no host; and a scheme-relative one it parses with a host and no scheme.
 		"success: readiness names an upstream that does not parse without its text": {
 			upstream:   "http://fixture-user:fixture-pass@[::1/fixture-path?fixture-query=yes",
 			wantOrigin: "anthropic (unparsable URL))",
 			forbidden:  []string{"fixture-user", "fixture-pass", "fixture-path", "fixture-query", "::1"},
 		},
-		"success: readiness names an upstream without a scheme and host without its text": {
+		"success: readiness names an upstream with a scheme and no host without its text": {
 			upstream:   "fixture-user:fixture-pass@fixture-host/fixture-path?fixture-query=yes",
+			wantOrigin: "anthropic (unparsable URL))",
+			forbidden:  []string{"fixture-user", "fixture-pass", "fixture-host", "fixture-path", "fixture-query"},
+		},
+		"success: readiness names an upstream with a host and no scheme without its text": {
+			upstream:   "//fixture-user:fixture-pass@fixture-host:9/fixture-path?fixture-query=yes",
 			wantOrigin: "anthropic (unparsable URL))",
 			forbidden:  []string{"fixture-user", "fixture-pass", "fixture-host", "fixture-path", "fixture-query"},
 		},

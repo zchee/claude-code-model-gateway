@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -99,8 +100,9 @@ type wireRequest struct {
 	want      verdict
 	// mayClose allows the server to close the connection after this request even if it was relayed.
 	mayClose bool
-	// closes requires the server to answer this request with 403 and Connection: close, before it read the request
-	// body, and then to end the connection without a byte for the next request.
+	// closes requires the server to answer this request with 403 and an explicit Connection: close field before it read
+	// the request body, and then to end the connection: the client's next read finds the end of the stream or a reset,
+	// not its own deadline, and no later request on the connection reaches the worker.
 	closes bool
 }
 
@@ -674,8 +676,10 @@ func checkAssociation(t *testing.T, worker *recordingWorker, requests []wireRequ
 	br := bufio.NewReader(conn)
 	outcomes := make([]outcome, len(requests))
 	statuses := make([]int, len(requests))
-	// closing records which answers said Connection: close.
+	// closing records which answers carried the Connection: close field; ends records the error that showed the
+	// connection had ended before any byte of an answer.
 	closing := make([]bool, len(requests))
+	ends := make([]error, len(requests))
 	written := make(chan error, 1)
 	if pipelined {
 		go func() {
@@ -696,7 +700,8 @@ func checkAssociation(t *testing.T, worker *recordingWorker, requests []wireRequ
 				outcomes[i] = outClosed
 				continue
 			}
-			outcomes[i], statuses[i], closing[i] = readOutcomeClosing(br, requests[i].head, probes[i])
+			a := readAnswer(br, requests[i].head, probes[i])
+			outcomes[i], statuses[i], closing[i], ends[i] = a.outcome, a.status, a.closing, a.end
 			closed = outcomes[i].ended()
 		}
 	} else {
@@ -704,7 +709,9 @@ func checkAssociation(t *testing.T, worker *recordingWorker, requests []wireRequ
 		closed := false
 		for i, r := range requests {
 			if !closed {
-				outcomes[i], statuses[i], closing[i], closed = sequentialExchange(tcp, br, r, heads[i], bodies[i], probes[i])
+				var a answer
+				a, closed = sequentialExchange(tcp, br, r, heads[i], bodies[i], probes[i])
+				outcomes[i], statuses[i], closing[i], ends[i] = a.outcome, a.status, a.closing, a.end
 			} else {
 				outcomes[i] = outClosed
 			}
@@ -715,13 +722,20 @@ func checkAssociation(t *testing.T, worker *recordingWorker, requests []wireRequ
 	<-written
 
 	seen := worker.seen(nonce)
+	received := make([]int, len(requests))
+	for i := range requests {
+		received[i] = seen[probes[i]]
+		delete(seen, probes[i])
+	}
 	var faults []string
 	report := make([]string, len(requests))
 	for i, r := range requests {
-		n := seen[probes[i]]
-		delete(seen, probes[i])
+		n := received[i]
 		report[i] = fmt.Sprintf("request %d (%s): %s, status %d, worker received it %d times", i, r.want, outcomes[i], statuses[i], n)
-		fault := judge(requests, outcomes, statuses, closing, i, n)
+		if ends[i] != nil {
+			report[i] += fmt.Sprintf(", connection end seen as %v", ends[i])
+		}
+		fault := judge(requests, outcomes, statuses, closing, ends, received, i)
 		if fault != "" {
 			faults = append(faults, fmt.Sprintf("request %d: %s", i, fault))
 		}
@@ -735,47 +749,70 @@ func checkAssociation(t *testing.T, worker *recordingWorker, requests []wireRequ
 }
 
 // sequentialExchange writes one request and reads its answer before the next request is written. It also reports
-// whether the answer said Connection: close, and whether the connection is known to have ended.
-func sequentialExchange(conn *net.TCPConn, br *bufio.Reader, r wireRequest, head, body, probe string) (outcome, int, bool, bool) {
+// whether the connection is known to have ended.
+func sequentialExchange(conn *net.TCPConn, br *bufio.Reader, r wireRequest, head, body, probe string) (answer, bool) {
 	if _, err := io.WriteString(conn, head); err != nil {
-		return outClosed, 0, false, true
+		return answer{outcome: outClosed, end: err}, true
 	}
 	if r.expect100 {
 		resp, err := http.ReadResponse(br, &http.Request{Method: method(head)})
 		if err != nil {
-			return outClosed, 0, false, true
+			return answer{outcome: outClosed, end: err}, true
 		}
 		if resp.StatusCode != http.StatusContinue {
 			// The server answered without asking for the body; the body is not sent.
 			o := classify(resp, probe)
 			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
-			return o, resp.StatusCode, resp.Close, false
+			return answer{outcome: o, status: resp.StatusCode, closing: saysClose(resp)}, false
 		}
 	}
 	if _, err := io.WriteString(conn, body); err != nil {
-		return outClosed, 0, false, true
+		return answer{outcome: outClosed, end: err}, true
 	}
-	o, status, closing := readOutcomeClosing(br, head, probe)
-	return o, status, closing, o.ended()
+	a := readAnswer(br, head, probe)
+	return a, a.outcome.ended()
+}
+
+// answer is what the client read for one request.
+type answer struct {
+	outcome outcome
+	status  int
+	// closing reports that the answer carried the Connection: close field.
+	closing bool
+	// end is the read or write error that showed the connection had ended before any byte of the answer; it is set
+	// only for outClosed.
+	end error
+}
+
+// saysClose reports whether resp carried the Connection: close field. For an HTTP/1.1 response the parser sets Close
+// from that field's close token alone (and removes the field); for HTTP/1.0 it also sets it when keep-alive is
+// absent, which is not the field this checks.
+func saysClose(resp *http.Response) bool { return resp.ProtoAtLeast(1, 1) && resp.Close }
+
+// terminal reports whether err shows that the peer ended the connection: the end of the stream, a reset, or a write
+// to a connection the peer closed. A deadline that expired is not one: the peer may still be holding the connection.
+func terminal(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)
 }
 
 // readOutcome reads the final answer to one request, skipping interim 100 responses. A connection that ends before
 // any byte of the answer is outClosed; bytes that do not make a complete response are outPartial.
 func readOutcome(br *bufio.Reader, head, probe string) (outcome, int) {
-	o, status, _ := readOutcomeClosing(br, head, probe)
-	return o, status
+	a := readAnswer(br, head, probe)
+	return a.outcome, a.status
 }
 
-// readOutcomeClosing is readOutcome that also reports whether the answer said Connection: close.
-func readOutcomeClosing(br *bufio.Reader, head, probe string) (outcome, int, bool) {
+// readAnswer is readOutcome that also reports whether the answer carried the Connection: close field, and for
+// outClosed the error that showed the end of the connection.
+func readAnswer(br *bufio.Reader, head, probe string) answer {
 	for {
 		if _, err := br.Peek(1); err != nil {
-			return outClosed, 0, false
+			return answer{outcome: outClosed, end: err}
 		}
 		resp, err := http.ReadResponse(br, &http.Request{Method: method(head)})
 		if err != nil {
-			return outPartial, 0, false
+			return answer{outcome: outPartial}
 		}
 		if resp.StatusCode == http.StatusContinue {
 			continue
@@ -783,10 +820,10 @@ func readOutcomeClosing(br *bufio.Reader, head, probe string) (outcome, int, boo
 		o := classify(resp, probe)
 		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
 			_ = resp.Body.Close()
-			return outPartial, resp.StatusCode, resp.Close
+			return answer{outcome: outPartial, status: resp.StatusCode, closing: saysClose(resp)}
 		}
 		_ = resp.Body.Close()
-		return o, resp.StatusCode, resp.Close
+		return answer{outcome: o, status: resp.StatusCode, closing: saysClose(resp)}
 	}
 }
 
@@ -809,15 +846,17 @@ func classify(resp *http.Response, probe string) outcome {
 }
 
 // judge returns why the observed outcome of request i violates its own Host's verdict, or "" when it does not.
-func judge(requests []wireRequest, outcomes []outcome, statuses []int, closing []bool, i, received int) string {
-	o, want := outcomes[i], requests[i].want
+// counts holds, per request, how many times the worker recorded it.
+func judge(requests []wireRequest, outcomes []outcome, statuses []int, closing []bool, ends []error, counts []int, i int) string {
+	o, want, received := outcomes[i], requests[i].want, counts[i]
+	if requests[i].closes {
+		if fault := judgeClosing(outcomes, statuses, closing, ends, counts, i); fault != "" {
+			return fault
+		}
+	}
 	switch {
 	case received > 1:
 		return fmt.Sprintf("the worker received it %d times", received)
-	case requests[i].closes && (o != outRefused || statuses[i] != http.StatusForbidden || !closing[i]):
-		return fmt.Sprintf("answered before its body was read, but not with 403 and Connection: close (%s, status %d, Connection: close %t)", o, statuses[i], closing[i])
-	case requests[i].closes && i+1 < len(outcomes) && outcomes[i+1] != outClosed:
-		return fmt.Sprintf("the connection carried an answer to the next request (%s, status %d) after a response sent before this request's body was read", outcomes[i+1], statuses[i+1])
 	case o == outMisrouted:
 		return "the client received the worker's answer to a different request"
 	case o == outAnswered:
@@ -858,6 +897,31 @@ func judge(requests []wireRequest, outcomes []outcome, statuses []int, closing [
 			return "refused although its own Host allows it, and the connection stayed open for the next request"
 		}
 	case mayRelay:
+	}
+	return ""
+}
+
+// judgeClosing returns why request i, which must be answered with 403 and Connection: close before its body is read,
+// was not, or why the connection did not end after that answer; "" when both hold. The end must be one the client
+// read, so a server that answers and then holds the connection until the client's deadline fails, and no later
+// request may reach the worker, even one the server relayed without answering it.
+func judgeClosing(outcomes []outcome, statuses []int, closing []bool, ends []error, received []int, i int) string {
+	if outcomes[i] != outRefused || statuses[i] != http.StatusForbidden || !closing[i] {
+		return fmt.Sprintf("answered before its body was read, but not with 403 and Connection: close (%s, status %d, Connection: close %t)", outcomes[i], statuses[i], closing[i])
+	}
+	if i+1 >= len(outcomes) {
+		return "no later request shows whether the connection ended after the answer"
+	}
+	if outcomes[i+1] != outClosed {
+		return fmt.Sprintf("the connection carried an answer to the next request (%s, status %d) after a response sent before this request's body was read", outcomes[i+1], statuses[i+1])
+	}
+	if !terminal(ends[i+1]) {
+		return fmt.Sprintf("after the answer the client's next read ended with %v, not with the end of the stream or a reset", ends[i+1])
+	}
+	for j := i + 1; j < len(received); j++ {
+		if received[j] > 0 {
+			return fmt.Sprintf("request %d reached the worker %d times after a response that closed the connection", j, received[j])
+		}
 	}
 	return ""
 }
