@@ -37,14 +37,19 @@ const nodeTimerMax = 1<<31 - 1
 // TestRelayTimerDurations checks that the heartbeat interval and the first-event wait are Go
 // durations taken as given: a fraction of a millisecond is kept, a duration beyond the JavaScript
 // timer maximum is kept, and a negative first-event wait hands the stream back at once. The
-// source's timers would fire one millisecond early, after one millisecond, and after one
-// millisecond for these values. A heartbeat is timed by the bubble's virtual clock at the moment
-// the relay writes it, and must arrive exactly at its interval; a first-event wait is checked one
-// nanosecond before its duration and at it.
+// source's timers discard the fractional millisecond (1.5 ms becomes 1 ms and 2.5 ms becomes 2 ms,
+// half a millisecond early) and fire after one millisecond for a delay beyond their maximum or
+// below zero. A heartbeat is timed by the bubble's virtual clock at the moment the relay writes
+// it, and must arrive exactly at its interval; a first-event wait is checked one nanosecond before
+// its duration and at it.
 //
-// The recorder holds the relay inside the first heartbeat write until the test lets it go, so a
-// relay that armed a much shorter timer writes one heartbeat, not one per millisecond of a virtual
-// wait that lasts weeks. A virtual watchdog ends the wait when no heartbeat comes at all.
+// While the upstream sends nothing, the recorder holds the relay inside its first write to the
+// client body, whatever that write holds, until the test lets it go. A relay that armed a much
+// shorter timer, or wrote something other than the heartbeat, therefore writes once, not once per
+// millisecond of a virtual wait that lasts weeks; the test then checks that write's bytes and its
+// virtual time on their own. A virtual watchdog ends the wait when nothing is written at all. After
+// the upstream ends and the relay returns, still at the same virtual instant, the heartbeats in the
+// body are counted again, so a relay that writes two heartbeats in one beat fails.
 func TestRelayTimerDurations(t *testing.T) {
 	// literalHeartbeat restates sse.HeartbeatComment.
 	const literalHeartbeat = ": ping\n\n"
@@ -100,9 +105,13 @@ func TestRelayTimerDurations(t *testing.T) {
 				src := newHeldBody()
 				rec := newStreamingRecorder()
 				start := time.Now()
-				// beats carries the virtual time of the first heartbeat write; gate holds the relay in
-				// that write until the test opens it.
-				beats := make(chan time.Duration, 1)
+				// firstWrite carries the bytes and the virtual time of the first write to the client
+				// body; gate holds the relay in every write until the test opens it.
+				type bodyWrite struct {
+					at      time.Duration
+					payload string
+				}
+				firstWrite := make(chan bodyWrite, 1)
 				gate := make(chan struct{})
 				gateOpen := false
 				openGate := func() {
@@ -112,11 +121,8 @@ func TestRelayTimerDurations(t *testing.T) {
 					}
 				}
 				rec.onWrite = func(chunk string) {
-					if !strings.Contains(chunk, literalHeartbeat) {
-						return
-					}
 					select {
-					case beats <- time.Since(start):
+					case firstWrite <- bodyWrite{at: time.Since(start), payload: chunk}:
 					default:
 					}
 					<-gate
@@ -154,14 +160,18 @@ func TestRelayTimerDurations(t *testing.T) {
 
 				if tt.heartbeat != 0 {
 					watchdog := time.NewTimer(tt.fireAt + watchdogSlack)
+					var first bodyWrite
 					select {
-					case elapsed := <-beats:
+					case first = <-firstWrite:
 						watchdog.Stop()
-						if elapsed != tt.fireAt {
-							t.Errorf("first heartbeat written at %v, want exactly its interval %v", elapsed, tt.fireAt)
-						}
 					case <-watchdog.C:
-						t.Fatalf("no heartbeat written by %v, its interval %v", time.Since(start), tt.fireAt)
+						t.Fatalf("nothing written to the client body by %v, the heartbeat interval %v", time.Since(start), tt.fireAt)
+					}
+					if diff := gocmp.Diff(literalHeartbeat, first.payload); diff != "" {
+						t.Errorf("first write to the client body, while the upstream sent nothing (-want heartbeat +got):\n%s", diff)
+					}
+					if first.at != tt.fireAt {
+						t.Errorf("first write to the client body at %v, want exactly the heartbeat interval %v", first.at, tt.fireAt)
 					}
 					_, _, body, _, _ := rec.snapshot()
 					if got := strings.Count(body, literalHeartbeat); got != 1 {
@@ -185,13 +195,19 @@ func TestRelayTimerDurations(t *testing.T) {
 						t.Errorf("head committed at the hand-back = %d, want 200", status)
 					}
 					select {
-					case elapsed := <-beats:
-						t.Errorf("heartbeat written at %v with heartbeats disabled", elapsed)
+					case first := <-firstWrite:
+						t.Errorf("client body written at %v before the upstream sent anything, with heartbeats disabled: %q", first.at, first.payload)
 					default:
 					}
 				}
+				// heldAt is the virtual time at which the relay is let go; the upstream ends and the
+				// relay returns without virtual time passing.
+				heldAt := time.Since(start)
 
 				openGate()
+				// The write in progress finishes while the upstream still sends nothing, so a second
+				// write in the same beat is recorded whatever order the relay gives its end.
+				synctest.Wait()
 				src.release("", io.EOF)
 				synctest.Wait()
 				select {
@@ -208,6 +224,17 @@ func TestRelayTimerDurations(t *testing.T) {
 				}
 				if got := src.closes.Load(); got != 1 {
 					t.Errorf("owned resp.Body close count = %d, want 1", got)
+				}
+				if now := time.Since(start); now != heldAt {
+					t.Fatalf("virtual time moved from %v to %v while the relay ended; the heartbeat count below would span more than one beat", heldAt, now)
+				}
+				wantBeats := 0
+				if tt.heartbeat != 0 {
+					wantBeats = 1
+				}
+				_, _, body, _, _ := rec.snapshot()
+				if got := strings.Count(body, literalHeartbeat); got != wantBeats {
+					t.Errorf("heartbeats in the client body after the relay returned = %d, want %d in one beat; body=%q", got, wantBeats, body)
 				}
 			})
 		})

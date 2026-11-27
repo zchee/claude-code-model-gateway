@@ -33,16 +33,20 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/worker/sentry"
 )
 
-// errFinalWriteShutdown is the cause the service ends with during the final chunk's write.
+// errFinalWriteShutdown is the distinct cause the service ends with during the final chunk's write
+// in the cases with a trailing event.
 var errFinalWriteShutdown = errors.New("service ended during the final chunk's write")
 
 // TestRelayServiceEndsDuringFinalChunkWrite ends the service context while the relay writes the
 // last chunk of a body whose final read returned that chunk together with io.EOF. The relay has
 // then seen both the shutdown and the clean end of the body; the shutdown must win: the relay
 // writes no synthesized message_stop and returns no clean status, and its error carries the cause
-// the service ended with. When the client leaves in the same write, the shutdown is still
-// reported, with a nil error since no client response is left to abort. The control cases run the
-// same streams with the service left alive and show that the harness otherwise completes the turn.
+// the service ended with. The cases without a trailing event end the service with an ordinary
+// cancellation, whose error is context.Canceled; the cases with one end it with a distinct cause,
+// so a relay that wraps the context's error instead of its cause fails them. When the client
+// leaves in the same write, the shutdown is still reported, with a nil error since no client
+// response is left to abort. The control cases run the same streams with the service left alive
+// and show that the harness otherwise completes the turn.
 //
 // In the cases with a trailing event, the final read also holds an unterminated event after its
 // complete frames, which only the relay's end-of-stream handling would emit or observe. Those cases
@@ -89,6 +93,9 @@ func TestRelayServiceEndsDuringFinalChunkWrite(t *testing.T) {
 		trailing string
 		// endService ends the service during the client write of the last chunk.
 		endService bool
+		// cause, when set, is the distinct cause the service ends with; otherwise the service ends
+		// with an ordinary cancellation, whose cause is context.Canceled.
+		cause error
 		// clientLeaves also makes the client leave during that write, after its bytes were accepted.
 		clientLeaves bool
 		// wantStops is the number of message_stop frames the client may be sent: the upstream's own.
@@ -150,6 +157,7 @@ func TestRelayServiceEndsDuringFinalChunkWrite(t *testing.T) {
 			chunks:     []string{observedStartFrame, departureDeltaFrame},
 			trailing:   trailingEvent,
 			endService: true,
+			cause:      errFinalWriteShutdown,
 			wantEvents: completeEvents,
 		},
 		"error: LM Studio proxy relay neither emits nor observes an unterminated trailing event held by the peek's only read when the service ends during its write": {
@@ -157,6 +165,7 @@ func TestRelayServiceEndsDuringFinalChunkWrite(t *testing.T) {
 			chunks:     []string{observedStartFrame + departureDeltaFrame},
 			trailing:   trailingEvent,
 			endService: true,
+			cause:      errFinalWriteShutdown,
 			wantEvents: completeEvents,
 		},
 		"error: Anthropic passthrough does not observe an unterminated trailing event when the service ends during the final write": {
@@ -164,6 +173,7 @@ func TestRelayServiceEndsDuringFinalChunkWrite(t *testing.T) {
 			chunks:       []string{observedStartFrame, departureDeltaFrame},
 			trailing:     trailingEvent,
 			endService:   true,
+			cause:        errFinalWriteShutdown,
 			wantEvents:   completeEvents,
 			trailingSent: true,
 		},
@@ -172,6 +182,7 @@ func TestRelayServiceEndsDuringFinalChunkWrite(t *testing.T) {
 			chunks:       []string{observedStartFrame, departureDeltaFrame},
 			trailing:     trailingEvent,
 			endService:   true,
+			cause:        errFinalWriteShutdown,
 			wantEvents:   completeEvents,
 			trailingSent: true,
 		},
@@ -263,7 +274,7 @@ func TestRelayServiceEndsDuringFinalChunkWrite(t *testing.T) {
 							if tt.clientLeaves {
 								close(clientDone)
 							}
-							cancel(errFinalWriteShutdown)
+							cancel(tt.cause)
 						}
 					}
 				}
@@ -324,11 +335,15 @@ func TestRelayServiceEndsDuringFinalChunkWrite(t *testing.T) {
 				// The shape a shutdown after commitment has everywhere else in the relays: an abort of the
 				// committed response that carries the service's cause, or a nil error once the client is
 				// gone, labelled as an aborted upstream either way.
+				wantCause := tt.cause
+				if wantCause == nil {
+					wantCause = context.Canceled
+				}
 				switch {
 				case tt.clientLeaves && err != nil:
 					t.Errorf("relay error = %v, want nil once the client has gone", err)
-				case !tt.clientLeaves && (!errors.Is(err, http.ErrAbortHandler) || !errors.Is(err, errFinalWriteShutdown)):
-					t.Errorf("relay error = %v, want http.ErrAbortHandler wrapping the service's cause %v", err, errFinalWriteShutdown)
+				case !tt.clientLeaves && (!errors.Is(err, http.ErrAbortHandler) || !errors.Is(err, wantCause)):
+					t.Errorf("relay error = %v, want http.ErrAbortHandler wrapping the service's cause %v", err, wantCause)
 				}
 				if diff := gocmp.Diff(outcome.Result{Status: http.StatusOK, StatusOverride: abortedOverride}, res); diff != "" {
 					t.Errorf("relay result after the service ended (-want +got):\n%s", diff)

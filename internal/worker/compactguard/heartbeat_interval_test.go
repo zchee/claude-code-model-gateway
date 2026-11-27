@@ -32,16 +32,24 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/worker/upstream"
 )
 
-// gatedBeatWriter is a concurrency-safe response writer that reports the virtual time of the first
-// heartbeat written to it and then holds the writing goroutine until gate is closed.
+// heartbeatIntervalFirstWrite is the first write a gatedBeatWriter received: its virtual time
+// since the writer's start and its bytes.
+type heartbeatIntervalFirstWrite struct {
+	at      time.Duration
+	payload string
+}
+
+// gatedBeatWriter is a concurrency-safe response writer that reports the virtual time and the bytes
+// of the first body write it receives, whatever those bytes are, and holds every writing goroutine
+// until gate is closed.
 type gatedBeatWriter struct {
-	mu     sync.Mutex
-	header http.Header
-	heads  []int
-	body   bytes.Buffer
-	start  time.Time
-	beats  chan time.Duration
-	gate   chan struct{}
+	mu         sync.Mutex
+	header     http.Header
+	heads      []int
+	body       bytes.Buffer
+	start      time.Time
+	firstWrite chan heartbeatIntervalFirstWrite
+	gate       chan struct{}
 }
 
 var (
@@ -64,13 +72,11 @@ func (w *gatedBeatWriter) Write(b []byte) (int, error) {
 	}
 	w.body.Write(b)
 	w.mu.Unlock()
-	if bytes.Contains(b, []byte(sse.HeartbeatComment)) {
-		select {
-		case w.beats <- time.Since(w.start):
-		default:
-		}
-		<-w.gate
+	select {
+	case w.firstWrite <- heartbeatIntervalFirstWrite{at: time.Since(w.start), payload: string(b)}:
+	default:
 	}
+	<-w.gate
 	return len(b), nil
 }
 
@@ -85,12 +91,15 @@ func (w *gatedBeatWriter) snapshot() (heads []int, body string) {
 // TestGuardHeartbeatIntervalTakenAsGiven checks that the guard uses its configured heartbeat
 // interval as a Go duration, on its own and not through the stream relay: a fraction of a
 // millisecond is kept and an interval beyond the largest delay a JavaScript timer accepts is kept.
-// The source's timers would fire one millisecond early for the first and after one millisecond for
-// the second. The first heartbeat is timed by the bubble's virtual clock as the guard writes it.
+// The source's timers would discard the fractional millisecond of the first (1.5 ms becomes 1 ms,
+// half a millisecond early) and fire after one millisecond for the second. The first heartbeat is
+// timed by the bubble's virtual clock as the guard writes it.
 //
-// The writer holds the guard inside its first heartbeat write until the test lets it go, so a
-// guard that armed a much shorter timer writes one heartbeat, not one per millisecond of a virtual
-// wait that lasts weeks. A virtual watchdog ends the wait when no heartbeat comes at all.
+// While the upstream sends nothing, the writer holds the guard inside its first write to the client
+// body, whatever that write holds, until the test lets it go. A guard that armed a much shorter
+// timer, or wrote something other than the heartbeat, therefore writes once, not once per
+// millisecond of a virtual wait that lasts weeks; the test then checks that write's bytes and its
+// virtual time on their own. A virtual watchdog ends the wait when nothing is written at all.
 func TestGuardHeartbeatIntervalTakenAsGiven(t *testing.T) {
 	// literalHeartbeat restates sse.HeartbeatComment.
 	const literalHeartbeat = ": ping\n\n"
@@ -115,7 +124,7 @@ func TestGuardHeartbeatIntervalTakenAsGiven(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				w := &gatedBeatWriter{header: http.Header{}, start: time.Now(), beats: make(chan time.Duration, 1), gate: make(chan struct{})}
+				w := &gatedBeatWriter{header: http.Header{}, start: time.Now(), firstWrite: make(chan heartbeatIntervalFirstWrite, 1), gate: make(chan struct{})}
 				gateOpen := false
 				openGate := func() {
 					if !gateOpen {
@@ -151,14 +160,18 @@ func TestGuardHeartbeatIntervalTakenAsGiven(t *testing.T) {
 				}()
 
 				watchdog := time.NewTimer(tt.interval + watchdogSlack)
+				var first heartbeatIntervalFirstWrite
 				select {
-				case elapsed := <-w.beats:
+				case first = <-w.firstWrite:
 					watchdog.Stop()
-					if elapsed != tt.interval {
-						t.Errorf("first heartbeat written at %v, want exactly its interval %v", elapsed, tt.interval)
-					}
 				case <-watchdog.C:
-					t.Fatalf("no heartbeat written by %v, its interval %v", time.Since(w.start), tt.interval)
+					t.Fatalf("nothing written to the client body by %v, the heartbeat interval %v", time.Since(w.start), tt.interval)
+				}
+				if diff := gocmp.Diff(literalHeartbeat, first.payload); diff != "" {
+					t.Errorf("first write to the client body, while the upstream sent nothing (-want heartbeat +got):\n%s", diff)
+				}
+				if first.at != tt.interval {
+					t.Errorf("first write to the client body at %v, want exactly the heartbeat interval %v", first.at, tt.interval)
 				}
 				if _, got := w.snapshot(); got != literalHeartbeat {
 					t.Errorf("client body at the first heartbeat = %q, want one heartbeat %q", got, literalHeartbeat)
