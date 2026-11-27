@@ -19,6 +19,8 @@ package serveshim
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -97,28 +99,33 @@ func TestReportTimeoutDecisionIsFinal(t *testing.T) {
 				defer func() { _ = res.End() }()
 				reportedPort := int(res.Port())
 				// leased asks the relay's lease source for a lease, as one relay attempt does, and returns the generation
-				// it reached.
-				leased := func() (workerlink.Generation, error) {
+				// it reached and the port its connection is connected to.
+				leased := func() (workerlink.Generation, int, error) {
 					lease, err := relayWorkers{s}.Acquire(t.Context(), "")
 					if err != nil {
-						return "", err
+						return "", 0, err
 					}
 					defer func() { _ = lease.Close() }()
-					return lease.Generation(), nil
+					remote, ok := lease.RemoteAddr().(*net.TCPAddr)
+					if !ok {
+						return lease.Generation(), 0, fmt.Errorf("the lease is connected to %v, not a TCP address", lease.RemoteAddr())
+					}
+					return lease.Generation(), remote.Port, nil
 				}
 				// checkLease compares the lease the relay obtains with the report's verdict: the worker's generation
-				// after a timely report, no eligible generation after a late one.
+				// after a timely report, connected to the port the worker reported, so that a lease reaching the right
+				// generation through another endpoint is refused as well; no eligible generation after a late one.
 				checkLease := func(when string) {
 					t.Helper()
-					got, err := leased()
+					got, port, err := leased()
 					if tc.expire {
 						if !errors.Is(err, workerlink.ErrUnavailable) {
 							t.Errorf("lease %s: generation %q, %v; want none, %v", when, got, err, workerlink.ErrUnavailable)
 						}
 						return
 					}
-					if err != nil || got != generation {
-						t.Errorf("lease %s: generation %q, %v; want generation %q", when, got, err, generation)
+					if err != nil || got != generation || port != reportedPort {
+						t.Errorf("lease %s: generation %q on port %d, %v; want generation %q on the reported port %d", when, got, port, err, generation, reportedPort)
 					}
 				}
 				w := &workerProc{pid: os.Getpid(), generation: generation, res: res, exited: make(chan struct{})}

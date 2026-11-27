@@ -104,6 +104,9 @@ func TestReportTimeoutIsFinal(t *testing.T) {
 			var lines <-chan string
 			select {
 			case second = <-s.children:
+				if second.unpublished {
+					t.Fatalf("test infrastructure: undecided: the replacement, worker %d: %s; this is no evidence about the descriptors it was given", second.pid, second.refusal)
+				}
 				if second.refusal != "" {
 					t.Fatalf("the replacement did not receive its listener and drain channel from the supervisor: %s", second.refusal)
 				}

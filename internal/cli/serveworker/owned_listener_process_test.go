@@ -1037,12 +1037,36 @@ type closeInfrastructure string
 // still stalled fails the case. With watchdog set, limit is only the fixture's liveness cutoff of a case that cannot
 // see when the exchange began: a listener still open after it fails the case as undecided, not as the worker's
 // failure.
+//
+// A dial that fails with a reset is retried at once, under the same limit. Linux reports a reset that reaches a
+// connection still in SYN_SENT as a refusal, but one that arrives after the handshake completed as a reset, and the
+// dial can return it: the handshake completed, so the port was still listening when the dial's SYN arrived, and the
+// reset only shows that the connection was dropped from the accept queue, not that listening ended. Such a dial is
+// therefore judged as an accepted one, the close is concluded only from a fresh refusal, and a reset never ends the
+// sampling: a dial started after the limit that is reset fails the case exactly as an accepted one does, and a refusal
+// observed only after the limit stays the undecided sample it is above. A worker that keeps its listener open past
+// the limit is therefore still failed, whether its connections are accepted or reset, and one whose exit drops
+// in-flight work is still caught by the same check of its exit.
 func observeClose(t *testing.T, ctx context.Context, public string, l *launched, limit time.Time, watchdog bool) closeInfrastructure {
 	t.Helper()
 	var dialer net.Dialer
 	for {
 		started := time.Now()
 		conn, err := dialer.DialContext(ctx, "tcp4", public)
+		if errors.Is(err, syscall.ECONNRESET) {
+			if started.After(limit) && watchdog {
+				t.Fatalf("test infrastructure: undecided: the worker's port was still listening at the fixture's liveness cutoff %v (a connection dialled %v after it completed its handshake and was reset); this case cannot observe when the drain exchange began, so this is no proof of a budget violation, and the exact budget is decided by TestDrainExchangeSharesOneBudget", limit, started.Sub(limit))
+			}
+			if started.After(limit) {
+				t.Fatalf("the worker's port completed the handshake of a connection dialled %v after the limit %v, and reset it", started.Sub(limit), limit)
+			}
+			select {
+			case <-l.done:
+				t.Fatalf("the worker exited before its in-flight request finished: %v: %s", l.runErr, l.stderr)
+			default:
+			}
+			continue
+		}
 		if err != nil {
 			if !errors.Is(err, syscall.ECONNREFUSED) {
 				t.Fatalf("dial the worker's port: %v; want the connection refused", err)

@@ -88,20 +88,29 @@ func ownedEligibilityChild(ctx context.Context, control string) error {
 	counts := func() string {
 		return fmt.Sprintf("%d %d %d %d", before.Load(), after.Load(), late.Load(), drains.Load())
 	}
-	// A worker stops when its supervisor goes away.
+	// A worker stops when its supervisor goes away. Its farewell and its exit wait until the child has published the
+	// outcome of its adoption, "inherited" or "refused", so that the test always reads that outcome as the line after
+	// "hello": a supervisor that already disconnected the child before the adoption finished is then seen as a child
+	// that inherited its listener and was disconnected, not as a failed handoff. The order decides nothing else: a
+	// supervisor that hands over no usable listener or drain channel still makes the child publish a refusal, which
+	// the test reads as the failed handoff it is.
+	published := make(chan struct{})
 	go func() {
 		_, _ = io.Copy(io.Discard, live)
+		<-published
 		send("parent gone %s", counts())
 		os.Exit(0)
 	}()
 	ln, drain, err := adoptHandoff()
 	if err != nil {
 		send("refused %v", err)
+		close(published)
 		_, _ = io.Copy(io.Discard, conn)
 		os.Exit(0)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 	send("inherited %d %s", port, generation)
+	close(published)
 
 	token, _ := os.ReadFile(filepath.Join(os.Getenv("MODEL_GATEWAY_STATE_DIR"), "control-token"))
 	var reported, answered, holdArmed, drainHeld atomic.Bool
@@ -335,9 +344,14 @@ type ownedChild struct {
 	pid        int
 	port       int
 	generation string
-	refusal    string
-	conn       net.Conn
-	lines      *bufio.Scanner
+	// refusal is set when the child did not adopt a listener: its refusal, or why none was published.
+	refusal string
+	// unpublished is set when the child ended before it published what it adopted. The supervisor's escalation may
+	// have killed it in that moment, so nothing is known about the descriptors it was given: the case fails as
+	// undecided test infrastructure, not as a failed handoff.
+	unpublished bool
+	conn        net.Conn
+	lines       *bufio.Scanner
 }
 
 // command sends one command and returns the child's reply, which must start with want.
@@ -515,7 +529,8 @@ func startOwnedShim(t *testing.T, env map[string]string, wrap func(context.Conte
 					c.refusal = line
 				}
 			} else {
-				c.refusal = "the child closed its control connection before it adopted its listener"
+				c.refusal = "the child ended before it published what it adopted"
+				c.unpublished = true
 			}
 			select {
 			case s.children <- c:
@@ -658,6 +673,9 @@ func (s *ownedShim) nextChild(t *testing.T) *ownedChild {
 	t.Helper()
 	select {
 	case c := <-s.children:
+		if c.unpublished {
+			t.Fatalf("test infrastructure: undecided: worker %d: %s; this is no evidence about the descriptors it was given", c.pid, c.refusal)
+		}
 		if c.refusal != "" {
 			t.Fatalf("worker %d did not receive its listener and drain channel from the supervisor: %s", c.pid, c.refusal)
 		}
@@ -1064,17 +1082,104 @@ func ownedReusePort(_, _ string, c syscall.RawConn) error {
 	return optErr
 }
 
-// configuredPort returns a loopback port number for CODEX_GATEWAY_WORKER_PORT. The number is free when this returns
-// and is bound by the supervisor's own reservation moments later; nothing hands it over without a gap, because the
-// supervisor's bind is exclusive and refuses any socket that shares the number. A bind by another program in that gap
-// makes the supervisor refuse the port, which fails the case loudly rather than passing it.
+// configuredPortFirst and configuredPortLast bound the block of loopback port numbers that configuredPort hands out.
+// The block lies below every ephemeral range in use (Linux 32768-60999, macOS 49152-65535 by default), so the system
+// never gives one of its numbers to a socket that binds port zero or connects without binding, and it avoids the
+// gateway's own 18764 and 18765.
+const (
+	configuredPortFirst = 21000
+	configuredPortLast  = 22999
+)
+
+// configuredPorts is the state of configuredPort in this process: the next candidate, as an offset into the block, and
+// how many candidates were tried. Every candidate is tried once per process, so no number is handed out twice.
+var configuredPorts struct {
+	mu      sync.Mutex
+	started bool
+	next    int
+	tried   int
+}
+
+// configuredPort returns a loopback port number for CODEX_GATEWAY_WORKER_PORT, owned by the calling test until it
+// ends. The supervisor binds the number itself, exclusively, so the number is free when this returns and stays
+// unbound until the supervisor's reservation, and again between one generation's end and its replacement's
+// reservation. A number from the ephemeral range could be given in such a gap to a connection or a port-zero listener
+// of a test running in parallel, and the supervisor's correct EADDRINUSE would then fail the case. So the number
+// comes from a block outside the system's ephemeral range, which is read and checked first, and the calling test
+// holds an exclusive lock file for it in the temporary directory. A candidate locked by another process, or already
+// bound by any program when it is probed, is passed over before it is handed out; nothing is retried after that.
+//
+// The guard covers cooperating test processes that share the temporary directory, as every test process of a venue
+// run does: none of them is handed a number another one holds. It does not cover a service that binds the number
+// after the probe, nor a second job on the host with another temporary directory: either can still make the
+// supervisor's correct bind fail, and that failure stays loud, as the case fails rather than passing. A supervisor that
+// does not bind the configured port exclusively is still refused by the occupied-port cases, which bind their foreign
+// listener first and keep it.
+//
+// The lock files are kept on purpose. A lock is released by closing its file; the file is never removed, since a
+// path unlinked while another process holds or is about to lock its inode would let a third process lock a new file
+// of the same name, and two tests would then hold the same number.
 func configuredPort(t *testing.T) int {
 	t.Helper()
-	f := mustBindForeign(t, 0, false)
-	port := f.port
-	_ = f.ln.Close()
-	f.wg.Wait()
-	return port
+	const size = configuredPortLast - configuredPortFirst + 1
+	configuredPorts.mu.Lock()
+	defer configuredPorts.mu.Unlock()
+	if !configuredPorts.started {
+		checkConfiguredPortBlock(t)
+		var seed [2]byte
+		if _, err := rand.Read(seed[:]); err != nil {
+			t.Fatal(err)
+		}
+		// Test processes start at different candidates, so that they seldom contend for the same lock files.
+		configuredPorts.next = (int(seed[0])<<8 | int(seed[1])) % size
+		configuredPorts.started = true
+	}
+	for configuredPorts.tried < size {
+		port := configuredPortFirst + configuredPorts.next
+		configuredPorts.next = (configuredPorts.next + 1) % size
+		configuredPorts.tried++
+		lock, err := os.OpenFile(filepath.Join(os.TempDir(), "model-gateway-test-port-"+strconv.Itoa(port)+".lock"), os.O_RDWR|os.O_CREATE, 0o600)
+		if err != nil {
+			t.Fatalf("test infrastructure: open the lock file of port %d: %v", port, err)
+		}
+		if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+			_ = lock.Close()
+			if errors.Is(err, unix.EWOULDBLOCK) {
+				continue
+			}
+			t.Fatalf("test infrastructure: lock port %d: %v", port, err)
+		}
+		f, err := bindForeign(t, port, false)
+		if err != nil {
+			_ = lock.Close()
+			if errors.Is(err, syscall.EADDRINUSE) {
+				continue
+			}
+			t.Fatalf("test infrastructure: probe port %d: %v", port, err)
+		}
+		f.stop()
+		// Closing the file releases the lock. Registered before the cleanup of a supervisor the test starts afterwards,
+		// so it runs after that one: the number stays this test's until its supervisor and every listener on it are
+		// gone.
+		t.Cleanup(func() { _ = lock.Close() })
+		return port
+	}
+	t.Fatalf("test infrastructure: every port from %d to %d is locked by another test or bound", configuredPortFirst, configuredPortLast)
+	return 0
+}
+
+// checkConfiguredPortBlock fails the test when the system's ephemeral port range overlaps the block configuredPort
+// hands out, or when that range cannot be read: the system could then give one of the block's numbers to another
+// socket while a test owns it.
+func checkConfiguredPortBlock(t *testing.T) {
+	t.Helper()
+	low, high, err := ephemeralPortRange()
+	if err != nil {
+		t.Fatalf("test infrastructure: read the ephemeral port range: %v", err)
+	}
+	if low <= configuredPortLast && configuredPortFirst <= high {
+		t.Fatalf("test infrastructure: the ephemeral port range %d-%d overlaps the test's own ports %d-%d", low, high, configuredPortFirst, configuredPortLast)
+	}
 }
 
 // otherPort returns a free loopback port other than port.

@@ -461,12 +461,32 @@ func TestDrainFinalSweepServesQueuedConnections(t *testing.T) {
 		t.Error("the queued connections were served without the worker announcing its final sweep")
 	}
 	// With the queue empty the sweep ends at once and the listener closes.
+	//
+	// Only a refusal shows the listener closed. A dial that fails with a reset completed its handshake, so the port was
+	// still listening when its SYN arrived; Linux reports a reset as a refusal only while the connection is still in
+	// SYN_SENT. Such a dial is retried at once under the same two-second cutoff as an accepted one. Once any reset was
+	// seen, the loop remembers it to the end, and the first refusal must then be observed within the cutoff: a reset
+	// before the cutoff followed by a refusal after it brackets the close between a handshake and that refusal, which
+	// does not decide whether the close came in time, so the case fails as undecided rather than passing. A worker whose
+	// port still listens after the cutoff therefore fails whether its connections are accepted or reset, and a reset
+	// never ends the check. A loop that saw no reset is judged exactly as before.
 	var dialer net.Dialer
+	sawReset := false
 	for {
 		conn, err := dialer.DialContext(ctx, "tcp4", public)
+		if errors.Is(err, syscall.ECONNRESET) {
+			if time.Since(answeredAt) > 2*time.Second {
+				t.Fatalf("the worker's port still completed the handshake of a connection, then reset it, %v after the answer with an empty queue", time.Since(answeredAt))
+			}
+			sawReset = true
+			continue
+		}
 		if err != nil {
 			if !errors.Is(err, syscall.ECONNREFUSED) {
 				t.Fatalf("dial after the sweep: %v", err)
+			}
+			if sawReset && time.Since(answeredAt) > 2*time.Second {
+				t.Fatalf("test infrastructure: undecided: the first refusal was observed %v after the answer with an empty queue, in a sampling that saw a reset connection; the close lies between the last dial that completed its handshake and that refusal, so this is no proof of a late close, and it is not a pass either", time.Since(answeredAt))
 			}
 			break
 		}
