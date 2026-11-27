@@ -22,6 +22,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -282,10 +283,11 @@ func TestFixtureDrainPairs(t *testing.T) {
 	}
 }
 
-// TestFixtureGatedConn checks the gated parent end inside a bubble: a Write announces its entry, is counted in
-// progress and waits; it ends when the gate opens (the bytes reach the real peer), at a write deadline set before it
-// or while it waits, at once for a deadline that is not in the future, and at once when the connection is closed; it
-// is no longer counted in progress once it returned, and its entry and return are recorded at the bubble's times they
+// TestFixtureGatedConn checks the gated parent end inside a bubble, with returns parked: a Write announces its entry
+// and waits; it ends when the gate opens (the bytes reach the real peer, and nothing parks), at a write deadline set
+// before it or while it waits, at once for a deadline that is not in the future, and at once when the connection is
+// closed. An interrupted Write announces, at the bubble's time it was interrupted, that it chose its error, and then
+// does not return until the returns are released. Its entry and return are recorded at the bubble's times they
 // happened; a write that did not go through delivers nothing; after the gate opened, later writes go through at once.
 func TestFixtureGatedConn(t *testing.T) {
 	tests := map[string]struct {
@@ -331,7 +333,8 @@ func TestFixtureGatedConn(t *testing.T) {
 				}
 				peer := fileConn(t, file)
 				g := newGatedConn(parent)
-				t.Cleanup(func() { _ = g.Close() })
+				t.Cleanup(func() { g.releaseReturns(); _ = g.Close() })
+				g.parkOnReturn()
 				if tt.before != nil {
 					tt.before(g)
 				}
@@ -350,18 +353,32 @@ func TestFixtureGatedConn(t *testing.T) {
 				if w, ok := ready(out); ok {
 					t.Fatalf("Write returned %d, %v before anything ended it", w.n, w.err)
 				}
-				if entry, exit := g.heldSpan(); !entry.Equal(start) || !exit.IsZero() || g.writing() != 1 || isClosed(g.exited) {
-					t.Fatalf("while the Write waits: entry %v (want the start %v), exit %v (want none), %d in progress (want 1)", entry, start, exit, g.writing())
+				if entry, exit := g.heldSpan(); !entry.Equal(start) || !exit.IsZero() || isClosed(g.exited) || isClosed(g.returning) {
+					t.Fatalf("while the Write waits: entry %v (want the start %v), exit %v (want none), interrupted %t", entry, start, exit, isClosed(g.returning))
 				}
 				if tt.during != nil {
 					tt.during(g)
+				}
+				if tt.err != nil {
+					await(t, g.returning, "the interrupted Write's choice of its error")
+					synctest.Wait()
+					if w, ok := ready(out); ok || isClosed(g.exited) {
+						t.Fatalf("the interrupted Write returned %d, %v before its return was released", w.n, w.err)
+					}
+					if got := g.interruption(); got.Sub(start) != tt.wait {
+						t.Errorf("the Write was interrupted %v after it began, want %v", got.Sub(start), tt.wait)
+					}
+					g.releaseReturns()
 				}
 				w := await(t, out, "the end of the Write")
 				if waited := time.Since(start); waited != tt.wait {
 					t.Errorf("the Write ended after %v of the bubble's time, want %v", waited, tt.wait)
 				}
-				if entry, exit := g.heldSpan(); exit.Sub(entry) != tt.wait || g.writing() != 0 || !isClosed(g.exited) {
-					t.Errorf("after the Write returned: span %v (want %v), %d in progress (want 0), exit announced %t", exit.Sub(entry), tt.wait, g.writing(), isClosed(g.exited))
+				if entry, exit := g.heldSpan(); exit.Sub(entry) != tt.wait || !isClosed(g.exited) {
+					t.Errorf("after the Write returned: span %v (want %v), exit announced %t", exit.Sub(entry), tt.wait, isClosed(g.exited))
+				}
+				if tt.err == nil && isClosed(g.returning) {
+					t.Error("a Write that went through was announced as interrupted")
 				}
 				offered, writes := g.attempts()
 				if diff := gocmp.Diff([]any{"line\n", 1}, []any{offered, writes}); diff != "" {
@@ -400,8 +417,9 @@ func TestFixtureGatedConn(t *testing.T) {
 
 // TestFixtureGatedConnHoldsTheLastByte checks the gated parent end with a hold offset, inside a bubble: however the
 // bytes are split into Writes, every Write that ends before the held offset goes through at once and is not announced,
-// and the Write that carries the byte at the offset is announced and waits until the gate opens; the peer then reads
-// every byte in order.
+// and the Write that carries the byte at the offset is announced and waits until the gate opens. While it waits, the
+// peer has exactly the bytes of the Writes that went through, none of the held one; after the gate opens the peer
+// reads every byte in order.
 func TestFixtureGatedConnHoldsTheLastByte(t *testing.T) {
 	const line = "line\n"
 	tests := map[string]struct {
@@ -434,9 +452,10 @@ func TestFixtureGatedConnHoldsTheLastByte(t *testing.T) {
 						t.Fatalf("Write(%q) before the held byte = %d, %v; want it through at once", w, n, err)
 					}
 				}
-				if isClosed(g.entered) || g.writing() != 0 {
-					t.Fatalf("the Writes before the held byte were announced (%t) or are still in progress (%d)", isClosed(g.entered), g.writing())
+				if isClosed(g.entered) {
+					t.Fatal("a Write before the held byte was announced as the held one")
 				}
+				prefix := strings.Join(tt.writes[:last], "")
 				out := make(chan error, 1)
 				go func() {
 					_, err := g.Write([]byte(tt.writes[last]))
@@ -447,8 +466,11 @@ func TestFixtureGatedConnHoldsTheLastByte(t *testing.T) {
 				if err, ok := ready(out); ok {
 					t.Fatalf("the Write that carries the held byte returned %v before the gate opened", err)
 				}
-				if g.writing() != 1 {
-					t.Fatalf("%d Writes in progress while the held one waits, want 1", g.writing())
+				if isClosed(g.exited) {
+					t.Fatal("the held Write was announced as returned before the gate opened")
+				}
+				if got := peeked(t, peer.(syscall.Conn)); got != prefix {
+					t.Fatalf("while the held Write waits the peer has %q, want exactly the bytes of the Writes that went through, %q", got, prefix)
 				}
 				g.openGate()
 				if err := await(t, out, "the held Write"); err != nil {

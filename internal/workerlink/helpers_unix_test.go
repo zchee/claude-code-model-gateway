@@ -143,6 +143,29 @@ func pending(t *testing.T, c syscall.Conn) int {
 	return n
 }
 
+// peeked returns the bytes queued for reading on c, up to 4096, without consuming them or blocking.
+func peeked(t *testing.T, c syscall.Conn) string {
+	t.Helper()
+	var queued string
+	control(t, c, func(fd int) {
+		buf := make([]byte, 4096)
+		for {
+			n, _, err := unix.Recvfrom(fd, buf, unix.MSG_PEEK|unix.MSG_DONTWAIT)
+			switch {
+			case err == nil:
+				queued = string(buf[:n])
+				return
+			case errors.Is(err, unix.EINTR):
+			case errors.Is(err, unix.EAGAIN):
+				return
+			default:
+				t.Fatalf("peek: %v", err)
+			}
+		}
+	})
+	return queued
+}
+
 // peekPending is pending without a test: it may run on a goroutine of the code under test.
 func peekPending(c syscall.Conn) (int, error) {
 	raw, err := c.SyscallConn()
@@ -698,12 +721,20 @@ func publish(t *testing.T, res *workerlink.Reservation, pid int) {
 // write to a peer that has stopped reading does, until the test opens the gate (the bytes then go to the real end),
 // its write deadline passes, or the connection is closed. A Write that ends before the held offset goes through at
 // once. A deadline set before or during the Write is honoured, and one that is not in the future ends the Write at
-// once with nothing written, as a net.Conn does. The connection counts the Writes in progress and records when the
-// first held Write began and when it returned.
+// once with nothing written, as a net.Conn does. The connection records when the first held Write began and when it
+// returned.
+//
+// With parkOnReturn, a Write that the deadline or Close interrupted has chosen its error and then waits, outside the
+// connection's lock, until the test calls releaseReturns; only then does it return. The first such Write announces
+// that point on returning. A caller that has not joined its Write therefore cannot have returned while the Write is
+// parked there.
 type gatedConn struct {
 	net.Conn
 	// entered is closed when the first held Write begins; exited when that Write returns.
 	entered, exited chan struct{}
+	// returning is closed when the first interrupted Write has chosen its error and parks; release is closed by
+	// releaseReturns.
+	returning, release chan struct{}
 
 	mu sync.Mutex
 	// changed is closed and replaced whenever the gate, the write deadline or closure changes.
@@ -714,15 +745,25 @@ type gatedConn struct {
 	// hold is the offset of the first byte whose Write waits; zero holds every Write with a byte in it.
 	hold     int
 	held     bool
+	park     bool
+	parked   bool
+	released bool
 	offered  []byte
 	writes   int
-	inFlight int
-	// enteredAt and exitedAt are the bubble's times of the first held Write's entry and return.
-	enteredAt, exitedAt time.Time
+	// enteredAt and exitedAt are the bubble's times of the first held Write's entry and return; interruptedAt is the
+	// time the first interrupted Write chose its error.
+	enteredAt, exitedAt, interruptedAt time.Time
 }
 
 func newGatedConn(real net.Conn) *gatedConn {
-	return &gatedConn{Conn: real, entered: make(chan struct{}), exited: make(chan struct{}), changed: make(chan struct{})}
+	return &gatedConn{
+		Conn:      real,
+		entered:   make(chan struct{}),
+		exited:    make(chan struct{}),
+		returning: make(chan struct{}),
+		release:   make(chan struct{}),
+		changed:   make(chan struct{}),
+	}
 }
 
 func (c *gatedConn) notifyLocked() {
@@ -738,11 +779,28 @@ func (c *gatedConn) holdFrom(offset int) {
 	c.hold = offset
 }
 
+// parkOnReturn makes every interrupted Write wait for releaseReturns before it returns. Call it before the first
+// Write.
+func (c *gatedConn) parkOnReturn() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.park = true
+}
+
+// releaseReturns lets every parked and later interrupted Write return. It may be called more than once.
+func (c *gatedConn) releaseReturns() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.released {
+		c.released = true
+		close(c.release)
+	}
+}
+
 func (c *gatedConn) Write(p []byte) (int, error) {
 	c.mu.Lock()
 	reaches := len(c.offered)+len(p) > c.hold
 	c.writes++
-	c.inFlight++
 	c.offered = append(c.offered, p...)
 	first := reaches && !c.held
 	if first {
@@ -752,21 +810,34 @@ func (c *gatedConn) Write(p []byte) (int, error) {
 	}
 	// leave is called with c.mu held and releases it.
 	leave := func() {
-		c.inFlight--
 		if first {
 			c.exitedAt = time.Now()
 			close(c.exited)
 		}
 		c.mu.Unlock()
 	}
+	// interrupted returns err once the test lets it, when returns are parked; it is called with c.mu held.
+	interrupted := func(err error) (int, error) {
+		if c.park {
+			if !c.parked {
+				c.parked = true
+				c.interruptedAt = time.Now()
+				close(c.returning)
+			}
+			release := c.release
+			c.mu.Unlock()
+			<-release
+			c.mu.Lock()
+		}
+		leave()
+		return 0, err
+	}
 	for {
 		switch {
 		case c.closed:
-			leave()
-			return 0, &net.OpError{Op: "write", Net: "unix", Err: net.ErrClosed}
+			return interrupted(&net.OpError{Op: "write", Net: "unix", Err: net.ErrClosed})
 		case !c.deadline.IsZero() && !time.Now().Before(c.deadline):
-			leave()
-			return 0, &net.OpError{Op: "write", Net: "unix", Err: os.ErrDeadlineExceeded}
+			return interrupted(&net.OpError{Op: "write", Net: "unix", Err: os.ErrDeadlineExceeded})
 		case c.open || !reaches:
 			c.mu.Unlock()
 			n, err := c.Conn.Write(p)
@@ -836,18 +907,18 @@ func (c *gatedConn) attempts() (offered string, writes int) {
 	return string(c.offered), c.writes
 }
 
-// writing returns the number of Write calls in progress.
-func (c *gatedConn) writing() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.inFlight
-}
-
 // heldSpan returns the bubble's times of the first held Write's entry and return; exit is zero while it runs.
 func (c *gatedConn) heldSpan() (entry, exit time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.enteredAt, c.exitedAt
+}
+
+// interruption returns the bubble's time at which the first interrupted Write chose its error; zero before that.
+func (c *gatedConn) interruption() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.interruptedAt
 }
 
 // errPair is the failure drainPairs injects.
@@ -949,12 +1020,14 @@ func (p *drainPairs) gatedAt(t *testing.T, i int) *gatedConn {
 	return p.gated[i]
 }
 
-// closeGated closes every gated parent end, so that no Write stays parked after a failed assertion.
+// closeGated closes every gated parent end and lets parked returns go, so that no Write stays parked after a
+// failed assertion.
 func (p *drainPairs) closeGated() {
 	p.mu.Lock()
 	gated := slices.Clone(p.gated)
 	p.mu.Unlock()
 	for _, g := range gated {
+		g.releaseReturns()
 		_ = g.Close()
 	}
 }

@@ -227,22 +227,15 @@ type ackRun struct {
 	done     chan error
 	returned bool
 	err      error
-	// at is the time AcknowledgeDrain returned and writing the number of Write calls on the watched parent end still
-	// in progress then, both taken in the calling goroutine the moment the call returned, before anything else runs
-	// there. They are set before the result is sent, so they may be read once poll or wait has seen it.
-	at      time.Time
-	writing int
+	// at is the bubble's time AcknowledgeDrain returned, taken in the calling goroutine and set before the result is
+	// sent, so it may be read once poll or wait has seen the result.
+	at time.Time
 }
 
-// startAck starts AcknowledgeDrain; parent, when not nil, is the gated parent end whose Writes in progress are
-// counted at the return.
-func startAck(ctx context.Context, res *workerlink.Reservation, parent *gatedConn) *ackRun {
+func startAck(ctx context.Context, res *workerlink.Reservation) *ackRun {
 	a := &ackRun{done: make(chan error, 1)}
 	go func() {
 		err := res.AcknowledgeDrain(ctx)
-		if parent != nil {
-			a.writing = parent.writing()
-		}
 		a.at = time.Now()
 		a.done <- err
 	}()
@@ -409,7 +402,7 @@ func TestAcknowledgeDrainWaitsForPinnedDial(t *testing.T) {
 				})
 				f.res.Retire()
 				at("two acknowledgments behind two pinned dials")
-				acks := []*ackRun{startAck(t.Context(), f.res, f.parent), startAck(t.Context(), f.res, f.parent)}
+				acks := []*ackRun{startAck(t.Context(), f.res), startAck(t.Context(), f.res)}
 				f.checkBarrier(t, "with two pinned dials in progress", true, acks...)
 
 				outcome := func(fails bool) error {
@@ -541,7 +534,7 @@ func TestAcknowledgeDrainRefuses(t *testing.T) {
 				}
 				ctx, cancel := context.WithCancel(t.Context())
 				defer cancel()
-				ack := startAck(ctx, f.res, f.parent)
+				ack := startAck(ctx, f.res)
 				if tt.interrupt != nil {
 					f.checkBarrier(t, "with a pinned dial in progress", false, ack)
 					tt.interrupt(t, f, cancel)
@@ -618,7 +611,7 @@ func TestAcknowledgeDrainBoundedWhenPeerStopsReading(t *testing.T) {
 			}
 			publish(t, res, 4101)
 			res.Retire()
-			ack := startAck(t.Context(), res, nil)
+			ack := startAck(t.Context(), res)
 			if tt.interrupt != nil {
 				tt.interrupt(t, res)
 			}
@@ -683,52 +676,113 @@ func abortIfStuck(what string, limit time.Duration, step *atomic.Pointer[string]
 }
 
 // writeBudget is the most the acknowledgment's write may take: the five seconds the worker allows for the whole
-// exchange. The exact budget below it is the implementation's.
+// exchange. The budget itself is one value per Registry, fixed when the Registry is made, and below this bound it is
+// the implementation's.
 const writeBudget = 5 * time.Second
 
-// gatedReservation is a published, retired reservation whose drain channel's parent end is gated.
+// guardedBubble runs body in a synctest bubble under the real-time watchdog of abortIfStuck; body records with at the
+// step it is at, which the watchdog names when it fires.
+func guardedBubble(t *testing.T, body func(t *testing.T, at func(string))) {
+	t.Helper()
+	var step atomic.Pointer[string]
+	stop := abortIfStuck(t.Name(), bubbleWatchdog, &step)
+	defer stop()
+	synctest.Test(t, func(t *testing.T) { body(t, func(s string) { step.Store(&s) }) })
+}
+
+// gatedRegistry is a registry with fake listeners, dials that succeed at once, and gated drain channel pairs.
+type gatedRegistry struct {
+	reg     *workerlink.Registry
+	pairs   *drainPairs
+	listens *fakeListens
+}
+
+// newGatedRegistry must run inside a bubble.
+func newGatedRegistry(t *testing.T) *gatedRegistry {
+	t.Helper()
+	listens := newFakeListens()
+	reg := workerlink.NewRegistry(listens.listen, (&immediateDials{t: t}).dial)
+	r := &gatedRegistry{reg: reg, pairs: newDrainPairs(t, reg, true, 0), listens: listens}
+	t.Cleanup(func() { listens.checkNeverAccepted(t) })
+	return r
+}
+
+// gatedReservation is a published, retired reservation whose drain channel's parent end is gated and parks every
+// interrupted Write before it returns.
 type gatedReservation struct {
 	res      *workerlink.Reservation
 	parent   *gatedConn
+	child    net.Conn
 	listener *fakeListener
 }
 
-// reserveGated reserves generation on port with the next pair of pairs, takes its drain channel, publishes it for
-// pid and retires it.
-func reserveGated(t *testing.T, reg *workerlink.Registry, pairs *drainPairs, listens *fakeListens, generation workerlink.Generation, port uint16, pid int) gatedReservation {
+// reserve reserves generation on port, takes its drain channel, publishes it for pid and retires it.
+func (r *gatedRegistry) reserve(t *testing.T, generation workerlink.Generation, port uint16, pid int) gatedReservation {
 	t.Helper()
-	res := reserve(t, reg, generation, port)
-	parent := pairs.gatedAt(t, pairs.count()-1)
+	res := reserve(t, r.reg, generation, port)
+	parent := r.pairs.gatedAt(t, r.pairs.count()-1)
 	// Registered after End's cleanup, so it runs first: no Write stays parked when an assertion fails.
-	t.Cleanup(func() { _ = parent.Close() })
-	drainChannel(t, res)
+	t.Cleanup(func() {
+		parent.releaseReturns()
+		_ = parent.Close()
+	})
+	parent.parkOnReturn()
+	_, child := drainChannel(t, res)
 	publish(t, res, pid)
 	res.Retire()
-	return gatedReservation{res: res, parent: parent, listener: listens.at(t, port)}
+	return gatedReservation{res: res, parent: parent, child: child, listener: r.listens.at(t, port)}
+}
+
+// awaitLeftWrite waits until the acknowledgment's interrupted Write has chosen its error and parked before returning,
+// lets the bubble settle, and requires the acknowledgment still pending then: a correct acknowledgment does not return
+// before its Write has left Write. It then releases the Write and returns the acknowledgment's result once both the
+// acknowledgment and the Write have returned.
+func awaitLeftWrite(t *testing.T, g gatedReservation, ack *ackRun) error {
+	t.Helper()
+	await(t, g.parent.returning, "the interruption of the acknowledgment's Write")
+	synctest.Wait()
+	if ack.poll() {
+		t.Fatalf("AcknowledgeDrain returned %v while its interrupted Write had not returned yet; it must not return before its Write has left", ack.err)
+	}
+	g.parent.releaseReturns()
+	err := ack.wait(t, "AcknowledgeDrain")
+	await(t, g.parent.exited, "the return of the interrupted Write")
+	return err
+}
+
+// checkFailedAckKeeps asserts what a failed acknowledgment of g leaves: the listener held and admission retired.
+func checkFailedAckKeeps(t *testing.T, reg *workerlink.Registry, g gatedReservation) {
+	t.Helper()
+	if isClosed(g.listener.closed) {
+		t.Error("a failed acknowledgment released the listener")
+	}
+	if l, err := reg.Acquire(t.Context(), ""); l != nil || !errors.Is(err, workerlink.ErrRetired) {
+		if l != nil {
+			_ = l.Close()
+		}
+		t.Errorf("Acquire after the failed acknowledgment = %v, %v; want %v", l, err, workerlink.ErrRetired)
+	}
 }
 
 // TestAcknowledgeDrainWriteIsBounded checks, in a bubble and through a gated parent end, an acknowledgment that has
-// begun its write to a worker that reads nothing. The test sees the Write begin, then runs unrelated registry work
-// (Reserve, Publish, Acquire and End of another generation), which must complete while that Write is still in progress
-// and the acknowledgment has not returned, so no registry lock is held across the write. The write then ends: with a
-// context that never ends, through the acknowledgment's own budget, at most five seconds after the Write began; at
-// once with the caller's cancellation, with that context's error; at the caller's deadline, with
-// context.DeadlineExceeded, when that deadline provably comes first; and at once when the generation ends. Whatever
-// ends it, no Write of the acknowledgment is still in progress when AcknowledgeDrain returns. A failed acknowledgment
-// keeps the listener and admission retired, except after End. That bound is enforced by a write deadline or by
-// closing the channel; the gated end honours both. The time a correct implementation lets pass before it calls Write
-// is its own: every bound is taken from the Write's entry, never from the call.
+// begun its write to a worker that reads nothing. The write ends: with a context that never ends, through the
+// acknowledgment's own budget, at most five seconds after the Write began; at once with the caller's cancellation,
+// with that context's error; and at once when the generation ends (End runs on its own goroutine, since it may wait
+// for the acknowledgment). Whatever ends it, the interrupted Write is held after it chose its error and before it
+// returns, and AcknowledgeDrain must still be pending then: it returns only after its Write has left. A failed
+// acknowledgment keeps the listener and admission retired, except after End. The bound may be a write deadline or a
+// close of the channel; the gated end honours both. The caller's deadline is checked by
+// TestAcknowledgeDrainCallerDeadline, and the absence of a registry lock across the write by
+// TestAcknowledgeDrainHoldsNoLockAcrossWrite.
 func TestAcknowledgeDrainWriteIsBounded(t *testing.T) {
 	tests := map[string]struct {
-		// callerDeadline gives the caller's context a deadline inside the write: after the Write begins and before
-		// the acknowledgment's own budget would end it, both observed first on a sibling reservation in the same
-		// bubble.
-		callerDeadline bool
-		// interrupt ends the write; nil leaves it to the budget or to the caller's deadline.
-		interrupt func(t *testing.T, res *workerlink.Reservation, cancel context.CancelFunc)
-		// atOnce requires the acknowledgment to return without the bubble's clock moving after the interrupt.
+		// interrupt ends the write and may return a check to run once the Write was released; nil leaves the write to
+		// the budget.
+		interrupt func(t *testing.T, res *workerlink.Reservation, cancel context.CancelFunc) (after func(t *testing.T))
+		// atOnce requires the Write to be interrupted, and the acknowledgment to return, without the bubble's clock
+		// moving after the interrupt.
 		atOnce bool
-		// budget requires the acknowledgment to return at most writeBudget after its Write began.
+		// budget requires the Write to be interrupted at most writeBudget after it began.
 		budget bool
 		want   error
 		ended  bool
@@ -737,17 +791,21 @@ func TestAcknowledgeDrainWriteIsBounded(t *testing.T) {
 			budget: true,
 		},
 		"error: the caller cancels while the write waits": {
-			interrupt: func(_ *testing.T, _ *workerlink.Reservation, cancel context.CancelFunc) { cancel() },
-			atOnce:    true,
-			want:      context.Canceled,
-		},
-		"error: the caller's deadline passes while the write waits": {
-			callerDeadline: true,
+			interrupt: func(_ *testing.T, _ *workerlink.Reservation, cancel context.CancelFunc) func(*testing.T) {
+				cancel()
+				return nil
+			},
+			atOnce: true,
+			want:   context.Canceled,
 		},
 		"error: the generation ends while the write waits": {
-			interrupt: func(t *testing.T, res *workerlink.Reservation, _ context.CancelFunc) {
-				if err := res.End(); err != nil {
-					t.Errorf("End: %v", err)
+			interrupt: func(_ *testing.T, res *workerlink.Reservation, _ context.CancelFunc) func(*testing.T) {
+				ended := make(chan error, 1)
+				go func() { ended <- res.End() }()
+				return func(t *testing.T) {
+					if err := await(t, ended, "End"); err != nil {
+						t.Errorf("End: %v", err)
+					}
 				}
 			},
 			atOnce: true,
@@ -756,88 +814,16 @@ func TestAcknowledgeDrainWriteIsBounded(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			var step atomic.Pointer[string]
-			at := func(s string) { step.Store(&s) }
-			stop := abortIfStuck(t.Name(), bubbleWatchdog, &step)
-			defer stop()
-			synctest.Test(t, func(t *testing.T) {
-				at("setting up the registry")
-				listens := newFakeListens()
-				reg := workerlink.NewRegistry(listens.listen, (&immediateDials{t: t}).dial)
-				pairs := newDrainPairs(t, reg, true, 0)
-				t.Cleanup(func() { listens.checkNeverAccepted(t) })
-
-				var ctx context.Context
-				var cancel context.CancelFunc
-				// deadlineInside is set when the caller's deadline was placed strictly inside the write.
-				deadlineInside := false
-				if tt.callerDeadline {
-					at("observing the budget on a sibling reservation")
-					sibling := reserveGated(t, reg, pairs, listens, "gen-sibling", 41003, 4103)
-					called := time.Now()
-					sibAck := startAck(t.Context(), sibling.res, sibling.parent)
-					await(t, sibling.parent.entered, "the sibling acknowledgment's write")
-					if err := sibAck.wait(t, "the sibling AcknowledgeDrain"); err == nil {
-						t.Fatal("the sibling AcknowledgeDrain reported success for a line the worker never read")
-					}
-					if sibAck.writing != 0 {
-						t.Fatalf("%d Write calls of the sibling acknowledgment were still in progress when it returned", sibAck.writing)
-					}
-					entry, exit := sibling.parent.heldSpan()
-					beforeWrite, window := entry.Sub(called), exit.Sub(entry)
-					if err := sibling.res.End(); err != nil {
-						t.Fatalf("End of the sibling: %v", err)
-					}
-					if half := window / 2; half > 0 {
-						deadlineInside = true
-						ctx, cancel = context.WithTimeout(t.Context(), beforeWrite+half)
-					} else {
-						// The budget leaves no time inside the write for a deadline to come first; which of the two
-						// wins is then not decided, and only an error is required.
-						t.Logf("the budget ended the write %v after it began; no caller deadline fits inside it", window)
-						ctx, cancel = context.WithCancel(t.Context())
-					}
-				} else {
-					ctx, cancel = context.WithCancel(t.Context())
-				}
+			guardedBubble(t, func(t *testing.T, at func(string)) {
+				at("setting up the reservation")
+				r := newGatedRegistry(t)
+				g := r.reserve(t, "gen-a", 41001, 4101)
+				ctx, cancel := context.WithCancel(t.Context())
 				defer cancel()
-
-				at("reserving gen-a")
-				g := reserveGated(t, reg, pairs, listens, "gen-a", 41001, 4101)
-				ack := startAck(ctx, g.res, g.parent)
+				ack := startAck(ctx, g.res)
 				at("waiting for the acknowledgment's write to begin")
 				await(t, g.parent.entered, "the acknowledgment's write")
 				entry, _ := g.parent.heldSpan()
-
-				// Unrelated registry work while the write waits.
-				at("Reserve of gen-b during the write")
-				other, err := reg.Reserve(t.Context(), "gen-b", 41002)
-				if other != nil {
-					endAtCleanup(t, other)
-				}
-				if err != nil {
-					t.Fatalf("Reserve gen-b during the write: %v", err)
-				}
-				at("Publish of gen-b during the write")
-				if err := other.Publish(4102); err != nil {
-					t.Fatalf("Publish gen-b during the write: %v", err)
-				}
-				at("Acquire during the write")
-				lease, err := reg.Acquire(t.Context(), "")
-				if lease != nil {
-					t.Cleanup(func() { _ = lease.Close() })
-				}
-				if err != nil || lease == nil || lease.Generation() != "gen-b" {
-					t.Fatalf("Acquire during the write = %v, %v; want a lease to gen-b", lease, err)
-				}
-				at("End of gen-b during the write")
-				if err := other.End(); err != nil {
-					t.Fatalf("End gen-b during the write: %v", err)
-				}
-				if isClosed(g.parent.exited) || ack.poll() {
-					_, exit := g.parent.heldSpan()
-					t.Fatalf("the unrelated registry work completed only after the acknowledgment's write ended (at %v after it began); it waited for the write", exit.Sub(entry))
-				}
 				synctest.Wait()
 				if ack.poll() {
 					t.Fatalf("AcknowledgeDrain returned %v before anything ended its write", ack.err)
@@ -845,44 +831,38 @@ func TestAcknowledgeDrainWriteIsBounded(t *testing.T) {
 
 				interrupted := time.Now()
 				at("the interruption of the write")
+				var after func(*testing.T)
 				if tt.interrupt != nil {
-					tt.interrupt(t, g.res, cancel)
+					after = tt.interrupt(t, g.res, cancel)
 				}
-				at("waiting for AcknowledgeDrain to return")
-				err = ack.wait(t, "AcknowledgeDrain")
+				at("the interrupted Write held before it returns")
+				err := awaitLeftWrite(t, g, ack)
+				if after != nil {
+					after(t)
+				}
 				at("the checks after the acknowledgment")
 				if err == nil {
 					t.Fatal("AcknowledgeDrain reported success for a line the worker never read")
 				}
-				if ack.writing != 0 {
-					t.Errorf("%d Write calls of the acknowledgment were still in progress when it returned; an interrupted or expired write must have left Write", ack.writing)
-				}
 				if tt.want != nil && !errors.Is(err, tt.want) {
 					t.Errorf("AcknowledgeDrain error = %v, want %v", err, tt.want)
 				}
-				if waited := ack.at.Sub(interrupted); tt.atOnce && waited != 0 {
-					t.Errorf("AcknowledgeDrain returned %v of the bubble's time after it was interrupted, want at once", waited)
-				}
-				if took := ack.at.Sub(entry); tt.budget && took > writeBudget {
-					t.Errorf("AcknowledgeDrain returned %v of the bubble's time after its write began, want at most %v", took, writeBudget)
-				}
-				if deadline, ok := ctx.Deadline(); deadlineInside && ok {
-					switch {
-					case ack.at.Before(deadline):
-						// The acknowledgment's own budget ended the write first; its own error stands.
-					case ack.at.Equal(deadline):
-						if !errors.Is(err, context.DeadlineExceeded) {
-							t.Errorf("AcknowledgeDrain at the caller's deadline, which came before its budget = %v, want %v", err, context.DeadlineExceeded)
-						}
-					default:
-						t.Errorf("AcknowledgeDrain returned %v after the caller's deadline", ack.at.Sub(deadline))
+				if tt.atOnce {
+					if waited := g.parent.interruption().Sub(interrupted); waited != 0 {
+						t.Errorf("the Write was interrupted %v of the bubble's time after the interrupt, want at once", waited)
 					}
+					if waited := ack.at.Sub(interrupted); waited != 0 {
+						t.Errorf("AcknowledgeDrain returned %v of the bubble's time after the interrupt, want at once", waited)
+					}
+				}
+				if took := g.parent.interruption().Sub(entry); tt.budget && took > writeBudget {
+					t.Errorf("the budget interrupted the Write %v of the bubble's time after it began, want at most %v", took, writeBudget)
 				}
 				if tt.ended {
 					if !isClosed(g.listener.closed) {
 						t.Error("End did not release the listener")
 					}
-					if l, err := reg.Acquire(t.Context(), ""); l != nil || !errors.Is(err, workerlink.ErrUnavailable) {
+					if l, err := r.reg.Acquire(t.Context(), ""); l != nil || !errors.Is(err, workerlink.ErrUnavailable) {
 						if l != nil {
 							_ = l.Close()
 						}
@@ -890,15 +870,154 @@ func TestAcknowledgeDrainWriteIsBounded(t *testing.T) {
 					}
 					return
 				}
-				if isClosed(g.listener.closed) {
-					t.Error("a failed acknowledgment released the listener")
+				checkFailedAckKeeps(t, r.reg, g)
+			})
+		})
+	}
+}
+
+// TestAcknowledgeDrainHoldsNoLockAcrossWrite checks that no lock of the registry is held across the acknowledgment's
+// write. The test holds the Write in progress for as long as it likes: the Write waits at the gate, and if the budget
+// interrupts it, it waits again before returning until the test releases it. While it is held, another reservation of
+// the same registry is reserved, published, leased and ended. That work must complete with the Write still held and
+// the acknowledgment pending; with a lock held across the write it can never complete. Then the test lets the Write go:
+// the acknowledgment succeeds and the line is on the channel, unless the budget had interrupted the Write meanwhile,
+// in which case it fails.
+func TestAcknowledgeDrainHoldsNoLockAcrossWrite(t *testing.T) {
+	tests := map[string]struct {
+		other workerlink.Generation
+	}{
+		"success: another reservation of the registry completes its work while the write is held": {other: "gen-b"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			guardedBubble(t, func(t *testing.T, at func(string)) {
+				at("setting up the reservation")
+				r := newGatedRegistry(t)
+				g := r.reserve(t, "gen-a", 41001, 4101)
+				ack := startAck(t.Context(), g.res)
+				at("waiting for the acknowledgment's write to begin")
+				await(t, g.parent.entered, "the acknowledgment's write")
+
+				at("Reserve of the other generation while the write is held")
+				other, err := r.reg.Reserve(t.Context(), tt.other, 41002)
+				if other != nil {
+					endAtCleanup(t, other)
 				}
-				if l, err := reg.Acquire(t.Context(), ""); l != nil || !errors.Is(err, workerlink.ErrRetired) {
-					if l != nil {
-						_ = l.Close()
+				if err != nil {
+					t.Fatalf("Reserve %s while the write is held: %v", tt.other, err)
+				}
+				at("Publish of the other generation while the write is held")
+				if err := other.Publish(4102); err != nil {
+					t.Fatalf("Publish %s while the write is held: %v", tt.other, err)
+				}
+				at("Acquire while the write is held")
+				lease, err := r.reg.Acquire(t.Context(), "")
+				if lease != nil {
+					t.Cleanup(func() { _ = lease.Close() })
+				}
+				if err != nil || lease == nil || lease.Generation() != tt.other {
+					t.Fatalf("Acquire while the write is held = %v, %v; want a lease to %s", lease, err, tt.other)
+				}
+				at("End of the other generation while the write is held")
+				if err := other.End(); err != nil {
+					t.Fatalf("End %s while the write is held: %v", tt.other, err)
+				}
+				synctest.Wait()
+				if isClosed(g.parent.exited) {
+					t.Fatal("the held Write returned before the test released it")
+				}
+				if ack.poll() {
+					t.Fatalf("AcknowledgeDrain returned %v while its Write was held", ack.err)
+				}
+
+				at("letting the held Write go")
+				g.parent.openGate()
+				g.parent.releaseReturns()
+				err = ack.wait(t, "AcknowledgeDrain")
+				if !g.parent.interruption().IsZero() {
+					if err == nil {
+						t.Error("AcknowledgeDrain reported success after the budget interrupted its Write")
 					}
-					t.Errorf("Acquire after the failed acknowledgment = %v, %v; want %v", l, err, workerlink.ErrRetired)
+					return
 				}
+				if err != nil {
+					t.Fatalf("AcknowledgeDrain after its Write went through: %v", err)
+				}
+				want := frame("retired", "gen-a")
+				if got := readExactly(t, g.child, len(want)); got != want {
+					t.Errorf("acknowledgment %q, want %q", got, want)
+				}
+			})
+		})
+	}
+}
+
+// TestAcknowledgeDrainCallerDeadline checks a caller's deadline that provably comes before the acknowledgment's own
+// budget. The target reservation is prepared first. The budget, one value per Registry, is then measured on a sibling
+// reservation of the same Registry, from its Write's entry to the Write's interruption, and the caller's context gets
+// a deadline of half that, created just before the call. Two outcomes are correct: AcknowledgeDrain returns
+// context.DeadlineExceeded before any Write was entered, or the Write is entered, the deadline interrupts it, and the
+// call returns context.DeadlineExceeded after its Write has left. When the measured budget leaves no room for a
+// strictly shorter deadline, the case is logged as not constructed and nothing about deadlines is asserted.
+func TestAcknowledgeDrainCallerDeadline(t *testing.T) {
+	tests := map[string]struct {
+		target, sibling workerlink.Generation
+	}{
+		"error: the caller's deadline comes before the budget": {target: "gen-a", sibling: "gen-sibling"},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			guardedBubble(t, func(t *testing.T, at func(string)) {
+				r := newGatedRegistry(t)
+				at("preparing the target reservation")
+				g := r.reserve(t, tt.target, 41001, 4101)
+
+				at("measuring the budget on a sibling reservation of the same registry")
+				sibling := r.reserve(t, tt.sibling, 41003, 4103)
+				sibAck := startAck(t.Context(), sibling.res)
+				await(t, sibling.parent.entered, "the sibling acknowledgment's write")
+				if err := awaitLeftWrite(t, sibling, sibAck); err == nil {
+					t.Fatal("the sibling AcknowledgeDrain reported success for a line the worker never read")
+				}
+				entry, _ := sibling.parent.heldSpan()
+				budget := sibling.parent.interruption().Sub(entry)
+				if err := sibling.res.End(); err != nil {
+					t.Fatalf("End of the sibling: %v", err)
+				}
+				if budget <= 0 {
+					t.Logf("the budget measured on the sibling is %v; no deadline strictly shorter than it can be placed, so the case was not constructed and no deadline is checked", budget)
+					return
+				}
+
+				ctx, cancel := context.WithTimeout(t.Context(), budget/2)
+				defer cancel()
+				deadline, _ := ctx.Deadline()
+				ack := startAck(ctx, g.res)
+				at("waiting for the target's Write to begin or its acknowledgment to return")
+				select {
+				case err := <-ack.done:
+					ack.returned, ack.err = true, err
+					// Refused before writing: no Write may have been entered.
+					if !errors.Is(err, context.DeadlineExceeded) {
+						t.Errorf("AcknowledgeDrain before any Write = %v, want %v", err, context.DeadlineExceeded)
+					}
+					if offered, writes := g.parent.attempts(); writes != 0 {
+						t.Errorf("AcknowledgeDrain returned before its Write was held, yet %d Write calls were made (%q)", writes, offered)
+					}
+				case <-g.parent.entered:
+					at("the target's Write interrupted and held before it returns")
+					err := awaitLeftWrite(t, g, ack)
+					if got := g.parent.interruption(); !got.Equal(deadline) {
+						t.Errorf("the Write was interrupted %v from the caller's deadline; that deadline, which comes before the budget, must end it", got.Sub(deadline))
+					}
+					if !errors.Is(err, context.DeadlineExceeded) {
+						t.Errorf("AcknowledgeDrain whose Write the caller's deadline ended = %v, want %v", err, context.DeadlineExceeded)
+					}
+				case <-time.After(watchdog):
+					t.Fatalf("neither the Write began nor AcknowledgeDrain returned within %v", watchdog)
+				}
+				checkFailedAckKeeps(t, r.reg, g)
 			})
 		})
 	}
