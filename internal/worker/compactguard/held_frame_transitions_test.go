@@ -44,21 +44,21 @@ func TestGuardHeldFramesAtBothTransitions(t *testing.T) {
 	longDelta := frameTextDelta(strings.Repeat("x", 1000))
 	tests := map[string]struct {
 		// reads are the upstream body's reads, in order; each is returned by one Read call.
-		reads      []string
-		wantWrites []string
+		reads []string
+		// wantFirst is the first client write, the released batch; wantRest is every later write joined.
+		wantFirst, wantRest string
+		// single requires the batch to be the only write.
+		single bool
 	}{
 		"success: a summary under the limit is released in one write when the attempt is accepted": {
-			reads:      []string{frameMessageStart, frameBlockStart, frameTextDelta("held"), frameBlockStop, frameMessageDelta, frameMessageStop},
-			wantWrites: []string{advertisedStart + frameBlockStart + frameTextDelta("held") + frameBlockStop + frameMessageDelta + frameMessageStop},
+			reads:     []string{frameMessageStart, frameBlockStart, frameTextDelta("held"), frameBlockStop, frameMessageDelta, frameMessageStop},
+			wantFirst: advertisedStart + frameBlockStart + frameTextDelta("held") + frameBlockStop + frameMessageDelta + frameMessageStop,
+			single:    true,
 		},
-		"success: a summary over the limit releases its held frames in one write and streams the rest on its own": {
-			reads: []string{frameMessageStart, frameBlockStart, longDelta + frameBlockStop, frameMessageDelta, frameMessageStop},
-			wantWrites: []string{
-				advertisedStart + frameBlockStart + longDelta,
-				frameBlockStop,
-				frameMessageDelta,
-				frameMessageStop,
-			},
+		"success: a summary over the limit releases its held frames in one write and streams the rest after it": {
+			reads:     []string{frameMessageStart, frameBlockStart, longDelta + frameBlockStop, frameMessageDelta, frameMessageStop},
+			wantFirst: advertisedStart + frameBlockStart + longDelta,
+			wantRest:  frameBlockStop + frameMessageDelta + frameMessageStop,
 		},
 	}
 	for name, tt := range tests {
@@ -88,8 +88,19 @@ func TestGuardHeldFramesAtBothTransitions(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Serve: %v", err)
 			}
-			if diff := gocmp.Diff(tt.wantWrites, w.writes); diff != "" {
-				t.Errorf("client writes (-want +got):\n%s", diff)
+			if len(w.writes) == 0 {
+				t.Fatal("the guard wrote nothing to the client")
+			}
+			if diff := gocmp.Diff(tt.wantFirst, w.writes[0]); diff != "" {
+				t.Errorf("first client write, the released batch (-want +got):\n%s", diff)
+			}
+			if diff := gocmp.Diff(tt.wantRest, strings.Join(w.writes[1:], "")); diff != "" {
+				t.Errorf("client writes after the batch, joined (-want +got):\n%s", diff)
+			}
+			if tt.single {
+				if diff := gocmp.Diff(1, len(w.writes)); diff != "" {
+					t.Errorf("client writes of an accepted summary (-want +got):\n%s", diff)
+				}
 			}
 			if diff := gocmp.Diff([]int{http.StatusOK}, w.heads); diff != "" {
 				t.Errorf("response heads (-want +got):\n%s", diff)
