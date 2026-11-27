@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/zchee/claude-code-model-gateway/internal/worker/outcome"
+	"github.com/zchee/claude-code-model-gateway/internal/worker/sentry"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/sse"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/upstream"
 )
@@ -32,19 +33,45 @@ import (
 // shutdownRelay runs one relay variant against resp with the given service context and client signal.
 type shutdownRelay func(ctx context.Context, w http.ResponseWriter, resp *upstream.Response, clientDone <-chan struct{}) (outcome.Result, error)
 
+// relayObservation is where a relay variant reports what it observes: a usage spy, and a sentry
+// state with the session and target it observes into.
+type relayObservation struct {
+	usage   *usageSpy
+	sentry  *sentry.State
+	session string
+	target  sentry.Target
+}
+
 func shutdownRelays() map[string]shutdownRelay {
+	return observedShutdownRelays(nil)
+}
+
+// observedShutdownRelays is shutdownRelays reporting to obs. With a nil obs every run gets a usage
+// spy of its own and no sentry.
+func observedShutdownRelays(obs *relayObservation) map[string]shutdownRelay {
+	observation := func() relayObservation {
+		if obs == nil {
+			return relayObservation{usage: &usageSpy{}}
+		}
+		return *obs
+	}
 	return map[string]shutdownRelay{
 		"proxy relay": func(ctx context.Context, w http.ResponseWriter, resp *upstream.Response, clientDone <-chan struct{}) (outcome.Result, error) {
+			o := observation()
 			return sse.RelayProxy(ctx, w, resp, sse.ProxyOptions{
 				Provider:          "codex",
 				AdvertisedModel:   "claude-gpt-5.6-sol",
 				BackendModel:      "gpt-5.6-sol",
 				HeartbeatInterval: -1,
 				ClientDone:        clientDone,
-				Usage:             &usageSpy{},
+				Usage:             o.usage,
+				Sentry:            o.sentry,
+				SessionKey:        o.session,
+				SentryTarget:      o.target,
 			})
 		},
 		"LM Studio proxy relay": func(ctx context.Context, w http.ResponseWriter, resp *upstream.Response, clientDone <-chan struct{}) (outcome.Result, error) {
+			o := observation()
 			return sse.RelayProxy(ctx, w, resp, sse.ProxyOptions{
 				Provider:          sse.LMStudioProvider,
 				AdvertisedModel:   "claude-lmstudio/qwen3-coder-30b",
@@ -52,22 +79,33 @@ func shutdownRelays() map[string]shutdownRelay {
 				HeartbeatInterval: -1,
 				FirstEventWait:    5 * time.Second,
 				ClientDone:        clientDone,
-				Usage:             &usageSpy{},
+				Usage:             o.usage,
+				Sentry:            o.sentry,
+				SessionKey:        o.session,
+				SentryTarget:      o.target,
 				OnOverflow:        testEngineOverflowResponder,
 			})
 		},
 		"Anthropic passthrough": func(ctx context.Context, w http.ResponseWriter, resp *upstream.Response, clientDone <-chan struct{}) (outcome.Result, error) {
+			o := observation()
 			return sse.RelayPassthrough(ctx, w, resp, sse.PassthroughOptions{
-				ClientDone: clientDone,
-				Usage:      &usageSpy{},
+				ClientDone:   clientDone,
+				Usage:        o.usage,
+				Sentry:       o.sentry,
+				SessionKey:   o.session,
+				SentryTarget: o.target,
 			})
 		},
 		"proxy passthrough": func(ctx context.Context, w http.ResponseWriter, resp *upstream.Response, clientDone <-chan struct{}) (outcome.Result, error) {
+			o := observation()
 			return sse.RelayPassthrough(ctx, w, resp, sse.PassthroughOptions{
 				ProxyProvider:     "codex",
 				HeartbeatInterval: -1,
 				ClientDone:        clientDone,
-				Usage:             &usageSpy{},
+				Usage:             o.usage,
+				Sentry:            o.sentry,
+				SessionKey:        o.session,
+				SentryTarget:      o.target,
 			})
 		},
 	}

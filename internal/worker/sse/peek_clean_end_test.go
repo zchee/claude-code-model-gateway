@@ -17,6 +17,7 @@ package sse_test
 import (
 	"net/http"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	gocmp "github.com/google/go-cmp/cmp"
@@ -47,42 +48,50 @@ func TestLMStudioCleanEndBeforeFirstFrame(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			chunks := make([][]byte, len(tt.chunks))
-			var want string
-			for i, c := range tt.chunks {
-				chunks[i] = []byte(c)
-				want += c
-			}
-			src := newEOFChunkBody(chunks...)
-			rec := newStreamingRecorder()
+			// The bubble makes the first-event wait virtual, so it cannot hand the read back on a real
+			// deadline and let the clean end reach the relay by another path.
+			synctest.Test(t, func(t *testing.T) {
+				chunks := make([][]byte, len(tt.chunks))
+				var want string
+				for i, c := range tt.chunks {
+					chunks[i] = []byte(c)
+					want += c
+				}
+				src := newEOFChunkBody(chunks...)
+				rec := newStreamingRecorder()
+				start := time.Now()
 
-			res, err := sse.RelayProxy(t.Context(), rec, sseResponse(src, nil), sse.ProxyOptions{
-				Provider:          sse.LMStudioProvider,
-				AdvertisedModel:   "claude-lmstudio/qwen3-coder-30b",
-				BackendModel:      "lmstudio/qwen3-coder-30b",
-				HeartbeatInterval: -1,
-				FirstEventWait:    time.Hour,
-				OnOverflow:        testEngineOverflowResponder,
+				res, err := sse.RelayProxy(t.Context(), rec, sseResponse(src, nil), sse.ProxyOptions{
+					Provider:          sse.LMStudioProvider,
+					AdvertisedModel:   "claude-lmstudio/qwen3-coder-30b",
+					BackendModel:      "lmstudio/qwen3-coder-30b",
+					HeartbeatInterval: -1,
+					FirstEventWait:    time.Hour,
+					OnOverflow:        testEngineOverflowResponder,
+				})
+				if elapsed := time.Since(start); elapsed != 0 {
+					t.Errorf("RelayProxy returned after %v of virtual time, want 0: the first-event wait expired", elapsed)
+				}
+				if err != nil {
+					t.Errorf("RelayProxy error = %v, want nil", err)
+				}
+				if diff := gocmp.Diff(outcome.Result{Status: http.StatusOK, StatusOverride: upstreamErrorOverride}, res); diff != "" {
+					t.Errorf("RelayProxy result (-want +got):\n%s", diff)
+				}
+				status, wroteHeader, body, _, _ := rec.snapshot()
+				if !wroteHeader || status != http.StatusOK {
+					t.Errorf("client head wroteHeader=%t status=%d, want a 200 head", wroteHeader, status)
+				}
+				if got := rec.Header().Get("Content-Type"); got != "text/event-stream" {
+					t.Errorf("client Content-Type = %q, want the upstream's text/event-stream", got)
+				}
+				if diff := gocmp.Diff(want, body); diff != "" {
+					t.Errorf("client body (-want the bytes that arrived +got):\n%s", diff)
+				}
+				if got := src.closes.Load(); got != 1 {
+					t.Errorf("owned resp.Body close count = %d, want 1", got)
+				}
 			})
-			if err != nil {
-				t.Errorf("RelayProxy error = %v, want nil", err)
-			}
-			if diff := gocmp.Diff(outcome.Result{Status: http.StatusOK, StatusOverride: upstreamErrorOverride}, res); diff != "" {
-				t.Errorf("RelayProxy result (-want +got):\n%s", diff)
-			}
-			status, wroteHeader, body, _, _ := rec.snapshot()
-			if !wroteHeader || status != http.StatusOK {
-				t.Errorf("client head wroteHeader=%t status=%d, want a 200 head", wroteHeader, status)
-			}
-			if got := rec.Header().Get("Content-Type"); got != "text/event-stream" {
-				t.Errorf("client Content-Type = %q, want the upstream's text/event-stream", got)
-			}
-			if diff := gocmp.Diff(want, body); diff != "" {
-				t.Errorf("client body (-want the bytes that arrived +got):\n%s", diff)
-			}
-			if got := src.closes.Load(); got != 1 {
-				t.Errorf("owned resp.Body close count = %d, want 1", got)
-			}
 		})
 	}
 }

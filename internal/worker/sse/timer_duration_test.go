@@ -38,11 +38,19 @@ const nodeTimerMax = 1<<31 - 1
 // durations taken as given: a fraction of a millisecond is kept, a duration beyond the JavaScript
 // timer maximum is kept, and a negative first-event wait hands the stream back at once. The
 // source's timers would fire one millisecond early, after one millisecond, and after one
-// millisecond for these values. The timer is checked one nanosecond before its duration and at
-// it, on the bubble's virtual clock.
+// millisecond for these values. A heartbeat is timed by the bubble's virtual clock at the moment
+// the relay writes it, and must arrive exactly at its interval; a first-event wait is checked one
+// nanosecond before its duration and at it.
+//
+// The recorder holds the relay inside the first heartbeat write until the test lets it go, so a
+// relay that armed a much shorter timer writes one heartbeat, not one per millisecond of a virtual
+// wait that lasts weeks. A virtual watchdog ends the wait when no heartbeat comes at all.
 func TestRelayTimerDurations(t *testing.T) {
 	// literalHeartbeat restates sse.HeartbeatComment.
 	const literalHeartbeat = ": ping\n\n"
+	// watchdogSlack is how long after its interval a heartbeat may still be awaited before the
+	// test reports that none came.
+	const watchdogSlack = time.Second
 	beyondNodeMax := time.Duration(nodeTimerMax+1)*time.Millisecond + 500*time.Microsecond
 
 	heartbeatRelays := map[string]func(ctx context.Context, w http.ResponseWriter, resp *upstream.Response, interval time.Duration) (outcome.Result, error){
@@ -91,6 +99,28 @@ func TestRelayTimerDurations(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				src := newHeldBody()
 				rec := newStreamingRecorder()
+				start := time.Now()
+				// beats carries the virtual time of the first heartbeat write; gate holds the relay in
+				// that write until the test opens it.
+				beats := make(chan time.Duration, 1)
+				gate := make(chan struct{})
+				gateOpen := false
+				openGate := func() {
+					if !gateOpen {
+						gateOpen = true
+						close(gate)
+					}
+				}
+				rec.onWrite = func(chunk string) {
+					if !strings.Contains(chunk, literalHeartbeat) {
+						return
+					}
+					select {
+					case beats <- time.Since(start):
+					default:
+					}
+					<-gate
+				}
 				run := func(ctx context.Context) (outcome.Result, error) {
 					if tt.relay == "LM Studio proxy relay" {
 						return sse.RelayProxy(ctx, rec, sseResponse(src, nil), sse.ProxyOptions{
@@ -115,43 +145,53 @@ func TestRelayTimerDurations(t *testing.T) {
 				}()
 				joined := false
 				defer func() {
+					openGate()
 					if !joined {
 						_ = src.Close()
 						<-done
 					}
 				}()
 
-				// fired reports whether the timer under test has fired by now.
-				fired := func() bool {
-					_, wroteHeader, body, _, _ := rec.snapshot()
-					if tt.heartbeat != 0 {
-						return strings.Contains(body, literalHeartbeat)
-					}
-					return wroteHeader
-				}
-				start := time.Now()
-				synctest.Wait()
-				if tt.fireAt > 0 {
-					time.Sleep(tt.fireAt - time.Nanosecond)
-					synctest.Wait()
-					if fired() {
-						t.Fatalf("timer fired by %v, before its duration %v", time.Since(start), tt.fireAt)
-					}
-					time.Sleep(time.Nanosecond)
-					synctest.Wait()
-				}
-				if !fired() {
-					t.Fatalf("timer had not fired at %v, its duration %v", time.Since(start), tt.fireAt)
-				}
 				if tt.heartbeat != 0 {
+					watchdog := time.NewTimer(tt.fireAt + watchdogSlack)
+					select {
+					case elapsed := <-beats:
+						watchdog.Stop()
+						if elapsed != tt.fireAt {
+							t.Errorf("first heartbeat written at %v, want exactly its interval %v", elapsed, tt.fireAt)
+						}
+					case <-watchdog.C:
+						t.Fatalf("no heartbeat written by %v, its interval %v", time.Since(start), tt.fireAt)
+					}
 					_, _, body, _, _ := rec.snapshot()
 					if got := strings.Count(body, literalHeartbeat); got != 1 {
-						t.Errorf("heartbeats at %v = %d, want 1; body=%q", tt.fireAt, got, body)
+						t.Errorf("heartbeats at the first one = %d, want 1; body=%q", got, body)
 					}
-				} else if status, _, _, _, _ := rec.snapshot(); status != http.StatusOK {
-					t.Errorf("head committed at the hand-back = %d, want 200", status)
+				} else {
+					synctest.Wait()
+					if tt.fireAt > 0 {
+						time.Sleep(tt.fireAt - time.Nanosecond)
+						synctest.Wait()
+						if _, wroteHeader, _, _, _ := rec.snapshot(); wroteHeader {
+							t.Fatalf("first-event wait handed the stream back by %v, before its duration %v", time.Since(start), tt.fireAt)
+						}
+						time.Sleep(time.Nanosecond)
+						synctest.Wait()
+					}
+					if _, wroteHeader, _, _, _ := rec.snapshot(); !wroteHeader {
+						t.Fatalf("first-event wait had not handed the stream back at %v, its duration %v", time.Since(start), tt.fireAt)
+					}
+					if status, _, _, _, _ := rec.snapshot(); status != http.StatusOK {
+						t.Errorf("head committed at the hand-back = %d, want 200", status)
+					}
+					select {
+					case elapsed := <-beats:
+						t.Errorf("heartbeat written at %v with heartbeats disabled", elapsed)
+					default:
+					}
 				}
 
+				openGate()
 				src.release("", io.EOF)
 				synctest.Wait()
 				select {
