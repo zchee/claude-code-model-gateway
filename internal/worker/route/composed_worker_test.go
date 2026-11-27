@@ -25,7 +25,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -62,13 +61,11 @@ const composedListing = `{"data":[` +
 func composedClock() time.Time { return time.UnixMilli(1_700_000_000_000).UTC() }
 
 // providerFake is a loopback provider that records every inference request it receives. A model
-// listing fetch is counted apart, so it never stands in for a forwarded turn.
+// listing fetch is answered without being recorded, so it never stands in for a forwarded turn.
 type providerFake struct {
-	srv      *httptest.Server
-	listings atomic.Int64
-	mu       sync.Mutex
-	bodies   [][]byte
-	paths    []string
+	srv    *httptest.Server
+	mu     sync.Mutex
+	bodies [][]byte
 }
 
 func newProviderFake(t *testing.T, listing string, answer func(http.ResponseWriter, []byte)) *providerFake {
@@ -76,7 +73,6 @@ func newProviderFake(t *testing.T, listing string, answer func(http.ResponseWrit
 	f := &providerFake{}
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if listing != "" && r.Method == http.MethodGet && r.URL.Path == "/v1/models" {
-			f.listings.Add(1)
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, listing)
 			return
@@ -88,7 +84,6 @@ func newProviderFake(t *testing.T, listing string, answer func(http.ResponseWrit
 		}
 		f.mu.Lock()
 		f.bodies = append(f.bodies, body)
-		f.paths = append(f.paths, r.URL.Path)
 		f.mu.Unlock()
 		answer(w, body)
 	}))
@@ -96,14 +91,14 @@ func newProviderFake(t *testing.T, listing string, answer func(http.ResponseWrit
 	return f
 }
 
-// received returns copies of the inference request bodies and paths in arrival order.
-func (f *providerFake) received() (bodies, paths []string) {
+// received returns copies of the inference request bodies in arrival order.
+func (f *providerFake) received() (bodies []string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, b := range f.bodies {
 		bodies = append(bodies, string(b))
 	}
-	return bodies, slices.Clone(f.paths)
+	return bodies
 }
 
 func jsonAnswer(body string) func(http.ResponseWriter, []byte) {

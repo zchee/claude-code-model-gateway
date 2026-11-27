@@ -36,48 +36,64 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/worker/sentry"
 )
 
-// parkOnce returns a gate whose first call after arm blocks until release. Every other call passes.
-type parkOnce struct {
-	armed    atomic.Bool
-	parked   chan struct{}
-	released chan struct{}
-	once     sync.Once
+// discoveryFile is the part of gateway-models.json the test compares.
+type discoveryFile struct {
+	BaseURL   string
+	FetchedAt int64
+	IDs       []string
 }
 
-func newParkOnce() *parkOnce {
-	return &parkOnce{parked: make(chan struct{}), released: make(chan struct{})}
-}
-
-func (p *parkOnce) pass() {
-	if p.armed.CompareAndSwap(true, false) {
-		close(p.parked)
-		<-p.released
+func readDiscoveryFile(t *testing.T, path string) (discoveryFile, []byte) {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read the discovery cache: %v", err)
 	}
+	var doc struct {
+		BaseURL   string `json:"baseUrl"`
+		FetchedAt int64  `json:"fetchedAt"`
+		Models    []struct {
+			ID string `json:"id"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("decode the discovery cache: %v", err)
+	}
+	out := discoveryFile{BaseURL: doc.BaseURL, FetchedAt: doc.FetchedAt, IDs: []string{}}
+	for _, m := range doc.Models {
+		out.IDs = append(out.IDs, m.ID)
+	}
+	return out, raw
 }
 
-func (p *parkOnce) release() { p.once.Do(func() { close(p.released) }) }
-
-// TestCatalogBurstNoWriteWait checks that GET /v1/models answers a burst of 50 concurrent requests from the published
-// catalog while the refresh that published it is still inside its discovery-cache sync. The source's handler only
-// reads the published snapshot and a refresh does the file work (lib/request-worker.js:1536-1538, and the burst of
-// test/codex-upstream-cases.test.js:205). Each case parks the sync at a step it runs while holding the lock that
-// serializes discovery writes (internal/worker/modelcache/discovery.go): the wiring read, the pin lookup, and the
-// timestamp taken just before the file is encoded and written. The burst completes before the park is released, so
-// no model-list response waited on the write; after the release the file holds the refreshed listing.
+// TestCatalogBurstNoWriteWait checks that a burst of 50 concurrent GET /v1/models requests completes while a discovery
+// synchronization is paused before it replaces the discovery-cache file. The source's handler only reads the published
+// snapshot and leaves the file work to the refresh (lib/request-worker.js:1536-1538; the burst size is that of
+// test/codex-upstream-cases.test.js:205). The test does not show progress while a writer is blocked inside the file
+// replacement itself: the source does not have that property either, because its discovery write runs synchronously
+// on the event loop.
+//
+// The listing is published by a completed refresh first. Then an explicit SyncDiscoveryCache is paused in
+// EffectiveBaseURL, the first step it takes after locking the mutex that serializes discovery writes, and before it
+// compares or replaces the file (internal/worker/modelcache/discovery.go). Only SyncDiscoveryCache calls
+// EffectiveBaseURL, so the paused caller is that synchronization. The burst must complete while the pause is held,
+// which a deadline cannot prove and does not: the pause returns only when the test releases it. After the release the
+// synchronization's own result is the join.
 func TestCatalogBurstNoWriteWait(t *testing.T) {
 	const gatewayURL = "http://127.0.0.1:18764"
 	const listing = `{"data":[{"id":"gpt-5.6-terra","display_name":"gpt-5.6-terra (codex)"},{"id":"kimi-k3","display_name":"kimi-k3 (kimi)"}]}`
 	const burst = 50
 	tests := map[string]struct {
-		// park selects the seam the discovery sync is held in.
-		park string
+		force bool
+		// wantState is the paused synchronization's result once released.
+		wantState string
 	}{
-		"success: sync parked reading the wiring":         {park: "wiring"},
-		"success: sync parked reading the pins":           {park: "pins"},
-		"success: sync parked before the file is written": {park: "write"},
+		"success: forced synchronization paused before it rewrites the file":   {force: true, wantState: "wrote"},
+		"success: unforced synchronization paused before it compares the file": {force: false, wantState: "unchanged"},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
+			// Created first so that its removal runs after every other cleanup below.
 			home := t.TempDir()
 			vars := map[string]string{
 				"HOME":                    home,
@@ -104,29 +120,35 @@ func TestCatalogBurstNoWriteWait(t *testing.T) {
 			}))
 			t.Cleanup(proxy.Close)
 
-			gate := newParkOnce()
+			// A clock that advances on every reading makes a rewritten file distinguishable by its fetchedAt.
+			base := time.UnixMilli(1_700_000_000_000).UTC()
+			var ticks atomic.Int64
+			clock := func() time.Time { return base.Add(time.Duration(ticks.Add(1)) * time.Millisecond) }
+
+			var (
+				armed    atomic.Bool
+				parked   = make(chan struct{})
+				released = make(chan struct{})
+				release  = sync.OnceFunc(func() { close(released) })
+			)
 			store := &route.Store{}
-			fixed := time.UnixMilli(1_700_000_000_000).UTC()
-			opts := modelcache.Options{
-				Lookup:           lookup,
-				Paths:            resolver,
-				ProxyBaseURL:     proxy.URL,
-				DefaultBaseURL:   gatewayURL,
-				Client:           proxy.Client(),
-				Clock:            func() time.Time { return fixed },
-				Routes:           store,
-				Sentry:           &sentry.State{},
-				EffectiveBaseURL: func() (string, error) { return gatewayURL, nil },
-			}
-			switch tt.park {
-			case "wiring":
-				opts.EffectiveBaseURL = func() (string, error) { gate.pass(); return gatewayURL, nil }
-			case "pins":
-				opts.CurrentPins = func() map[string]string { gate.pass(); return nil }
-			case "write":
-				opts.Clock = func() time.Time { gate.pass(); return fixed }
-			}
-			cache, err := modelcache.New(opts)
+			cache, err := modelcache.New(modelcache.Options{
+				Lookup:         lookup,
+				Paths:          resolver,
+				ProxyBaseURL:   proxy.URL,
+				DefaultBaseURL: gatewayURL,
+				Client:         proxy.Client(),
+				Clock:          clock,
+				Routes:         store,
+				Sentry:         &sentry.State{},
+				EffectiveBaseURL: func() (string, error) {
+					if armed.CompareAndSwap(true, false) {
+						close(parked)
+						<-released
+					}
+					return gatewayURL, nil
+				},
+			})
 			if err != nil {
 				t.Fatalf("modelcache.New: %v", err)
 			}
@@ -135,21 +157,39 @@ func TestCatalogBurstNoWriteWait(t *testing.T) {
 			gateway := httptest.NewServer(handler(t, worker.Options{Routes: store, Models: cache.ModelsResponse, HealthCatalog: cache.HealthCatalog}))
 			t.Cleanup(gateway.Close)
 			t.Cleanup(gateway.Client().CloseIdleConnections)
-			// Registered last so it runs first: a failed case releases the park before the server waits for
-			// the requests that may still be held behind it.
-			t.Cleanup(gate.release)
+			// Registered last, so it runs first: on any failure the pause is released and every goroutine the test
+			// started has returned before the listener closes and the temporary directory is removed.
+			var started sync.WaitGroup
+			t.Cleanup(func() {
+				release()
+				started.Wait()
+			})
 
-			// The refresh is the only caller between arming and the park, so the parked call is the sync's.
-			gate.armed.Store(true)
-			refreshed := make(chan error, 1)
-			go func() { refreshed <- cache.Refresh(t.Context()) }()
-			select {
-			case <-gate.parked:
-			case err := <-refreshed:
-				t.Fatalf("the refresh returned (%v) without reaching the %s step of its discovery sync", err, tt.park)
+			if err := cache.Refresh(t.Context()); err != nil {
+				t.Fatalf("Refresh: %v", err)
 			}
-			if _, statErr := os.Stat(discoveryPath); !os.IsNotExist(statErr) {
-				t.Fatalf("discovery cache exists before the parked sync wrote it: %v", statErr)
+			if source, _ := cache.HealthCatalog(); source != "proxy" {
+				t.Fatalf("catalog source after the refresh = %q, want the proxy listing", source)
+			}
+			before, beforeRaw := readDiscoveryFile(t, discoveryPath)
+
+			type syncResult struct {
+				result modelcache.DiscoverySyncResult
+				err    error
+			}
+			synced := make(chan syncResult, 1)
+			armed.Store(true)
+			started.Go(func() {
+				result, err := cache.SyncDiscoveryCache(tt.force)
+				synced <- syncResult{result, err}
+			})
+			// This deadline only reports a setup that never reaches the pause.
+			select {
+			case <-parked:
+			case r := <-synced:
+				t.Fatalf("the synchronization returned (%+v, %v) without calling EffectiveBaseURL", r.result, r.err)
+			case <-time.After(30 * time.Second):
+				t.Fatal("the synchronization did not reach EffectiveBaseURL within 30s")
 			}
 
 			type response struct {
@@ -159,7 +199,7 @@ func TestCatalogBurstNoWriteWait(t *testing.T) {
 			}
 			responses := make(chan response, burst)
 			for range burst {
-				go func() {
+				started.Go(func() {
 					req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, gateway.URL+"/v1/models", nil)
 					if err != nil {
 						responses <- response{err: err}
@@ -182,10 +222,9 @@ func TestCatalogBurstNoWriteWait(t *testing.T) {
 						ids = append(ids, row.ID)
 					}
 					responses <- response{status: resp.StatusCode, ids: ids, err: err}
-				}()
+				})
 			}
-			// The deadline only turns a burst stuck behind the parked write into a failure; success is the burst
-			// completing while the park is still held.
+			// The deadline only turns a burst stuck behind the paused synchronization into a failure.
 			deadline := time.NewTimer(30 * time.Second)
 			defer deadline.Stop()
 			for i := range burst {
@@ -199,49 +238,40 @@ func TestCatalogBurstNoWriteWait(t *testing.T) {
 						t.Fatalf("model-list request %d served %q, want the refreshed proxy listing", i, r.ids)
 					}
 				case <-deadline.C:
-					t.Fatalf("only %d of %d model-list requests answered while the discovery sync was parked at the %s step", i, burst, tt.park)
+					t.Fatalf("only %d of %d model-list requests answered while the discovery synchronization was paused", i, burst)
 				}
 			}
 			select {
-			case err := <-refreshed:
-				t.Fatalf("the refresh returned (%v) while its discovery sync was parked", err)
+			case r := <-synced:
+				t.Fatalf("the synchronization returned (%+v, %v) while it was paused", r.result, r.err)
 			default:
 			}
 			if got := listings.Load(); got != 1 {
 				t.Errorf("proxy listing fetched %d times, want 1: the burst must not start refreshes", got)
 			}
+			if _, raw := readDiscoveryFile(t, discoveryPath); string(raw) != string(beforeRaw) {
+				t.Error("the discovery cache changed while its synchronization was paused")
+			}
 
-			gate.release()
-			if err := <-refreshed; err != nil {
-				t.Fatalf("Refresh: %v", err)
+			release()
+			r := <-synced
+			if r.err != nil {
+				t.Fatalf("SyncDiscoveryCache: %v", r.err)
 			}
-			raw, err := os.ReadFile(discoveryPath)
-			if err != nil {
-				t.Fatalf("the released sync did not write the discovery cache: %v", err)
+			if diff := gocmp.Diff(tt.wantState, r.result.State); diff != "" {
+				t.Errorf("synchronization state (-want +got):\n%s", diff)
 			}
-			var written struct {
-				BaseURL   string `json:"baseUrl"`
-				FetchedAt int64  `json:"fetchedAt"`
-				Models    []struct {
-					ID string `json:"id"`
-				} `json:"models"`
+			after, afterRaw := readDiscoveryFile(t, discoveryPath)
+			if !slices.Contains(after.IDs, "claude-kimi-k3") || after.BaseURL != gatewayURL {
+				t.Errorf("discovery cache after the release = %+v, want the refreshed listing under %s", after, gatewayURL)
 			}
-			if err := json.Unmarshal(raw, &written); err != nil {
-				t.Fatalf("decode the discovery cache: %v", err)
-			}
-			ids := []string{}
-			for _, m := range written.Models {
-				ids = append(ids, m.ID)
-			}
-			type file struct {
-				BaseURL   string
-				FetchedAt int64
-				HasKimi   bool
-			}
-			got := file{written.BaseURL, written.FetchedAt, slices.Contains(ids, "claude-kimi-k3")}
-			want := file{BaseURL: gatewayURL, FetchedAt: fixed.UnixMilli(), HasKimi: true}
-			if diff := gocmp.Diff(want, got); diff != "" {
-				t.Errorf("discovery cache after the release (-want +got):\n%s\nmodels: %q", diff, ids)
+			if tt.force {
+				// The forced write reads the clock after the refresh's write did, so a rewrite shows as a later fetchedAt.
+				if after.FetchedAt <= before.FetchedAt {
+					t.Errorf("fetchedAt = %d after the forced synchronization, want later than %d", after.FetchedAt, before.FetchedAt)
+				}
+			} else if string(afterRaw) != string(beforeRaw) {
+				t.Error("an unforced synchronization of an unchanged listing rewrote the discovery cache")
 			}
 		})
 	}

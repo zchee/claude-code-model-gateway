@@ -91,7 +91,7 @@ func TestRoutingKeepPlanToolsOverride(t *testing.T) {
 			if status != http.StatusOK {
 				t.Fatalf("status = %d, want 200; body:\n%s", status, body)
 			}
-			forwarded, _ := cw.proxy.received()
+			forwarded := cw.proxy.received()
 			if len(forwarded) != 1 {
 				t.Fatalf("the proxy received %d requests, want 1", len(forwarded))
 			}
@@ -142,9 +142,9 @@ func TestRoutingGrokThreadNotForwarded(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			cw := newComposedWorker(t, nil, jsonAnswer(`{"type":"message","model":"gpt-5.6-terra","content":[]}`))
 			status, contentType, body := cw.post(tt.path, tt.body)
-			grokBodies, _ := cw.grok.received()
-			anthropicBodies, _ := cw.anthropic.received()
-			proxyBodies, _ := cw.proxy.received()
+			grokBodies := cw.grok.received()
+			anthropicBodies := cw.anthropic.received()
+			proxyBodies := cw.proxy.received()
 			if !tt.refused {
 				if status != http.StatusOK || len(grokBodies) != 1 {
 					t.Fatalf("status = %d with %d Grok requests, want 200 with 1; body:\n%s", status, len(grokBodies), body)
@@ -156,7 +156,7 @@ func TestRoutingGrokThreadNotForwarded(t *testing.T) {
 				ContentType, Body                         string
 				Grok, GrokDials, Issuer, Anthropic, Proxy int
 			}
-			issuerBodies, _ := cw.issuer.received()
+			issuerBodies := cw.issuer.received()
 			got := observed{status, contentType, body, len(grokBodies), int(cw.grokDials.Load()), len(issuerBodies), len(anthropicBodies), len(proxyBodies)}
 			want := observed{Status: http.StatusBadRequest, ContentType: "application/json", Body: sourceThreadRefusal}
 			if diff := gocmp.Diff(want, got); diff != "" {
@@ -190,9 +190,9 @@ func TestRoutingListedProviderThreadRefusal(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			cw := newComposedWorker(t, nil, jsonAnswer(`{"id":"msg_proxy","type":"message","model":"backend","stop_reason":"end_turn","content":[],"usage":{"input_tokens":1,"output_tokens":1}}`))
 			status, contentType, body := cw.post(tt.path, tt.body)
-			proxyBodies, _ := cw.proxy.received()
-			anthropicBodies, _ := cw.anthropic.received()
-			grokBodies, _ := cw.grok.received()
+			proxyBodies := cw.proxy.received()
+			anthropicBodies := cw.anthropic.received()
+			grokBodies := cw.grok.received()
 			if !tt.refused {
 				if status != http.StatusOK || len(proxyBodies) != 1 {
 					t.Fatalf("status = %d with %d proxy requests, want 200 with 1; body:\n%s", status, len(proxyBodies), body)
