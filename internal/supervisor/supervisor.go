@@ -32,6 +32,7 @@ import (
 
 	"github.com/zchee/claude-code-model-gateway/internal/controlauth"
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
+	"github.com/zchee/claude-code-model-gateway/internal/workerlink"
 )
 
 const (
@@ -71,6 +72,16 @@ func NewHandler(publicPort int, workerPort func() int, token, version string, pi
 		return nil, errors.New("model-gateway: the supervisor needs its public port and a worker port source")
 	}
 	return &handler{publicPort: publicPort, workerPort: workerPort, token: token, version: version, pid: pid}, nil
+}
+
+// newLeaseHandler constructs the handler for an already bound public port that reaches workers only through leases
+// from workers, never by a port number. The recipient of a relayed request is the generation a lease reached: a body
+// taken by one generation is sent again only to a newer generation and only before response headers were relayed.
+// lost is called once, with the generation that took the body, when a request is answered with the 503 that forbids
+// a retry: when that generation is still current as the attempts run out, and also when the connection of the last
+// attempt reached a generation and then failed, whether or not that generation is still current, as the source does.
+func newLeaseHandler(publicPort int, workers workerlink.Source, token, version string, pid int, lost func(workerlink.Generation)) (http.Handler, error) {
+	panic("not implemented")
 }
 
 func validToken(token string) bool {

@@ -83,6 +83,10 @@ type shim struct {
 	timedOut     bool
 	stderrWrites sync.Mutex
 	tasks        sync.WaitGroup
+
+	// startCmd starts a prepared worker command; nil means (*exec.Cmd).Start. Only the package's tests set it, to hold
+	// a launch at a barrier of their own.
+	startCmd func(*exec.Cmd) error
 }
 
 type workerProc struct {
@@ -94,7 +98,13 @@ type workerProc struct {
 	exited     chan struct{}
 }
 
-func (s *shim) port() int { return int(s.endpoint.Load()) }
+func (s *shim) port() int {
+	port := int(s.endpoint.Load())
+	if hook := hooksOf(s.lifetime).relayLookup; hook != nil {
+		hook(port != 0)
+	}
+	return port
+}
 
 func (s *shim) logf(format string, args ...any) {
 	s.stderrWrites.Lock()
@@ -232,6 +242,10 @@ func (s *shim) writeRecord(name, role string, pid int, command, generation strin
 // startWorker launches one worker unless the supervisor is stopping or a worker is still running
 // (lib/commands.js:2593-2641).
 func (s *shim) startWorker() {
+	started := false
+	if hook := hooksOf(s.lifetime).launchEnded; hook != nil {
+		defer func() { hook(started) }()
+	}
 	s.mu.Lock()
 	if s.stopped || s.current != nil {
 		s.mu.Unlock()
@@ -252,6 +266,7 @@ func (s *shim) startWorker() {
 		return
 	}
 	s.current = w
+	started = true
 	s.files.Record("worker-started", map[string]any{"component": "supervisor", "pid": s.pid, "startedAt": s.startedAt, "child": map[string]any{"component": "worker", "pid": w.pid}})
 	s.tasks.Go(func() { s.readReport(w) })
 	s.tasks.Go(func() { s.awaitExit(w) })
@@ -259,6 +274,9 @@ func (s *shim) startWorker() {
 }
 
 func (s *shim) spawn() (*workerProc, error) {
+	if hook := hooksOf(s.lifetime).launching; hook != nil {
+		hook()
+	}
 	log, err := os.OpenFile(filepath.Join(s.state, "logs", "shim.log"), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o666)
 	if err != nil {
 		return nil, err
@@ -280,7 +298,14 @@ func (s *shim) spawn() (*workerProc, error) {
 	cmd.Stdout, cmd.Stderr = log, log
 	// The child's ends become descriptors 3 and 4; the supervisor holds the only write end of the liveness pipe.
 	cmd.ExtraFiles = []*os.File{reportW, liveR}
-	err = cmd.Start()
+	start := s.startCmd
+	if start == nil {
+		start = (*exec.Cmd).Start
+	}
+	if hook := hooksOf(s.lifetime).starting; hook != nil {
+		hook()
+	}
+	err = start(cmd)
 	_, _ = reportW.Close(), liveR.Close()
 	if err != nil {
 		_, _ = reportR.Close(), liveW.Close()
@@ -349,6 +374,9 @@ func (s *shim) publish(w *workerProc, port int, eligible bool) error {
 	if !eligible {
 		return nil
 	}
+	if hook := hooksOf(s.lifetime).published; hook != nil {
+		hook(w.pid)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.stopped || s.current != w || s.timedOut {
@@ -408,6 +436,7 @@ func (s *shim) reportExpired(epoch uint64) {
 // being eligible before any of the slower steps run; a relay that loads the port afterwards finds no worker.
 func (s *shim) awaitExit(w *workerProc) {
 	err := w.cmd.Wait()
+	holdExitObservation(s.lifetime, w.pid)
 	s.mu.Lock()
 	if s.current == w {
 		s.current = nil
@@ -423,6 +452,49 @@ func (s *shim) awaitExit(w *workerProc) {
 	defer s.mu.Unlock()
 	if !s.stopped {
 		s.respawn = time.AfterFunc(respawnDelay, s.startWorker)
+	}
+}
+
+// testHooks are the points at which the package's tests hold or observe the supervisor. Only the package's tests put
+// them into Run's context; without them every point does nothing.
+type testHooks struct {
+	// launching runs at the start of every attempt to launch a worker, before anything is reserved or opened for it.
+	launching func()
+	// starting runs immediately before the worker's process is started, inside whatever serializes worker starts.
+	starting func()
+	// published runs once the eligible pid record of a worker has been written and before the worker becomes
+	// eligible for relay.
+	published func(pid int)
+	// exitObserved runs once the system has reported a worker's exit and before the supervisor acts on it.
+	exitObserved func(pid int)
+	// stopInhibited runs once a stop has recorded that no further worker may start, before the stop disconnects or
+	// waits for anything.
+	stopInhibited func()
+	// relayLookup runs each time the relay actually asks the supervisor for a worker to deliver a request to, with
+	// whether one was eligible. It reports lookups that happened; the relay is not required to make any, for instance
+	// while a worker that took the request is current.
+	relayLookup func(eligible bool)
+	// launchEnded runs once each decision whether to start a worker, the first one or a replacement, has been carried
+	// out, with whether a worker process was started; it runs without the supervisor's lock held.
+	launchEnded func(started bool)
+	// acknowledging runs just before the supervisor writes its answer to a worker's drain notice; the answer is written
+	// only once it returns.
+	acknowledging func() //nolint:unused,nolintlint // Unused only where export_test.go is not built: the supervisor does not answer drain notices yet, and the code that writes the answer runs it.
+}
+
+// hooksKey is the private context key of a testHooks value.
+type hooksKey struct{}
+
+func hooksOf(ctx context.Context) testHooks {
+	hooks, _ := ctx.Value(hooksKey{}).(testHooks)
+	return hooks
+}
+
+// holdExitObservation runs the exitObserved hook, if any, with the pid of a worker whose exit the system has just
+// reported, before the supervisor acts on that exit.
+func holdExitObservation(ctx context.Context, pid int) {
+	if hook := hooksOf(ctx).exitObserved; hook != nil {
+		hook(pid)
 	}
 }
 
@@ -459,6 +531,9 @@ func (s *shim) stop(signal string) {
 	s.reportTimer = nil
 	s.reportEpoch++
 	s.mu.Unlock()
+	if hook := hooksOf(s.lifetime).stopInhibited; hook != nil {
+		hook()
+	}
 	if signal != "" {
 		s.files.Record("supervisor-stop-requested", map[string]any{"component": "supervisor", "pid": s.pid, "startedAt": s.startedAt, "signal": signal})
 		if w != nil {

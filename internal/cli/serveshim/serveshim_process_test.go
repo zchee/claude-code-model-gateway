@@ -37,53 +37,12 @@ import (
 	"time"
 
 	gocmp "github.com/google/go-cmp/cmp"
-	"go.uber.org/goleak"
 
-	"github.com/zchee/claude-code-model-gateway/internal/cli/serveshim"
 	"github.com/zchee/claude-code-model-gateway/internal/controlauth"
 	"github.com/zchee/claude-code-model-gateway/internal/gatewaytest"
 	"github.com/zchee/claude-code-model-gateway/internal/lifecycle"
 	"github.com/zchee/claude-code-model-gateway/internal/procinfo"
-	"github.com/zchee/claude-code-model-gateway/internal/venue"
 )
-
-const (
-	fixtureVersion = "1.2.3"
-	workerStderr   = "fixture worker stderr"
-	fixtureStop    = "{\"type\":\"fixture-shutdown\"}\n"
-)
-
-func TestMain(m *testing.M) {
-	venue.Require()
-	if slices.Equal(os.Args[1:], []string{"serve-worker"}) && os.Getenv("MODEL_GATEWAY_TEST_SANDBOX") != "" {
-		if err := fixtureWorker(); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-	goleak.VerifyTestMain(m)
-}
-
-func TestGatewayFixtureHelper(t *testing.T) {
-	gatewaytest.DispatchHelper(t, map[string]gatewaytest.HelperFunc{"supervisor": func(t testing.TB, _ []string) {
-		exe, err := os.Executable()
-		if err != nil {
-			t.Fatal(err)
-		}
-		var output bytes.Buffer
-		opts := serveshim.Options{
-			Environment: os.Environ(), Home: os.UserHomeDir, Executable: exe, Version: fixtureVersion,
-			Stdout: io.MultiWriter(os.Stdout, &output), Stderr: os.Stderr,
-		}
-		if err := serveshim.Run(t.Context(), opts); err != nil {
-			t.Fatal(err)
-		}
-		if line, ok := strings.CutSuffix(output.String(), "\n"); !ok || strings.Contains(line, "\n") {
-			t.Error("supervisor stdout must contain exactly one complete readiness line")
-		}
-	}})
-}
 
 // The real supervisor execs this test executable with its normal worker argv.
 // Only the worker side of the descriptor protocol is supplied by the fixture.

@@ -134,6 +134,7 @@ func Run(ctx context.Context, options Options) error {
 	if err != nil {
 		return fmt.Errorf("model-gateway: worker could not listen on 127.0.0.1:%d: %w", port, err)
 	}
+	tcp = gateListener(ctx, tcp)
 	listeners := []net.Listener{tcp}
 	defer func() {
 		for _, ln := range listeners {
@@ -182,6 +183,10 @@ func Run(ctx context.Context, options Options) error {
 		stop.signal(stopNow)
 	case <-stop.done:
 	}
+	if stop.mode() == stopDrain {
+		// The drain ends admission here; the final sweep of the queued connections belongs at this point.
+		announceSweep(tcp)
+	}
 	life.stop(stop)
 	// Closing the descriptors ends a watcher that is still reading them.
 	if control != nil {
@@ -195,6 +200,29 @@ func Run(ctx context.Context, options Options) error {
 		return serveErr
 	}
 	return nil
+}
+
+// acceptGateKey is the private context key of the function gateListener applies.
+type acceptGateKey struct{}
+
+// gateListener returns the TCP listener the worker accepts on: ln, or what the function ctx carries under
+// acceptGateKey makes of it. Only the package's tests put such a function into Run's context, to decide when the
+// worker's ordinary accept loop may take a connection. The worker uses the returned listener for its ordinary accept
+// loop and calls announceSweep with it when its final sweep of a drain begins.
+func gateListener(ctx context.Context, ln net.Listener) net.Listener {
+	if gate, ok := ctx.Value(acceptGateKey{}).(func(net.Listener) net.Listener); ok && gate != nil {
+		return gate(ln)
+	}
+	return ln
+}
+
+// announceSweep tells a listener that wants to know that the worker's final sweep of a drain begins: the ordinary
+// accept loop takes no more connections, and the sweep accepts what is already queued. Any other listener is left
+// alone.
+func announceSweep(ln net.Listener) {
+	if l, ok := ln.(interface{ SweepStarting() }); ok {
+		l.SweepStarting()
+	}
 }
 
 func writerOr(w io.Writer) io.Writer {

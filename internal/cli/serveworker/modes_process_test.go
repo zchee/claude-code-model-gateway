@@ -76,7 +76,7 @@ func TestGatewayFixtureHelper(t *testing.T) {
 			t.Fatal(err)
 		}
 		_, _ = fmt.Fprintln(os.Stdout, "worker returned cleanly")
-	}, authStatusHelper: authStatusOutput})
+	}, authStatusHelper: authStatusOutput, serveworker.UnwindCensusHelper: func(t testing.TB, _ []string) { serveworker.UnwindCensus(t) }})
 }
 
 func pipe(t *testing.T) (*os.File, *os.File) {
