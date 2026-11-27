@@ -214,8 +214,8 @@ type Cache struct {
 	closed bool
 	wg     sync.WaitGroup
 
-	// firstListing is closed, through firstListingDone, once the first refresh after Start ended,
-	// whatever its outcome, or the refresh loop stopped.
+	// firstListing is closed, through firstListingDone, at the first commit of a refresh, or when
+	// the first refresh after Start ended without committing, or when the refresh loop stopped.
 	firstListing     chan struct{}
 	firstListingDone func()
 }
@@ -282,8 +282,13 @@ func New(opts Options) (*Cache, error) {
 	// Creating the subdirectory is itself an event in that directory: it happens here, while the
 	// worker starts and before it answers any request, and a write into an existing directory never
 	// creates it. A subdirectory that cannot be created makes the later writes fail as cache
-	// writes fail today.
-	for _, dir := range []string{c.stateDir, filepath.Dir(c.discoveryPath)} {
+	// writes fail today. A shadow cache writes nothing outside its own state directory, and it
+	// never writes the discovery cache, so that directory is left as it is.
+	dirs := []string{c.stateDir}
+	if !opts.Shadow {
+		dirs = append(dirs, filepath.Dir(c.discoveryPath))
+	}
+	for _, dir := range dirs {
 		if dir == "" || dir == "." {
 			continue
 		}
@@ -392,6 +397,8 @@ func (c *Cache) run(ctx context.Context) {
 			delay = min(delay*2, MaxRetryDelay)
 		}
 	}
+	// A commit already ended the startup wait; these release it when the first refresh ended
+	// without one, by an error or by stopping.
 	defer c.firstListingDone()
 	err := c.refresh(ctx, onListing)
 	c.firstListingDone()
@@ -588,6 +595,13 @@ func (c *Cache) commit(ctx context.Context, ticket uint64, base, next *committed
 	c.opts.Sentry.Publish(next.generation, next.snapshot.Resolver(), maps.Clone(c.windows), c.env)
 	c.opts.Routes.Publish(next.snapshot)
 	c.current.Store(next)
+	// The first commit of a refresh, whichever refresh wins it, ends the startup wait of model
+	// answers. It is signalled here, before the refresh persists the discovery cache, so that
+	// persistence never delays an answer whose snapshot is already published. Ticket 0 is the
+	// fallback committed by New, before any listing was read.
+	if ticket > 0 {
+		c.firstListingDone()
+	}
 	return published
 }
 

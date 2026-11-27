@@ -93,11 +93,14 @@ type writer struct {
 const StagingDirName = ".model-gateway-staging"
 
 // PrivateStaging stages the new file in the destination directory's [StagingDirName]
-// subdirectory instead of beside the destination, then renames it into place. A watcher of the
-// destination directory sees no staging name: no event reaches it before the rename that puts the
-// finished file in place. The subdirectory must already exist, be a real directory owned by the
-// caller and be inaccessible to others; it is not created here, and a missing or unusable
-// subdirectory fails the write. [CreateStagingDir] creates it.
+// subdirectory instead of beside the destination, then renames it into place. A nonrecursive
+// watcher of the destination directory's change events, set up after that subdirectory exists,
+// sees no staging name: the write makes no change in the destination directory before the rename
+// that puts the finished file in place. A watcher that also sees opens or reads, or that watches
+// recursively, can still see the staging work. The subdirectory must already exist and be a real
+// directory owned by the effective user whose POSIX mode grants nothing to group or others; an
+// extended ACL that grants access to others (as macOS allows) is not checked. It is not created
+// here, and a missing or refused subdirectory fails the write. [CreateStagingDir] creates it.
 func PrivateStaging() WriteOption {
 	return func(w *writer) { w.privateStaging = true }
 }
@@ -113,11 +116,10 @@ func newWriter(opts ...WriteOption) writer {
 // WriteOption changes how [WriteFile] and [Dir.WriteFile] stage a replacement.
 type WriteOption func(*writer)
 
-// SkipSync publishes the staged sibling without syncing it to storage first. By default the
-// sibling is synced before the rename. It is meant only for a cache that is fetched again when
-// lost, such as the model catalog caches: a reader that watches the directory can be woken by
-// the staging sibling and must find the new content at once, as with the source's writer, which
-// never syncs, and such a cache does not need the durability the sync buys.
+// SkipSync publishes the staged file without syncing it to storage first. By default the staged
+// file is synced before the rename, so the replacement survives a crash or power loss. It is meant
+// only for a cache that is fetched again when lost, such as the model catalog caches, which need
+// no such durability; the source's writer never syncs them either.
 func SkipSync() WriteOption {
 	return func(w *writer) { w.skipSync = true }
 }

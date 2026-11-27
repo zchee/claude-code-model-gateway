@@ -107,16 +107,23 @@ func (c *Cache) SyncDiscoveryCache(force bool) (DiscoverySyncResult, error) {
 	if err != nil {
 		return result, err
 	}
-	// A missing directory has no watcher yet, so this write creates it with its staging
-	// subdirectory; an existing one got that subdirectory when the cache was created.
-	if dir := filepath.Dir(c.discoveryPath); !exists(dir) {
-		if err := atomicfile.CreateStagingDir(dir, 0o777); err != nil {
-			return result, err
-		}
-	}
 	// Like the Anthropic catalog, the discovery cache is rebuilt from the catalogs, so it is not
 	// synced, and a reader may watch its directory, so it is staged out of that view and renamed in.
-	if err := atomicfile.WriteFile(c.discoveryPath, data, 0o600, atomicfile.SkipSync(), atomicfile.PrivateStaging()); err != nil {
+	opts := []atomicfile.WriteOption{atomicfile.SkipSync(), atomicfile.PrivateStaging()}
+	if dir := filepath.Dir(c.discoveryPath); !exists(dir) {
+		// A missing directory has no watcher yet, so this write creates it with its staging
+		// subdirectory, and writes through the handle it prepared; an existing directory got that
+		// subdirectory when the cache was created.
+		d, err := atomicfile.OpenDirCreateStaging(dir, 0o777)
+		if err != nil {
+			return result, err
+		}
+		defer func() { _ = d.Close() }()
+		err = d.WriteFile(filepath.Base(c.discoveryPath), data, 0o600, opts...)
+		if err != nil {
+			return result, err
+		}
+	} else if err := atomicfile.WriteFile(c.discoveryPath, data, 0o600, opts...); err != nil {
 		return result, err
 	}
 	result.State = "wrote"

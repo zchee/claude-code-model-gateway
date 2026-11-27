@@ -211,10 +211,9 @@ func write(path string, obj jsonx.WireValue) error {
 	if errors.Is(err, fs.ErrNotExist) {
 		// No reader can watch a directory that does not exist yet, so the write that creates it
 		// also creates its staging subdirectory. In an existing directory the cache creates that
-		// subdirectory when it starts, and a write never does.
-		if err = atomicfile.CreateStagingDir(parent, 0o777); err == nil {
-			dir, err = atomicfile.OpenDir(parent)
-		}
+		// subdirectory when it starts, and a write never does. The write keeps the handle it
+		// prepared, so no later lookup of parent can redirect it.
+		dir, err = atomicfile.OpenDirCreateStaging(parent, 0o777)
 	}
 	if err != nil {
 		return err

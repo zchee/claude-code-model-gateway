@@ -145,7 +145,8 @@ func (d *directory) renameInto(from string, dest *directory, to string) error {
 }
 
 // openStaging opens d's existing [StagingDirName] subdirectory without following a symlink, and
-// refuses it unless it is a directory owned by the effective user with no access for others.
+// refuses it unless it is a directory owned by the effective user whose POSIX mode grants nothing
+// to group or others.
 func (d *directory) openStaging() (*directory, error) {
 	fd, err := retryEINTR(func() (int, error) {
 		return unix.Openat(int(d.handle.Fd()), StagingDirName, directoryFlags|unix.O_NOFOLLOW, 0)
@@ -160,6 +161,8 @@ func (d *directory) openStaging() (*directory, error) {
 		_ = unix.Close(fd)
 		return nil, &os.PathError{Op: "stat staging directory", Path: path, Err: err}
 	}
+	// Privacy is checked by owner and POSIX mode only; an extended ACL that grants access to
+	// others, as macOS allows, is not examined.
 	if st.Uid != uint32(os.Geteuid()) || st.Mode&0o077 != 0 {
 		_ = unix.Close(fd)
 		return nil, &os.PathError{Op: "open staging directory", Path: path, Err: fs.ErrPermission}

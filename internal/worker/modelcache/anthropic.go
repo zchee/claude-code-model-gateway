@@ -53,10 +53,13 @@ type catalogFlight struct {
 // ModelsResponse builds the GET /v1/models JSON response body using allowed credential headers from incoming.
 // When serving stale cached rows immediately, any background refresh runs under the worker context from Start rather than ctx.
 func (c *Cache) ModelsResponse(ctx context.Context, incoming http.Header) (jsontext.Value, error) {
+	// The Anthropic catalog refresh is elected first, as the source does on the request
+	// (lib/request-worker.js:2409-2413), so that its fetch runs while the answer waits for the first
+	// proxy listing; the answer is built only once both are ready.
+	anthropicRows, count, flight := c.anthropicRows(incoming)
 	if err := c.awaitFirstListing(ctx); err != nil {
 		return nil, err
 	}
-	anthropicRows, count, flight := c.anthropicRows(incoming)
 	// A cold cache waits for the shared refresh; the request context ends only this wait
 	// (lib/anthropic-catalog.js:96-104).
 	if flight != nil && count == 0 {
@@ -84,13 +87,14 @@ func (c *Cache) ModelsResponse(ctx context.Context, incoming http.Header) (jsont
 	return body, nil
 }
 
-// awaitFirstListing holds an answer given after Start until the first proxy listing has been
-// refreshed, so an answer just after startup does not list the built-in Codex defaults while the
-// listing is still on its way. The wait ends at the latest when the listing's own timeout after
-// Start has passed, and a failed or timed-out listing leaves the fallback to answer. Once the first
-// refresh ended or that bound passed, no answer waits; before Start none does. The request context
-// ends only this wait. The source answers at once from the fallback; this wait is a deliberate
-// difference.
+// awaitFirstListing holds an answer given after Start until a refresh has committed the first
+// snapshot built from a listing attempt, so an answer just after startup does not list the
+// built-in Codex defaults while the listing is still on its way. It does not wait for that
+// refresh to persist the discovery cache. The wait ends at the latest when the listing's own
+// timeout after Start has passed, and a failed or timed-out listing leaves the fallback to answer.
+// Once that commit happened, the first refresh ended without one, or the bound passed, no answer
+// waits; before Start none does. The request context ends only this wait. The source answers at
+// once from the fallback; this wait is a deliberate difference.
 func (c *Cache) awaitFirstListing(ctx context.Context) error {
 	c.mu.Lock()
 	started, deadline := c.started, c.firstDeadline

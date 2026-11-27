@@ -182,12 +182,16 @@ func (b *Builder) emitterRecords(primary Record, added []toolAttribution) []Reco
 	return append(records, b.toolResultRecords(primary, added)...)
 }
 
-// schedule submits one record for export in the background and returns at once. Records reach the
-// collector in submission order, as the source starts its posts in order: one sender starts each
-// post and waits only until its request is written, or the post ended, before starting the next.
-// Replies are read concurrently, so a slow collector delays no later post. Each post's bound starts
-// at submission, and a record still queued when its bound expires is dropped. Delivery failures,
-// including timeouts and refused connections, are silent and never affect the request.
+// schedule submits one record for export in the background and returns at once. One sender starts
+// each post and waits until its request has been written to the local connection, or the attempt
+// failed, before it starts the next, so the local writes complete, or fail, in submission order.
+// That is all it guarantees: posts use separate connections, and a completed write does not mean
+// the collector read or processed it. A slow reply holds no later post, because replies are read
+// concurrently; a stalled dial, TLS handshake or request write does, until that post ends. An
+// injected RoundTripper must report the write through httptrace (WroteRequest), or the sender
+// waits for the whole post. Each post's bound starts at submission, and a record still queued
+// when its bound expires is dropped. Delivery failures, including timeouts and refused
+// connections, are silent and never affect the request.
 func (e *Emitter) schedule(record Record) {
 	if e.client == nil {
 		return

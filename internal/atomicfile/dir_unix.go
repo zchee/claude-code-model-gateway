@@ -61,21 +61,35 @@ func OpenDirCreate(path string, perm fs.FileMode) (*Dir, error) {
 // [PrivateStaging] checks it. Creating the subdirectory is itself an event in path for a watcher
 // of path, so it belongs before any reader watches, not before a write.
 func CreateStagingDir(path string, perm fs.FileMode) error {
-	d, err := OpenDirCreate(path, perm)
+	d, err := OpenDirCreateStaging(path, perm)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = d.Close() }()
+	return d.Close()
+}
+
+// OpenDirCreateStaging is [CreateStagingDir] that returns the opened directory, so that a write
+// that has just prepared it goes through the same directory and not another lookup of path. The
+// caller must close it.
+func OpenDirCreateStaging(path string, perm fs.FileMode) (*Dir, error) {
+	d, err := OpenDirCreate(path, perm)
+	if err != nil {
+		return nil, err
+	}
 	fd := int(d.root.handle.Fd())
 	_, err = retryEINTR(func() (int, error) { return 0, unix.Mkdirat(fd, StagingDirName, 0o700) })
 	if err != nil && !errors.Is(err, fs.ErrExist) {
-		return &os.PathError{Op: "mkdir", Path: d.root.path(StagingDirName), Err: err}
+		err = &os.PathError{Op: "mkdir", Path: d.root.path(StagingDirName), Err: err}
+		return nil, errors.Join(err, d.Close())
 	}
 	staging, err := d.root.openStaging()
-	if err != nil {
-		return err
+	if err == nil {
+		err = staging.Close()
 	}
-	return staging.Close()
+	if err != nil {
+		return nil, errors.Join(err, d.Close())
+	}
+	return d, nil
 }
 
 func openDirCreate(path string, perm fs.FileMode, afterOpen func(string)) (*Dir, error) {
