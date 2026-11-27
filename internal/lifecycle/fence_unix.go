@@ -59,8 +59,9 @@ func (f *StartFence) Acquire(ctx context.Context) (release func() error, err err
 		}
 	}()
 	for {
-		// Checked before every attempt, also after a timer wake and after an interrupted call, so that an ended
-		// context never takes the lock, not even for an instant.
+		// Checked before every attempt, also after a timer wake and after an interrupted call: once the context has
+		// been observed ended, no attempt is started and no retry is made. A cancellation that arrives between this
+		// check and the lock call is given up by the check after locking.
 		if err := ctx.Err(); err != nil {
 			return nil, closeFence(err, fd, path)
 		}
