@@ -350,8 +350,10 @@ func (c *Client) exchangeError(ctx context.Context, cause, err error, connected 
 // and Connection headers it honours) as a body that also implements io.Writer, and neither the
 // request's context nor the transport's deadlines end a read of it then. The source registers no
 // upgrade listener on its requests, so Node destroys such a socket and the request fails. The close
-// runs before RefuseSwitch returns and no context bounds it: on a TLS connection it first sends the
-// close-notify alert, which the Go 1.27.4 TLS package bounds by its own five-second write deadline.
+// runs before RefuseSwitch returns and neither the request's context nor its budget bounds it: on a
+// TLS connection it may first attempt the close-notify alert, which the Go 1.27.4 TLS package bounds
+// by its own five-second write deadline; no alert is attempted before the handshake completed,
+// while a write is in flight, or after an earlier close.
 func RefuseSwitch(resp *http.Response) error {
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		return nil

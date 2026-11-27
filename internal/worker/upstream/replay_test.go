@@ -46,9 +46,10 @@ type replayContact struct {
 // HEAD, OPTIONS or TRACE is sent again on a fresh connection, and so is a bodyless request of any
 // other method that carries an Idempotency-Key or X-Idempotency-Key header, however the client
 // spelled the name. A bodyless request of another method without such a header, and a request with
-// a body whatever its headers, reach the upstream once and fail with the fixed response error. These
-// replay triggers are those of the Go 1.27.4 net/http transport, observed implementation behaviour
-// rather than a documented guarantee.
+// a body whatever its headers, reach the upstream once and fail with the fixed response error.
+// net/http documents which requests are eligible for a retry (an idempotent method or an idempotency
+// key header, and no body or a GetBody); that the Go 1.27.4 transport does retry each eligible
+// request on this simulated failure of a reused connection is observed behaviour, not documented.
 func TestReplayAfterWrittenRequestOnReusedConnection(t *testing.T) {
 	const (
 		probeURI   = "/v1/messages/batches/probe"

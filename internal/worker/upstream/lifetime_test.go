@@ -47,8 +47,9 @@ const (
 	clientClosedText = "upstream client closed"
 )
 
-// messagesRequest is a request with a body, which the Go 1.27.4 net/http transport never replays on
-// another connection (observed implementation behaviour, not a documented guarantee).
+// messagesRequest is a POST with a body and no idempotency key header, which the documented retry
+// rules of net/http make ineligible for a replay on another connection; that the Go 1.27.4 transport
+// sends it once on the failures these tests simulate is observed behaviour.
 func messagesRequest() upstream.Request {
 	return upstream.Request{
 		Target:        upstream.TargetAnthropic,
