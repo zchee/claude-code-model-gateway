@@ -686,13 +686,14 @@ func (d *sideDecoder) abandon() {
 // never sets outcome.Result.Cancelled. A client that is already gone on entry gets nothing, not even
 // the head, no heartbeat and no upstream read. A ctx that has ended before the head is written closes
 // resp.Body and returns ctx.Err() (nil once the client is gone); ctx is checked again before every
-// upstream read. At a clean end of the body, observation finishes whenever every chunk read was
-// observed, even when the client left after the last one; it is abandoned only when a chunk that
-// arrived after the client left was discarded or, with nothing discarded, when ctx ended by then
-// (for example while the last chunk was written), which also returns the shutdown abort instead
-// of a clean status. If the upstream breaks after response headers are committed,
-// RelayPassthrough returns the terminal outcome facts alongside http.ErrAbortHandler rather than
-// panicking.
+// upstream read, and once more when the body has ended, before anything else is decided: a ctx
+// that ended by then (for example while the last chunk was written) abandons observation and
+// returns the shutdown abort, never a clean status, also when a chunk was discarded. With ctx
+// live, at a clean end of the body observation finishes whenever every chunk read was observed,
+// even when the client left after the last one; it is abandoned only when a chunk that arrived
+// after the client left was discarded. If the upstream breaks after response headers are
+// committed, RelayPassthrough returns the terminal outcome facts alongside http.ErrAbortHandler
+// rather than panicking.
 func RelayPassthrough(ctx context.Context, w http.ResponseWriter, resp *upstream.Response, opts PassthroughOptions) (outcome.Result, error) {
 	if resp == nil || resp.Body == nil {
 		return outcome.Result{}, errNilResponse
@@ -755,23 +756,20 @@ func RelayPassthrough(ctx context.Context, w http.ResponseWriter, resp *upstream
 			return abortResult(ctx, status, s.clientGone())
 		}
 	}
-	if !errors.Is(termErr, io.EOF) || discarded {
-		observer.abandon()
-		_ = body.close()
-		switch {
-		case errors.Is(termErr, io.EOF):
-			return outcome.Result{Status: status}, nil
-		case ctx.Err() != nil:
-			return abortResult(ctx, status, s.clientGone())
-		}
-		return brokenResult(status, s.clientGone())
-	}
 	// The last read may have carried data and the end of the body together, and the service may
-	// have ended while that data was written: such a stream is not finished as a clean one.
+	// have ended while that data was written or discarded: such a stream does not end as a clean one.
 	if ctx.Err() != nil {
 		observer.abandon()
 		_ = body.close()
 		return abortResult(ctx, status, s.clientGone())
+	}
+	if !errors.Is(termErr, io.EOF) || discarded {
+		observer.abandon()
+		_ = body.close()
+		if errors.Is(termErr, io.EOF) {
+			return outcome.Result{Status: status}, nil
+		}
+		return brokenResult(status, s.clientGone())
 	}
 	observer.finish()
 	return outcome.Result{Status: status}, nil
