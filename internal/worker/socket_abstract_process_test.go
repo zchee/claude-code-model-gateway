@@ -155,7 +155,7 @@ func TestAbstractSocketSecondStartGetsBindError(t *testing.T) {
 				t.Fatalf("ListenUnix on a free abstract address: %v", err)
 			}
 			defer func() { _ = owner.Close() }()
-			reached, err := reachedBy(t.Context(), "@"+id, owner.(*net.UnixListener))
+			reached, err := reachedBy(t, "@"+id, owner.(*net.UnixListener))
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -18,7 +18,6 @@ package worker_test
 
 import (
 	"bufio"
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -50,7 +49,7 @@ func staleSocket(t *testing.T, path string) {
 }
 
 // reclaimRound releases every starter at once against the same stale socket and returns the listeners they obtained.
-func reclaimRound(path string, starters int) []*net.UnixListener {
+func reclaimRound(path string, starters int) []net.Listener {
 	start := make(chan struct{})
 	results := make([]net.Listener, starters)
 	var wg sync.WaitGroup
@@ -63,37 +62,60 @@ func reclaimRound(path string, starters int) []*net.UnixListener {
 	}
 	close(start)
 	wg.Wait()
-	var owners []*net.UnixListener
+	var owners []net.Listener
 	for _, ln := range results {
 		if ln == nil {
 			continue
 		}
-		owners = append(owners, ln.(*net.UnixListener))
+		owners = append(owners, ln)
 	}
 	return owners
 }
 
-// reachedBy reports whether a connection to path arrives at ln. The dial completes into the listen queue of whatever
-// socket the path names, so the owner accepts at once; the deadline only bounds a listener the path no longer names.
-func reachedBy(ctx context.Context, path string, ln *net.UnixListener) (bool, error) {
+// reachedBy reports whether a connection to path arrives at ln, accepted through ln's own Accept, so that it works for
+// any listener ListenUnix returns. The dial completes into the listen queue of whatever socket the path names, so the
+// owner accepts at once; the bound only ends the wait for a listener the path no longer names, which then counts as
+// not reached. The Accept is always joined: at once when it returned, otherwise when the test ends, after closing ln.
+func reachedBy(t testing.TB, path string, ln net.Listener) (bool, error) {
+	type acceptance struct{ acceptErr, closeErr error }
+	accepted := make(chan acceptance, 1)
+	finished := make(chan struct{})
+	joined := false
+	defer func() {
+		if joined {
+			<-finished
+			return
+		}
+		t.Cleanup(func() {
+			_ = ln.Close()
+			<-finished
+		})
+	}()
+	go func() {
+		defer close(finished)
+		conn, err := ln.Accept()
+		if err != nil {
+			accepted <- acceptance{acceptErr: err}
+			return
+		}
+		accepted <- acceptance{closeErr: conn.Close()}
+	}()
 	var dialer net.Dialer
-	conn, err := dialer.DialContext(ctx, "unix", path)
+	conn, err := dialer.DialContext(t.Context(), "unix", path)
 	if err != nil {
 		return false, err
 	}
 	defer func() { _ = conn.Close() }()
-	if err := ln.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		return false, err
-	}
-	accepted, err := ln.Accept()
-	if err != nil {
-		var ne net.Error
-		if errors.As(err, &ne) && ne.Timeout() {
-			return false, nil
+	select {
+	case a := <-accepted:
+		joined = true
+		if a.acceptErr != nil {
+			return false, a.acceptErr
 		}
-		return false, err
+		return true, a.closeErr
+	case <-time.After(2 * time.Second):
+		return false, nil
 	}
-	return true, accepted.Close()
 }
 
 // TestStaleSocketReclaimByConcurrentStarters starts several workers' socket binding at the same moment against one
@@ -140,7 +162,7 @@ func TestStaleSocketReclaimByConcurrentStarters(t *testing.T) {
 				if tc.processes {
 					got, err = processRound(t, env, path, tc.starters)
 				} else {
-					got, err = goroutineRound(t.Context(), path, tc.starters)
+					got, err = goroutineRound(t, path, tc.starters)
 				}
 				if err != nil {
 					t.Fatalf("round %d of %d: %v", round+1, tc.rounds, err)
@@ -154,7 +176,7 @@ func TestStaleSocketReclaimByConcurrentStarters(t *testing.T) {
 }
 
 // goroutineRound runs one round with the starters as goroutines of this process.
-func goroutineRound(ctx context.Context, path string, starters int) (reclaimVerdict, error) {
+func goroutineRound(t testing.TB, path string, starters int) (reclaimVerdict, error) {
 	owners := reclaimRound(path, starters)
 	defer func() {
 		for _, ln := range owners {
@@ -165,7 +187,7 @@ func goroutineRound(ctx context.Context, path string, starters int) (reclaimVerd
 	if len(owners) != 1 {
 		return got, nil
 	}
-	reached, err := reachedBy(ctx, path, owners[0])
+	reached, err := reachedBy(t, path, owners[0])
 	got.OwnerReached = reached
 	return got, err
 }

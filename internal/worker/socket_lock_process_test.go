@@ -19,7 +19,6 @@ package worker_test
 import (
 	"errors"
 	"io/fs"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -132,7 +131,7 @@ func TestSocketStartRefusesUnusableLock(t *testing.T) {
 					t.Fatalf("ListenUnix with a usable lock over a stale socket: %v", err)
 				}
 				defer func() { _ = ln.Close() }()
-				reached, err := reachedBy(t.Context(), path, ln.(*net.UnixListener))
+				reached, err := reachedBy(t, path, ln)
 				if err != nil {
 					t.Fatal(err)
 				}

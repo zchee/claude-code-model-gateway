@@ -134,6 +134,15 @@ func ListenUnix(path string) (net.Listener, error) {
 	return ln, nil
 }
 
+// lockedUnixListener returns ln, the Unix listener ListenUnix bound, as a listener that holds the pathname reclamation
+// lock until it is closed. The first Close closes ln, which removes the socket file ln bound, and only then calls
+// unlock. ln is closed and unlock runs exactly once, however many times and from however many goroutines Close is
+// called. Every Close returns the result of that one close of ln, and none returns before unlock has returned. Accept
+// and Addr are those of ln.
+func lockedUnixListener(ln net.Listener, unlock func()) net.Listener {
+	panic("not implemented")
+}
+
 // staleProbeTimeout bounds the connection attempt that decides whether a socket file still has an owner.
 const staleProbeTimeout = 2 * time.Second
 

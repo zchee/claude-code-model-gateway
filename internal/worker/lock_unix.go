@@ -24,6 +24,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// flockSocketLock is the flock call lockReclaim makes on the lock file's descriptor. It is a variable so that a test
+// can interrupt the attempt or fail it, which a nonblocking lock of a local file does not do on its own.
+var flockSocketLock = func(fd, how int) error {
+	panic("not implemented")
+}
+
 // lockReclaim takes an exclusive advisory lock on the regular file path+".lock", creating it, and returns its release
 // with locked set. The lock file is never followed through a symbolic link and is left in place, so that every starter
 // locks the same file. A Linux abstract address has no file that could be reclaimed, so it gets no lock file and
