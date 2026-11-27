@@ -574,16 +574,18 @@ type portReservation struct {
 	release func()
 }
 
-// reservePort reserves a loopback port number until release is called or the test ends. The reservation is a socket
-// bound with SO_REUSEPORT alone that never listens: no connection reaches it, no bind to port 0 nor any outgoing
-// connection is handed its number while it is held, the supervisor's public listener included, and a bind that names
-// the number fails unless that socket also sets SO_REUSEPORT. A worker told to "listen shared" sets SO_REUSEPORT and
-// can bind and listen on the number beside it, so the number passes from the test to the worker without a moment in
-// which another program could take it. A port number that was free a moment ago, as freePort returns, can be taken
-// by any bind between its release and the worker's.
+// reservePort reserves a TCP port number on 127.0.0.1 until release is called or the test ends. The reservation is a
+// socket bound with SO_REUSEPORT alone that never listens, so no connection reaches it. While it is held it keeps the
+// endpoint from the ordinary competing binds: a bind to port 0 (the supervisor's public listener included) or an
+// outgoing connection is not handed the number, and a plain bind that names it fails. It covers neither other
+// addresses or protocols at that number, nor a socket of the same user that names the endpoint with SO_REUSEPORT set
+// itself. A worker told to "listen shared" is such a socket: it binds and listens on the number beside the
+// reservation, so the number passes from the test to the worker without a moment in which an ordinary bind could
+// take it. A port number that was free a moment ago, as freePort returns, can be taken by any bind between its
+// release and the worker's.
 //
-// The test releases the reservation once the worker listens, before any request can be relayed to the port, so the
-// worker's listener is then the only socket on it.
+// A test that hands the number to a worker releases the reservation once the worker listens, before any request can
+// be relayed to that worker, so no traffic to the worker's listener overlaps the reservation.
 func reservePort(t *testing.T) *portReservation {
 	t.Helper()
 	// The supervisor under test starts its workers from this process; none may inherit the reservation, so the
@@ -652,6 +654,12 @@ func TestPortReservation(t *testing.T) {
 	}
 	defer func() { _ = ln.Close() }()
 	reserved.release()
+	// A connection that went to some other socket sharing the number would leave the accept waiting; the bound makes
+	// that a failure of this premise instead of a package timeout.
+	const bound = 10 * time.Second
+	if err := ln.(*net.TCPListener).SetDeadline(time.Now().Add(bound)); err != nil {
+		t.Fatal(err)
+	}
 	accepted := make(chan error, 1)
 	go func() {
 		conn, err := ln.Accept()
@@ -660,14 +668,14 @@ func TestPortReservation(t *testing.T) {
 		}
 		accepted <- err
 	}()
-	var dialer net.Dialer
+	dialer := net.Dialer{Timeout: bound}
 	conn, err := dialer.DialContext(t.Context(), "tcp4", addr)
 	if err != nil {
 		t.Fatalf("connect to the listener on the formerly reserved port %d: %v", reserved.port, err)
 	}
 	_ = conn.Close()
 	if err := <-accepted; err != nil {
-		t.Errorf("accept on the formerly reserved port %d: %v", reserved.port, err)
+		t.Errorf("accept on the formerly reserved port %d within %v: %v", reserved.port, bound, err)
 	}
 }
 
