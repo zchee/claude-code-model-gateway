@@ -107,11 +107,16 @@ func darwinStartToken(start unix.Timeval) StartToken {
 	return StartToken(fmt.Sprintf("%d.%06d", start.Sec, start.Usec))
 }
 
+// darwinBirth turns the start the kernel recorded for a process into a time.
+func darwinBirth(start unix.Timeval) time.Time {
+	return time.Unix(start.Sec, int64(start.Usec)*1000)
+}
+
 // darwinRow builds the birth and the start token from the same kernel record,
 // so both describe the same process lifetime.
 func darwinRow(info *unix.KinfoProc) Identity {
-	birth := info.Proc.P_starttime
-	return Identity{PID: int(info.Proc.P_pid), ParentPID: int(info.Eproc.Ppid), Birth: time.Unix(birth.Sec, int64(birth.Usec)*1000), StartToken: darwinStartToken(birth)}
+	start := info.Proc.P_starttime
+	return Identity{PID: int(info.Proc.P_pid), ParentPID: int(info.Eproc.Ppid), Birth: darwinBirth(start), StartToken: darwinStartToken(start)}
 }
 
 func nativeTable(ctx context.Context) ([]Identity, error) {
@@ -130,9 +135,11 @@ func nativeTable(ctx context.Context) ([]Identity, error) {
 		}
 		_, args, _ := procArgs(row.PID) // A failed sample carries nil argv.
 		after, err := kernelRecord(ctx, row.PID)
+		// The recheck compares only the process number and the birth, so it
+		// formats no token.
 		var current Identity
 		if err == nil {
-			current = darwinRow(after)
+			current = Identity{PID: int(after.Proc.P_pid), Birth: darwinBirth(after.Proc.P_starttime)}
 		} else if errors.Is(unix.Kill(row.PID, 0), unix.ESRCH) {
 			continue
 		}
@@ -151,7 +158,7 @@ func nativeBirth(ctx context.Context, pid int) (time.Time, error) {
 	if int(info.Proc.P_pid) != pid || info.Proc.P_starttime.Sec <= 0 {
 		return time.Time{}, ErrUnknown
 	}
-	return darwinRow(info).Birth, nil
+	return darwinBirth(info.Proc.P_starttime), nil
 }
 
 // nativeStartToken reads only the kernel's process record, so a process whose

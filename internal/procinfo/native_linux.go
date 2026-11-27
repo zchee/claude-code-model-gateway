@@ -73,7 +73,9 @@ func readClock(root string) (procClock, error) {
 }
 
 // readBootID returns the kernel's identifier of the current boot. Start ticks
-// count from boot, so only together with it do they name one process lifetime.
+// count from boot, so they are evidence about a process lifetime only together
+// with it. Two processes can still start in the same tick, so a token is not
+// a unique handle.
 // It is refused when empty, or when it holds a space, a control or non-ASCII
 // byte or the token separator, so that a token splits in exactly one way.
 func readBootID(root string) (string, error) {
@@ -107,11 +109,17 @@ func readAt(dir *os.File, name string) ([]byte, error) {
 	return io.ReadAll(f)
 }
 
-// statFields returns the parent pid and the start ticks of a stat line. The
-// command name may hold spaces and parentheses, so the fields are counted from
-// the last ") ".
-func statFields(stat []byte) (int, int64, error) {
-	_, fields, ok := strings.CutLast(string(stat), ") ")
+// statFields returns the parent pid and the start ticks of the stat record of
+// pid. The record is evidence about pid only when it starts with that decimal
+// number, one space and the opening parenthesis of the command name; any other
+// start makes it malformed. The command name may hold spaces, parentheses and
+// newlines, so the fields are counted from the last ") " after that opening.
+func statFields(pid int, stat []byte) (int, int64, error) {
+	rest, ok := strings.CutPrefix(string(stat), strconv.Itoa(pid)+" (")
+	if !ok {
+		return 0, 0, ErrUnknown
+	}
+	_, fields, ok := strings.CutLast(rest, ") ")
 	cols := strings.Fields(fields)
 	if !ok || len(cols) < 20 {
 		return 0, 0, ErrUnknown
@@ -130,7 +138,7 @@ func statFields(stat []byte) (int, int64, error) {
 // processStat builds the birth and the start token from one stat read, so both
 // describe the same process even when its number is reused right after.
 func (c procClock) processStat(pid int, stat []byte) (Identity, error) {
-	ppid, start, err := statFields(stat)
+	ppid, start, err := statFields(pid, stat)
 	if err != nil {
 		return Identity{}, err
 	}
@@ -146,7 +154,7 @@ func nativeStartToken(ctx context.Context, pid int) (StartToken, error) {
 	if err != nil {
 		return "", err
 	}
-	_, start, err := statFields(stat)
+	_, start, err := statFields(pid, stat)
 	if err != nil {
 		return "", err
 	}
@@ -226,9 +234,10 @@ func nativeIdentity(ctx context.Context, pid int) (Identity, error) {
 	if err != nil {
 		return Identity{}, err
 	}
-	// The token only grants authority to act, and an empty one never matches,
-	// so an unreadable boot identifier empties the token instead of failing the
-	// sample. The token comes from the stat line inspect reads for the birth.
+	// The token is only one piece of evidence about the lifetime, and an empty
+	// one never matches, so an unreadable boot identifier empties the token
+	// instead of failing the sample. The token comes from the stat record
+	// inspect reads for the birth.
 	clock.bootID, _ = readBootID(root)
 	return clock.inspect(root, pid, true)
 }

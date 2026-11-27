@@ -21,9 +21,12 @@ import (
 	"runtime"
 )
 
-// StartToken identifies one lifetime of a process number independently of the
-// wall clock. It is opaque and compared for equality only; an empty token is
-// unreadable evidence and never matches. A token does not reveal an exec.
+// StartToken is evidence about one lifetime of a process number, independent
+// of the wall clock. It is opaque and compared for equality only; an empty
+// token is unreadable evidence and never matches. A process number together
+// with a token is not a unique handle and not an authority to signal: two
+// processes can share a start tick on Linux or a microsecond on macOS. A token
+// does not reveal an exec.
 type StartToken string
 
 // StartToken returns the process-start token of pid. It reads only what the
