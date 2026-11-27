@@ -108,9 +108,11 @@ type Request struct {
 // Runner.ServiceContext bounds upstream peeking and reads. When it is done
 // while the guard owns a response, Serve closes any in-flight peek or stream
 // body exactly once, writes nothing more to w, and returns promptly with an
-// error matching context.Canceled (or the service context's cause). A verdict
-// Next settled itself, such as a response it relayed, is returned with the
-// result and error Next reported; see Request.
+// error matching context.Canceled (or the service context's cause). For a
+// verdict Next settled itself, such as a response it relayed, Serve returns the
+// error Next reported; the result is Next's on the first attempt, and on a
+// retry it also carries forward the earlier contact and the compaction usage.
+// See Request.
 func (r Runner) Serve(ctx context.Context, w http.ResponseWriter, req Request) (outcome.Result, error) {
 	if r.ServiceContext == nil {
 		return outcome.Result{}, errNoServiceContext
