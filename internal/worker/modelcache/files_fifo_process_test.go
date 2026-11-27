@@ -32,6 +32,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/zchee/claude-code-model-gateway/internal/anthropiccatalog"
+	"github.com/zchee/claude-code-model-gateway/internal/atomicfile"
 	"github.com/zchee/claude-code-model-gateway/internal/paths"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/modelcache"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/route"
@@ -486,6 +487,11 @@ func TestCatalogCacheFIFOIsAbsent(t *testing.T) {
 				}
 			case "regular":
 				target := filepath.Join(dir, "catalog.json")
+				// The catalog is staged in the private subdirectory of its existing directory, which
+				// the running cache creates for its own directories and a write never creates.
+				if err := atomicfile.CreateStagingDir(dir, 0o777); err != nil {
+					t.Fatal(err)
+				}
 				if err := anthropiccatalog.WriteSuccess(target, []byte("["+cachedRow+"]"), time.Now()); err != nil {
 					t.Fatalf("write the regular catalog: %v", err)
 				}

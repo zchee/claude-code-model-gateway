@@ -26,6 +26,7 @@ import (
 	gocmp "github.com/google/go-cmp/cmp"
 
 	"github.com/zchee/claude-code-model-gateway/internal/anthropiccatalog"
+	"github.com/zchee/claude-code-model-gateway/internal/atomicfile"
 	"github.com/zchee/claude-code-model-gateway/internal/config"
 	"github.com/zchee/claude-code-model-gateway/internal/policy"
 	"github.com/zchee/claude-code-model-gateway/internal/venue"
@@ -175,7 +176,13 @@ func TestCacheFreshness(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "anthropic-models.json")
+			dir := t.TempDir()
+			// The cache stages its writes in the private subdirectory of an existing directory,
+			// which the running cache creates and a write never does.
+			if err := atomicfile.CreateStagingDir(dir, 0o777); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, "anthropic-models.json")
 			if err := os.WriteFile(path, []byte(`{"data":[],"updatedAt":`+tt.stamp+`}`), 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -261,7 +268,9 @@ func TestCacheBytes(t *testing.T) {
 				err = anthropiccatalog.WriteSuccess(path, jsontext.Value(tt.rows), at)
 			} else {
 				if tt.snapshot != "" {
-					if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					// An existing cache directory has the private staging subdirectory the running
+					// cache created; a write never creates it.
+					if err := atomicfile.CreateStagingDir(filepath.Dir(path), 0o700); err != nil {
 						t.Fatal(err)
 					}
 					if err := os.WriteFile(path, []byte(tt.snapshot), 0o600); err != nil {
