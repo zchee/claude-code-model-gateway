@@ -218,3 +218,28 @@ func (d *Dir) CreateExclusive(name string, data []byte, mode fs.FileMode) error 
 	}
 	return newWriter().createExclusiveAt(&d.root, name, data, mode)
 }
+
+// Remove unlinks the entry name, one path component, relative to the held directory. A symbolic link is removed
+// itself, never followed, and a directory is never removed. A missing entry returns an error matching fs.ErrNotExist.
+func (d *Dir) Remove(name string) error {
+	if d.root.handle == nil {
+		return fs.ErrClosed
+	}
+	if err := d.root.Remove(name); err != nil {
+		if _, ok := errors.AsType[*DestinationError](err); ok {
+			return err
+		}
+		return &os.PathError{Op: "remove", Path: d.root.path(name), Err: err}
+	}
+	return nil
+}
+
+// OpenFile opens the entry name, one path component, relative to the held directory with flag and, when it creates
+// the entry, the permission bits of perm. O_NOFOLLOW and O_CLOEXEC are always added, so a symbolic link at name is
+// never followed and no executed child inherits the file. The caller owns the returned file and must close it.
+func (d *Dir) OpenFile(name string, flag int, perm os.FileMode) (*os.File, error) {
+	if d.root.handle == nil {
+		return nil, fs.ErrClosed
+	}
+	return d.root.OpenFile(name, flag, perm)
+}

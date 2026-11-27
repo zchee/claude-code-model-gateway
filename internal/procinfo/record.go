@@ -52,6 +52,14 @@ func openRecordDir(root, name string) (*atomicfile.Dir, string, error) {
 	return dir, name + ".pid", err
 }
 
+// Validate reports whether the fields of r make a complete record of the supplied state root, exactly as WriteRecord
+// and ReadRecord require: a start time in the legacy form that names a whole second, a process number in range, root
+// as its state root, a command, role, generation and version, and an absolute image path with a nonzero inode. It does
+// not require a start token, and it does not validate the root pathname itself; WriteRecord and ReadRecord check that
+// it is clean and absolute before they open it. It is for callers that read or write the record's bytes through a
+// directory they already hold.
+func (r Record) Validate(root string) error { return r.validate(root) }
+
 func (r Record) validate(root string) error {
 	start, err := time.Parse(time.ANSIC, r.StartedAt)
 	if err != nil || LegacyStart(start) != r.StartedAt {

@@ -78,33 +78,75 @@ type Owner struct {
 type Authority struct {
 	// Records is this state root's record store.
 	Records Store
-	// Processes supplies the live evidence.
+	// Processes supplies the live evidence; nil means the native probe with its default budget, one probe shared by
+	// every such Authority.
 	Processes Processes
-	// Signal delivers sig to the process the identity sample names.
+	// Signal delivers sig to the process the identity sample names. Nil, which production uses, means the built-in
+	// delivery: Stop opens a handle on the process before the second sample of each decision and signals through it.
+	// On Linux that is a pidfd, which cannot reach a process that reused the number; where pidfd_open answers ENOSYS
+	// (a kernel before 5.3, or a system-call filter such as a seccomp profile that refuses it on a newer kernel) and on
+	// the other supported Unix platforms it is the number itself, whose reuse between the second sample and the signal
+	// the samples only narrow. The built-in delivery acts only on the native probe's evidence: with a nil Signal,
+	// Processes must be nil or a procinfo.Probe, and any other Processes is refused before anything is signalled.
+	//
+	// A non-nil Signal bypasses the handles by design: it receives the second sample and is the whole delivery, with
+	// whatever guarantee it gives itself; tests use it to signal only processes they own. Signal is called while the
+	// store's exclusion is held, so it must return promptly, must not wait for the process, and must not call the
+	// Store; the exclusion is given up even if it panics.
 	Signal func(context.Context, procinfo.Identity, os.Signal) error
-	// Wait pauses for the duration or until the context ends.
+	// Wait pauses for the duration or until the context ends; nil means a timer.
 	Wait func(context.Context, time.Duration) error
 	// Legacy reads a command line as a Node gateway's. It returns the install root the command line names, or an
 	// empty root when it is not a Node gateway's; this plugin's install root, for the refusal text; and whether the
-	// named root belongs to this plugin.
+	// named root belongs to this plugin. NodeGateway returns the production predicate; nil reads no command line as
+	// a Node gateway's.
 	Legacy func(argv []string) (root, current string, ours bool)
 }
 
 // ErrNotOwned means the evidence did not establish authority to act on the process.
 var ErrNotOwned = errors.New("process ownership not established")
 
-// ErrStillRunning means the process was signalled and its exit could not be confirmed.
+// ErrStillRunning means a fresh sample after the kill confirmed the signalled process still running in the same
+// lifetime. A stop whose evidence establishes neither that nor an exit fails with an error that matches neither
+// ErrStillRunning nor ErrNotOwned.
 var ErrStillRunning = errors.New("process exit not confirmed")
 
-// Resolve classifies the holder of port against the record name in this state root.
-func (Authority) Resolve(ctx context.Context, name string, port uint16) (Owner, error) {
-	panic("not implemented")
+// Resolve classifies the holder of port against the record name in this state root. It never signals. It reads the
+// record through Store.Read, which repairs a stale or missing decimal mirror under the store's exclusion; nothing
+// else is written. The probe budget is the time to the context's deadline when Resolve starts, or the native probe's
+// platform default when the context has none; evidence that arrives after the deadline proves nothing, and an
+// inconclusive first inspection is retried once while budget is left. A request it cannot answer (an invalid state
+// root or record name, port zero) is an error; a cancelled context is reported as an error beside an Unknown owner.
+func (a Authority) Resolve(ctx context.Context, name string, port uint16) (Owner, error) {
+	return a.resolve(ctx, name, port)
 }
 
 // Stop ends the process that the record name of this state root names. The stored record, not expected, is the
 // authority; expected only has to agree with it on process number, generation and start token. Every action is
 // decided on a fresh sample, the stored record and, for a supervisor or proxy record, the listener evidence of its
 // port, and re-sampled immediately before the signal. Success means the recorded process is gone.
-func (Authority) Stop(ctx context.Context, name string, expected procinfo.Record) error {
-	panic("not implemented")
+//
+// The terminate is sent on two samples that show the recorded process; the kill only when it is still running
+// three seconds later and two fresh samples taken then still show it. A sample showing another start token on the
+// number means the recorded process has already exited: nothing is signalled and the record is retired. Any other
+// gap or contradiction in the evidence, a record replaced before the signal, or a kill whose fresh samples no longer
+// show the recorded process, is an error matching ErrNotOwned, and the record is kept. A process still running after
+// the kill, confirmed by a sample of the same lifetime, is an error matching ErrStillRunning, and the record is kept;
+// when the last sample establishes neither the exit nor that, the error matches neither sentinel and the record is
+// kept. A process that is gone has its record removed, unless it has been replaced in the meantime. An ended context
+// returns the context's error.
+//
+// Three steps take the store's exclusion, and a signal is sent only by the second. A wait for the lock is bounded by
+// the caller's deadline or, when the caller has none, by the default probe budget. When the lock stays held to that
+// bound, the record has not been touched, and the error says so and matches neither sentinel; when the caller's own
+// context ended the wait, the error also matches the caller's error:
+//   - reading the stored record at the start: the error says nothing was signalled;
+//   - the check immediately before each signal, which never waits: the error names the signal that was not sent and
+//     says which were attempted before it (for the kill, the terminate was attempted; its delivery is not
+//     established, only an exit would be);
+//   - removing the record of a process that is gone: the error says the process is gone and which signals were
+//     attempted. An error of the removal itself, a partial one that removed the record but not its mirror included,
+//     is reported as that failure and never as a record left intact.
+func (a Authority) Stop(ctx context.Context, name string, expected procinfo.Record) error {
+	return a.stop(ctx, name, expected)
 }

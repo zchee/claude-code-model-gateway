@@ -330,6 +330,16 @@ func CacheIdentity(installRoot string, registryDirs []string) string {
 	return normalPath(physicalPath(pluginDir))
 }
 
+// SameInstallRoot reports whether a and b name the same install root after the normalization the package applies to
+// every path it compares: each is cleaned, its physical path resolved through symbolic links where it exists, its
+// separators folded and its letters lowercased. An empty or relative argument is never the same root.
+func SameInstallRoot(a, b string) bool {
+	if a == "" || b == "" || !filepath.IsAbs(a) || !filepath.IsAbs(b) {
+		return false
+	}
+	return normalPath(physicalPath(filepath.Clean(a))) == normalPath(physicalPath(filepath.Clean(b)))
+}
+
 func physicalPath(path string) string {
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
 		return resolved

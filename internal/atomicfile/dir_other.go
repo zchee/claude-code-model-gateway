@@ -54,3 +54,11 @@ func (d *Dir) RewriteFile(name string, data []byte) error { return fs.ErrClosed 
 
 // CreateExclusive returns fs.ErrClosed because no Dir can be opened on this platform.
 func (d *Dir) CreateExclusive(name string, data []byte, mode fs.FileMode) error { return fs.ErrClosed }
+
+// Remove returns fs.ErrClosed because no Dir can be opened on this platform.
+func (d *Dir) Remove(name string) error { return fs.ErrClosed }
+
+// OpenFile returns fs.ErrClosed because no Dir can be opened on this platform.
+func (d *Dir) OpenFile(name string, flag int, perm os.FileMode) (*os.File, error) {
+	return nil, fs.ErrClosed
+}
