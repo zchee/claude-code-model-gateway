@@ -32,19 +32,27 @@ import (
 // TestRequestedEffortUnits pins how a requested effort reaches the prepared body and the route log. The body keeps
 // the client's UTF-16 units, so an unpaired surrogate is forwarded escaped as the source forwards it, while the
 // route and its log entry are Go strings and carry U+FFFD in its place. Ordinary efforts read the same in both.
+// The client's effort is kept only while no dispatch replaces it: a dispatched turn whose marker names an effort
+// forwards and logs that effort instead, and one whose marker names none keeps the client's units as a direct
+// turn does.
 func TestRequestedEffortUnits(t *testing.T) {
 	tests := map[string]struct {
-		effort, wantBody, wantEffort string
+		// marker, when set, dispatches the turn on a briefing marker instead of selecting the model directly.
+		effort, marker, wantBody, wantEffort string
 	}{
-		"success: ordinary effort":            {`"high"`, `"high"`, "high"},
-		"success: paired surrogates":          {`"\ud83d\ude00"`, "\"\U0001F600\"", "\U0001F600"},
-		"success: unpaired high surrogate":    {`"\ud800"`, `"\ud800"`, "�"},
-		"success: unpaired low surrogate":     {`"x\udc00y"`, `"x\udc00y"`, "x�y"},
-		"success: literal replacement stays":  {`"�"`, "\"�\"", "�"},
-		"success: reversed surrogate pair":    {`"\ude00\ud83d"`, `"\ude00\ud83d"`, "��"},
-		"success: surrogate before a letter":  {`"\ud83dz"`, `"\ud83dz"`, "�z"},
-		"success: surrogate at the very end":  {`"low\udbff"`, `"low\udbff"`, "low�"},
-		"success: escaped ASCII is unescaped": {`"\u0068\u0069\u0067\u0068"`, `"high"`, "high"},
+		"success: ordinary effort":            {effort: `"high"`, wantBody: `"high"`, wantEffort: "high"},
+		"success: paired surrogates":          {effort: `"\ud83d\ude00"`, wantBody: "\"\U0001F600\"", wantEffort: "\U0001F600"},
+		"success: unpaired high surrogate":    {effort: `"\ud800"`, wantBody: `"\ud800"`, wantEffort: "�"},
+		"success: unpaired low surrogate":     {effort: `"x\udc00y"`, wantBody: `"x\udc00y"`, wantEffort: "x�y"},
+		"success: literal replacement stays":  {effort: `"�"`, wantBody: "\"�\"", wantEffort: "�"},
+		"success: reversed surrogate pair":    {effort: `"\ude00\ud83d"`, wantBody: `"\ude00\ud83d"`, wantEffort: "��"},
+		"success: surrogate before a letter":  {effort: `"\ud83dz"`, wantBody: `"\ud83dz"`, wantEffort: "�z"},
+		"success: surrogate at the very end":  {effort: `"low\udbff"`, wantBody: `"low\udbff"`, wantEffort: "low�"},
+		"success: escaped ASCII is unescaped": {effort: `"\u0068\u0069\u0067\u0068"`, wantBody: `"high"`, wantEffort: "high"},
+
+		"success: dispatch effort replaces an unpaired surrogate": {effort: `"\ud800"`, marker: "[sidequest-route model=gpt-5.6-sol effort=high]", wantBody: `"high"`, wantEffort: "high"},
+		"success: dispatch effort replaces an ordinary effort":    {effort: `"low"`, marker: "[sidequest-route model=gpt-5.6-sol effort=xhigh]", wantBody: `"xhigh"`, wantEffort: "xhigh"},
+		"success: dispatch without effort keeps the client units": {effort: `"\ud800"`, marker: "[sidequest-route model=gpt-5.6-sol]", wantBody: `"\ud800"`, wantEffort: "�"},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -52,19 +60,25 @@ func TestRequestedEffortUnits(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			raw := `{"model":"claude-gpt-5.6-sol","output_config":{"effort":` + tc.effort + `}}`
+			selected, messages := "claude-gpt-5.6-sol", ""
+			wantRoute := outcome.Route{SelectedModel: selected, EffectiveModel: "gpt-5.6-sol", Backend: "codex", Effort: tc.wantEffort, Via: "direct"}
+			wantAudit := &outcome.Audit{Backend: "codex", Model: new("gpt-5.6-sol"), Effort: tc.wantEffort}
+			if tc.marker != "" {
+				selected, messages = "claude-codex-auto", fmt.Sprintf(`,"messages":[{"role":"user","content":%q}]`, tc.marker)
+				wantRoute.SelectedModel, wantRoute.Via = selected, "dispatch"
+				wantAudit.Via, wantAudit.MarkersLength = "dispatch", new(1)
+			}
+			raw := `{"model":"` + selected + `"` + messages + `,"output_config":{"effort":` + tc.effort + `}}`
 			res, err := newPendingTurn(t, "/v1/messages", raw, nil).prepare(h)
 			if err != nil || res.LocalStatus != 0 {
 				t.Fatalf("error %v, local status %d", err, res.LocalStatus)
 			}
-			if diff := gocmp.Diff(`{"model":"gpt-5.6-sol","output_config":{"effort":`+tc.wantBody+`}}`, string(res.Body)); diff != "" {
+			if diff := gocmp.Diff(`{"model":"gpt-5.6-sol"`+messages+`,"output_config":{"effort":`+tc.wantBody+`}}`, string(res.Body)); diff != "" {
 				t.Errorf("prepared body (-want +got): %s", diff)
 			}
-			wantRoute := outcome.Route{SelectedModel: "claude-gpt-5.6-sol", EffectiveModel: "gpt-5.6-sol", Backend: "codex", Effort: tc.wantEffort, Via: "direct"}
 			if diff := gocmp.Diff(wantRoute, res.Route); diff != "" {
 				t.Errorf("route (-want +got): %s", diff)
 			}
-			wantAudit := &outcome.Audit{Backend: "codex", Model: new("gpt-5.6-sol"), Effort: tc.wantEffort}
 			if diff := gocmp.Diff(wantAudit, res.Audit); diff != "" {
 				t.Errorf("route log entry (-want +got): %s", diff)
 			}
@@ -72,8 +86,10 @@ func TestRequestedEffortUnits(t *testing.T) {
 	}
 }
 
-// TestKeepPlanToolsStartupSnapshot checks that the plan tools switch is read once, when the handler is built:
-// changing what the lookup reports afterwards does not change how later requests are prepared.
+// TestKeepPlanToolsStartupSnapshot checks that the plan tools switch is read once, when the handler is built. In the
+// first three cases the lookup changes after the handler is built and before its first request; in the others one
+// request is prepared, the lookup changes, and a second request on the same handler is prepared exactly like the
+// first. Neither request sees the changed setting.
 func TestKeepPlanToolsStartupSnapshot(t *testing.T) {
 	const raw = `{"model":"claude-gpt-5.6-sol","tools":[{"name":"EnterPlanMode"},{"name":"Read"}]}`
 	const kept = `{"model":"gpt-5.6-sol","tools":[{"name":"EnterPlanMode"},{"name":"Read"}]}`
@@ -81,10 +97,16 @@ func TestKeepPlanToolsStartupSnapshot(t *testing.T) {
 	tests := map[string]struct {
 		atStart, later *string
 		want           string
+		// between prepares a request before the lookup changes, so the change falls between two requests.
+		between bool
 	}{
-		"success: switched on after startup stays off": {nil, new("1"), removed},
-		"success: switched off after startup stays on": {new("1"), nil, kept},
-		"success: emptied after startup stays on":      {new("1"), new(""), kept},
+		"success: switched on after startup stays off": {atStart: nil, later: new("1"), want: removed},
+		"success: switched off after startup stays on": {atStart: new("1"), later: nil, want: kept},
+		"success: emptied after startup stays on":      {atStart: new("1"), later: new(""), want: kept},
+
+		"success: switched on between requests stays off": {atStart: nil, later: new("1"), want: removed, between: true},
+		"success: switched off between requests stays on": {atStart: new("1"), later: nil, want: kept, between: true},
+		"success: emptied between requests stays on":      {atStart: new("1"), later: new(""), want: kept, between: true},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -97,17 +119,24 @@ func TestKeepPlanToolsStartupSnapshot(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			check := func(when string) {
+				t.Helper()
+				res, err := newPendingTurn(t, "/v1/messages", raw, nil).prepare(h)
+				if err != nil || res.LocalStatus != 0 {
+					t.Fatalf("%s: error %v, local status %d", when, err, res.LocalStatus)
+				}
+				if diff := gocmp.Diff(tc.want, string(res.Body)); diff != "" {
+					t.Errorf("%s: prepared body (-want +got): %s", when, diff)
+				}
+			}
+			if tc.between {
+				check("request before the change")
+			}
 			delete(env, key)
 			if tc.later != nil {
 				env[key] = *tc.later
 			}
-			res, err := newPendingTurn(t, "/v1/messages", raw, nil).prepare(h)
-			if err != nil || res.LocalStatus != 0 {
-				t.Fatalf("error %v, local status %d", err, res.LocalStatus)
-			}
-			if diff := gocmp.Diff(tc.want, string(res.Body)); diff != "" {
-				t.Errorf("prepared body (-want +got): %s", diff)
-			}
+			check("request after the change")
 		})
 	}
 }

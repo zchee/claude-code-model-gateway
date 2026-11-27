@@ -36,13 +36,17 @@ func TestBodyCompletion(t *testing.T) {
 		body                                                        string
 		readErr                                                     error
 		cancelOnRead, cancelBeforeAdmission, inputFailure, noBranch bool
+		// aborted is whether the handler ends with http.ErrAbortHandler, so that net/http neither answers nor keeps
+		// the connection. A departure the worker finds itself aborts; a branch that returned owns the response, and a
+		// body that failed while the client remains is answered with the fixed 400.
+		aborted bool
 	}{
-		"error: client leaves before classifier refusal":  {body: `{"model":"claude-grok-test\ud800"}`, cancelOnRead: true},
-		"error: client leaves before unconfigured branch": {cancelOnRead: true, noBranch: true},
-		"error: client leaves before branch selection":    {cancelOnRead: true},
+		"error: client leaves before classifier refusal":  {body: `{"model":"claude-grok-test\ud800"}`, cancelOnRead: true, aborted: true},
+		"error: client leaves before unconfigured branch": {cancelOnRead: true, noBranch: true, aborted: true},
+		"error: client leaves before branch selection":    {cancelOnRead: true, aborted: true},
 		"error: client leaves before admission callback":  {cancelBeforeAdmission: true},
 		"error: body fails while client remains":          {readErr: errors.New("corrupt chunk length"), inputFailure: true},
-		"error: body ends early before context cancels":   {readErr: io.ErrUnexpectedEOF},
+		"error: body ends early before context cancels":   {readErr: io.ErrUnexpectedEOF, aborted: true},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -86,14 +90,21 @@ func TestBodyCompletion(t *testing.T) {
 			}))
 			w := httptest.NewRecorder()
 			w.Code = 0 // Distinguish no write from an explicit HTTP 200.
+			var aborted bool
 			func() {
 				defer func() {
-					if v := recover(); v != nil && v != http.ErrAbortHandler { //nolint:errorlint // Only this exact panic is handled silently by net/http.
-						panic(v)
+					if v := recover(); v != nil {
+						if v != http.ErrAbortHandler { //nolint:errorlint // Only this exact panic is handled silently by net/http.
+							panic(v)
+						}
+						aborted = true
 					}
 				}()
 				h.ServeHTTP(w, r)
 			}()
+			if aborted != tt.aborted {
+				t.Errorf("handler aborted the connection=%t, want %t", aborted, tt.aborted)
+			}
 			mu.Lock()
 			gotTerminals := append([]outcome.Result(nil), terminals...)
 			mu.Unlock()
@@ -108,6 +119,10 @@ func TestBodyCompletion(t *testing.T) {
 				equal(t, http.StatusBadRequest, gotTerminals[0].Status)
 				equal(t, http.StatusBadRequest, w.Code)
 				equal(t, "application/json", w.Header().Get("Content-Type"))
+				// As the supervisor's answer to the same failure, the 400 closes the connection and tells the client
+				// not to retry.
+				equal(t, "close", w.Header().Get("Connection"))
+				equal(t, "false", w.Header().Get("X-Should-Retry"))
 				equal(t, map[string]any{
 					"type":  "error",
 					"error": map[string]any{"type": "invalid_request_error", "message": "model-gateway could not read the request body"},
@@ -177,9 +192,11 @@ func TestModelsHookFailure(t *testing.T) {
 				}
 				return
 			}
-			if w.Code < 500 || w.Code >= 600 || strings.Contains(w.Body.String(), `"data"`) {
-				t.Errorf("catalog hook failed; status=%d, listing returned=%t", w.Code, strings.Contains(w.Body.String(), `"data"`))
-			}
+			// The fixed answer restates modelsFailureBody in handler.go byte for byte: no listing rows, no hook detail.
+			const failure = `{"type":"error","error":{"type":"api_error","message":"model-gateway could not build the model listing"}}`
+			equal(t, http.StatusBadGateway, w.Code)
+			equal(t, "application/json", w.Header().Get("Content-Type"))
+			equal(t, failure, w.Body.String())
 		})
 	}
 }
