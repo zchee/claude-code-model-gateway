@@ -19,7 +19,6 @@ import (
 	json "encoding/json/v2"
 	"errors"
 	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -38,25 +37,33 @@ func readStartToken(t *testing.T, ctx context.Context, p Probe, pid int) (token 
 	return p.StartToken(ctx, pid)
 }
 
-func TestRecordStartToken(t *testing.T) {
-	tests := map[string]struct {
-		token StartToken
-		// suffix follows the image object in the exact encoding.
-		suffix string
-	}{
-		"success: token is the last field under startToken":        {token: "boot-a/4242", suffix: `,"startToken":"boot-a/4242"}`},
-		"success: record from before the token keeps its encoding": {suffix: `}`},
+// recordStartTokenCases are records with and without a token, each with the
+// part of the exact encoding that follows the image object.
+var recordStartTokenCases = map[string]struct {
+	token  StartToken
+	suffix string
+}{
+	"success: token is the last field under startToken":        {token: "boot-a/4242", suffix: `,"startToken":"boot-a/4242"}`},
+	"success: record from before the token keeps its encoding": {suffix: `}`},
+}
+
+// recordWithToken returns the record fixture for root carrying token, and its
+// exact encoding, which ends with suffix.
+func recordWithToken(t *testing.T, root string, token StartToken, suffix string) (Record, string) {
+	t.Helper()
+	record, _ := recordFixture(root)
+	record.StartToken = token
+	quotedRoot, err := json.Marshal(root)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for name, tt := range tests {
+	return record, `{"pid":702,"command":"router serve-shim","startedAt":"Sat Feb  3 22:15:09 2001","role":"guardian","stateRoot":` + string(quotedRoot) + `,"generation":"generation-a","port":27123,"version":"1.2.3","image":{"path":"/opt/bin/router","device":11,"inode":55}` + suffix
+}
+
+func TestRecordStartToken(t *testing.T) {
+	for name, tt := range recordStartTokenCases {
 		t.Run(name, func(t *testing.T) {
-			root := t.TempDir()
-			record, _ := recordFixture(root)
-			record.StartToken = tt.token
-			quotedRoot, err := json.Marshal(root)
-			if err != nil {
-				t.Fatal(err)
-			}
-			wire := `{"pid":702,"command":"router serve-shim","startedAt":"Sat Feb  3 22:15:09 2001","role":"guardian","stateRoot":` + string(quotedRoot) + `,"generation":"generation-a","port":27123,"version":"1.2.3","image":{"path":"/opt/bin/router","device":11,"inode":55}` + tt.suffix
+			record, wire := recordWithToken(t, "/var/lib/router", tt.token, tt.suffix)
 			encoded, err := json.Marshal(record)
 			if err != nil {
 				t.Fatal(err)
@@ -70,19 +77,6 @@ func TestRecordStartToken(t *testing.T) {
 			}
 			if diff := gocmp.Diff(record, decoded); diff != "" {
 				t.Errorf("decoded record (-want +got): %s", diff)
-			}
-			if err := WriteRecord(root, "guardian", record); err != nil {
-				t.Fatalf("publish record: %v", err)
-			}
-			if diff := gocmp.Diff(wire, readFile(t, filepath.Join(root, "guardian.pid.json"))); diff != "" {
-				t.Errorf("published bytes (-want +got): %s", diff)
-			}
-			got, err := ReadRecord(root, "guardian")
-			if err != nil {
-				t.Fatalf("read record: %v", err)
-			}
-			if diff := gocmp.Diff(record, got); diff != "" {
-				t.Errorf("read record (-want +got): %s", diff)
 			}
 		})
 	}

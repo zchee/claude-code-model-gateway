@@ -72,11 +72,6 @@ type ImageEvidence struct {
 	DirectFromExecutable bool `json:"-"`
 }
 
-// StartToken identifies one lifetime of a process number independently of the
-// wall clock. It is opaque and compared for equality only; an empty token is
-// unreadable evidence and never matches. A token does not reveal an exec.
-type StartToken string
-
 // Identity describes a running process. ParentPID zero denotes a proven root.
 // PID and birth survive exec and cannot prove that the executable is unchanged.
 // Linux Birth adds start ticks to the boot wall clock; a clock step can change
@@ -153,12 +148,6 @@ func (p Probe) Birth(ctx context.Context, pid int) (time.Time, error) {
 		return birth, nil
 	}
 	return time.Time{}, p.inspectionError(ctx, pid, err)
-}
-
-// StartToken returns the process-start token of pid, or an empty token and an
-// error when the token cannot be read.
-func (p Probe) StartToken(ctx context.Context, pid int) (StartToken, error) {
-	panic("not implemented")
 }
 
 func (p Probe) inspectionError(ctx context.Context, pid int, err error) error {

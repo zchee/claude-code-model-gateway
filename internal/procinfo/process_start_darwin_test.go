@@ -41,8 +41,8 @@ func checkDarwinToken(t *testing.T, token StartToken, sec int64, usec int32) {
 	t.Helper()
 	rest, secFirst := strings.CutPrefix(string(token), strconv.FormatInt(sec, 10))
 	sep, usecLast := strings.CutSuffix(rest, fmt.Sprintf("%06d", usec))
-	if !secFirst || !usecLast || len(sep) != 1 || !strings.Contains("!#$%&*+,-./:;<=>?@^_|~", sep) {
-		t.Errorf("token %q; want %d, one punctuation separator, then %06d", token, sec, usec)
+	if !secFirst || !usecLast || !oneASCIIPunctuation(sep) {
+		t.Errorf("token %q; want %d, one ASCII punctuation byte, then %06d", token, sec, usec)
 	}
 }
 
