@@ -145,54 +145,68 @@ func gzipped(t *testing.T, s string) []byte {
 
 // TestCountSettingsBeyond32Bits guards the conversion of count and byte settings above 32 bits with
 // small bodies: such a setting must be honoured as a large bound, never wrap or disable the feature.
+// The saturation point of the conversion itself is tested directly in clamp_internal_test.go.
 func TestCountSettingsBeyond32Bits(t *testing.T) {
-	t.Run("success: an observation ceiling beyond 32 bits still observes a compressed native stream", func(t *testing.T) {
-		encoded := gzipped(t, nativeStart+nativeDelta+nativeStop)
-		h := newHarness(t, harnessConfig{
-			disableTrace: true,
-			env:          map[string]string{"CODEX_GATEWAY_USAGE_MAX_RESPONSE_BYTES": beyond32Bits},
-			anthropicHandler: func(w http.ResponseWriter, r *http.Request) {
-				_, _ = io.Copy(io.Discard, r.Body)
-				w.Header().Set("Content-Type", "text/event-stream")
-				w.Header().Set("Content-Encoding", "gzip")
-				w.Header().Set("Request-Id", "req-native-large-bound")
-				_, _ = w.Write(encoded)
+	encoded := gzipped(t, nativeStart+nativeDelta+nativeStop)
+	var attempts atomic.Int32
+	tests := map[string]struct {
+		cfg   harnessConfig
+		check func(t *testing.T, h *harness)
+	}{
+		"success: an observation ceiling beyond 32 bits still observes a compressed native stream": {
+			cfg: harnessConfig{
+				disableTrace: true,
+				env:          map[string]string{"CODEX_GATEWAY_USAGE_MAX_RESPONSE_BYTES": beyond32Bits},
+				anthropicHandler: func(w http.ResponseWriter, r *http.Request) {
+					_, _ = io.Copy(io.Discard, r.Body)
+					w.Header().Set("Content-Type", "text/event-stream")
+					w.Header().Set("Content-Encoding", "gzip")
+					w.Header().Set("Request-Id", "req-native-large-bound")
+					_, _ = w.Write(encoded)
+				},
 			},
+			check: func(t *testing.T, h *harness) {
+				// The handler is run to its end here: a client can read a sized body before the handler returns.
+				w := newDeliveryWriter()
+				serveDirect(t.Context(), t, h, w, messageRequestJSON("claude-sonnet-4-6", true), http.Header{"Accept-Encoding": {"gzip"}})
+				status, _ := w.snapshot()
+				mustDiff(t, "native status", http.StatusOK, status)
+				h.usageEmitter.Wait()
+				logs := decodeOTLPLogs(t, h.usageCollector.snapshot())
+				mustDiff(t, "usage records", 1, len(logs))
+				mustDiff(t, "observed input tokens", int64(10), logs[0].Attributes["input_tokens"])
+				mustDiff(t, "observed output tokens", int64(3), logs[0].Attributes["output_tokens"])
+			},
+		},
+		"success: a retry count beyond 32 bits still retries rejected upgrades": {
+			cfg: harnessConfig{
+				disableTrace: true,
+				disableUsage: true,
+				env: map[string]string{
+					"CODEX_GATEWAY_WS_UPGRADE_RETRIES":        beyond32Bits,
+					"CODEX_GATEWAY_WS_UPGRADE_RETRY_DELAY_MS": "0",
+				},
+				proxyHandler: func(w http.ResponseWriter, r *http.Request) {
+					_, _ = io.Copy(io.Discard, r.Body)
+					w.Header().Set("Content-Type", "application/json")
+					if attempts.Add(1) <= 3 {
+						w.WriteHeader(http.StatusForbidden)
+						_, _ = io.WriteString(w, upgradeRejection)
+						return
+					}
+					_, _ = io.WriteString(w, `{"id":"msg_retry","type":"message","model":"gpt-6.1-sol","stop_reason":"end_turn","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`)
+				},
+			},
+			check: func(t *testing.T, h *harness) {
+				status, _, _ := h.do(http.MethodPost, "/v1/messages", messageRequestJSON("claude-gpt-6.1-sol[1m]", false), nil)
+				mustDiff(t, "status after three rejected upgrades", http.StatusOK, status)
+				mustDiff(t, "upstream attempts", int32(4), attempts.Load())
+			},
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			tt.check(t, newHarness(t, tt.cfg))
 		})
-		// The handler is run to its end here: a client can read a sized body before the handler returns.
-		w := newDeliveryWriter()
-		serveDirect(t.Context(), t, h, w, messageRequestJSON("claude-sonnet-4-6", true), http.Header{"Accept-Encoding": {"gzip"}})
-		status, _ := w.snapshot()
-		mustDiff(t, "native status", http.StatusOK, status)
-		h.usageEmitter.Wait()
-		logs := decodeOTLPLogs(t, h.usageCollector.snapshot())
-		mustDiff(t, "usage records", 1, len(logs))
-		mustDiff(t, "observed input tokens", int64(10), logs[0].Attributes["input_tokens"])
-		mustDiff(t, "observed output tokens", int64(3), logs[0].Attributes["output_tokens"])
-	})
-
-	t.Run("success: a retry count beyond 32 bits still retries rejected upgrades", func(t *testing.T) {
-		var attempts atomic.Int32
-		h := newHarness(t, harnessConfig{
-			disableTrace: true,
-			disableUsage: true,
-			env: map[string]string{
-				"CODEX_GATEWAY_WS_UPGRADE_RETRIES":        beyond32Bits,
-				"CODEX_GATEWAY_WS_UPGRADE_RETRY_DELAY_MS": "0",
-			},
-			proxyHandler: func(w http.ResponseWriter, r *http.Request) {
-				_, _ = io.Copy(io.Discard, r.Body)
-				w.Header().Set("Content-Type", "application/json")
-				if attempts.Add(1) <= 3 {
-					w.WriteHeader(http.StatusForbidden)
-					_, _ = io.WriteString(w, upgradeRejection)
-					return
-				}
-				_, _ = io.WriteString(w, `{"id":"msg_retry","type":"message","model":"gpt-6.1-sol","stop_reason":"end_turn","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`)
-			},
-		})
-		status, _, _ := h.do(http.MethodPost, "/v1/messages", messageRequestJSON("claude-gpt-6.1-sol[1m]", false), nil)
-		mustDiff(t, "status after three rejected upgrades", http.StatusOK, status)
-		mustDiff(t, "upstream attempts", int32(4), attempts.Load())
-	})
+	}
 }

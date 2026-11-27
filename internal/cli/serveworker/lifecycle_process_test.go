@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	json "encoding/json/v2"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -29,6 +30,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -232,7 +234,8 @@ func TestGracefulDrainAfterNativeDeparture(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			home, env, _ := sandbox(t)
 			entered, providerEnded, release := newSignal(), newSignal(), newSignal()
-			t.Cleanup(release.fire)
+			// Deferred, so it runs before the worker's cleanup waits for Run.
+			defer release.fire()
 			env["CODEX_GATEWAY_ANTHROPIC_UPSTREAM"] = env.StartUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				_, _ = io.Copy(io.Discard, r.Body)
 				w.Header().Set("Content-Type", "text/event-stream")
@@ -286,22 +289,36 @@ func TestGracefulDrainAfterNativeDeparture(t *testing.T) {
 	}
 }
 
-// heldSink holds the one write that contains marker until released, and records whether Run had
-// already returned when the write was let go.
+// heldSink holds the one write that contains marker until released. When that write has ended it
+// records whether Run had already returned, which a worker that joins its request handlers never
+// lets happen.
 type heldSink struct {
 	lockedSink
-	marker   string
-	entered  *signal
-	release  *signal
-	released atomic.Bool
+	marker  string
+	entered *signal
+	release *signal
+	// runDone is closed when Run returns; it is set before the held write can start.
+	runDone atomic.Pointer[chan struct{}]
+	// ended is set once the held write has ended, and afterRun records what it saw at that moment.
+	ended, afterRun atomic.Bool
 }
 
 func (s *heldSink) Write(p []byte) (int, error) {
-	if strings.Contains(string(p), s.marker) {
-		s.entered.fire()
-		<-s.release.ch
+	if !strings.Contains(string(p), s.marker) {
+		return s.lockedSink.Write(p)
 	}
-	return s.lockedSink.Write(p)
+	s.entered.fire()
+	<-s.release.ch
+	n, err := s.lockedSink.Write(p)
+	if done := s.runDone.Load(); done != nil {
+		select {
+		case <-*done:
+			s.afterRun.Store(true)
+		default:
+		}
+	}
+	s.ended.Store(true)
+	return n, err
 }
 
 func TestForcedStopJoinsRequestHandlers(t *testing.T) {
@@ -315,7 +332,9 @@ func TestForcedStopJoinsRequestHandlers(t *testing.T) {
 			home, env, _ := sandbox(t)
 			heldEntered, serviceEnded := newSignal(), newSignal()
 			stderr := &heldSink{marker: tt.marker, entered: newSignal(), release: newSignal()}
-			t.Cleanup(stderr.release.fire)
+			// Deferred, so it runs before the worker's cleanup waits for Run, which joins the handler
+			// that this sink holds.
+			defer stderr.release.fire()
 			mux := http.NewServeMux()
 			mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
@@ -340,6 +359,7 @@ func TestForcedStopJoinsRequestHandlers(t *testing.T) {
 			env["CODEX_GATEWAY_PROXY_PORT"] = portOf(t, env.StartUpstream(t, mux))
 			var stdout lockedSink
 			w := startWorker(t, home, env, &stdout, stderr)
+			stderr.runDone.Store(&w.done)
 			pollHealth(t, w.public, "the proxy catalog", func(doc map[string]any) bool { return doc["catalog"] == "proxy" })
 
 			var clients sync.WaitGroup
@@ -368,28 +388,24 @@ func TestForcedStopJoinsRequestHandlers(t *testing.T) {
 			send("rejected", false)
 			stderr.entered.wait(t, "the handler to reach its diagnostic line")
 
-			// The moment Run returns, record whether the blocked handler had been let go by then.
-			var returnedAfterRelease atomic.Bool
-			watched := make(chan struct{})
-			go func() { defer close(watched); <-w.done; returnedAfterRelease.Store(stderr.released.Load()) }()
 			w.cancel()
 			// The service context has ended once the held provider request is cancelled; only then is the
 			// blocked handler let go.
 			serviceEnded.wait(t, "the forced stop to cancel the service")
-			stderr.released.Store(true)
 			stderr.release.fire()
 			if !w.returned() {
 				t.Fatal("the stopped worker did not return")
 			}
-			<-watched
 			if w.err != nil {
 				t.Errorf("Run: %v", w.err)
 			}
-			if !returnedAfterRelease.Load() {
-				t.Error("Run returned while a request handler was still blocked writing its diagnostic")
+			// Both observations order the held write against Run's return: one made when the write
+			// ended, one made now that Run has returned.
+			if stderr.afterRun.Load() {
+				t.Error("Run returned before a request handler's blocked diagnostic write had ended")
 			}
-			if !strings.Contains(stderr.String(), tt.marker) {
-				t.Errorf("the handler's diagnostic line was not written before Run returned; stderr=%q", stderr.String())
+			if !stderr.ended.Load() {
+				t.Errorf("Run returned while a request handler was still blocked writing its diagnostic; stderr=%q", stderr.String())
 			}
 		})
 	}
@@ -424,16 +440,26 @@ func writeExpiredGrokAuth(t *testing.T, env gatewaytest.Environment, issuer stri
 	return file
 }
 
-// listenerClosed waits until the worker's TCP listener refuses connections.
+// listenerClosed waits until the worker's TCP listener refuses connections. Only a refused
+// connection counts. An accepted connection, a dial timeout, or a reset of a connection that was
+// queued while the listener closed means the listener's state is not decided yet, and the dial is
+// repeated; any other dial error says nothing about the listener and fails the test.
 func listenerClosed(t *testing.T, public string) {
 	t.Helper()
 	deadline := time.Now().Add(failureBound)
 	for time.Now().Before(deadline) {
 		conn, err := (&net.Dialer{Timeout: 100 * time.Millisecond}).DialContext(t.Context(), "tcp", public)
-		if err != nil {
+		switch {
+		case errors.Is(err, syscall.ECONNREFUSED):
 			return
+		case err == nil:
+			_ = conn.Close()
+		case errors.Is(err, syscall.ECONNRESET):
+		default:
+			if ne, ok := errors.AsType[net.Error](err); !ok || !ne.Timeout() {
+				t.Fatalf("dial of the stopped worker failed other than by a refused connection: %v", err)
+			}
 		}
-		_ = conn.Close()
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("the stopped worker kept accepting connections")
@@ -441,14 +467,15 @@ func listenerClosed(t *testing.T, public string) {
 
 func TestShutdownDuringGrokAuth(t *testing.T) {
 	tests := map[string]struct{ hold string }{
-		"success: a forced stop ends a Grok credential discovery before Run returns":             {hold: "discovery"},
-		"success: a forced stop lets a committed Grok token exchange persist before Run returns": {hold: "exchange"},
+		"success: a forced stop cancels a Grok credential discovery":                              {hold: "discovery"},
+		"success: a forced stop leaves a committed Grok token exchange to persist its credential": {hold: "exchange"},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			home, env, _ := sandbox(t)
 			entered, ended, release := newSignal(), newSignal(), newSignal()
-			t.Cleanup(release.fire)
+			// Deferred, so it runs before the worker's cleanup waits for Run, which joins the exchange.
+			defer release.fire()
 			mux := http.NewServeMux()
 			mux.HandleFunc("GET /.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
 				if tt.hold == "discovery" {
@@ -524,7 +551,7 @@ func TestShutdownDuringGrokAuth(t *testing.T) {
 					t.Fatal(err)
 				}
 				if !bytes.Contains(raw, []byte(grokRotatedAccess)) {
-					t.Errorf("the committed token exchange was not persisted when Run returned (rotated credential stored: false, expired credential still stored: %t, exchange cancelled: %t)", bytes.Contains(raw, []byte(grokFixtureAccess)), ended.fired())
+					t.Errorf("the committed token exchange was not persisted once Run had returned (rotated credential stored: false, expired credential still stored: %t, exchange cancelled: %t)", bytes.Contains(raw, []byte(grokFixtureAccess)), ended.fired())
 				}
 			}
 		})
@@ -554,7 +581,20 @@ func TestCommandWiresCodexReadiness(t *testing.T) {
 			}
 			var stdout, stderr lockedSink
 			w := startWorker(t, home, env, &stdout, &stderr)
+			// The first /healthz starts the shared check, so it always answers before the check completes.
 			cr := codexReadiness(t, getJSON(t, "http://"+w.public+"/healthz"))
+			if !tt.settled {
+				want := map[string]any{
+					"state":     "checking",
+					"message":   "Codex readiness is still being checked (proxy /v1/models and codex auth status); ask /healthz again in a few seconds.",
+					"checks":    nil,
+					"checkedAt": nil,
+				}
+				got := map[string]any{"state": cr["state"], "message": cr["message"], "checks": cr["checks"], "checkedAt": cr["checkedAt"]}
+				if diff := gocmp.Diff(want, got); diff != "" {
+					t.Errorf("summary before the first check completes (-want +got):\n%s", diff)
+				}
+			}
 			if tt.settled {
 				doc := pollHealth(t, w.public, "a completed readiness check", func(doc map[string]any) bool {
 					state, _ := codexReadiness(t, doc)["state"].(string)
