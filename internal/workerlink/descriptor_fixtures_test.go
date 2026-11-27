@@ -37,7 +37,8 @@ import (
 
 // The tests in this file check the observations the package's tests rely on, against the operating system and
 // the fakes alone, so that a wrong observation cannot pass for a wrong implementation. Of the package under test they
-// call only the default drain channel pair, which is real code and no stub.
+// call only the default drain channel pair, which is real code and no stub, and they probe its parent end only
+// through net.Conn.
 
 func TestFixturePeekCountsWithoutConsuming(t *testing.T) {
 	a, b := socketPair(t, unix.SOCK_STREAM)
@@ -146,10 +147,10 @@ func TestFixtureAddressFreedByLastCopy(t *testing.T) {
 }
 
 // TestFixtureFilledChannelBlocksWrites checks the saturation the acknowledgment tests rely on, on the parent end of
-// a drain channel pair made as the registry makes it by default: once saturate returns, a nonblocking one-byte send
-// on that same end returns EAGAIN, and the peer then reads exactly the bytes saturate reported and nothing more.
+// a drain channel pair made as drainPairs makes it: once saturate returns, a nonblocking one-byte send on that same
+// end returns EAGAIN, and the peer then reads exactly the bytes saturate reported and nothing more.
 func TestFixtureFilledChannelBlocksWrites(t *testing.T) {
-	parent, file, err := workerlink.NewDrainPair()
+	parent, file, err := newTestDrainPair()
 	if parent != nil {
 		t.Cleanup(func() { _ = parent.Close() })
 	}
@@ -157,11 +158,11 @@ func TestFixtureFilledChannelBlocksWrites(t *testing.T) {
 		t.Cleanup(func() { _ = file.Close() })
 	}
 	if err != nil {
-		t.Fatalf("NewDrainPair: %v", err)
+		t.Fatalf("newTestDrainPair: %v", err)
 	}
 	sc, ok := parent.(syscall.Conn)
 	if !ok {
-		t.Fatalf("the default parent end is a %T without a descriptor", parent)
+		t.Fatalf("the test's parent end is a %T without a descriptor", parent)
 	}
 	peer := fileConn(t, file)
 	filled := saturate(t, sc)
@@ -211,10 +212,11 @@ func TestFixtureCountsDescriptors(t *testing.T) {
 	}
 }
 
-// TestFixtureDefaultDrainPair checks the pair a registry makes when no test replaced its factory: both ends are
-// close-on-exec, connected local stream sockets that carry bytes both ways, the parent end is nonblocking (so that
-// saturate can use it), and closing every handle of the child's end gives the parent end of file, so the pair keeps
-// no other copy of it.
+// TestFixtureDefaultDrainPair checks the pair a registry makes when no test replaced its factory: the child's end is
+// a close-on-exec, connected local stream socket, the two ends carry bytes both ways, and closing every handle of the
+// child's end gives the parent end of file, so the pair keeps no other copy of it. The parent end is used only as a
+// net.Conn: the default may return any connection type, and that a child does not inherit it is checked in a child
+// process (TestFixtureDefaultDrainPairNotInherited).
 func TestFixtureDefaultDrainPair(t *testing.T) {
 	parent, file, err := workerlink.NewDrainPair()
 	if parent != nil {
@@ -226,24 +228,11 @@ func TestFixtureDefaultDrainPair(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDrainPair: %v", err)
 	}
-	sc, ok := parent.(syscall.Conn)
-	if !ok {
-		t.Fatalf("the default parent end is a %T without a descriptor", parent)
-	}
 	want := socketKind{Family: "unix", Type: unix.SOCK_STREAM, Listening: wantListening(false), Connected: true}
-	if diff := gocmp.Diff(want, describeSocket(t, sc)); diff != "" {
-		t.Errorf("parent end (-want +got):\n%s", diff)
-	}
 	if diff := gocmp.Diff(want, describeSocket(t, file)); diff != "" {
 		t.Errorf("child end (-want +got):\n%s", diff)
 	}
-	checkCloseOnExec(t, sc, "parent end")
 	checkCloseOnExec(t, file, "child end")
-	control(t, sc, func(fd int) {
-		if flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0); err != nil || flags&unix.O_NONBLOCK == 0 {
-			t.Errorf("parent end flags %#x, %v; want a nonblocking descriptor", flags, err)
-		}
-	})
 	child := fileConn(t, file)
 	writeAll(t, parent, "to-child\n")
 	if got := readExactly(t, child, 9); got != "to-child\n" {
@@ -293,10 +282,11 @@ func TestFixtureDrainPairs(t *testing.T) {
 	}
 }
 
-// TestFixtureGatedConn checks the gated parent end inside a bubble: a Write announces its entry and waits; it ends
-// when the gate opens (the bytes reach the real peer), at a write deadline set before it or while it waits, at once
-// for a deadline that is not in the future, and at once when the connection is closed; a write that did not go
-// through delivers nothing; after the gate opened, later writes go through at once.
+// TestFixtureGatedConn checks the gated parent end inside a bubble: a Write announces its entry, is counted in
+// progress and waits; it ends when the gate opens (the bytes reach the real peer), at a write deadline set before it
+// or while it waits, at once for a deadline that is not in the future, and at once when the connection is closed; it
+// is no longer counted in progress once it returned, and its entry and return are recorded at the bubble's times they
+// happened; a write that did not go through delivers nothing; after the gate opened, later writes go through at once.
 func TestFixtureGatedConn(t *testing.T) {
 	tests := map[string]struct {
 		// before runs before the Write starts; during runs once it has entered.
@@ -360,12 +350,18 @@ func TestFixtureGatedConn(t *testing.T) {
 				if w, ok := ready(out); ok {
 					t.Fatalf("Write returned %d, %v before anything ended it", w.n, w.err)
 				}
+				if entry, exit := g.heldSpan(); !entry.Equal(start) || !exit.IsZero() || g.writing() != 1 || isClosed(g.exited) {
+					t.Fatalf("while the Write waits: entry %v (want the start %v), exit %v (want none), %d in progress (want 1)", entry, start, exit, g.writing())
+				}
 				if tt.during != nil {
 					tt.during(g)
 				}
 				w := await(t, out, "the end of the Write")
 				if waited := time.Since(start); waited != tt.wait {
 					t.Errorf("the Write ended after %v of the bubble's time, want %v", waited, tt.wait)
+				}
+				if entry, exit := g.heldSpan(); exit.Sub(entry) != tt.wait || g.writing() != 0 || !isClosed(g.exited) {
+					t.Errorf("after the Write returned: span %v (want %v), %d in progress (want 0), exit announced %t", exit.Sub(entry), tt.wait, g.writing(), isClosed(g.exited))
 				}
 				offered, writes := g.attempts()
 				if diff := gocmp.Diff([]any{"line\n", 1}, []any{offered, writes}); diff != "" {
@@ -396,6 +392,73 @@ func TestFixtureGatedConn(t *testing.T) {
 				}
 				if waited := time.Since(start); waited != 0 {
 					t.Errorf("writes through an open gate took %v of the bubble's time", waited)
+				}
+			})
+		})
+	}
+}
+
+// TestFixtureGatedConnHoldsTheLastByte checks the gated parent end with a hold offset, inside a bubble: however the
+// bytes are split into Writes, every Write that ends before the held offset goes through at once and is not announced,
+// and the Write that carries the byte at the offset is announced and waits until the gate opens; the peer then reads
+// every byte in order.
+func TestFixtureGatedConnHoldsTheLastByte(t *testing.T) {
+	const line = "line\n"
+	tests := map[string]struct {
+		writes []string
+	}{
+		"success: one Write carries the whole line":          {writes: []string{line}},
+		"success: the last byte comes in a Write of its own": {writes: []string{"line", "\n"}},
+		"success: the held Write also carries earlier bytes": {writes: []string{"l", "in", "e\n"}},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				parent, file, err := newTestDrainPair()
+				if parent != nil {
+					t.Cleanup(func() { _ = parent.Close() })
+				}
+				if file != nil {
+					t.Cleanup(func() { _ = file.Close() })
+				}
+				if err != nil {
+					t.Fatalf("newTestDrainPair: %v", err)
+				}
+				peer := fileConn(t, file)
+				g := newGatedConn(parent)
+				t.Cleanup(func() { _ = g.Close() })
+				g.holdFrom(len(line) - 1)
+				last := len(tt.writes) - 1
+				for _, w := range tt.writes[:last] {
+					if n, err := g.Write([]byte(w)); n != len(w) || err != nil {
+						t.Fatalf("Write(%q) before the held byte = %d, %v; want it through at once", w, n, err)
+					}
+				}
+				if isClosed(g.entered) || g.writing() != 0 {
+					t.Fatalf("the Writes before the held byte were announced (%t) or are still in progress (%d)", isClosed(g.entered), g.writing())
+				}
+				out := make(chan error, 1)
+				go func() {
+					_, err := g.Write([]byte(tt.writes[last]))
+					out <- err
+				}()
+				await(t, g.entered, "entry into the Write that carries the held byte")
+				synctest.Wait()
+				if err, ok := ready(out); ok {
+					t.Fatalf("the Write that carries the held byte returned %v before the gate opened", err)
+				}
+				if g.writing() != 1 {
+					t.Fatalf("%d Writes in progress while the held one waits, want 1", g.writing())
+				}
+				g.openGate()
+				if err := await(t, out, "the held Write"); err != nil {
+					t.Fatalf("the held Write after the gate opened: %v", err)
+				}
+				if got := readExactly(t, peer, len(line)); got != line {
+					t.Errorf("peer read %q, want %q", got, line)
+				}
+				if offered, writes := g.attempts(); offered != line || writes != len(tt.writes) {
+					t.Errorf("recorded %q in %d Writes, want %q in %d", offered, writes, line, len(tt.writes))
 				}
 			})
 		})

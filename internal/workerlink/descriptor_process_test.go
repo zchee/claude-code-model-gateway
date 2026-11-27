@@ -45,11 +45,12 @@ const helperLinePrefix = "workerlink-helper: "
 // inheritedSocket is one socket descriptor the child found open. Its listening state is not recorded: macOS does
 // not answer that question (see listeningOf), so a listener is identified by its family and bound port.
 type inheritedSocket struct {
-	FD     int    `json:"fd"`
-	Family string `json:"family,omitzero"`
-	Type   int    `json:"type,omitzero"`
-	Port   int    `json:"port,omitzero"`
-	// Pending is what is queued for reading on the socket, peeked without consuming it.
+	FD        int    `json:"fd"`
+	Family    string `json:"family,omitzero"`
+	Type      int    `json:"type,omitzero"`
+	Port      int    `json:"port,omitzero"`
+	Connected bool   `json:"connected,omitzero"`
+	// Pending is what is queued for reading on a connected local stream socket, peeked without consuming it.
 	Pending string `json:"pending,omitzero"`
 }
 
@@ -79,16 +80,12 @@ func report(t *testing.T, format string, args ...any) {
 	}
 }
 
-// nothingToRead reports whether a failed peek means only that the socket has nothing to read: EAGAIN for a socket
-// with an empty queue; ENOTCONN for a TCP socket that is listening or not connected (Linux tcp(7) receive; macOS
-// soreceive, xnu bsd/kern/uipc_socket.c:3470-3472); EINVAL for a local stream socket that is listening or not
-// connected (Linux unix_stream_recvmsg).
-func nothingToRead(err error) bool {
-	return errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.ENOTCONN) || errors.Is(err, unix.EINVAL)
-}
-
-// inheritedSocketsHelper reports every socket descriptor open in the child. Any inspection that fails for another
-// reason than the ones nothingToRead names fails the helper, so that a socket cannot hide behind an error.
+// inheritedSocketsHelper reports every socket descriptor open in the child: its type, family and port, whether it
+// has a peer, and, for a connected local stream socket only, what is queued for reading on it. getpeername failing
+// with ENOTCONN means no peer (Linux getpeername(2); xnu bsd/kern/uipc_syscalls.c:3239-3243); a connected local
+// stream socket with an empty queue answers a nonblocking peek with EAGAIN (Linux recv(2); xnu soreceive,
+// bsd/kern/uipc_socket.c:3477-3481, where EWOULDBLOCK is EAGAIN), and a peek interrupted by a signal is repeated. Any
+// other failure of an inspection fails the helper, so that a socket cannot hide behind an error.
 func inheritedSocketsHelper(tb testing.TB, _ []string) {
 	t := helperT(tb)
 	fds, err := openDescriptors()
@@ -121,18 +118,39 @@ func inheritedSocketsHelper(tb testing.TB, _ []string) {
 		default:
 			s.Family = "other"
 		}
-		buf := make([]byte, 256)
-		switch n, _, err := unix.Recvfrom(fd, buf, unix.MSG_PEEK|unix.MSG_DONTWAIT); {
+		switch _, err := unix.Getpeername(fd); {
 		case err == nil:
-			s.Pending = string(buf[:n])
-		case !nothingToRead(err):
-			t.Fatalf("peek of %d: %v", fd, err)
+			s.Connected = true
+		case !errors.Is(err, unix.ENOTCONN):
+			t.Fatalf("getpeername of %d: %v", fd, err)
+		}
+		if s.Family == "unix" && s.Type == unix.SOCK_STREAM && s.Connected {
+			s.Pending = peekQueued(t, fd)
 		}
 		line, err := json.Marshal(s)
 		if err != nil {
 			t.Fatalf("marshal: %v", err)
 		}
 		report(t, "%s", line)
+	}
+}
+
+// peekQueued returns what is queued for reading on the connected local stream socket fd, without consuming it or
+// blocking.
+func peekQueued(t *testing.T, fd int) string {
+	t.Helper()
+	buf := make([]byte, 256)
+	for {
+		n, _, err := unix.Recvfrom(fd, buf, unix.MSG_PEEK|unix.MSG_DONTWAIT)
+		switch {
+		case err == nil:
+			return string(buf[:n])
+		case errors.Is(err, unix.EINTR):
+		case errors.Is(err, unix.EAGAIN):
+			return ""
+		default:
+			t.Fatalf("peek of %d: %v", fd, err)
+		}
 	}
 }
 
@@ -408,6 +426,34 @@ func TestFixtureChildDescriptorSets(t *testing.T) {
 	}
 	if diff := gocmp.Diff(want, runHelper(t, "descriptor-sets")); diff != "" {
 		t.Errorf("helper report (-want +got):\n%s", diff)
+	}
+}
+
+// TestFixtureDefaultDrainPairNotInherited checks the pair a registry makes when no test replaced its factory, through
+// what a child started now finds open: neither the parent's end nor the child's end of the pair, each with a tag
+// queued on it, is inherited, so both were close-on-exec before the pair was returned. The parent end is used only as
+// a net.Conn.
+func TestFixtureDefaultDrainPairNotInherited(t *testing.T) {
+	holdLowDescriptors(t)
+	parent, file, err := workerlink.NewDrainPair()
+	if parent != nil {
+		t.Cleanup(func() { _ = parent.Close() })
+	}
+	if file != nil {
+		t.Cleanup(func() { _ = file.Close() })
+	}
+	if err != nil {
+		t.Fatalf("NewDrainPair: %v", err)
+	}
+	child := fileConn(t, file)
+	const toParent, toChild = "queued-for-the-default-parent-end", "queued-for-the-default-child-end"
+	writeAll(t, child, toParent)
+	writeAll(t, parent, toChild)
+	sockets := childSockets(t)
+	for _, tag := range []string{toParent, toChild} {
+		if found := leakedInto(sockets, 0, tag); len(found) != 0 {
+			t.Errorf("a child inherited an end of the default drain channel pair: %v", found)
+		}
 	}
 }
 

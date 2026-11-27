@@ -279,29 +279,37 @@ func TestImportListenerAccepts(t *testing.T) {
 // TestImportListenerRefuses checks every refusal of the inherited listener. A refusal returns no listener (there
 // is no fallback bind) and still consumes the inherited file. A bound TCP socket that is not listening is refused
 // by the import where the system reports the listening state (Linux). On macOS, which does not (see listeningOf),
-// it may pass the import, and then its first Accept fails at once; the worker command treats that as a failed start.
-// A listener on another loopback address than exactly 127.0.0.1 is refused; that case runs where 127.0.0.2 can be
-// bound without configuration (Linux, see otherLoopbackBindable).
+// the import succeeds: it returns the listener and no error and consumes the file, and the first Accept on that
+// listener returns no connection and an error; the worker command treats that as a failed start. Go wraps a bound
+// TCP socket as a listener without asking whether it listens (src/net/file_posix.go:15-45,74-80 in go1.27.4); XNU's
+// accept fails with EINVAL on a stream socket that is not listening (bsd/kern/uipc_syscalls.c:502-508), and Go
+// returns that error from Accept without waiting (src/internal/poll/fd_unix.go:608-627, only EINTR, EAGAIN and
+// ECONNABORTED are retried). A listener on another loopback address than exactly 127.0.0.1 is refused; that case
+// runs where 127.0.0.2 can be bound without configuration (Linux, see otherLoopbackBindable).
 func TestImportListenerRefuses(t *testing.T) {
 	type refusal struct {
 		fixture  fixtureFile
 		expected func(port uint16) uint16
-		// orFirstAccept also accepts a listener whose first Accept fails.
-		orFirstAccept bool
+		// importedThenAcceptFails requires the import to succeed and the first Accept to fail instead.
+		importedThenAcceptFails bool
 	}
 	tests := map[string]refusal{
-		"error: expected port is zero":                  {fixture: tcpListenerFile("tcp4", "127.0.0.1:0"), expected: func(uint16) uint16 { return 0 }},
-		"error: listener on another port":               {fixture: tcpListenerFile("tcp4", "127.0.0.1:0"), expected: otherPort},
-		"error: listener on the wildcard address":       {fixture: tcpListenerFile("tcp4", "0.0.0.0:0")},
-		"error: connected TCP stream":                   {fixture: connectedTCPFile},
-		"error: bound TCP socket that is not listening": {fixture: boundTCPFile, orFirstAccept: !listeningObservable},
-		"error: UDP socket":                             {fixture: udpFile},
-		"error: Unix stream listener":                   {fixture: unixListenerFile},
-		"error: drain channel given as the listener":    {fixture: socketPairFile(unix.SOCK_STREAM)},
-		"error: regular file":                           {fixture: regularFile},
-		"error: pipe":                                   {fixture: pipeFile},
-		"error: closed file":                            {fixture: closedFile},
-		"error: no file":                                {fixture: noFile},
+		"error: expected port is zero":               {fixture: tcpListenerFile("tcp4", "127.0.0.1:0"), expected: func(uint16) uint16 { return 0 }},
+		"error: listener on another port":            {fixture: tcpListenerFile("tcp4", "127.0.0.1:0"), expected: otherPort},
+		"error: listener on the wildcard address":    {fixture: tcpListenerFile("tcp4", "0.0.0.0:0")},
+		"error: connected TCP stream":                {fixture: connectedTCPFile},
+		"error: UDP socket":                          {fixture: udpFile},
+		"error: Unix stream listener":                {fixture: unixListenerFile},
+		"error: drain channel given as the listener": {fixture: socketPairFile(unix.SOCK_STREAM)},
+		"error: regular file":                        {fixture: regularFile},
+		"error: pipe":                                {fixture: pipeFile},
+		"error: closed file":                         {fixture: closedFile},
+		"error: no file":                             {fixture: noFile},
+	}
+	if listeningObservable {
+		tests["error: bound TCP socket that is not listening"] = refusal{fixture: boundTCPFile}
+	} else {
+		tests["success: bound TCP socket that is not listening is imported, and its first Accept fails"] = refusal{fixture: boundTCPFile, importedThenAcceptFails: true}
 	}
 	if otherLoopbackBindable {
 		tests["error: listener on another loopback address"] = refusal{fixture: tcpListenerFile("tcp4", "127.0.0.2:0")}
@@ -316,7 +324,10 @@ func TestImportListenerRefuses(t *testing.T) {
 			if l != nil {
 				t.Cleanup(func() { _ = l.Close() })
 			}
-			if l != nil && err == nil && tt.orFirstAccept {
+			if tt.importedThenAcceptFails {
+				if l == nil || err != nil {
+					t.Fatalf("ImportListener = %v, %v; want the listener and no error", l, err)
+				}
 				checkConsumed(t, f)
 				checkAcceptFails(t, l)
 				return
@@ -332,15 +343,16 @@ func TestImportListenerRefuses(t *testing.T) {
 	}
 }
 
-// checkAcceptFails asserts that the first Accept on l fails; the watchdog of acceptOutcome only aborts a hang.
+// checkAcceptFails asserts that the first Accept on l returns no connection and an error; the watchdog of
+// acceptOutcome only aborts a hang.
 func checkAcceptFails(t *testing.T, l net.Listener) {
 	t.Helper()
 	c, err := acceptOutcome(t, l)
 	if c != nil {
 		_ = c.Close()
 	}
-	if err == nil {
-		t.Fatal("the imported socket that is not listening accepted a connection")
+	if c != nil || err == nil {
+		t.Fatalf("first Accept on the imported socket that is not listening = %v, %v; want no connection and an error", c, err)
 	}
 }
 

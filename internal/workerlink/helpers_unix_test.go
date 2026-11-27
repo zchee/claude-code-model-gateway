@@ -169,15 +169,20 @@ func peekPending(c syscall.Conn) (int, error) {
 }
 
 // openDescriptors returns the sorted numbers of the descriptors open in this process. It reads the names of
-// /dev/fd and parses them as numbers, without a stat of each entry: on macOS os.ReadDir stats the entries and drops
-// the ones that fail, such as a kqueue descriptor, where Readdirnames returns every name. The directory's own
-// descriptor is left out, so that two sets taken at different times compare exactly.
+// /dev/fd, without a stat of each entry: on macOS os.ReadDir stats the entries and drops the ones that fail, such as a
+// kqueue descriptor, where Readdirnames returns every name. The listing also names the descriptors the enumeration
+// itself held: the directory's own, and on macOS the duplicate Go makes of it for fdopendir (Go
+// src/os/dir_darwin.go:36, src/internal/poll/fd_opendir_darwin.go:15-18), which /dev/fd lists like any other (xnu
+// bsd/miscfs/devfs/devfs_fdesc_support.c:694-713). Both are closed with the directory, so after that each listed
+// number is asked F_GETFD: EBADF means it is closed now and it is left out (fcntl looks the number up at xnu
+// bsd/kern/kern_descrip.c:2871, and fp_lookup returns EBADF for a closed one at :1524-1530); any other error fails;
+// a descriptor of any kind that is still open, a kqueue included, answers (the F_GETFD case reads only the
+// descriptor's flags, kern_descrip.c:2922-2925).
 func openDescriptors() ([]int, error) {
 	dir, err := os.Open("/dev/fd")
 	if err != nil {
 		return nil, err
 	}
-	own := int(dir.Fd())
 	names, err := dir.Readdirnames(-1)
 	if closeErr := dir.Close(); err == nil {
 		err = closeErr
@@ -191,7 +196,11 @@ func openDescriptors() ([]int, error) {
 		if err != nil {
 			return nil, fmt.Errorf("descriptor name %q: %w", name, err)
 		}
-		if fd != own {
+		switch _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); {
+		case errors.Is(err, unix.EBADF):
+		case err != nil:
+			return nil, fmt.Errorf("F_GETFD of descriptor %d: %w", fd, err)
+		default:
 			fds = append(fds, fd)
 		}
 	}
@@ -684,15 +693,17 @@ func publish(t *testing.T, res *workerlink.Reservation, pid int) {
 }
 
 // gatedConn is the parent's end of a drain channel as a test supplies it through the registry's pair factory. It
-// passes everything to a real end, except that a Write first records the bytes it was asked to write and announces
-// that it began, and then waits, as a write to a peer that has stopped reading does, until the test opens the gate
-// (the bytes then go to the real end), its write deadline passes, or the connection is closed. A deadline set before
-// or during the Write is honoured, and one that is not in the future ends the Write at once with nothing written,
-// as a net.Conn does.
+// passes everything to a real end, except that a Write first records the bytes it was asked to write, and a Write
+// whose bytes reach the held offset (counted over every byte offered so far, from zero; see holdFrom) then waits, as a
+// write to a peer that has stopped reading does, until the test opens the gate (the bytes then go to the real end),
+// its write deadline passes, or the connection is closed. A Write that ends before the held offset goes through at
+// once. A deadline set before or during the Write is honoured, and one that is not in the future ends the Write at
+// once with nothing written, as a net.Conn does. The connection counts the Writes in progress and records when the
+// first held Write began and when it returned.
 type gatedConn struct {
 	net.Conn
-	// entered is closed when the first Write begins.
-	entered chan struct{}
+	// entered is closed when the first held Write begins; exited when that Write returns.
+	entered, exited chan struct{}
 
 	mu sync.Mutex
 	// changed is closed and replaced whenever the gate, the write deadline or closure changes.
@@ -700,12 +711,18 @@ type gatedConn struct {
 	open     bool
 	closed   bool
 	deadline time.Time
+	// hold is the offset of the first byte whose Write waits; zero holds every Write with a byte in it.
+	hold     int
+	held     bool
 	offered  []byte
 	writes   int
+	inFlight int
+	// enteredAt and exitedAt are the bubble's times of the first held Write's entry and return.
+	enteredAt, exitedAt time.Time
 }
 
 func newGatedConn(real net.Conn) *gatedConn {
-	return &gatedConn{Conn: real, entered: make(chan struct{}), changed: make(chan struct{})}
+	return &gatedConn{Conn: real, entered: make(chan struct{}), exited: make(chan struct{}), changed: make(chan struct{})}
 }
 
 func (c *gatedConn) notifyLocked() {
@@ -713,24 +730,49 @@ func (c *gatedConn) notifyLocked() {
 	c.changed = make(chan struct{})
 }
 
+// holdFrom makes the Writes before offset go through at once and holds the Write that reaches it. Call it before
+// the first Write.
+func (c *gatedConn) holdFrom(offset int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.hold = offset
+}
+
 func (c *gatedConn) Write(p []byte) (int, error) {
 	c.mu.Lock()
+	reaches := len(c.offered)+len(p) > c.hold
 	c.writes++
+	c.inFlight++
 	c.offered = append(c.offered, p...)
-	if c.writes == 1 {
+	first := reaches && !c.held
+	if first {
+		c.held = true
+		c.enteredAt = time.Now()
 		close(c.entered)
+	}
+	// leave is called with c.mu held and releases it.
+	leave := func() {
+		c.inFlight--
+		if first {
+			c.exitedAt = time.Now()
+			close(c.exited)
+		}
+		c.mu.Unlock()
 	}
 	for {
 		switch {
 		case c.closed:
-			c.mu.Unlock()
+			leave()
 			return 0, &net.OpError{Op: "write", Net: "unix", Err: net.ErrClosed}
 		case !c.deadline.IsZero() && !time.Now().Before(c.deadline):
-			c.mu.Unlock()
+			leave()
 			return 0, &net.OpError{Op: "write", Net: "unix", Err: os.ErrDeadlineExceeded}
-		case c.open:
+		case c.open || !reaches:
 			c.mu.Unlock()
-			return c.Conn.Write(p)
+			n, err := c.Conn.Write(p)
+			c.mu.Lock()
+			leave()
+			return n, err
 		}
 		changed, deadline := c.changed, c.deadline
 		c.mu.Unlock()
@@ -794,13 +836,57 @@ func (c *gatedConn) attempts() (offered string, writes int) {
 	return string(c.offered), c.writes
 }
 
+// writing returns the number of Write calls in progress.
+func (c *gatedConn) writing() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.inFlight
+}
+
+// heldSpan returns the bubble's times of the first held Write's entry and return; exit is zero while it runs.
+func (c *gatedConn) heldSpan() (entry, exit time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.enteredAt, c.exitedAt
+}
+
 // errPair is the failure drainPairs injects.
 var errPair = errors.New("drain channel pair not created")
 
-// drainPairs is a registry's drain channel pair factory under the test's control. Every pair is a real one, made
-// as the registry makes it by default; the test keeps its own handle on each parent end. With gate set the parent
-// end is handed to the registry wrapped in a gatedConn. The call whose number, counted from one, is fail returns
-// errPair and creates nothing.
+// newTestDrainPair creates a drain channel pair the test owns: a connected local stream socket pair, both
+// descriptors marked close-on-exec under syscall.ForkLock, the parent's end as a connection over its own descriptor
+// (nonblocking, as net.FileConn makes it) and the child's end as a file. The tests probe a parent's descriptor only
+// on such a pair, so that the registry's default pair stays free to return a parent end of any net.Conn type.
+func newTestDrainPair() (net.Conn, *os.File, error) {
+	syscall.ForkLock.RLock()
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err == nil {
+		if _, err = unix.FcntlInt(uintptr(fds[0]), unix.F_SETFD, unix.FD_CLOEXEC); err == nil {
+			_, err = unix.FcntlInt(uintptr(fds[1]), unix.F_SETFD, unix.FD_CLOEXEC)
+		}
+		if err != nil {
+			_ = unix.Close(fds[0])
+			_ = unix.Close(fds[1])
+		}
+	}
+	syscall.ForkLock.RUnlock()
+	if err != nil {
+		return nil, nil, err
+	}
+	parentFile := os.NewFile(uintptr(fds[0]), "test-drain-parent")
+	parent, err := net.FileConn(parentFile)
+	_ = parentFile.Close()
+	if err != nil {
+		_ = unix.Close(fds[1])
+		return nil, nil, err
+	}
+	return parent, os.NewFile(uintptr(fds[1]), "test-drain-child"), nil
+}
+
+// drainPairs is a registry's drain channel pair factory under the test's control. Every pair is a real one, made by
+// newTestDrainPair; the test keeps its own handle on each parent end. With gate set the parent end is handed to the
+// registry wrapped in a gatedConn. The call whose number, counted from one, is fail returns errPair and creates
+// nothing.
 type drainPairs struct {
 	t    *testing.T
 	gate bool
@@ -826,7 +912,7 @@ func (p *drainPairs) pair() (net.Conn, *os.File, error) {
 	if p.calls == p.fail {
 		return nil, nil, errPair
 	}
-	parent, child, err := workerlink.NewDrainPair()
+	parent, child, err := newTestDrainPair()
 	if err != nil {
 		return nil, nil, err
 	}

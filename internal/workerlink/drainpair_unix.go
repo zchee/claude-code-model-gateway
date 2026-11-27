@@ -20,21 +20,32 @@ import (
 	"net"
 	"os"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // newDrainPair creates a connected local stream socket pair whose two descriptors are close-on-exec, and returns
 // the parent's end as a connection and the child's end as a file to pass to the worker. Both descriptors are
-// marked under syscall.ForkLock, so no process this program starts meanwhile inherits either of them.
+// marked under syscall.ForkLock, so no process this program starts meanwhile inherits either of them. The pair
+// fails closed: when either mark is refused, both descriptors are closed before the lock is released and the pair
+// is not created.
 func newDrainPair() (parent net.Conn, child *os.File, err error) {
 	syscall.ForkLock.RLock()
-	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	call := "socketpair"
 	if err == nil {
-		syscall.CloseOnExec(fds[0])
-		syscall.CloseOnExec(fds[1])
+		call = "fcntl"
+		if _, err = unix.FcntlInt(uintptr(fds[0]), unix.F_SETFD, unix.FD_CLOEXEC); err == nil {
+			_, err = unix.FcntlInt(uintptr(fds[1]), unix.F_SETFD, unix.FD_CLOEXEC)
+		}
+		if err != nil {
+			_ = unix.Close(fds[0])
+			_ = unix.Close(fds[1])
+		}
 	}
 	syscall.ForkLock.RUnlock()
 	if err != nil {
-		return nil, nil, os.NewSyscallError("socketpair", err)
+		return nil, nil, os.NewSyscallError(call, err)
 	}
 	parentFile := os.NewFile(uintptr(fds[0]), "drain-parent")
 	parent, err = net.FileConn(parentFile)
@@ -43,7 +54,7 @@ func newDrainPair() (parent net.Conn, child *os.File, err error) {
 		err = closeErr
 	}
 	if err != nil {
-		_ = syscall.Close(fds[1])
+		_ = unix.Close(fds[1])
 		return nil, nil, err
 	}
 	return parent, os.NewFile(uintptr(fds[1]), "drain-child"), nil

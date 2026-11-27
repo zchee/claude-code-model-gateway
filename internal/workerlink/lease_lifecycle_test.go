@@ -319,6 +319,9 @@ func TestRetireKeepsPinnedDial(t *testing.T) {
 					t.Errorf("Retire cancelled a dial that had already pinned the generation: %v", attempt.ctx.Err())
 				}
 				if r, ok := ready(out); ok {
+					if r.lease != nil {
+						_ = r.lease.Close()
+					}
 					t.Fatalf("Acquire returned %+v before its dial completed", r)
 				}
 				if lease, err := reg.Acquire(t.Context(), ""); lease != nil || !errors.Is(err, workerlink.ErrRetired) {

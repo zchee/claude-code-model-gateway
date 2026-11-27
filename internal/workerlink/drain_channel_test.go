@@ -130,8 +130,8 @@ func TestDrainChannel(t *testing.T) {
 
 // TestAcknowledgeDrain checks the graceful path on real sockets: after retirement the acknowledgment writes
 // exactly one retired line for its own generation and releases the supervisor's copy of the listener; it leaves the
-// lease issued before it working in both directions and its Exited channel untouched, never reopens admission, and
-// a repeated call writes nothing. A second reservation's acknowledgment carries that reservation's generation and
+// lease issued before it working in both directions and its Exited channel untouched until End closes it, never
+// reopens admission, and a repeated call writes nothing. A second reservation's acknowledgment carries that reservation's generation and
 // reaches only that reservation's channel.
 func TestAcknowledgeDrain(t *testing.T) {
 	reg := workerlink.NewRegistry(realListen, realDial)
@@ -214,6 +214,9 @@ func TestAcknowledgeDrain(t *testing.T) {
 	if err := res.End(); err != nil {
 		t.Errorf("End: %v", err)
 	}
+	// The waiter captured before the acknowledgment saw nothing until End; End wakes it by closing the channel, so
+	// its receive reports closure. A value it received earlier, before it could tell, would be reported here instead.
+	checkExitWaitersWoke(t, woke, 1)
 	if err := second.End(); err != nil {
 		t.Errorf("End of the second reservation: %v", err)
 	}
@@ -224,11 +227,25 @@ type ackRun struct {
 	done     chan error
 	returned bool
 	err      error
+	// at is the time AcknowledgeDrain returned and writing the number of Write calls on the watched parent end still
+	// in progress then, both taken in the calling goroutine the moment the call returned, before anything else runs
+	// there. They are set before the result is sent, so they may be read once poll or wait has seen it.
+	at      time.Time
+	writing int
 }
 
-func startAck(ctx context.Context, res *workerlink.Reservation) *ackRun {
+// startAck starts AcknowledgeDrain; parent, when not nil, is the gated parent end whose Writes in progress are
+// counted at the return.
+func startAck(ctx context.Context, res *workerlink.Reservation, parent *gatedConn) *ackRun {
 	a := &ackRun{done: make(chan error, 1)}
-	go func() { a.done <- res.AcknowledgeDrain(ctx) }()
+	go func() {
+		err := res.AcknowledgeDrain(ctx)
+		if parent != nil {
+			a.writing = parent.writing()
+		}
+		a.at = time.Now()
+		a.done <- err
+	}()
 	return a
 }
 
@@ -353,9 +370,11 @@ func (f *ackFixture) settle(t *testing.T, i int, errDial error) (workerlink.Leas
 // TestAcknowledgeDrainWaitsForPinnedDial checks that the acknowledgment waits for every dial that pinned the
 // generation before its retirement, whichever settles first and whether the first succeeds or fails, while the other
 // is shown to be still open; that of two acknowledgers racing behind the pins neither succeeds before the pins have
-// settled and the one line is completely written (the test holds that write), at least one then succeeds and one
-// line is offered in total; that the complete line is on the channel before the listener is released; and that the
-// handed-over lease keeps working and its Exited channel stays untouched.
+// settled and the Write that carries the line's last byte has gone through (the test holds that Write, however the
+// line is split into Writes; the bytes before it go through), at least one then succeeds and one line is offered in
+// total; that the complete line is on the channel before the listener is released; and that the handed-over lease
+// keeps working and its Exited channel stays untouched. A real-time watchdog outside the bubble turns a lock that
+// parks a goroutine of the bubble for good into a failure.
 func TestAcknowledgeDrainWaitsForPinnedDial(t *testing.T) {
 	tests := map[string]struct {
 		// first is the pinned dial that settles first; firstFails makes it fail and the other succeed.
@@ -369,10 +388,16 @@ func TestAcknowledgeDrainWaitsForPinnedDial(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
+			var step atomic.Pointer[string]
+			at := func(s string) { step.Store(&s) }
+			stop := abortIfStuck(t.Name(), bubbleWatchdog, &step)
+			defer stop()
 			synctest.Test(t, func(t *testing.T) {
 				errDial := errors.New("connect failed")
+				at("parking the two pinned acquisitions")
 				f := newAckFixture(t, false, 2)
 				want := frame("retired", "gen-a")
+				f.parent.holdFrom(len(want) - 1)
 				var atRelease atomic.Int64
 				atRelease.Store(-2)
 				f.listener.onClose(func() {
@@ -383,7 +408,8 @@ func TestAcknowledgeDrainWaitsForPinnedDial(t *testing.T) {
 					atRelease.Store(int64(n))
 				})
 				f.res.Retire()
-				acks := []*ackRun{startAck(t.Context(), f.res), startAck(t.Context(), f.res)}
+				at("two acknowledgments behind two pinned dials")
+				acks := []*ackRun{startAck(t.Context(), f.res, f.parent), startAck(t.Context(), f.res, f.parent)}
 				f.checkBarrier(t, "with two pinned dials in progress", true, acks...)
 
 				outcome := func(fails bool) error {
@@ -393,6 +419,7 @@ func TestAcknowledgeDrainWaitsForPinnedDial(t *testing.T) {
 					return nil
 				}
 				other := 1 - tt.first
+				at("settling the first pinned dial")
 				handed, handedConn := f.settle(t, tt.first, outcome(tt.firstFails))
 				// The other pin is still open: its dial is parked unanswered and uncancelled, its Acquire pending.
 				synctest.Wait()
@@ -406,23 +433,27 @@ func TestAcknowledgeDrainWaitsForPinnedDial(t *testing.T) {
 					t.Fatalf("the other pinned dial was cancelled: %v", err)
 				}
 				f.checkBarrier(t, "with one pinned dial still in progress", true, acks...)
+				at("settling the other pinned dial")
 				if lease, conn := f.settle(t, other, outcome(!tt.firstFails)); lease != nil {
 					handed, handedConn = lease, conn
 				}
 				exited := handed.Exited()
 				woke := exitWaiters(handed)
 
-				// Every pin has settled: an acknowledgment now writes its line, and the test holds that write.
-				await(t, f.parent.entered, "the acknowledgment's write")
+				// Every pin has settled: an acknowledgment now writes its line, and the test holds the Write that carries
+				// its last byte.
+				at("waiting for the Write that carries the line's last byte")
+				await(t, f.parent.entered, "the Write that carries the line's last byte")
 				synctest.Wait()
 				for i, a := range acks {
 					if a.poll() && a.err == nil {
-						t.Fatalf("acknowledgment %d succeeded while its line was still being written", i+1)
+						t.Fatalf("acknowledgment %d succeeded before the Write that carries the line's last byte went through", i+1)
 					}
 				}
 				if isClosed(f.listener.closed) {
-					t.Fatal("the listener was released while the line was still being written")
+					t.Fatal("the listener was released before the Write that carries the line's last byte went through")
 				}
+				at("the acknowledgments after the gate opened")
 				f.parent.openGate()
 				errs := []error{acks[0].wait(t, "the first acknowledgment"), acks[1].wait(t, "the second acknowledgment")}
 				if errs[0] != nil && errs[1] != nil {
@@ -445,6 +476,7 @@ func TestAcknowledgeDrainWaitsForPinnedDial(t *testing.T) {
 				}
 
 				// The handed-over lease is left alone: its Exited channel and waiter are untouched, it carries bytes.
+				at("the checks on the handed-over lease")
 				synctest.Wait()
 				if _, ok := ready(woke); ok || !untouched(exited) {
 					t.Error("the acknowledgment closed or signalled the handed-over lease's Exited channel")
@@ -509,7 +541,7 @@ func TestAcknowledgeDrainRefuses(t *testing.T) {
 				}
 				ctx, cancel := context.WithCancel(t.Context())
 				defer cancel()
-				ack := startAck(ctx, f.res)
+				ack := startAck(ctx, f.res, f.parent)
 				if tt.interrupt != nil {
 					f.checkBarrier(t, "with a pinned dial in progress", false, ack)
 					tt.interrupt(t, f, cancel)
@@ -586,7 +618,7 @@ func TestAcknowledgeDrainBoundedWhenPeerStopsReading(t *testing.T) {
 			}
 			publish(t, res, 4101)
 			res.Retire()
-			ack := startAck(t.Context(), res)
+			ack := startAck(t.Context(), res, nil)
 			if tt.interrupt != nil {
 				tt.interrupt(t, res)
 			}
@@ -622,10 +654,10 @@ func TestAcknowledgeDrainBoundedWhenPeerStopsReading(t *testing.T) {
 	}
 }
 
-// bubbleWatchdog bounds one bubble of TestAcknowledgeDrainWriteIsBounded in real time. A goroutine waiting for a
-// sync.Mutex is not durably blocked for synctest, so while one waits the bubble's clock, and every watchdog inside the
-// bubble with it, stands still; only a timer outside the bubble can then end the test. Correct code finishes such a
-// bubble in milliseconds of real time, so a loaded runner does not come near this bound.
+// bubbleWatchdog bounds in real time one bubble of a test that may park a goroutine on a lock of the code under test.
+// A goroutine waiting for a sync.Mutex is not durably blocked for synctest, so while one waits the bubble's clock, and
+// every watchdog inside the bubble with it, stands still; only a timer outside the bubble can then end the test.
+// Correct code finishes such a bubble in milliseconds of real time, so a loaded runner does not come near this bound.
 const bubbleWatchdog = 2 * time.Minute
 
 // abortIfStuck starts a real-time watchdog outside any bubble. Unless stop is called within limit, it ends the test
@@ -644,7 +676,7 @@ func abortIfStuck(what string, limit time.Duration, step *atomic.Pointer[string]
 				current = *s
 			}
 			debug.SetTraceback("all")
-			panic(fmt.Sprintf("%s: still blocked after %v of real time, at the step %q; a lock held across the acknowledgment's write stops the bubble's clock", what, limit, current))
+			panic(fmt.Sprintf("%s: still blocked after %v of real time, at the step %q; a goroutine of the bubble waits for a lock that is not released, which stops the bubble's clock", what, limit, current))
 		}
 	}()
 	return func() { close(done) }
@@ -654,29 +686,55 @@ func abortIfStuck(what string, limit time.Duration, step *atomic.Pointer[string]
 // exchange. The exact budget below it is the implementation's.
 const writeBudget = 5 * time.Second
 
+// gatedReservation is a published, retired reservation whose drain channel's parent end is gated.
+type gatedReservation struct {
+	res      *workerlink.Reservation
+	parent   *gatedConn
+	listener *fakeListener
+}
+
+// reserveGated reserves generation on port with the next pair of pairs, takes its drain channel, publishes it for
+// pid and retires it.
+func reserveGated(t *testing.T, reg *workerlink.Registry, pairs *drainPairs, listens *fakeListens, generation workerlink.Generation, port uint16, pid int) gatedReservation {
+	t.Helper()
+	res := reserve(t, reg, generation, port)
+	parent := pairs.gatedAt(t, pairs.count()-1)
+	// Registered after End's cleanup, so it runs first: no Write stays parked when an assertion fails.
+	t.Cleanup(func() { _ = parent.Close() })
+	drainChannel(t, res)
+	publish(t, res, pid)
+	res.Retire()
+	return gatedReservation{res: res, parent: parent, listener: listens.at(t, port)}
+}
+
 // TestAcknowledgeDrainWriteIsBounded checks, in a bubble and through a gated parent end, an acknowledgment that has
 // begun its write to a worker that reads nothing. The test sees the Write begin, then runs unrelated registry work
-// (Reserve, Publish, Acquire and End of another generation), which must complete without the bubble's clock moving,
-// so no registry lock is held across the write. The write then ends: with a context that never ends, through the
-// acknowledgment's own budget, at most five seconds after the call; at once with the caller's cancellation, with
-// that context's error; no later than the caller's deadline; and at once when the generation ends. A failed
-// acknowledgment keeps the listener and admission retired, except after End. That bound is enforced by a write
-// deadline or by closing the channel; the gated end honours both.
+// (Reserve, Publish, Acquire and End of another generation), which must complete while that Write is still in progress
+// and the acknowledgment has not returned, so no registry lock is held across the write. The write then ends: with a
+// context that never ends, through the acknowledgment's own budget, at most five seconds after the Write began; at
+// once with the caller's cancellation, with that context's error; at the caller's deadline, with
+// context.DeadlineExceeded, when that deadline provably comes first; and at once when the generation ends. Whatever
+// ends it, no Write of the acknowledgment is still in progress when AcknowledgeDrain returns. A failed acknowledgment
+// keeps the listener and admission retired, except after End. That bound is enforced by a write deadline or by
+// closing the channel; the gated end honours both. The time a correct implementation lets pass before it calls Write
+// is its own: every bound is taken from the Write's entry, never from the call.
 func TestAcknowledgeDrainWriteIsBounded(t *testing.T) {
 	tests := map[string]struct {
-		// deadline, when nonzero, is the caller's deadline after the call starts.
-		deadline time.Duration
+		// callerDeadline gives the caller's context a deadline inside the write: after the Write begins and before
+		// the acknowledgment's own budget would end it, both observed first on a sibling reservation in the same
+		// bubble.
+		callerDeadline bool
 		// interrupt ends the write; nil leaves it to the budget or to the caller's deadline.
 		interrupt func(t *testing.T, res *workerlink.Reservation, cancel context.CancelFunc)
 		// atOnce requires the acknowledgment to return without the bubble's clock moving after the interrupt.
 		atOnce bool
-		// limit is the most bubble time the call may take from its start.
-		limit time.Duration
-		want  error
-		ended bool
+		// budget requires the acknowledgment to return at most writeBudget after its Write began.
+		budget bool
+		want   error
+		ended  bool
 	}{
 		"error: the budget is spent with a context that never ends": {
-			limit: writeBudget,
+			budget: true,
 		},
 		"error: the caller cancels while the write waits": {
 			interrupt: func(_ *testing.T, _ *workerlink.Reservation, cancel context.CancelFunc) { cancel() },
@@ -684,8 +742,7 @@ func TestAcknowledgeDrainWriteIsBounded(t *testing.T) {
 			want:      context.Canceled,
 		},
 		"error: the caller's deadline passes while the write waits": {
-			deadline: 100 * time.Millisecond,
-			limit:    100 * time.Millisecond,
+			callerDeadline: true,
 		},
 		"error: the generation ends while the write waits": {
 			interrupt: func(t *testing.T, res *workerlink.Reservation, _ context.CancelFunc) {
@@ -704,28 +761,53 @@ func TestAcknowledgeDrainWriteIsBounded(t *testing.T) {
 			stop := abortIfStuck(t.Name(), bubbleWatchdog, &step)
 			defer stop()
 			synctest.Test(t, func(t *testing.T) {
-				at("setting up the reservation")
+				at("setting up the registry")
 				listens := newFakeListens()
-				dials := &immediateDials{t: t}
-				reg := workerlink.NewRegistry(listens.listen, dials.dial)
+				reg := workerlink.NewRegistry(listens.listen, (&immediateDials{t: t}).dial)
 				pairs := newDrainPairs(t, reg, true, 0)
-				res := reserve(t, reg, "gen-a", 41001)
-				t.Cleanup(pairs.closeGated)
 				t.Cleanup(func() { listens.checkNeverAccepted(t) })
-				parent := pairs.gatedAt(t, 0)
-				listener := listens.at(t, 41001)
-				drainChannel(t, res)
-				publish(t, res, 4101)
-				res.Retire()
-				ctx, cancel := context.WithCancel(t.Context())
-				if tt.deadline != 0 {
-					ctx, cancel = context.WithTimeout(t.Context(), tt.deadline)
+
+				var ctx context.Context
+				var cancel context.CancelFunc
+				// deadlineInside is set when the caller's deadline was placed strictly inside the write.
+				deadlineInside := false
+				if tt.callerDeadline {
+					at("observing the budget on a sibling reservation")
+					sibling := reserveGated(t, reg, pairs, listens, "gen-sibling", 41003, 4103)
+					called := time.Now()
+					sibAck := startAck(t.Context(), sibling.res, sibling.parent)
+					await(t, sibling.parent.entered, "the sibling acknowledgment's write")
+					if err := sibAck.wait(t, "the sibling AcknowledgeDrain"); err == nil {
+						t.Fatal("the sibling AcknowledgeDrain reported success for a line the worker never read")
+					}
+					if sibAck.writing != 0 {
+						t.Fatalf("%d Write calls of the sibling acknowledgment were still in progress when it returned", sibAck.writing)
+					}
+					entry, exit := sibling.parent.heldSpan()
+					beforeWrite, window := entry.Sub(called), exit.Sub(entry)
+					if err := sibling.res.End(); err != nil {
+						t.Fatalf("End of the sibling: %v", err)
+					}
+					if half := window / 2; half > 0 {
+						deadlineInside = true
+						ctx, cancel = context.WithTimeout(t.Context(), beforeWrite+half)
+					} else {
+						// The budget leaves no time inside the write for a deadline to come first; which of the two
+						// wins is then not decided, and only an error is required.
+						t.Logf("the budget ended the write %v after it began; no caller deadline fits inside it", window)
+						ctx, cancel = context.WithCancel(t.Context())
+					}
+				} else {
+					ctx, cancel = context.WithCancel(t.Context())
 				}
 				defer cancel()
-				start := time.Now()
-				ack := startAck(ctx, res)
+
+				at("reserving gen-a")
+				g := reserveGated(t, reg, pairs, listens, "gen-a", 41001, 4101)
+				ack := startAck(ctx, g.res, g.parent)
 				at("waiting for the acknowledgment's write to begin")
-				await(t, parent.entered, "the acknowledgment's write")
+				await(t, g.parent.entered, "the acknowledgment's write")
+				entry, _ := g.parent.heldSpan()
 
 				// Unrelated registry work while the write waits.
 				at("Reserve of gen-b during the write")
@@ -752,8 +834,9 @@ func TestAcknowledgeDrainWriteIsBounded(t *testing.T) {
 				if err := other.End(); err != nil {
 					t.Fatalf("End gen-b during the write: %v", err)
 				}
-				if waited := time.Since(start); waited != 0 {
-					t.Fatalf("the unrelated registry work took %v of the bubble's time; it waited for the write", waited)
+				if isClosed(g.parent.exited) || ack.poll() {
+					_, exit := g.parent.heldSpan()
+					t.Fatalf("the unrelated registry work completed only after the acknowledgment's write ended (at %v after it began); it waited for the write", exit.Sub(entry))
 				}
 				synctest.Wait()
 				if ack.poll() {
@@ -763,7 +846,7 @@ func TestAcknowledgeDrainWriteIsBounded(t *testing.T) {
 				interrupted := time.Now()
 				at("the interruption of the write")
 				if tt.interrupt != nil {
-					tt.interrupt(t, res, cancel)
+					tt.interrupt(t, g.res, cancel)
 				}
 				at("waiting for AcknowledgeDrain to return")
 				err = ack.wait(t, "AcknowledgeDrain")
@@ -771,17 +854,32 @@ func TestAcknowledgeDrainWriteIsBounded(t *testing.T) {
 				if err == nil {
 					t.Fatal("AcknowledgeDrain reported success for a line the worker never read")
 				}
+				if ack.writing != 0 {
+					t.Errorf("%d Write calls of the acknowledgment were still in progress when it returned; an interrupted or expired write must have left Write", ack.writing)
+				}
 				if tt.want != nil && !errors.Is(err, tt.want) {
 					t.Errorf("AcknowledgeDrain error = %v, want %v", err, tt.want)
 				}
-				if waited := time.Since(interrupted); tt.atOnce && waited != 0 {
+				if waited := ack.at.Sub(interrupted); tt.atOnce && waited != 0 {
 					t.Errorf("AcknowledgeDrain returned %v of the bubble's time after it was interrupted, want at once", waited)
 				}
-				if took := time.Since(start); tt.limit != 0 && took > tt.limit {
-					t.Errorf("AcknowledgeDrain took %v of the bubble's time, want at most %v", took, tt.limit)
+				if took := ack.at.Sub(entry); tt.budget && took > writeBudget {
+					t.Errorf("AcknowledgeDrain returned %v of the bubble's time after its write began, want at most %v", took, writeBudget)
+				}
+				if deadline, ok := ctx.Deadline(); deadlineInside && ok {
+					switch {
+					case ack.at.Before(deadline):
+						// The acknowledgment's own budget ended the write first; its own error stands.
+					case ack.at.Equal(deadline):
+						if !errors.Is(err, context.DeadlineExceeded) {
+							t.Errorf("AcknowledgeDrain at the caller's deadline, which came before its budget = %v, want %v", err, context.DeadlineExceeded)
+						}
+					default:
+						t.Errorf("AcknowledgeDrain returned %v after the caller's deadline", ack.at.Sub(deadline))
+					}
 				}
 				if tt.ended {
-					if !isClosed(listener.closed) {
+					if !isClosed(g.listener.closed) {
 						t.Error("End did not release the listener")
 					}
 					if l, err := reg.Acquire(t.Context(), ""); l != nil || !errors.Is(err, workerlink.ErrUnavailable) {
@@ -792,7 +890,7 @@ func TestAcknowledgeDrainWriteIsBounded(t *testing.T) {
 					}
 					return
 				}
-				if isClosed(listener.closed) {
+				if isClosed(g.listener.closed) {
 					t.Error("a failed acknowledgment released the listener")
 				}
 				if l, err := reg.Acquire(t.Context(), ""); l != nil || !errors.Is(err, workerlink.ErrRetired) {
