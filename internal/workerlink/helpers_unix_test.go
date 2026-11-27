@@ -721,7 +721,8 @@ func publish(t *testing.T, res *workerlink.Reservation, pid int) {
 // write to a peer that has stopped reading does, until the test opens the gate (the bytes then go to the real end),
 // its write deadline passes, or the connection is closed. A Write that ends before the held offset goes through at
 // once. A deadline set before or during the Write is honoured, and one that is not in the future ends the Write at
-// once with nothing written, as a net.Conn does. The connection records when the first held Write began and when it
+// once with nothing written, as a net.Conn does. Write deadlines are enforced by the fake alone, on the bubble's
+// clock, and never reach the backing connection. The connection records when the first held Write began and when it
 // returned.
 //
 // With parkOnReturn, a Write that the deadline or Close interrupted has chosen its error and then waits, outside the
@@ -871,14 +872,18 @@ func (c *gatedConn) setWriteDeadline(t time.Time) {
 	c.notifyLocked()
 }
 
+// SetDeadline keeps the write deadline in the fake and gives the backing connection only the read deadline. The
+// backing connection's own timers run on the host's clock, not the bubble's, so a write deadline armed there could
+// expire in real time while the bubble's clock stands still and fail a Write the fake let through.
 func (c *gatedConn) SetDeadline(t time.Time) error {
 	c.setWriteDeadline(t)
-	return c.Conn.SetDeadline(t)
+	return c.SetReadDeadline(t)
 }
 
+// SetWriteDeadline keeps the write deadline in the fake only; see SetDeadline.
 func (c *gatedConn) SetWriteDeadline(t time.Time) error {
 	c.setWriteDeadline(t)
-	return c.Conn.SetWriteDeadline(t)
+	return nil
 }
 
 func (c *gatedConn) Close() error {

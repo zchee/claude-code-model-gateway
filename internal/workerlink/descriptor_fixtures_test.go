@@ -19,10 +19,13 @@ package workerlink_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
+	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -483,6 +486,68 @@ func TestFixtureGatedConnHoldsTheLastByte(t *testing.T) {
 					t.Errorf("recorded %q in %d Writes, want %q in %d", offered, writes, line, len(tt.writes))
 				}
 			})
+		})
+	}
+}
+
+// deadlineSpy is a backing connection that records every deadline set on it.
+type deadlineSpy struct {
+	net.Conn
+	mu    sync.Mutex
+	calls []string
+}
+
+func (s *deadlineSpy) record(call string, t time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, fmt.Sprintf("%s(%d)", call, t.Unix()))
+	return nil
+}
+
+func (s *deadlineSpy) SetDeadline(t time.Time) error      { return s.record("SetDeadline", t) }
+func (s *deadlineSpy) SetReadDeadline(t time.Time) error  { return s.record("SetReadDeadline", t) }
+func (s *deadlineSpy) SetWriteDeadline(t time.Time) error { return s.record("SetWriteDeadline", t) }
+
+// TestFixtureGatedConnKeepsWriteDeadlines checks that the gated parent end never gives its backing connection a write
+// deadline: SetWriteDeadline reaches nothing below it, and SetDeadline reaches it only as a read deadline. A write
+// deadline on the real descriptor would run on the host's clock and could fail, in real time, a Write the fake let
+// through while the bubble's clock stood still.
+func TestFixtureGatedConnKeepsWriteDeadlines(t *testing.T) {
+	tests := map[string]struct {
+		set  func(g *gatedConn, at time.Time) error
+		want []string
+	}{
+		"success: SetWriteDeadline stays in the fake": {
+			set:  func(g *gatedConn, at time.Time) error { return g.SetWriteDeadline(at) },
+			want: []string{},
+		},
+		"success: SetDeadline gives the backing connection only its read deadline": {
+			set:  func(g *gatedConn, at time.Time) error { return g.SetDeadline(at) },
+			want: []string{"SetReadDeadline(1000)"},
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			a, b := net.Pipe()
+			t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+			spy := &deadlineSpy{Conn: a, calls: []string{}}
+			g := newGatedConn(spy)
+			at := time.Unix(1000, 0)
+			if err := tt.set(g, at); err != nil {
+				t.Fatalf("setting the deadline: %v", err)
+			}
+			g.mu.Lock()
+			kept := g.deadline
+			g.mu.Unlock()
+			if !kept.Equal(at) {
+				t.Errorf("the fake keeps the write deadline %v, want %v", kept, at)
+			}
+			spy.mu.Lock()
+			got := slices.Clone(spy.calls)
+			spy.mu.Unlock()
+			if diff := gocmp.Diff(tt.want, got); diff != "" {
+				t.Errorf("deadlines that reached the backing connection (-want +got):\n%s", diff)
+			}
 		})
 	}
 }
