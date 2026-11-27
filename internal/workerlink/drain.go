@@ -294,9 +294,11 @@ type ackWrite struct {
 	admitted bool
 	// cancel is the caller's interruption, recorded the first time the callback runs.
 	cancel error
-	// pastDeadlineAt is when the callback began to set, successfully, a passed write deadline on the parent end of
-	// an admitted Write.
-	pastDeadlineAt time.Time
+	// pastDeadlineBegan and pastDeadlineSet are when the callback began and finished setting, successfully, a passed
+	// write deadline on the parent end of an admitted Write. Both are kept: a setter that began early may finish only
+	// after the Write has already returned the timeout of the deadline armed before it.
+	pastDeadlineBegan time.Time
+	pastDeadlineSet   time.Time
 	// fallbackAt is when the callback began to close the parent end because that deadline could not be set;
 	// fallbackEffective records whether that Close was the one that closed it, and setterErr is why the deadline
 	// could not be set.
@@ -346,10 +348,17 @@ func (r *Reservation) writeAck(ctx context.Context) error {
 		}
 		began := time.Now()
 		err := parent.SetWriteDeadline(aLongTimeAgo)
+		set := time.Now()
 		reg.mu.Lock()
 		if err == nil {
 			// Recorded only once it is in force, so that a failed setter is never taken for the cause of a timeout.
-			w.pastDeadlineAt = began
+			w.pastDeadlineBegan, w.pastDeadlineSet = began, set
+			reg.mu.Unlock()
+			return
+		}
+		if !w.admitted {
+			// The Write finished while the setter ran: there is nothing left to end, and the parent end, which is the
+			// manager's, may carry a complete acknowledgment, so it is not closed.
 			reg.mu.Unlock()
 			return
 		}
@@ -457,12 +466,20 @@ type ackOutcome struct {
 }
 
 // ackWriteError decides the acknowledgment's error from the Write's result. The error the Write chose stands unless
-// this call's own interruption produced it. A timeout from the deadline this call armed becomes the caller's
-// deadline or the budget's cause, and a timeout from the passed deadline the cancellation set becomes the
-// cancellation; a timeout carries no mark of which deadline fired, so it is attributed by time: to the deadline that
-// was in force first. A closed connection becomes End's or the cancellation's only when End's or the fallback's own
-// Close was the one that closed it, which that Close tells by not finding the end already closed; a connection
-// someone else closed keeps the Write's error. Events recorded after the Write returned did not cause its error.
+// this call's own interruption produced it. Events recorded after the Write returned did not cause its error.
+//
+// A timeout carries no mark of which deadline fired, so it is attributed by a policy, not by proven causality. The
+// cancellation's passed deadline is taken as the cause when its setter began before the armed deadline and had
+// completed by the time the Write returned; in that overlap the caller's cancellation wins. A Write that returned its
+// timeout before that late deadline had been applied, or a setter that began only after the armed deadline, leaves
+// the timeout to the armed deadline: the caller's own deadline or the budget's cause. A timeout neither explains,
+// one that returned before the armed deadline without a cancellation in force, keeps the Write's error.
+//
+// A closed connection becomes End's or the cancellation's only when End's or the fallback's own Close was the one
+// that closed it, which that Close tells by not getting net.ErrClosed; a connection someone else closed keeps the
+// Write's error. That test relies on the real parent end: the connection of a Unix socket pair returns
+// net.ErrClosed from a Close that finds it already closed. It is not a property every net.Conn has, and a parent end
+// that returns nil from every Close is taken as closed by whichever of End and the fallback began closing it first.
 func (r *Reservation) ackWriteError(n, size int, werr error, o ackOutcome) error {
 	happened := func(at time.Time) bool { return !at.IsZero() && !at.After(o.returned) }
 	switch {
@@ -472,7 +489,7 @@ func (r *Reservation) ackWriteError(n, size int, werr error, o ackOutcome) error
 		return fmt.Errorf("workerlink: acknowledgment of generation %q: %d of %d bytes written: %w", r.generation, n, size, io.ErrShortWrite)
 	case errors.Is(werr, os.ErrDeadlineExceeded):
 		switch {
-		case happened(o.write.pastDeadlineAt) && o.write.pastDeadlineAt.Before(o.deadline):
+		case happened(o.write.pastDeadlineSet) && o.write.pastDeadlineBegan.Before(o.deadline):
 			return o.write.cancel
 		case !o.returned.Before(o.deadline) && o.callerDeadline:
 			return r.cancelledAckError(context.DeadlineExceeded)
