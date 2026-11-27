@@ -349,6 +349,7 @@ func TestFinishPanicOutsideCallerCallback(t *testing.T) {
 			}
 			// The endpoint 0 disables export: the emitter derives its records whether or not it posts
 			// them, so no collector is needed.
+			var capture *usage.Capture
 			finish := func(random *offsetRandom) (*usage.Record, any) {
 				opts := newTestOptions(t)
 				opts.Random = random
@@ -360,6 +361,7 @@ func TestFinishPanicOutsideCallerCallback(t *testing.T) {
 				c := e.Start(usage.Request{Body: decodeWire(t, mcpBody)})
 				c.SetResponse(http.StatusOK, nil)
 				c.ObserveJSON([]byte(response))
+				capture = c
 				return callFinishGuarded(c)
 			}
 
@@ -390,6 +392,15 @@ func TestFinishPanicOutsideCallerCallback(t *testing.T) {
 			}
 			if rec != nil {
 				t.Errorf("Finish returned %+v while its emitter panicked, want the panic", rec)
+			}
+			// The panicking call was the capture's one eligible Finish: calling it again returns
+			// nil without a panic and without drawing another random byte.
+			rec, panicked = callFinishGuarded(capture)
+			if rec != nil || panicked != nil {
+				t.Errorf("Finish called again after the emitter panic = (%+v, panic=%v), want nil and no panic", rec, panicked)
+			}
+			if random.offset != 32 {
+				t.Errorf("Finish called again drew random bytes: offset %d, want 32", random.offset)
 			}
 		})
 	}

@@ -141,6 +141,10 @@ func TestEarlierResponseWins(t *testing.T) {
 			equal(t, tc.want, w.Body.String())
 			equal(t, "kept", w.Header().Get("X-Upstream-Test"))
 			equal(t, (*outcome.Overflow)(nil), r.Route.Overflow)
+			// The turn's span status is the relayed upstream status with no override, also for a
+			// 413 relayed with the sentry off.
+			equal(t, tc.code, r.Status)
+			equal(t, "", r.StatusOverride)
 		})
 	}
 }

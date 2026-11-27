@@ -32,6 +32,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -709,10 +710,19 @@ func TestSpanIntegerAttributeExact(t *testing.T) {
 
 func TestTraceStalledReplyBody(t *testing.T) {
 	const reply = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n{"
-	tests := map[string]struct{}{
+	tests := map[string]struct {
+		// trickle sends one more body byte at each interval after the response headers; zero
+		// sends nothing more. 90ms does not divide the 500ms bound, so no byte coincides with it.
+		trickle time.Duration
+		// wantProgress is the number of trickled bytes the exporter reads before the bound.
+		wantProgress int32
+	}{
 		"error: collector on a pipe stalls after its response headers": {},
+		"error: collector on a pipe trickles its reply body more often than the bound": {
+			trickle: 90 * time.Millisecond, wantProgress: 5,
+		},
 	}
-	for name := range tests {
+	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 			// Virtual time pins the bound exactly; the pipe stands in for the collector's socket.
@@ -724,6 +734,7 @@ func TestTraceStalledReplyBody(t *testing.T) {
 				}()
 				headers := make(chan error, 1)
 				abandoned := make(chan struct{})
+				var progress atomic.Int32
 				go func() {
 					defer close(abandoned)
 					req, err := http.ReadRequest(bufio.NewReader(peer))
@@ -734,8 +745,26 @@ func TestTraceStalledReplyBody(t *testing.T) {
 						_, err = io.WriteString(peer, reply)
 					}
 					headers <- err
-					// Send nothing more; this read ends only when the exporter closes the connection.
-					_, _ = io.Copy(io.Discard, peer)
+					// This read ends only when the exporter closes the connection.
+					closed := make(chan struct{})
+					go func() {
+						defer close(closed)
+						_, _ = io.Copy(io.Discard, peer)
+					}()
+					// A trickling collector keeps the reply moving, so only a bound on the whole
+					// post, not one on inactivity, ends it at 500ms. It stops when the exporter
+					// closes the connection; otherwise it sends nothing more.
+					for err == nil && tt.trickle > 0 {
+						select {
+						case <-closed:
+							err = net.ErrClosed
+						case <-time.After(tt.trickle):
+							if _, err = io.WriteString(peer, " "); err == nil {
+								progress.Add(1)
+							}
+						}
+					}
+					<-closed
 				}()
 				opts := recorderOptions((&pipeTraceCollector{}).env())
 				var diagnostics bytes.Buffer
@@ -767,6 +796,9 @@ func TestTraceStalledReplyBody(t *testing.T) {
 				}
 				select {
 				case <-abandoned:
+					if got := progress.Load(); got != tt.wantProgress {
+						t.Errorf("exporter read %d trickled bytes before the bound, want %d", got, tt.wantProgress)
+					}
 				default:
 					t.Error("exporter did not close the stalled collector connection")
 				}

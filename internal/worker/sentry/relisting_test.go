@@ -78,3 +78,44 @@ func TestReplacedBackendDoesNotFollowPickerAlias(t *testing.T) {
 	observe(&s, "reader", replacement, 40001, false)
 	check(t, &s, "reader", replacement, first, sentry.Crossing{Usage: 40001, Trigger: 40000})
 }
+
+// TestWindowChangedAndRestoredLosesCeiling checks that every publication replaces the policy of each
+// tracked model at once: a learned ceiling is dropped as soon as a publication changes the model's
+// window, and a later publication that restores the window does not bring it back, even when no
+// request touched the model in between. The source replaces a model's policy only when a request
+// reads it, so with no request between the two publications it keeps the learned ceiling.
+func TestWindowChangedAndRestoredLosesCeiling(t *testing.T) {
+	tests := map[string]struct {
+		// between is the window published after the ceiling was learned, before 60000 is
+		// published again.
+		between int64
+		want    sentry.Crossing
+	}{
+		"success: unchanged window keeps the learned trigger": {
+			between: 60000, want: sentry.Crossing{Usage: 37000, Trigger: 35000},
+		},
+		"success: window changed and restored with no request between drops the learned trigger": {
+			between: 90000,
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			var s sentry.State
+			m := sentry.Target{Key: "local-model"}
+			s.Publish(1, localListing(m.Key, 60000), nil, 0)
+			observe(&s, "learner", m, 55000, false)
+			if got := s.Overflow("learner", m, true); got != 55000 {
+				t.Fatalf("learning overflow usage = %g, want 55000", got)
+			}
+			s.Publish(2, localListing(m.Key, tt.between), nil, 0)
+			s.Publish(3, localListing(m.Key, 60000), nil, 0)
+			observe(&s, "reader", m, 37000, false)
+			check(t, &s, "reader", m, first, tt.want)
+			if tt.want == (sentry.Crossing{}) {
+				// The derived trigger of a 60000 window without a learned ceiling.
+				observe(&s, "reader", m, 40001, false)
+				check(t, &s, "reader", m, first, sentry.Crossing{Usage: 40001, Trigger: 40000})
+			}
+		})
+	}
+}

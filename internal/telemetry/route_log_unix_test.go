@@ -84,6 +84,8 @@ func TestRouteLogPathSafety(t *testing.T) {
 		written bool
 		// prior holds the rows the file at the log path has before the appends.
 		prior []map[string]any
+		// code, when set, is the exact error name every diagnostic line of a refused append ends with.
+		code  string
 		check func(t *testing.T, root string)
 	}{
 		"success: missing parent directories are created private": {
@@ -193,6 +195,52 @@ func TestRouteLogPathSafety(t *testing.T) {
 			},
 			check: func(t *testing.T, root string) { absent(t, root+"/missing.jsonl") },
 		},
+		"error: reserved temporary-file name at the log path is refused": {
+			// The name has the spelling of an atomic replacement's staging file, which the
+			// recorder's append refuses by name before opening anything; the source appends to it.
+			setup: func(t *testing.T, root string) string {
+				if err := os.Mkdir(root+"/logs", 0o700); err != nil {
+					t.Fatal(err)
+				}
+				return root + "/logs/request-routes.jsonl.42.0123456789ab.tmp"
+			},
+			code:  "unknown error",
+			check: func(t *testing.T, root string) { absent(t, root+"/logs/request-routes.jsonl.42.0123456789ab.tmp") },
+		},
+		"error: reserved temporary-file name in another letter case is refused": {
+			setup: func(t *testing.T, root string) string {
+				if err := os.Mkdir(root+"/logs", 0o700); err != nil {
+					t.Fatal(err)
+				}
+				return root + "/logs/request-routes.jsonl.42.0123456789AB.TMP"
+			},
+			code:  "unknown error",
+			check: func(t *testing.T, root string) { absent(t, root+"/logs/request-routes.jsonl.42.0123456789AB.TMP") },
+		},
+		"error: existing parent directory without read permission is refused": {
+			// The parent grants write and search but not read. The recorder opens the final
+			// directory for reading, so the append fails; the source appends by name and needs
+			// only search permission there.
+			setup: func(t *testing.T, root string) string {
+				if os.Geteuid() == 0 {
+					t.Fatal("the venue must not run as root to test a directory without read permission")
+				}
+				if err := os.Mkdir(root+"/logs", 0o300); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() {
+					if err := os.Chmod(root+"/logs", 0o700); err != nil {
+						t.Error(err)
+					}
+				})
+				if _, err := os.ReadDir(root + "/logs"); !errors.Is(err, fs.ErrPermission) {
+					t.Fatalf("test precondition: the parent directory is readable: %v", err)
+				}
+				return root + "/logs/request-routes.jsonl"
+			},
+			code:  "EACCES",
+			check: func(t *testing.T, root string) { absent(t, root+"/logs/request-routes.jsonl") },
+		},
 		"error: directory at the log path": {
 			setup: func(t *testing.T, root string) string {
 				if err := os.MkdirAll(root+"/logs/request-routes.jsonl", 0o700); err != nil {
@@ -240,6 +288,12 @@ func TestRouteLogPathSafety(t *testing.T) {
 				}
 			} else {
 				checkRouteLogDiagnostics(t, diagnostics.String(), root, 2)
+				if tt.code != "" {
+					line := routeLogDiagnostic + tt.code + "\n"
+					if d := gocmp.Diff(line+line, diagnostics.String()); d != "" {
+						t.Errorf("diagnostics (-want +got):\n%s", d)
+					}
+				}
 			}
 			tt.check(t, root)
 		})

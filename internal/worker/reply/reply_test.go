@@ -266,6 +266,11 @@ func TestUpgradeRetry(t *testing.T) {
 		"error: zero retries":              {"codex", new(0), nil, false, []time.Duration{0}, 503, `{"type":"error","error":{"type":"api_error","message":"model-gateway: Codex WebSocket upgrade was temporarily rejected after 1 attempts; retry the request."}}`},
 		"success: zero retry delay":        {"codex", nil, new(time.Duration(0)), true, []time.Duration{0, 0, 0}, 200, `{"model":"public"}`},
 		"error: configured retry budget":   {"codex", new(1), new(7 * time.Millisecond), false, []time.Duration{0, 7 * time.Millisecond}, 503, `{"type":"error","error":{"type":"api_error","message":"model-gateway: Codex WebSocket upgrade was temporarily rejected after 2 attempts; retry the request."}}`},
+		// A positive delay is a Go duration used as given, never truncated to whole milliseconds
+		// as Node's timer does: 1.5ms waits 1.5ms and 250µs waits 250µs.
+		"success: fractional millisecond retry delay": {"codex", nil, new(1500 * time.Microsecond), true, []time.Duration{0, 1500 * time.Microsecond, 3 * time.Millisecond}, 200, `{"model":"public"}`},
+		"success: sub-millisecond retry delay":        {"codex", nil, new(250 * time.Microsecond), true, []time.Duration{0, 250 * time.Microsecond, 500 * time.Microsecond}, 200, `{"model":"public"}`},
+		"success: one nanosecond retry delay":         {"codex", nil, new(time.Nanosecond), true, []time.Duration{0, time.Nanosecond, 2 * time.Nanosecond}, 200, `{"model":"public"}`},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {

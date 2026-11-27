@@ -260,6 +260,10 @@ func TestBufferedReadFailure(t *testing.T) {
 				_, _ = io.WriteString(w, "truncated")
 			}).forward(req.Body))
 			equal(t, true, result.Contacted && result.Stream == nil)
+			// The body is shorter than its declared length, so the read ends with an unexpected
+			// end of file: the turn keeps the upstream status, labelled as an abort, on every branch.
+			equal(t, tc.status, result.Status)
+			equal(t, "upstream_aborted", result.StatusOverride)
 			if tc.abort {
 				if !errors.Is(e, http.ErrAbortHandler) || w.Body.Len() != 0 {
 					t.Errorf("must abort without a clean partial reply: err=%v body=%q", e, w.Body.String())
