@@ -23,6 +23,8 @@ import (
 
 func nativeBirth(context.Context, int) (time.Time, error) { return time.Time{}, ErrUnsupported }
 
+func nativeStartToken(context.Context, int) (StartToken, error) { return "", ErrUnsupported }
+
 func nativeExistence(context.Context, int) error            { return ErrUnsupported }
 func nativeIdentity(context.Context, int) (Identity, error) { return Identity{}, ErrUnsupported }
 func nativeTable(context.Context) ([]Identity, error)       { return nil, ErrUnsupported }

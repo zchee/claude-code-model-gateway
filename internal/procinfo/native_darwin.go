@@ -96,9 +96,22 @@ func kernelRecord(ctx context.Context, pid int) (*unix.KinfoProc, error) {
 	return unix.SysctlKinfoProc("kern.proc.pid", pid)
 }
 
+// darwinStartToken formats the start the kernel recorded for a process as
+// seconds and six-digit microseconds. The kernel sets it at fork; a clock step
+// does not rewrite it and an exec keeps it. A start outside the range of a
+// time value yields an empty token.
+func darwinStartToken(start unix.Timeval) StartToken {
+	if start.Sec <= 0 || start.Usec < 0 || start.Usec >= 1_000_000 {
+		return ""
+	}
+	return StartToken(fmt.Sprintf("%d.%06d", start.Sec, start.Usec))
+}
+
+// darwinRow builds the birth and the start token from the same kernel record,
+// so both describe the same process lifetime.
 func darwinRow(info *unix.KinfoProc) Identity {
 	birth := info.Proc.P_starttime
-	return Identity{PID: int(info.Proc.P_pid), ParentPID: int(info.Eproc.Ppid), Birth: time.Unix(birth.Sec, int64(birth.Usec)*1000)}
+	return Identity{PID: int(info.Proc.P_pid), ParentPID: int(info.Eproc.Ppid), Birth: time.Unix(birth.Sec, int64(birth.Usec)*1000), StartToken: darwinStartToken(birth)}
 }
 
 func nativeTable(ctx context.Context) ([]Identity, error) {
@@ -139,6 +152,20 @@ func nativeBirth(ctx context.Context, pid int) (time.Time, error) {
 		return time.Time{}, ErrUnknown
 	}
 	return darwinRow(info).Birth, nil
+}
+
+// nativeStartToken reads only the kernel's process record, so a process whose
+// arguments or executable are out of reach still has a token.
+func nativeStartToken(ctx context.Context, pid int) (StartToken, error) {
+	info, err := kernelRecord(ctx, pid)
+	if err != nil {
+		return "", fmt.Errorf("kern.proc.pid: %w", err)
+	}
+	token := darwinStartToken(info.Proc.P_starttime)
+	if int(info.Proc.P_pid) != pid || token == "" {
+		return "", ErrUnknown
+	}
+	return token, nil
 }
 
 func nativeIdentity(ctx context.Context, pid int) (Identity, error) {
