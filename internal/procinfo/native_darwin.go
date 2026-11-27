@@ -83,6 +83,19 @@ func procArgs(pid int) (string, []string, error) {
 	return path, argv, nil
 }
 
+// kernelRecordKey carries a replacement for the kernel's process record read.
+// Only tests set it, so they can present a record the kernel would not give.
+type kernelRecordKey struct{}
+
+// kernelRecord reads the kernel's process record of pid. SysctlKinfoProc
+// rejects an empty or short kernel result with EIO.
+func kernelRecord(ctx context.Context, pid int) (*unix.KinfoProc, error) {
+	if read, ok := ctx.Value(kernelRecordKey{}).(func(int) (*unix.KinfoProc, error)); ok {
+		return read(pid)
+	}
+	return unix.SysctlKinfoProc("kern.proc.pid", pid)
+}
+
 func darwinRow(info *unix.KinfoProc) Identity {
 	birth := info.Proc.P_starttime
 	return Identity{PID: int(info.Proc.P_pid), ParentPID: int(info.Eproc.Ppid), Birth: time.Unix(birth.Sec, int64(birth.Usec)*1000)}
@@ -103,7 +116,7 @@ func nativeTable(ctx context.Context) ([]Identity, error) {
 			continue
 		}
 		_, args, _ := procArgs(row.PID) // A failed sample carries nil argv.
-		after, err := unix.SysctlKinfoProc("kern.proc.pid", row.PID)
+		after, err := kernelRecord(ctx, row.PID)
 		var current Identity
 		if err == nil {
 			current = darwinRow(after)
@@ -117,8 +130,8 @@ func nativeTable(ctx context.Context) ([]Identity, error) {
 	return rows, nil
 }
 
-func nativeBirth(_ context.Context, pid int) (time.Time, error) {
-	info, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+func nativeBirth(ctx context.Context, pid int) (time.Time, error) {
+	info, err := kernelRecord(ctx, pid)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("kern.proc.pid: %w", err)
 	}
@@ -129,7 +142,7 @@ func nativeBirth(_ context.Context, pid int) (time.Time, error) {
 }
 
 func nativeIdentity(ctx context.Context, pid int) (Identity, error) {
-	info, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	info, err := kernelRecord(ctx, pid)
 	if err != nil {
 		return Identity{}, fmt.Errorf("kern.proc.pid: %w", err)
 	}
@@ -158,7 +171,7 @@ func nativeIdentity(ctx context.Context, pid int) (Identity, error) {
 	if launchPath != secondPath || !slices.Equal(argv, secondArgs) {
 		return Identity{}, fmt.Errorf("argv changed during inspection: %w", ErrUnknown)
 	}
-	after, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	after, err := kernelRecord(ctx, pid)
 	if err != nil {
 		return Identity{}, fmt.Errorf("reread kern.proc.pid: %w", err)
 	}

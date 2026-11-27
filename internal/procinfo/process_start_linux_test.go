@@ -244,6 +244,57 @@ func TestLinuxStartTokenReuse(t *testing.T) {
 	}
 }
 
+func TestLinuxStartTokenFromItsInputsAlone(t *testing.T) {
+	// The token is made of the boot identifier and the start field of stat, so
+	// it must not depend on the arguments, the executable or the boot wall clock,
+	// all of which the full identity sample needs.
+	self := os.Getpid()
+	dir := strconv.Itoa(self)
+	denied := func(path string) func(*testing.T, string) {
+		return func(t *testing.T, root string) { t.Helper(); denyRead(t, filepath.Join(root, path)) }
+	}
+	remove := func(paths ...string) func(*testing.T, string) {
+		return func(t *testing.T, root string) {
+			t.Helper()
+			for _, path := range paths {
+				removePath(t, filepath.Join(root, path))
+			}
+		}
+	}
+	cmdline, exe, clock := filepath.Join(dir, "cmdline"), filepath.Join(dir, "exe"), "stat"
+	tests := map[string]struct {
+		setup   func(*testing.T, string)
+		noBirth bool
+	}{
+		"success: arguments are not readable":                             {setup: denied(cmdline)},
+		"success: executable link is missing":                             {setup: remove(exe)},
+		"success: boot wall clock is missing":                             {setup: remove(clock), noBirth: true},
+		"success: only the boot identifier and the stat line are present": {setup: remove(cmdline, exe, clock), noBirth: true},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			ctx, root := fakeProc(t, self, "worker", procSample{btime: 1000, bootID: bootA, ppid: 1, start: "4242"})
+			p := Probe{}
+			if _, err := p.Identity(ctx, self); err != nil {
+				t.Fatalf("identity before the removal: %v", err)
+			}
+			tt.setup(t, root)
+			// These prove the fixture took away what the full sample needs.
+			if id, err := p.Identity(ctx, self); err == nil {
+				t.Fatalf("identity without its inputs = %+v; want an error", id)
+			}
+			if _, err := p.Birth(ctx, self); (err != nil) != tt.noBirth {
+				t.Fatalf("birth without its inputs: %v; want an error = %t", err, tt.noBirth)
+			}
+			token, err := readStartToken(t, ctx, p, self)
+			if err != nil {
+				t.Fatalf("StartToken(%d) = %q, %v; want the token from the boot identifier and stat", self, token, err)
+			}
+			checkLinuxToken(t, token, bootA, "4242")
+		})
+	}
+}
+
 func TestLinuxStartTokenUnreadable(t *testing.T) {
 	self := os.Getpid()
 	denied := func(path string) func(*testing.T, string) {
@@ -355,6 +406,7 @@ func TestLinuxMalformedStartSample(t *testing.T) {
 			if !ok {
 				t.Fatalf("table %v lost the valid neighbour %d", table, neighbour)
 			}
+			checkLinuxToken(t, row.StartToken, bootA, "5151")
 			row.StartToken = ""
 			if diff := gocmp.Diff(Identity{PID: neighbour, ParentPID: 1, Argv: []string{"worker"}, Birth: birth}, row); diff != "" {
 				t.Errorf("neighbour row (-want +got): %s", diff)
