@@ -1,6 +1,6 @@
 # Go port of the model-gateway Claude Code plugin: work plan (v7)
 
-- **Status: phases 0 and 1 landed; the worker packages and their composition are implemented; the phase 2 gate is open (see the phase table).** Approval covers phase 5 and the phase 6 rehearsal (T6.0); stop before T6.1.
+- **Status: phases 0 and 1 landed; phase 2 passed its gate, and its status commit is intended to land phase 2 on `main` after independent verification (see the phase table); phase 3 is next.** Approval covers phase 5 and the phase 6 rehearsal (T6.0); stop before T6.1.
 - Mode: `/plan --direct --deliberate` (direct plan with deliberate-mode content: options, pre-mortem, expanded test plan, ADR).
 - Written: v6 on 2026-11-25; v7 on 2026-11-26, corrected after the test inventory on 2026-11-26 (from `date`). v1 and v2 were each reviewed by an architect lane and a
   critic lane (`claude-gpt-6.2-astra-fast[1m]`); verdicts were "sound with changes" and "revise" both times. v3, v4 and v5
@@ -945,7 +945,7 @@ source as `hack/pinned-source` materializes it (`.cache/model-gateway-js/plugins
 |---|---|---|---|
 | 0 | Foundations, isolation, identity seam, test inventory | AC-1, AC-2; test inventory (T0.7) reviewed and landed | ✅ done: gate passed at `ccdc0b6` on 2026-11-26; landed on `main` |
 | 1 | Pure logic packages | AC-3 (tables), AC-8 for phase 1 rows | ✅ landed on `main` at `be4c774` |
-| 2 | Walking skeleton, launch adapter, worker | AC-3 (HTTP), AC-4, AC-5 (worker paths), AC-11 for tests assigned to phase 2 | 🔶 in progress: walking skeleton (supervisor, worker root, `serve-shim`, `serve-worker`) and command-root dispatch implemented and reviewed (approved with nits); launch-adapter proof passed on 2026-11-26 on the Linux venue at test checkout `117d198` (test archives identify `117d198` and launch records identify the executable hash, without attested build provenance because the standalone build run labeled its input a working tree; the four launch-only probes, the pinned orderly-signal case and the six cases due at the adapter's gate — five supervisor, one worker, with the orderly-signal case counted in both selections — passed with no skips; the lead recorded the decision that the conformance class stands and no case is reclassified; the proof is repeated on the gate commit); worker packages and final composition implemented and reviewed together with their source-comparison fixes; follow-up review, cumulative binary evidence and the phase gate remain open |
+| 2 | Walking skeleton, launch adapter, worker | AC-3 (HTTP), AC-4, AC-5 (worker paths), AC-11 for tests assigned to phase 2 | ✅ done: gate passed on 2026-11-28 on the evidence commit `95b0e0f`; the status commit on top of it changes documentation only and is intended to land phase 2 on `main` after independent verification. Hosted run 46008855917, attempt 1 (`workflow_dispatch` with `conformance_phase=phase-2`): `ubuntu-26.04`, `xcode-27` and `publish-conformance-export` green; the hosted conformance export `gha-46008855917-1` (177 of 177 cases passed) and the Go test JSON of both runners from that attempt passed `hack/parity-check results phase-2`. Linux venue: the four Go test tiers (the process race tier five times) ran from a clean checkout of `95b0e0f` with no failure and no data race, 0 skipped tests and 26 package-level skip events (over the eight runs) for packages without test files; their logs label the archive "working-tree", so byte identity with the commit is attested by the hosted run and by the conformance export only. The launch-adapter proof was repeated from a clean checkout (the four launch-only probes, the pinned orderly-signal case and the six cases due at the adapter's gate passed with no skips; test archives identify `95b0e0f` and launch records identify the executable hash, still without attested build provenance because the standalone build run labels its input a working tree); the cumulative binary conformance export `venue-mgw-run-2208970-1795787455` (177 of 177 cases due through phase 2 passed with no skips; 176 launches of one executable, recorded as 192 case attributions because a nested launch also credits its parent case) accepted by `hack/conformance-export verify` from a clean checkout of `95b0e0f`, with the same case identities as the hosted export. Independent verification: passed on 2026-11-28 for `95b0e0f` on all eleven gate items, after earlier passes had failed on stop-path differences that §3.10 now records; the stop path was judged on an agreed list of 99 reachable transitions with no sweep beyond it, and the build provenance of the venue binaries, the causes of the two proxy exits and all phase 3 behavior were outside what it verified |
 | 3 | Supervisor and process layer | AC-5 (supervisor paths), AC-6 (start/stop/recover), AC-14, macOS Node baseline (T3.9), security review 1 (AC-13) | 🔜 not started |
 | 4 | CLI and settings | AC-6 (ensure/setup), AC-9, AC-12, AC-11 for the CLI set | 🔜 not started |
 | 5 | Packaging, migration, shadow mode | AC-7, AC-15a, AC-16, security review 2 (AC-13) | 🔜 not started |
@@ -960,8 +960,8 @@ requires the companion command-removal commit and a passing `internal/cli.TestRe
 The inventory assigns 151 cases to phase exits: 1, 2, 130, 3, 15 and 0 for phases 0 through 5, respectively. Phases 2–4
 have numbered gate tasks; phases 0, 1 and 5 use the exit gate in the table directly.
 
-Current stop point: phase 0 passed its gate and landed on `main` at `ccdc0b6`. Phase 1 implementation is complete;
-the worker-phase handoffs are frozen separately, not a phase-1 landing or a binary pass. The lead reports
+Current stop point: phase 2 passed its gate, and its status commit is intended to land it on `main` after independent
+verification; phase 3 is next. The lead reports
 this table at every gate and starts the next phase when its predecessor lands, through T6.0. Stop before T6.1: the shadow
 soak, cutover and removal of the old plugin belong to the user.
 
@@ -1028,10 +1028,10 @@ and reviewed (approved with nits), and the launch-adapter proof passed on 2026-1
 attested build provenance because the standalone build run labeled its input a working tree; the four launch-only probes,
 the pinned orderly-signal case and the six cases due at the adapter's gate — five supervisor, one worker, with the
 orderly-signal case counted in both selections — passed with no skips; the lead recorded the decision that the
-conformance class stands and no case is reclassified; the proof is repeated on the gate commit). The worker packages, final composition and source-comparison fixes are implemented and reviewed.
+conformance class stands and no case is reclassified; the proof was repeated with the same result at `95b0e0f`, the commit of the phase gate's evidence). The worker packages, final composition and source-comparison fixes are implemented and reviewed.
 `serve-worker` joins the serve loops, request handlers, credential refresh, readiness and model-cache work,
 exporters and registered watchers. This is not a promise that every scheduled signal callback has returned.
-Follow-up review, cumulative binary evidence (§6) and the phase gate remain open.
+The phase gate, with the cumulative binary evidence of §6, passed on 2026-11-28 (phase table).
 
 | Task | Work | Size / lane | Needs |
 |---|---|---|---|
@@ -1048,7 +1048,7 @@ Follow-up review, cumulative binary evidence (§6) and the phase gate remain ope
 | T2.7 | Grok branch: credential file, single-flight refresh, forwarding and translation; shadow token policy in §3.10. `grok.NewBranch` must reject a nil inference client. That client, not `r.Context()`, owns the upstream call. On client departure the branch stops writing to the client, continues consuming an open stream and leaves `Result.Cancelled` false for the worker root to decide. Translate and encode a non-stream response before committing response headers; use the fixed sanitized 502 on translation or encoding failure (§3.10). Admit after thread validation, then apply sentry to the Grok messages prefix on original bytes before auth or upstream contact. Reply alone writes a request-side 413. For JSON, report usage as ordinary-completed only when the upstream status field is `completed` and the request is not compaction. For SSE, observe each frame's usage without completion; report final usage only for a deliverable stream that saw `response.completed` and no error, and mark it ordinary-completed only for a non-compaction request. As in the source, observe translated usage and finish the route span but emit no usage record: `forwardGrok` never finishes the capture (`lib/request-worker.js:1822-1825,2244-2359,2635-2644`; `lib/usage-observability.js:878-894,1023-1042`). Frozen handoff: `internal/grok.TestBranchStream` | M / astra | T2.2, T2.4, T1.6, T1.9, usage capture |
 | T2.8 | Usage emitter (`usage.Emitter`), route telemetry (OTLP/HTTP JSON to loopback only), request-route log, request-body high-water files (INV-02 §11; INV-04 §10); `usage.Capture` is implemented ahead of the reply step. Preserve the usage exporter's identifier allowlist: omit a slash-containing `model` or `requested_model` from the usage export attributes without removing it from routing or model discovery. Alias route, overflow, compaction and audit values to `worker/outcome`; the worker owns terminal publication after observation, not the branch or relay. Finish one route span per traced client request, once at terminal completion; internal retries do not add spans (`test/gateway-telemetry.test.js:293-335`: three client requests, four upstream attempts, three spans) | L / astra | T2.0, T1.12d, usage capture |
 | | Final composition: `worker/compose.New` builds `worker.Options` from dispatch and admission, buffered reply, streaming relays, compaction guard, Grok, model cache, telemetry and usage, preserving terminal outcomes across branches, and `serve-worker` wires `compose.New` as its handler. Construction starts no goroutine, timer or refresh. The lifetime owner (`serve-worker` and each test) calls `Cache.Start(serviceCtx)`, cancels that context at shutdown, then calls `Cache.Wait()`. | L / astra | Worker packages above |
-| T2.9 | Phase gate: every in-scope case assigned to phase 2 by the revised test inventory, in its reviewed class, plus the Tier 1 integration suites. Still owed: the verified cumulative binary export (§6) from the implemented worker. Keep in-scope assertions of mixed cases; no test requires the removed listener, control endpoint or DNS bypass | M / astra | Reviewed worker packages and final composition; adapter proof |
+| T2.9 | Phase gate: every in-scope case assigned to phase 2 by the revised test inventory, in its reviewed class, plus the Tier 1 integration suites. Passed on 2026-11-28 with the verified cumulative binary export (§6) from the implemented worker: 177 cases (phase table). Keep in-scope assertions of mixed cases; no test requires the removed listener, control endpoint or DNS bypass | M / astra | Reviewed worker packages and final composition; adapter proof |
 
 **Worker branch contract (T2.0).** `worker/outcome` is a leaf of values only. The branch supplies resolved route and
 optional audit facts. Reply sets overflow facts; the compaction guard sets compaction facts. The component that settles
@@ -1203,7 +1203,7 @@ marker, and the fake proxy binary is installed. (With the plugin disabled, `reco
    commit whose archive was sent. Never restamp evidence with the verifier's checkout or a caller-chosen run ID.
    The verifier derives the cumulative expected case set from the gated tree's own inventory and compares identities,
    passing outcomes and launch records, not counts alone. The worker gate requires 177 cases; the following gates
-   add 11, 65 and 1 (188, 253 and 254 cumulative). The export and this verification are owed at the first binary gate.
+   add 11, 65 and 1 (188, 253 and 254 cumulative). The first binary gate, phase 2, produced and verified the export on 2026-11-27.
 3. **Lead check per phase.** For each in-scope difference in §3.10 and for the relay, sentry and ownership code of that phase,
    the lead compares the Go code with the pinned source lines directly, not with the inventory.
 4. **Before phase 6.** `fd -H -I -t d '^\.omc$'` shows no stray state directory; every spawned lane has acknowledged
@@ -1624,6 +1624,54 @@ launch-only probes, the pinned orderly-signal case and the six cases due at the 
 worker, with the orderly-signal case counted in both selections) and the lead recorded that the conformance class stands
 with no reclassification (to be repeated on the gate commit), leaving the worker packages and final composition (frozen
 tests against stubs), their reviews, cumulative binary evidence and the phase gate owed.
+
+After the phase 2 gate (2026-11-28): the worker packages, final composition and source-comparison fixes are
+implemented and reviewed. An independent comparison of the relay with the pinned source found two differences that the
+table in §3.10 did not record: a client whose departure was observed after its upload while the relay waits for a
+worker port, and a supervisor that stops during that wait. Both are now rows. `supervisor-departure-before-delivery`
+keeps the Go behavior: no worker receives the request of a client whose departure the listener observed;
+`internal/supervisor.TestRelayDepartureBeforeDelivery` decides it and passes on both hosted runners and in the six
+venue process runs. `supervisor-stop-during-delivery-wait` keeps the Go behavior in phase 2 and is scheduled for phase
+3, subject to its deciding test, where the relay matches the source;
+`internal/supervisor/relay.TestDeliveryAttempts/error:_a_stop_between_attempts_answers_at_once_before_any_delivery`
+decides it and is due at the phase 3 gate. A further independent comparison and a review of the whole stop path then
+recorded nineteen more rows, `supervisor-stop-during-upload` through `supervisor-connection-timers`. Of these,
+`supervisor-stop-after-taken-delivery`, `supervisor-lost-request-journal`,
+`supervisor-stop-record-and-publication-order`, `supervisor-final-worker-wait`,
+`supervisor-guardian-record-after-exit`, `worker-parent-loss-before-serving`, `supervisor-health-proxy-recovery-field`
+and `supervisor-oversize-upload-grace` are scheduled for phase 3, subject to their deciding tests; the others keep the
+Go behavior, `supervisor-stop-during-upload` by lead ruling; `supervisor-fatal-stop-diagnostics` keeps its
+diagnostics, and its startup-failure marker is due in phase 3. Their pending and frozen tests are due at the phase 3
+gate, and the runs below are not evidence for them. T2.0 states what the phase 2 supervisor does not do: it neither
+starts nor stops the proxy, and it answers an authorized `/restart` with 501. The gate's evidence commit is `95b0e0f`;
+the status commit on top of it changes documentation only and is intended to land phase 2 on `main` after independent
+verification.
+From a clean checkout of `95b0e0f` the venue's four Go test tiers
+passed in units `mgw-run-2111393-1795786945`, `mgw-run-2116955-1795786953`, `mgw-run-2127384-1795786986` and, for the
+process race tier, `mgw-run-2134188-1795787008`, `mgw-run-2146057-1795787070`, `mgw-run-2157861-1795787131`,
+`mgw-run-2169669-1795787193` and `mgw-run-2181416-1795787254`, with 0 skipped tests and 26 package-level skip events
+(over the eight runs) for packages without test files. Their logs label the archive "working-tree"; byte identity
+with the commit is attested by the hosted run and by the conformance export only. The launch-adapter proof was
+repeated with the same result, and the first cumulative binary conformance export (177 cases through phase 2) passed
+on the venue and on the hosted runner and was verified from a clean checkout. The tripwire against the phase 1
+baseline shows four differences; this is what is evidenced about each. First, the user's own edit of
+`~/.claude/settings.json` (confirmed by the user on 2026-11-27). Second, the running Node gateway's earlier stop and
+restart (`~/.claude/model-gateway/logs/lifecycle.jsonl:176-192`). Third, at 22:39:56 JST the gateway's supervisor began a
+recovery after its own health probe of the proxy failed, the proxy exited with status 130 seventeen milliseconds later,
+and the supervisor started a new proxy (`lifecycle.jsonl:193-196`, `guardian.log:231-232`); why the probe failed and
+where status 130 came from were not established. Fourth, at 22:48:35 JST the proxy exited with status 0 and the
+supervisor recovered it (`lifecycle.jsonl:197-200`, `guardian.log:233-234`); ten seconds earlier the proxy executable at
+the path the gateway's symlink points to had been replaced (file times 22:48:24.94 and 22:48:25.10 JST), which no
+transcript of this project did; who replaced it, and whether the replacement caused the exit, were not established.
+The comparisons are `.omc/artifacts/verify/phase-2/tripwire-compare-95b0e0f.log` and, after the fourth difference,
+`.omc/artifacts/verify/phase-2/tripwire-compare-95b0e0f-2.log`. An audit of the session transcripts modified since
+2026-11-26 15:08:50 JST found no file-editing tool call on those paths, and no command naming them or starting a
+gateway program inside the three earlier time windows it examined
+(`.omc/artifacts/verify/phase-2/transcript-audit-14f38be.txt`). For this port's own part, a second audit of all 624
+transcripts of this project found no signal sent to a proxy process or to anything but a lane's own child processes
+(the commands that name a proxy pid only read its process listing or write notes), and the proxy has no controlling
+terminal (`.omc/artifacts/verify/phase-2/transcript-audit-2-95b0e0f.txt`); it covers this project's sessions only. The
+phase table records the evidence and the hosted result.
 
 ## Appendix D: what the reviews leave open
 

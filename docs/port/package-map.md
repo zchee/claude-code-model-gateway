@@ -4,7 +4,7 @@ This page shows how the Go port is organized: what each package does, which Node
 is. Read it top to bottom once; after that, use the index at the end to go from a Node file to its Go packages.
 
 The plan (`model-gateway-go-port.md`, section 3.2 and the phase table) is the authority for the mapping and the
-phases. The status marks here are a snapshot taken on 2026-11-27 and are updated at each phase gate.
+phases. The status marks here are a snapshot taken on 2026-11-28 and are updated at each phase gate.
 
 Go packages are relative to `internal/`. Node paths are relative to the pinned source tree.
 
@@ -43,7 +43,8 @@ message content.
 | 🔜 | Not started; the phase column says when |
 
 Phases: 0 foundations, 1 pure logic, 2 worker, 3 supervisor and process layer, 4 command line and settings,
-5 packaging, migration and shadow mode, 6 rehearsal and cutover. Phases 0 and 1 are on `main`; phase 2 is in progress.
+5 packaging, migration and shadow mode, 6 rehearsal and cutover. Phases 0 and 1 are on `main`; phase 2 passed its
+gate, and its status commit is intended to land it on `main` after independent verification; phase 3 is next.
 
 ## 1. The request path (worker)
 
@@ -51,20 +52,20 @@ What happens to one inference request, in the order it happens.
 
 | Package | What it does | Replaces | Phase | Status |
 |---|---|---|---|---|
-| `worker` | Serves the local endpoints and runs a request through the steps below | `lib/request-worker.js` (server part) | 2 | 🔶 in review |
+| `worker` | Serves the local endpoints and runs a request through the steps below | `lib/request-worker.js` (server part) | 2 | ✅ |
 | `worker/route` | Classifies the requested model: Anthropic, proxy, Grok, or refused | `lib/request-worker.js` | 1 | ✅ |
 | `worker/dispatch` | Recognizes route markers in a conversation and remembers a session's route | `lib/request-worker.js` | 1 | ✅ |
 | `worker/sentry` | Tracks context usage per session and refuses a request that cannot fit | `lib/request-worker.js` | 1 | ✅ |
-| `worker/proxyreq` | Builds the request for a proxy model and answers local refusals | `lib/request-worker.js` | 2 | 🔶 reviewed; follow-up tests pending |
-| `grok` | Translates between Anthropic messages and Grok's wire format, and keeps the Grok credential fresh | `lib/grok-backend.js` | 1, 2 | 🔶 translation ✅; request branch in review |
+| `worker/proxyreq` | Builds the request for a proxy model and answers local refusals | `lib/request-worker.js` | 2 | ✅ |
+| `grok` | Translates between Anthropic messages and Grok's wire format, and keeps the Grok credential fresh | `lib/grok-backend.js` | 1, 2 | ✅ |
 | `toolschema` | Adapts tool input schemas for Codex | `lib/tool-schema-compat.js` | 1 | ✅ |
-| `worker/upstream` | Filters headers and sends the request to Anthropic, the proxy or Grok | `lib/request-worker.js` | 2 | 🔶 reviewed; TLS error text in review |
-| `worker/reply` | Handles a buffered answer: errors, retries, overflow, rejections | `lib/request-worker.js` | 2 | 🔶 in review |
-| `worker/sse`, `sse` | Relays a streamed answer to the client; `sse` splits the event stream | `lib/request-worker.js` | 1, 2 | 🔶 splitter ✅; relays in review |
-| `worker/compactguard` | Buffers a compaction stream and retries it when it is incomplete | `lib/request-worker.js` | 2 | 🔶 in review |
-| `worker/modelcache` | Keeps the model list current and serves `/v1/models` | `lib/request-worker.js` | 2 | 🔶 in review |
-| `worker/outcome` | Carries the facts of one request (route, status) between the steps | `lib/request-worker.js` | 2 | 🔶 in review |
-| `worker/compose` | Wires all of the above into one worker | new | 2 | 🔜 after the unit reviews |
+| `worker/upstream` | Filters headers and sends the request to Anthropic, the proxy or Grok | `lib/request-worker.js` | 2 | ✅ |
+| `worker/reply` | Handles a buffered answer: errors, retries, overflow, rejections | `lib/request-worker.js` | 2 | ✅ |
+| `worker/sse`, `sse` | Relays a streamed answer to the client; `sse` splits the event stream | `lib/request-worker.js` | 1, 2 | ✅ |
+| `worker/compactguard` | Buffers a compaction stream and retries it when it is incomplete | `lib/request-worker.js` | 2 | ✅ |
+| `worker/modelcache` | Keeps the model list current and serves `/v1/models` | `lib/request-worker.js` | 2 | ✅ |
+| `worker/outcome` | Carries the facts of one request (route, status) between the steps | `lib/request-worker.js` | 2 | ✅ |
+| `worker/compose` | Wires all of the above into one worker | new | 2 | ✅ |
 
 ## 2. Processes: supervisor, worker lifecycle, ownership
 
@@ -72,8 +73,8 @@ Who listens, who starts and stops whom, and how the gateway knows a process is i
 
 | Package | What it does | Replaces | Phase | Status |
 |---|---|---|---|---|
-| `supervisor`, `supervisor/relay`, `supervisor/workerproc` | Owns the public listener, starts and replaces workers, relays requests to them | `lib/commands.js` (supervisor part) | 2, 3 | 🔶 skeleton in review; the rest is phase 3 |
-| `cli/serveshim`, `cli/serveworker` | The two long-running commands: supervisor and worker | `lib/commands.js` | 2 | 🔶 in review |
+| `supervisor`, `supervisor/relay`, `supervisor/workerproc` | Owns the public listener, starts and replaces workers, relays requests to them | `lib/commands.js` (supervisor part) | 2, 3 | 🔶 skeleton ✅; the rest is phase 3 |
+| `cli/serveshim`, `cli/serveworker` | The two long-running commands: supervisor and worker | `lib/commands.js` | 2 | ✅ |
 | `procinfo` | Reads process and listener facts from the operating system | `lib/process-supervision.js` | 0 | ✅ |
 | `ownership`, `supervisor/proxyrecovery`, `launch` | Decide which processes belong to the gateway, recover the proxy, start detached processes | `lib/process-supervision.js`, `lib/windows-detached.js` | 3 | 🔜 |
 | `shimstate` | Works out whether a gateway already answers on the port and whether it is this install's | `lib/shim-state.js` | 3 | 🔜 |
@@ -90,7 +91,7 @@ Which models exist, which one a picker alias means, and what limits apply.
 | `pins` | Chooses the model behind each picker alias | `lib/pins.js`, `lib/previous-picker-rows.js` | 1, 4 | 🔶 logic ✅; live probe in phase 4 |
 | `anthropiccatalog` | Stores snapshots of Anthropic's model catalog and merges picker rows | `lib/anthropic-catalog.js` | 1 | ✅ |
 | `proxymodels` | Reads the model listing the proxy serves | `lib/proxy-models.js` | 1 | ✅ |
-| `localprov`, `proxyconfig` | Read local providers (LM Studio, llama.cpp) and the proxy's configuration | `lib/lmstudio.js`, `lib/local-llama.js`, `lib/proxy-config.js` | 1, 2 | 🔶 parsers ✅; live probes in review |
+| `localprov`, `proxyconfig` | Read local providers (LM Studio, llama.cpp) and the proxy's configuration | `lib/lmstudio.js`, `lib/local-llama.js`, `lib/proxy-config.js` | 1, 2 | ✅ |
 | `catalog` | Builds the catalog document other tools consume | `lib/commands.js` | 1 | ✅ |
 | `pickerguard` | The model-picker guard that `ensure` runs; it keeps its own state file | `lib/picker-guard.js` | 4 | 🔜 |
 
@@ -113,8 +114,8 @@ How the gateway writes itself into Claude Code's settings and keeps its own file
 
 | Package | What it does | Replaces | Phase | Status |
 |---|---|---|---|---|
-| `usage` | Builds and emits counts-only usage records | `lib/usage-observability.js` | 1, 2 | 🔶 records ✅; capture and emitter in review |
-| `telemetry` | Records route decisions as spans and a local log, without message content | `lib/request-worker.js` | 2 | 🔶 in review |
+| `usage` | Builds and emits counts-only usage records | `lib/usage-observability.js` | 1, 2 | ✅ |
+| `telemetry` | Records route decisions as spans and a local log, without message content | `lib/request-worker.js` | 2 | ✅ |
 | `upstreamstate` | Remembers that Codex refused dispatch, with evidence and expiry | `lib/codex-upstream-state.js` | 1 | ✅ |
 | `jsdate` | Parses dates the way the Node code's `Date.parse` did, independent of the time zone; used by the two packages above | new | 1 | ✅ |
 
@@ -143,7 +144,7 @@ block the Node version manages, in `doctor` and in the migration check.
 |---|---|---|---|
 | `venue` | Refuses to run a test binary on a machine that runs a real gateway | 0 | ✅ |
 | `gatewaytest` | Gives tests an isolated home, environment and child processes | 0 | ✅ |
-| `test/conformance/` | Runs the same cases against the Node gateway and the Go binary (not a Go package) | 2 | 🔶 cases and hosted evidence export exist; the binary proof is the phase 2 gate |
+| `test/conformance/` | Runs the same cases against the Node gateway and the Go binary (not a Go package) | 2 | ✅ the Go binary passes the 177 cases due through phase 2; later cases run at their phase gates |
 
 ## Index: from a Node file to its Go packages
 
