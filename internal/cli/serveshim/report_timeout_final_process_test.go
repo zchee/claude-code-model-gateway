@@ -87,14 +87,12 @@ func TestReportTimeoutIsFinal(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			// Each case waits for its own report deadline; the cases need not wait in turn.
 			t.Parallel()
-			// The configured port stays held until the supervisor bound its public listener, so that it cannot become
-			// the public port; the replacement binds it afterwards.
-			reserved := startForeign(t, 0)
+			// The configured port stays reserved until the replacement listens on it, so that no other bind is handed
+			// the number in between, the supervisor's public listener included; the first worker never binds it.
+			reserved := reservePort(t)
 			port := reserved.port
 			s := startShim(t, map[string]string{"CODEX_GATEWAY_WORKER_PORT": strconv.Itoa(port)})
 			s.awaitReady(t)
-			_ = reserved.ln.Close()
-			reserved.wg.Wait()
 			deadline := s.readyAt.Add(reportDeadline)
 
 			first := s.nextChild(t)
@@ -120,8 +118,12 @@ func TestReportTimeoutIsFinal(t *testing.T) {
 				}
 			}
 			if second != nil {
-				_, _ = io.WriteString(second.conn, "listen\n")
-				switch reply := <-lines; {
+				_, _ = io.WriteString(second.conn, "listen shared\n")
+				reply := <-lines
+				// The replacement listens on the port now or never will; the reservation goes before any request can be
+				// relayed there.
+				reserved.release()
+				switch {
 				case reply == "listening "+strconv.Itoa(port):
 				case strings.HasPrefix(reply, "parent gone"):
 					farewell = reply

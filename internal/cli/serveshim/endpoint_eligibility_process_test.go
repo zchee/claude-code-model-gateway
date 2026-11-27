@@ -36,10 +36,12 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	gocmp "github.com/google/go-cmp/cmp"
+	"golang.org/x/sys/unix"
 
 	"github.com/zchee/claude-code-model-gateway/internal/cli/serveshim"
 	"github.com/zchee/claude-code-model-gateway/internal/gatewaytest"
@@ -55,8 +57,9 @@ const reportDeadline = 5 * time.Second
 
 // eligibilityChild is the worker the supervisor under test starts through the launcher script, which runs this test
 // binary again. It binds, reports and exits only when the test tells it to, so the test decides when an endpoint
-// becomes eligible. It counts the requests it receives before and after its report, and tells the test those counts
-// when its supervisor goes away.
+// becomes eligible. "listen shared" binds beside the test's reservation of the configured port (see reservePort). It
+// counts the requests it receives before and after its report, and tells the test those counts when its supervisor
+// goes away.
 func eligibilityChild(ctx context.Context, control string) error {
 	generation := os.Getenv("MODEL_GATEWAY_WORKER_GENERATION")
 	if generation == "" || os.Getenv("MODEL_GATEWAY_CONTROL_FDS") != "3,4" {
@@ -98,6 +101,9 @@ func eligibilityChild(ctx context.Context, control string) error {
 		switch command {
 		case "listen":
 			var cfg net.ListenConfig
+			if arg == "shared" {
+				cfg.Control = reusePort
+			}
 			if ln, err = cfg.Listen(ctx, "tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(configured))); err != nil {
 				send("error %v", err)
 				continue
@@ -562,6 +568,109 @@ func freePort(t *testing.T) int {
 	return port
 }
 
+// portReservation holds a loopback port number for a worker that binds it later.
+type portReservation struct {
+	port    int
+	release func()
+}
+
+// reservePort reserves a loopback port number until release is called or the test ends. The reservation is a socket
+// bound with SO_REUSEPORT alone that never listens: no connection reaches it, no bind to port 0 nor any outgoing
+// connection is handed its number while it is held, the supervisor's public listener included, and a bind that names
+// the number fails unless that socket also sets SO_REUSEPORT. A worker told to "listen shared" sets SO_REUSEPORT and
+// can bind and listen on the number beside it, so the number passes from the test to the worker without a moment in
+// which another program could take it. A port number that was free a moment ago, as freePort returns, can be taken
+// by any bind between its release and the worker's.
+//
+// The test releases the reservation once the worker listens, before any request can be relayed to the port, so the
+// worker's listener is then the only socket on it.
+func reservePort(t *testing.T) *portReservation {
+	t.Helper()
+	// The supervisor under test starts its workers from this process; none may inherit the reservation, so the
+	// descriptor is marked close-on-exec before a fork can happen.
+	syscall.ForkLock.RLock()
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
+	if err == nil {
+		unix.CloseOnExec(fd)
+	}
+	syscall.ForkLock.RUnlock()
+	if err != nil {
+		t.Fatalf("create the port reservation socket: %v", err)
+	}
+	r := &portReservation{release: sync.OnceFunc(func() { _ = unix.Close(fd) })}
+	t.Cleanup(r.release)
+	// SO_REUSEADDR stays unset: Go sets it on every listener, and on Linux two sockets that both set it may share a
+	// port that neither listens on, so any listener that names the number could take the port beside the reservation.
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
+		t.Fatalf("set SO_REUSEPORT on the port reservation: %v", err)
+	}
+	if err := unix.Bind(fd, &unix.SockaddrInet4{Addr: [4]byte{127, 0, 0, 1}}); err != nil {
+		t.Fatalf("bind the port reservation: %v", err)
+	}
+	sa, err := unix.Getsockname(fd)
+	if err != nil {
+		t.Fatalf("read the port reservation's address: %v", err)
+	}
+	inet4, ok := sa.(*unix.SockaddrInet4)
+	if !ok || inet4.Port == 0 {
+		t.Fatalf("port reservation bound to %#v; want a loopback port", sa)
+	}
+	r.port = inet4.Port
+	return r
+}
+
+// reusePort sets SO_REUSEPORT on a socket before it binds, so that it can bind a port reservePort holds.
+func reusePort(_, _ string, c syscall.RawConn) error {
+	var optErr error
+	if err := c.Control(func(fd uintptr) {
+		optErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+	}); err != nil {
+		return err
+	}
+	return optErr
+}
+
+// TestPortReservation checks the hand-over the fixed-port cases rely on: while reservePort holds a number, a listener
+// that names it without SO_REUSEPORT is refused, and a listener with SO_REUSEPORT, as a worker's "listen shared",
+// binds it and receives the connections to it once the reservation is released.
+func TestPortReservation(t *testing.T) {
+	reserved := reservePort(t)
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(reserved.port))
+	var plain net.ListenConfig
+	ln, err := plain.Listen(t.Context(), "tcp4", addr)
+	if err == nil {
+		_ = ln.Close()
+		t.Fatalf("a listener without SO_REUSEPORT bound the reserved port %d", reserved.port)
+	}
+	if !errors.Is(err, syscall.EADDRINUSE) {
+		t.Fatalf("a listener without SO_REUSEPORT on the reserved port %d: %v; want %v", reserved.port, err, syscall.EADDRINUSE)
+	}
+	shared := net.ListenConfig{Control: reusePort}
+	ln, err = shared.Listen(t.Context(), "tcp4", addr)
+	if err != nil {
+		t.Fatalf("a listener with SO_REUSEPORT could not bind the reserved port %d: %v", reserved.port, err)
+	}
+	defer func() { _ = ln.Close() }()
+	reserved.release()
+	accepted := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err == nil {
+			_ = conn.Close()
+		}
+		accepted <- err
+	}()
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(t.Context(), "tcp4", addr)
+	if err != nil {
+		t.Fatalf("connect to the listener on the formerly reserved port %d: %v", reserved.port, err)
+	}
+	_ = conn.Close()
+	if err := <-accepted; err != nil {
+		t.Errorf("accept on the formerly reserved port %d: %v", reserved.port, err)
+	}
+}
+
 // otherFreePort returns a free loopback port other than port.
 func otherFreePort(t *testing.T, port int) int {
 	t.Helper()
@@ -613,11 +722,13 @@ func TestEndpointEligibility(t *testing.T) {
 			}
 		}},
 		"error: configured port the child bound receives nothing before the child reports": {func(t *testing.T) {
-			port := freePort(t)
+			reserved := reservePort(t)
+			port := reserved.port
 			s := startShim(t, map[string]string{"CODEX_GATEWAY_WORKER_PORT": strconv.Itoa(port)})
 			s.awaitReady(t)
 			child := s.nextChild(t)
-			child.command(t, "listen", "listening "+strconv.Itoa(port))
+			child.command(t, "listen shared", "listening "+strconv.Itoa(port))
+			reserved.release()
 			probe := s.startProbe(t, rand.Text())
 			defer probe.cancel()
 			// The child counts each request as arriving before or after its report, so the verdict does not depend on
@@ -646,11 +757,13 @@ func TestEndpointEligibility(t *testing.T) {
 			}
 		}},
 		"success: configured port is relayed to once the child reports it": {func(t *testing.T) {
-			port := freePort(t)
+			reserved := reservePort(t)
+			port := reserved.port
 			s := startShim(t, map[string]string{"CODEX_GATEWAY_WORKER_PORT": strconv.Itoa(port)})
 			s.awaitReady(t)
 			child := s.nextChild(t)
-			child.command(t, "listen", "listening "+strconv.Itoa(port))
+			child.command(t, "listen shared", "listening "+strconv.Itoa(port))
+			reserved.release()
 			child.command(t, "report", "reported")
 			if diff := gocmp.Diff(probeResult{Status: http.StatusOK, ChildPID: child.pid}, s.probe(t, rand.Text())); diff != "" {
 				t.Errorf("request after the child reported (-want +got):\n%s", diff)
@@ -689,7 +802,9 @@ func TestEndpointEligibility(t *testing.T) {
 			}
 		}},
 		"error: configured port whose child never reports stops the supervisor at the report deadline": {func(t *testing.T) {
-			port := freePort(t)
+			// The configured port stays reserved for the whole case, so the supervisor can never choose it as its public
+			// port; the child never binds it.
+			port := reservePort(t).port
 			s := startShim(t, map[string]string{"CODEX_GATEWAY_WORKER_PORT": strconv.Itoa(port)})
 			s.awaitReady(t)
 			s.nextChild(t)
@@ -706,7 +821,9 @@ func TestEndpointEligibility(t *testing.T) {
 			}
 		}},
 		"error: configured port reported as another port stops the supervisor at once": {func(t *testing.T) {
-			port := freePort(t)
+			// The configured port stays reserved for the whole case, so the supervisor can never choose it as its public
+			// port; the child only names it.
+			port := reservePort(t).port
 			other := otherFreePort(t, port)
 			s := startShim(t, map[string]string{"CODEX_GATEWAY_WORKER_PORT": strconv.Itoa(port)})
 			s.awaitReady(t)
