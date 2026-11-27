@@ -338,7 +338,8 @@ func brokenResult(status int, clientGone bool) (outcome.Result, error) {
 // closes resp.Body and returns ctx.Err() (nil once the client is gone); with HeadWritten it returns
 // the abort described next. ctx is checked again before every upstream read, and once more at the
 // clean end of the body before the stream is finalized: a ctx that ended while the last chunk was
-// written gets no closing events and no synthesized stop, only the shutdown abort.
+// written gets no additional closing events and no synthesized stop, only the shutdown abort; a stop
+// the upstream sent in that last chunk has already been forwarded.
 // If the upstream breaks after response headers are committed, RelayProxy returns the terminal
 // outcome facts alongside http.ErrAbortHandler rather than panicking.
 // When the first-event peek finds an engine overflow, OnOverflow is called even if the client is

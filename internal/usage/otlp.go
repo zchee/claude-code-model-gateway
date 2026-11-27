@@ -54,9 +54,10 @@ func otlpValue(value any) (jsonx.WireValue, error) {
 		// A binary64 rounds integers beyond 2^53; the largest int64 would become 2^63, which is
 		// outside the signed 64-bit range of intValue.
 		return object(member("intValue", wireString(strconv.FormatInt(v.Int(), 10)))), nil
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
 		// Formatted from the integer itself for the same reason: through a binary64,
-		// 9007199254740993 would be sent as 9007199254740992.
+		// 9007199254740993 would be sent as 9007199254740992. A value above the signed 64-bit
+		// range keeps its digits, although it lies outside the range of an OTLP intValue.
 		return object(member("intValue", wireString(strconv.FormatUint(v.Uint(), 10)))), nil
 	case reflect.Float32, reflect.Float64:
 		n = v.Float()

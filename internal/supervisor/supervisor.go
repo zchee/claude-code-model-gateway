@@ -434,7 +434,7 @@ func writeWorkerFailure(w http.ResponseWriter, bodyTaken bool) {
 // It reports whether the channel's first message is the fixture's shutdown message. Only the first message is
 // decided, as the source listens for one message only (lib/commands.js:2900-2903): after any other first message the
 // channel stays open and later messages are read and dropped until the channel ends, so none of them stops the
-// supervisor.
+// supervisor. A failure of the channel other than its end is returned with false.
 func FixtureShutdown(channel io.ReadCloser, guarded bool) (bool, error) {
 	defer func() { _ = channel.Close() }()
 	if !guarded {
@@ -447,10 +447,11 @@ func FixtureShutdown(channel io.ReadCloser, guarded bool) (bool, error) {
 			if fixtureStop(line) {
 				return true, nil
 			}
-			if err == nil {
-				// io.Copy reports the channel's end as a nil error.
-				if _, err = io.Copy(io.Discard, reader); err == nil {
-					return false, nil
+			// The rest is drained through the reader itself, so an error it already holds is returned
+			// and the channel is not read again after it.
+			for err == nil {
+				if _, err = reader.ReadSlice('\n'); errors.Is(err, bufio.ErrBufferFull) {
+					err = nil
 				}
 			}
 		}

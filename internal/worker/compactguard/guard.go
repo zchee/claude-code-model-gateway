@@ -175,19 +175,19 @@ func (g *guard) serve() (outcome.Result, error) {
 			}
 			return res, err
 		}
-		if err != nil {
-			if resp.Body != nil {
-				_ = resp.Body.Close()
-			}
-			return res, err
-		}
 		// The service may have ended while the attempt was sent: its response is neither committed
-		// to the client nor relayed.
+		// to the client nor relayed, also when it came with a dispatch error.
 		if g.ServiceContext.Err() != nil {
 			if resp.Body != nil {
 				_ = resp.Body.Close()
 			}
 			return g.shutdown(resp.StatusCode)
+		}
+		if err != nil {
+			if resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			return res, err
 		}
 		res, retry, err := g.attempt(resp)
 		if err != nil || !retry {

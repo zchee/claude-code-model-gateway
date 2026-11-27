@@ -144,15 +144,16 @@ func compactionFailure(status int) *outcome.Compaction {
 
 // writeRelay answers with the upstream's relay headers, an optional content type and the length of
 // body, or reports errDeparted when the client left before the head was committed. With neither an
-// upstream nor a given content type, the answer carries none.
+// upstream nor a given content type, no type is sniffed from the body; a content type the writer
+// already holds is kept.
 func (t *turn) writeRelay(status int, body []byte, contentType string) error {
 	_, err := t.send(status, body, func(h http.Header) {
 		maps.Copy(h, t.res.RelayHeader)
 		if contentType != "" {
 			h.Set("Content-Type", contentType)
 		}
-		// An upstream reply without a content type is answered without one: the present but empty
-		// entry keeps net/http from sniffing a type from the body.
+		// Without a content type from the upstream, the argument or the writer, the present but
+		// empty entry keeps net/http from sniffing a type from the body.
 		if _, ok := h["Content-Type"]; !ok {
 			h["Content-Type"] = nil
 		}
