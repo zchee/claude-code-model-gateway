@@ -31,25 +31,27 @@ func TestBaseURLValidation(t *testing.T) {
 		anthropicError = "compose: AnthropicBaseURL must be an absolute http or https URL"
 		proxyError     = "compose: ProxyBaseURL must be an absolute http or https URL"
 	)
+	// Each refused value carries its own user, password, host, port, path, query key and query value. An http value
+	// also forbids its scheme prefix with the next character of the value, because "http" alone is in the error text.
 	invalid := map[string]struct {
 		value     string
 		forbidden []string
 	}{
 		"a value that does not parse": {
-			value:     "http://fixture-user:fixture-pass@[::1/fixture-path?fixture-query=yes",
-			forbidden: []string{"fixture-user", "fixture-pass", "fixture-path", "fixture-query", "::1"},
+			value:     "http://fixture-user:fixture-pass@[fixture-host:28417/fixture-path?fixture-query=fixture-value",
+			forbidden: []string{"http://f", "fixture-user", "fixture-pass", "fixture-host", "28417", "fixture-path", "fixture-query", "fixture-value"},
 		},
-		"a value with a scheme and no host": {
-			value:     "fixture-user:fixture-pass@fixture-host/fixture-path?fixture-query=yes",
-			forbidden: []string{"fixture-user", "fixture-pass", "fixture-host", "fixture-path", "fixture-query"},
+		"an http value with an empty host": {
+			value:     "http:fixture-user:fixture-pass@fixture-host:28417/fixture-path?fixture-query=fixture-value",
+			forbidden: []string{"http:f", "fixture-user", "fixture-pass", "fixture-host", "28417", "fixture-path", "fixture-query", "fixture-value"},
 		},
 		"a value with a host and no scheme": {
-			value:     "//fixture-user:fixture-pass@fixture-host:9/fixture-path?fixture-query=yes",
-			forbidden: []string{"fixture-user", "fixture-pass", "fixture-host", "fixture-path", "fixture-query"},
+			value:     "//fixture-user:fixture-pass@fixture-host:28417/fixture-path?fixture-query=fixture-value",
+			forbidden: []string{"fixture-user", "fixture-pass", "fixture-host", "28417", "fixture-path", "fixture-query", "fixture-value"},
 		},
 		"a value with a non-http scheme": {
-			value:     "ftp://fixture-user:fixture-pass@fixture-host:21/fixture-path?fixture-query=yes",
-			forbidden: []string{"ftp:", "fixture-user", "fixture-pass", "fixture-host", "fixture-path", "fixture-query"},
+			value:     "ftp://fixture-user:fixture-pass@fixture-host:28417/fixture-path?fixture-query=fixture-value",
+			forbidden: []string{"ftp:", "fixture-user", "fixture-pass", "fixture-host", "28417", "fixture-path", "fixture-query", "fixture-value"},
 		},
 	}
 	valid := map[string]string{
@@ -89,6 +91,12 @@ func TestBaseURLValidation(t *testing.T) {
 			opts := minimalOptions(t, t.Context(), client)
 			tt.set(&opts, tt.value)
 			_, err := compose.New(opts)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("compose.New refused an accepted base URL: got error %v, want nil", err)
+				}
+				return
+			}
 			gotErr := ""
 			if err != nil {
 				gotErr = err.Error()

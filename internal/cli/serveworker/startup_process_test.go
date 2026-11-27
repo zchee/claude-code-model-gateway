@@ -58,27 +58,31 @@ func TestWorkerStartupBoundaries(t *testing.T) {
 			forbidden:  []string{"alice", "secret-pass", "/v1/custom", "api_key", "tok", "frag"},
 		},
 		// The worker refuses to start with an upstream that is not an absolute http or https URL: a value url.Parse
-		// refuses; one it parses with a scheme (fixture-user, the rest opaque) and no host; a scheme-relative one it
-		// parses with a host and no scheme; and one with a host and a scheme other than http or https.
+		// refuses; an http value it parses with an empty host (the rest is opaque); a scheme-relative one it parses
+		// with a host and no scheme; and one with a host and a scheme other than http or https. Each carries its own
+		// user, password, host, port, path, query key and query value, and none of them may appear on either stream.
+		// The port 28417 lies below the default ephemeral port ranges of Linux and macOS and appears nowhere else.
+		// An http value also forbids its scheme prefix with the next character of the value: "http" alone is in the
+		// error text, and "http://1" is the start of the fixture's own loopback endpoints.
 		"error: worker refuses an upstream that does not parse and never repeats it": {
-			upstream:  "http://fixture-user:fixture-pass@[::1/fixture-path?fixture-query=yes",
+			upstream:  "http://fixture-user:fixture-pass@[fixture-host:28417/fixture-path?fixture-query=fixture-value",
 			wantErr:   invalidUpstreamError,
-			forbidden: []string{"fixture-user", "fixture-pass", "fixture-path", "fixture-query", "::1"},
+			forbidden: []string{"http://f", "fixture-user", "fixture-pass", "fixture-host", "28417", "fixture-path", "fixture-query", "fixture-value"},
 		},
-		"error: worker refuses an upstream with a scheme and no host and never repeats it": {
-			upstream:  "fixture-user:fixture-pass@fixture-host/fixture-path?fixture-query=yes",
+		"error: worker refuses an http upstream with an empty host and never repeats it": {
+			upstream:  "http:fixture-user:fixture-pass@fixture-host:28417/fixture-path?fixture-query=fixture-value",
 			wantErr:   invalidUpstreamError,
-			forbidden: []string{"fixture-user", "fixture-pass", "fixture-host", "fixture-path", "fixture-query"},
+			forbidden: []string{"http:f", "fixture-user", "fixture-pass", "fixture-host", "28417", "fixture-path", "fixture-query", "fixture-value"},
 		},
 		"error: worker refuses an upstream with a host and no scheme and never repeats it": {
-			upstream:  "//fixture-user:fixture-pass@fixture-host:9/fixture-path?fixture-query=yes",
+			upstream:  "//fixture-user:fixture-pass@fixture-host:28417/fixture-path?fixture-query=fixture-value",
 			wantErr:   invalidUpstreamError,
-			forbidden: []string{"fixture-user", "fixture-pass", "fixture-host", "fixture-path", "fixture-query"},
+			forbidden: []string{"fixture-user", "fixture-pass", "fixture-host", "28417", "fixture-path", "fixture-query", "fixture-value"},
 		},
 		"error: worker refuses an upstream with a non-http scheme and never repeats it": {
-			upstream:  "ftp://fixture-user:fixture-pass@fixture-host:21/fixture-path?fixture-query=yes",
+			upstream:  "ftp://fixture-user:fixture-pass@fixture-host:28417/fixture-path?fixture-query=fixture-value",
 			wantErr:   invalidUpstreamError,
-			forbidden: []string{"ftp:", "fixture-user", "fixture-pass", "fixture-host", "fixture-path", "fixture-query"},
+			forbidden: []string{"ftp:", "fixture-user", "fixture-pass", "fixture-host", "28417", "fixture-path", "fixture-query", "fixture-value"},
 		},
 		"error: unclean dot state root":       {stateKind: "dot"},
 		"error: symlink traversal state root": {stateKind: "symlink"},
@@ -161,10 +165,13 @@ func TestWorkerStartupBoundaries(t *testing.T) {
 				if stdout.Len() != 0 {
 					t.Errorf("worker wrote %d bytes to stdout before refusing an invalid upstream, want none", stdout.Len())
 				}
-				for _, marker := range tt.forbidden {
-					if strings.Contains(stdout.String(), marker) || strings.Contains(stderr.String(), marker) {
-						t.Error("worker output repeats a part of the refused upstream URL")
-						break
+				// The temporary home's path holds random digits, so paths under it are cut before the port is looked for.
+				for stream, text := range map[string]string{"stdout": stdout.String(), "stderr": stderr.String()} {
+					text = strings.ReplaceAll(text, home, "")
+					for _, marker := range tt.forbidden {
+						if strings.Contains(text, marker) {
+							t.Errorf("worker %s repeats %q of the refused upstream URL", stream, marker)
+						}
 					}
 				}
 				return
