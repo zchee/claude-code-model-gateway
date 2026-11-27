@@ -424,15 +424,11 @@ func TestClearStartupFailure(t *testing.T) {
 			lock: new(fs.FileMode(0o500)),
 			// The precondition is the operation under test: unlinking the record itself is refused. Creating an
 			// entry is a different right (on macOS an access control list can grant one and not the other). If
-			// the unlink went through, the record is written back before the case fails.
+			// the unlink goes through, the probe has consumed this disposable record and the case fails as a void
+			// fixture; nothing is written back.
 			denied: func(t *testing.T, f rootFixture) {
-				path := filepath.Join(f.state, failureName)
 				modeDenies(t, "unlinking the record from the state root", func() error {
-					err := unix.Unlink(path)
-					if err == nil {
-						noError(t, os.WriteFile(path, []byte(record), 0o600))
-					}
-					return err
+					return unix.Unlink(filepath.Join(f.state, failureName))
 				})
 			},
 			wantErr: true,
