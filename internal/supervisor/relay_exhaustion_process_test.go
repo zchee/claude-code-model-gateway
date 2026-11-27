@@ -19,12 +19,15 @@ package supervisor_test
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -34,16 +37,20 @@ import (
 // undeliveredBody is the answer to a request that no worker took: a resend is free, so it carries no retry veto.
 const undeliveredBody = `{"type":"error","error":{"type":"api_error","message":"model-gateway could not deliver this request to the shim worker; retry it shortly"}}`
 
-// takingWorker reads each relayed request to the end of its body, counts the bodies it received, and then either
-// writes answer or, when answer is empty, closes the connection without a response. With closeAfterTake it closes its
-// listener before it closes the first connection whose body it took, so its port refuses connections from then on.
+// relayedPayload is the body of the client's request. Every worker that receives the request must receive exactly
+// these bytes; an empty or altered body counts as a different body.
+const relayedPayload = `{"model":"m","max_tokens":16,"messages":[{"role":"user","content":"relay this body unchanged"}]}`
+
+// takingWorker reads each relayed request to the end of its body and records the body it received, and then either
+// writes answer or, when answer is empty, closes the connection without a response. Its listener stays open until the
+// test ends, so a later dial to its port reaches it and is recorded.
 type takingWorker struct {
-	port  int
-	mu    sync.Mutex
-	taken int
+	port     int
+	mu       sync.Mutex
+	received []string
 }
 
-func startTakingWorker(t *testing.T, answer string, closeAfterTake bool) *takingWorker {
+func startTakingWorker(t *testing.T, answer string) *takingWorker {
 	t.Helper()
 	var cfg net.ListenConfig
 	ln, err := cfg.Listen(t.Context(), "tcp4", "127.0.0.1:0")
@@ -65,15 +72,13 @@ func startTakingWorker(t *testing.T, answer string, closeAfterTake bool) *taking
 				if err != nil {
 					return
 				}
-				if _, err := io.ReadAll(req.Body); err != nil {
+				body, err := io.ReadAll(req.Body)
+				if err != nil {
 					return
 				}
 				w.mu.Lock()
-				w.taken++
+				w.received = append(w.received, string(body))
 				w.mu.Unlock()
-				if closeAfterTake {
-					_ = ln.Close()
-				}
 				if answer != "" {
 					_, _ = io.WriteString(conn, answer)
 				}
@@ -87,23 +92,63 @@ func startTakingWorker(t *testing.T, answer string, closeAfterTake bool) *taking
 	return w
 }
 
-func (w *takingWorker) bodies() int {
+// bodies returns the request bodies the worker received, in arrival order, or nil when it received none.
+func (w *takingWorker) bodies() []string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.taken
+	return slices.Clone(w.received)
 }
 
-// refusedPort returns a loopback port whose listener has been closed, so that a connection to it is refused.
-func refusedPort(t *testing.T) int {
+// refusingPort returns a loopback port that refuses connections. The port is the local end of an open client
+// connection to a listener of the test's own, held until the test ends: both Linux and macOS refuse a connection
+// attempt to that port (ECONNREFUSED). A socket that is only bound to a port is not used: Linux refuses a connection
+// to it, but macOS leaves the attempt unanswered, so the dial would hang instead of failing.
+//
+// While the connection is held, a bind to port 0 is never given this port (Linux 6.12: inet_bind_conflict in
+// net/ipv4/inet_connection_sock.c; XNU: in_pcbbind in bsd/netinet/in_pcb.c, which takes only an unused port for a
+// port-0 bind). Every listener in this package's tests is bound to port 0 and the relay under test opens none. An
+// explicit bind of the number is not excluded on macOS: Go sets SO_REUSEADDR on every listener, and macOS lets such a
+// bind take a port held by a connection, where Linux refuses it. The procinfo tests, which can run at the same time,
+// bind numbers drawn at random from 20000 to 60000, so on macOS they could take this port over by chance. The dial
+// check before the port is returned proves that the port refuses at that moment only.
+//
+// What a run proves therefore depends on the system. On Linux the refusal holds for the whole case, so a Linux run
+// decides the rows that use this port. On macOS a procinfo listener that holds the port when the relay dials it
+// completes the relay's connection and closes it without an HTTP answer, because neither procinfo test serves its
+// connections; the relay counts that port as one whose worker took the body and failed. In the row "error: the worker
+// took the body and another port that refuses is published afterwards" that leads to the expected non-retryable 503
+// whether or not any dial to the port was refused, so a green macOS run of that row is not independent proof that
+// the relay keeps the first worker's port after a refused dial. In the row "error: no worker took the body because
+// the port refuses from the start" the same takeover can only make the row fail.
+func refusingPort(t *testing.T) int {
 	t.Helper()
 	var cfg net.ListenConfig
 	ln, err := cfg.Listen(t.Context(), "tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	if err := ln.Close(); err != nil {
+	t.Cleanup(func() { _ = ln.Close() })
+	var dialer net.Dialer
+	held, err := dialer.DialContext(t.Context(), "tcp4", ln.Addr().String())
+	if err != nil {
 		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = held.Close() })
+	peer, err := ln.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = peer.Close() })
+	port := held.LocalAddr().(*net.TCPAddr).Port
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	probe, err := dialer.DialContext(ctx, "tcp4", held.LocalAddr().String())
+	if err == nil {
+		_ = probe.Close()
+		t.Fatalf("port %d accepted a connection; want it refused", port)
+	}
+	if !errors.Is(err, syscall.ECONNREFUSED) {
+		t.Fatalf("dialling port %d: %v; want ECONNREFUSED", port, err)
 	}
 	return port
 }
@@ -116,20 +161,24 @@ type exhaustionAnswer struct {
 	ContentType       string
 	Body              string
 	PortLookups       int32
-	TakerBodies       int
-	ReplacementBodies int
+	TakerBodies       []string
+	ReplacementBodies []string
 }
 
 // TestRelayExhaustedAfterBodyTaken pins the relay's answer once a worker accepted the request body and then closed
-// the connection without a response. The relay remembers the port of that worker for the rest of the request and
-// never dials it again; when no worker on another port answers before its attempts run out, the client receives the
-// non-retryable 503, whether the remembered port refuses connections by then, no port is published any more, or
-// another port is published that refuses. A request that no worker ever took gets the retryable 503 without the
-// X-Should-Retry field, and a worker on another port that answers before the attempts run out receives the body a
-// second time and answers the request.
+// the connection without a response. The relay remembers one port, the most recent one whose worker accepted the
+// connection and then failed, overwriting it when a worker on another port accepts and fails, and it does not dial
+// that port while it is the remembered one. Here the worker that took the body keeps listening on its port, so a
+// second leg to it would reach it and be recorded. When no worker on another port answers before the attempts run
+// out, the client receives the non-retryable 503, whether the remembered port is still published and accepting, no
+// port is published any more, or another port is published that refuses. A request that no worker ever took gets the
+// retryable 503 without the X-Should-Retry field, and a worker on another port that answers before the attempts run
+// out receives the same body a second time and answers the request.
 //
 // The relay's attempts are fixed: one attempt plus 80 waits of 50 milliseconds (relayAttempts and relayWait in
-// supervisor.go), and the relay asks for the worker port once per attempt. The number of lookups shows that the relay
+// supervisor.go). Its loop asks for the worker port once per attempt, also in the attempts that do not dial because
+// no port is published or the port is the remembered one, so a request that exhausts the attempts makes 81 lookups.
+// That number is a property of this implementation's loop, not a contract of the relay; it shows here that the relay
 // gave up only after its last attempt.
 func TestRelayExhaustedAfterBodyTaken(t *testing.T) {
 	const relayLookups = 1 + 80
@@ -141,31 +190,37 @@ func TestRelayExhaustedAfterBodyTaken(t *testing.T) {
 		refused     = "another port that refuses connections"
 		none        = "no port"
 	)
+	tookOnce := []string{relayedPayload}
 	tests := map[string]struct {
 		first, later string
 		want         exhaustionAnswer
 	}{
-		"error: the worker took the body and its port refuses connections afterwards": {
+		"error: the worker took the body and its port stays published and keeps accepting": {
 			first: taker, later: taker,
 			want: exhaustionAnswer{
 				Status: http.StatusServiceUnavailable, ShouldRetry: []string{"false"}, ContentType: "application/json",
-				Body: lostWorkerBody, PortLookups: relayLookups, TakerBodies: 1,
+				Body: lostWorkerBody, PortLookups: relayLookups, TakerBodies: tookOnce,
 			},
 		},
 		"error: the worker took the body and no worker port is published afterwards": {
 			first: taker, later: none,
 			want: exhaustionAnswer{
 				Status: http.StatusServiceUnavailable, ShouldRetry: []string{"false"}, ContentType: "application/json",
-				Body: lostWorkerBody, PortLookups: relayLookups, TakerBodies: 1,
+				Body: lostWorkerBody, PortLookups: relayLookups, TakerBodies: tookOnce,
 			},
 		},
+		// A Linux run decides this row. On macOS another test's listener can hold the refusing port when the relay
+		// dials it, and then the row passes whether or not a dial was refused (see refusingPort), so a green macOS run
+		// does not prove the refusal case.
 		"error: the worker took the body and another port that refuses is published afterwards": {
 			first: taker, later: refused,
 			want: exhaustionAnswer{
 				Status: http.StatusServiceUnavailable, ShouldRetry: []string{"false"}, ContentType: "application/json",
-				Body: lostWorkerBody, PortLookups: relayLookups, TakerBodies: 1,
+				Body: lostWorkerBody, PortLookups: relayLookups, TakerBodies: tookOnce,
 			},
 		},
+		// A Linux run decides this row too. On macOS a listener that holds the refusing port when the relay dials it
+		// makes the row fail, never pass.
 		"error: no worker took the body because the port refuses from the start": {
 			first: refused, later: refused,
 			want: exhaustionAnswer{
@@ -176,7 +231,8 @@ func TestRelayExhaustedAfterBodyTaken(t *testing.T) {
 		"success: a worker on another port takes the body again and answers in time": {
 			first: taker, later: replacement,
 			want: exhaustionAnswer{
-				Status: http.StatusOK, ContentType: "text/plain", Body: "ok", PortLookups: 2, TakerBodies: 1, ReplacementBodies: 1,
+				Status: http.StatusOK, ContentType: "text/plain", Body: "ok", PortLookups: 2,
+				TakerBodies: tookOnce, ReplacementBodies: tookOnce,
 			},
 		},
 	}
@@ -184,9 +240,9 @@ func TestRelayExhaustedAfterBodyTaken(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			// The relay's attempts last about four seconds; the cases need not wait in turn.
 			t.Parallel()
-			takingOne := startTakingWorker(t, "", true)
-			answering := startTakingWorker(t, replacementAnswer, false)
-			ports := map[string]int{taker: takingOne.port, replacement: answering.port, refused: refusedPort(t), none: 0}
+			takingOne := startTakingWorker(t, "")
+			answering := startTakingWorker(t, replacementAnswer)
+			ports := map[string]int{taker: takingOne.port, replacement: answering.port, refused: refusingPort(t), none: 0}
 			var lookups atomic.Int32
 			public := servePublicFrom(t, func() int {
 				if lookups.Add(1) == 1 {
@@ -196,7 +252,7 @@ func TestRelayExhaustedAfterBodyTaken(t *testing.T) {
 			})
 			ctx, cancel := context.WithTimeout(t.Context(), hangGuard)
 			defer cancel()
-			req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+public+"/v1/messages", strings.NewReader(`{"model":"m"}`))
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+public+"/v1/messages", strings.NewReader(relayedPayload))
 			if err != nil {
 				t.Fatal(err)
 			}
