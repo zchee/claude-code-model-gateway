@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -75,12 +76,56 @@ func checkLease(t testing.TB, r fenceResult) {
 	}
 }
 
+// quietly runs a fallback cleanup. It runs only after a test stopped before its own release or close, so its error and
+// any panic are dropped: the test has already reported why it stopped.
+func quietly(cleanup func() error) {
+	defer func() { _ = recover() }()
+	_ = cleanup()
+}
+
+// guardLease registers a fallback that releases a lease the test owns if the test ends before releasing it, so that a
+// failed assertion never leaves a fence locked for a later test. The returned closure is the one the test calls: every
+// call disarms the fallback and then calls release, so a lease the test released gets no further call at cleanup.
+func guardLease(t testing.TB, release func() error) func() error {
+	armed := true
+	t.Cleanup(func() {
+		if armed {
+			armed = false
+			quietly(release)
+		}
+	})
+	return func() error {
+		armed = false
+		return release()
+	}
+}
+
+// ownFD registers a fallback that closes fd if the test ends before closing it, and returns the close the test calls.
+// That call disarms the fallback first, so a number the system may hand out again is never closed a second time.
+func ownFD(t testing.TB, fd int) (closeFD func() error) {
+	open := true
+	t.Cleanup(func() {
+		if open {
+			open = false
+			_ = unix.Close(fd)
+		}
+	})
+	return func() error {
+		open = false
+		return unix.Close(fd)
+	}
+}
+
 func tryFence(t testing.TB, ctx context.Context, f *lifecycle.StartFence) fenceResult {
 	t.Helper()
 	r := noPanic(t, "StartFence.Acquire", func() fenceResult {
 		release, err := f.Acquire(ctx)
 		return fenceResult{release, err}
 	})
+	// Guarded the moment it is received, so that a lease the checks reject is still released.
+	if r.release != nil {
+		r.release = guardLease(t, r.release)
+	}
 	checkLease(t, r)
 	return r
 }
@@ -101,9 +146,12 @@ func unfence(t testing.TB, release func() error) error {
 }
 
 // acquireAsync runs Acquire on its own goroutine. A panic is reported as a test error and as a result without a lease.
+// The channel is closed after its one result. A result the test never received (because it stopped early) is drained
+// at cleanup, after the test's context has ended, and a lease in it is released; the watchdog bounds that wait.
 func acquireAsync(t testing.TB, ctx context.Context, f *lifecycle.StartFence) <-chan fenceResult {
 	results := make(chan fenceResult, 1)
 	go func() {
+		defer close(results)
 		defer func() {
 			if p := recover(); p != nil {
 				t.Errorf("StartFence.Acquire panicked: %v", p)
@@ -113,17 +161,137 @@ func acquireAsync(t testing.TB, ctx context.Context, f *lifecycle.StartFence) <-
 		release, err := f.Acquire(ctx)
 		results <- fenceResult{release, err}
 	}()
+	t.Cleanup(func() {
+		select {
+		case late, ok := <-results:
+			if ok && late.release != nil {
+				quietly(late.release)
+			}
+		case <-time.After(watchdogLimit):
+		}
+	})
 	return results
 }
 
 func receive(t testing.TB, results <-chan fenceResult) fenceResult {
 	t.Helper()
 	r := <-results
+	// Guarded the moment it is received, so that a lease the checks reject is still released.
+	if r.release != nil {
+		r.release = guardLease(t, r.release)
+	}
 	if t.Failed() {
 		t.FailNow()
 	}
 	checkLease(t, r)
 	return r
+}
+
+// watchdogLimit bounds a wait that a correct implementation ends on its own. When it expires the test is aborted; it
+// never decides an assertion, and no context the code under test receives carries it.
+const watchdogLimit = 30 * time.Second
+
+// leaseWithin acquires f under t.Context(), which has no deadline, so a lease the test then holds cannot end while
+// it is held. The watchdog only aborts a test whose Acquire never returns; a lease that arrives after that is
+// released by acquireAsync's cleanup.
+func leaseWithin(t testing.TB, f *lifecycle.StartFence, what string) func() error {
+	t.Helper()
+	results := acquireAsync(t, t.Context(), f)
+	select {
+	case <-time.After(watchdogLimit):
+		t.Fatalf("watchdog: Acquire of %s did not return within %v; the test is aborted", what, watchdogLimit)
+		return nil
+	case r := <-results:
+		// Guarded the moment it is received, so that a lease the checks reject is still released.
+		if r.release != nil {
+			r.release = guardLease(t, r.release)
+		}
+		if t.Failed() {
+			t.FailNow()
+		}
+		checkLease(t, r)
+		if r.err != nil {
+			t.Fatalf("Acquire of %s: %v", what, r.err)
+		}
+		return r.release
+	}
+}
+
+// openReference opens an unlocked, close-on-exec descriptor on the file at path, without following a link, and keeps
+// it open until the test ends. While it is open the file cannot be freed, so no file created later can take its device
+// and inode number: comparing the path with this descriptor shows the same file, where a number saved earlier would not.
+func openReference(t testing.TB, path string) int {
+	t.Helper()
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	if err != nil {
+		t.Fatalf("open a reference to %s: %v", path, err)
+	}
+	t.Cleanup(func() { _ = unix.Close(fd) })
+	return fd
+}
+
+// sameFileAs reports whether path names, without following a link, the very file that the open descriptor fd refers to.
+func sameFileAs(t testing.TB, path string, fd int) bool {
+	t.Helper()
+	var held, at unix.Stat_t
+	if err := unix.Fstat(fd, &held); err != nil {
+		t.Fatalf("fstat descriptor %d: %v", fd, err)
+	}
+	if err := unix.Lstat(path, &at); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return false
+		}
+		t.Fatalf("lstat %s: %v", path, err)
+	}
+	return at.Dev == held.Dev && at.Ino == held.Ino
+}
+
+// fileMode returns the complete mode of the entry at path as lstat reports it: the file type and every permission
+// and special bit. FileMode.Perm would drop the setuid, setgid and sticky bits.
+func fileMode(t testing.TB, path string) uint32 {
+	t.Helper()
+	var st unix.Stat_t
+	noError(t, unix.Lstat(path, &st))
+	return uint32(st.Mode)
+}
+
+// occupy makes the free descriptor number fd refer to a sentinel file the test creates, without disturbing any open
+// descriptor: F_DUPFD_CLOEXEC returns the lowest free number at or above its argument, so it lands on fd only when
+// fd is free. The fixture fails when something the test does not own already holds fd. The returned close, and the
+// fallback at cleanup, close fd only while it still refers to the sentinel, so a number taken over is never closed.
+func occupy(t testing.TB, fd int, sentinel string) (closeSentinel func()) {
+	t.Helper()
+	noError(t, os.WriteFile(sentinel, []byte("sentinel"), 0o600))
+	src, err := unix.Open(sentinel, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	noError(t, err)
+	if src != fd {
+		placed, err := unix.FcntlInt(uintptr(src), unix.F_DUPFD_CLOEXEC, fd)
+		_ = unix.Close(src)
+		noError(t, err)
+		if placed != fd {
+			_ = unix.Close(placed)
+			t.Fatalf("descriptor %d is held by something this test does not own; the sentinel cannot be placed there", fd)
+		}
+	}
+	open := true
+	closeSentinel = func() {
+		if !open {
+			return
+		}
+		open = false
+		var held, want unix.Stat_t
+		if unix.Fstat(fd, &held) == nil && unix.Lstat(sentinel, &want) == nil && held.Dev == want.Dev && held.Ino == want.Ino {
+			_ = unix.Close(fd)
+		}
+	}
+	t.Cleanup(closeSentinel)
+	return closeSentinel
+}
+
+// descriptorOpen reports whether fd is an open descriptor of this process.
+func descriptorOpen(fd int) bool {
+	_, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
+	return err == nil
 }
 
 // fenceHeld reports whether another open file description holds the advisory lock on path. It tries a
@@ -186,10 +354,29 @@ func fenceDescriptors(t testing.TB, path string) map[int]bool {
 	return found
 }
 
-// onlyCloseOnExec fails unless exactly want descriptors refer to path and all of them are close-on-exec.
-func onlyCloseOnExec(t testing.TB, path string, want int) {
+// besides checks that each of own, descriptors the test opened itself, is in a census of path and close-on-exec, and
+// returns the census without them.
+func besides(t testing.TB, path string, census map[int]bool, own ...int) map[int]bool {
 	t.Helper()
-	got := fenceDescriptors(t, path)
+	rest := maps.Clone(census)
+	for _, fd := range own {
+		cloexec, ok := rest[fd]
+		if !ok {
+			t.Fatalf("the test's own descriptor %d does not refer to %s (%v); the file at the path was replaced", fd, path, census)
+		}
+		if !cloexec {
+			t.Fatalf("the test's own descriptor %d for %s is not close-on-exec", fd, path)
+		}
+		delete(rest, fd)
+	}
+	return rest
+}
+
+// onlyCloseOnExec fails unless exactly want descriptors besides own (see besides) refer to path and all of them are
+// close-on-exec.
+func onlyCloseOnExec(t testing.TB, path string, want int, own ...int) {
+	t.Helper()
+	got := besides(t, path, fenceDescriptors(t, path), own...)
 	if len(got) != want {
 		t.Fatalf("%d descriptors refer to %s (%v), want %d", len(got), path, got, want)
 	}
@@ -220,20 +407,108 @@ func TestFenceProbes(t *testing.T) {
 
 	held, err := unix.Open(path, unix.O_RDWR|unix.O_CLOEXEC, 0)
 	noError(t, err)
+	closeHeld := ownFD(t, held)
 	noError(t, unix.Flock(held, unix.LOCK_EX|unix.LOCK_NB))
 	equal(t, true, fenceHeld(t, path))
 	equal(t, map[int]bool{held: true}, fenceDescriptors(t, path))
 
 	inherited, err := unix.Open(path, unix.O_RDONLY, 0)
 	noError(t, err)
+	closeInherited := ownFD(t, inherited)
 	equal(t, map[int]bool{held: true, inherited: false}, fenceDescriptors(t, path))
-	noError(t, unix.Close(inherited))
+	// The census leaves out a descriptor the test names as its own, and keeps the rest.
+	equal(t, map[int]bool{inherited: false}, besides(t, path, fenceDescriptors(t, path), held))
+	noError(t, closeInherited())
 
 	noError(t, unix.Flock(held, unix.LOCK_UN))
 	equal(t, false, fenceHeld(t, path))
-	noError(t, unix.Close(held))
+	noError(t, closeHeld())
 	equal(t, map[int]bool{}, fenceDescriptors(t, path))
 	equal(t, false, fenceHeld(t, filepath.Join(filepath.Dir(path), "absent")))
+}
+
+// TestFenceFixtureHelpers checks the file identity, mode, descriptor placement and fallback cleanup helpers the fence
+// tests rely on, against files and descriptors this test creates itself.
+func TestFenceFixtureHelpers(t *testing.T) {
+	tests := map[string]func(t *testing.T){
+		"success: a reference tells a recreated file from the original": func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), fenceName)
+			noError(t, os.WriteFile(path, nil, 0o600))
+			reference := openReference(t, path)
+			equal(t, true, sameFileAs(t, path, reference))
+			onlyCloseOnExec(t, path, 0, reference)
+			noError(t, unix.Unlink(path))
+			equal(t, false, sameFileAs(t, path, reference))
+			// The reference keeps the removed file allocated, so the new file cannot take its number.
+			noError(t, os.WriteFile(path, nil, 0o600))
+			equal(t, false, sameFileAs(t, path, reference))
+			equal(t, map[int]bool{}, fenceDescriptors(t, path))
+		},
+		"success: the complete mode shows a setuid bit that the permission bits hide": func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "mode")
+			noError(t, os.WriteFile(path, nil, 0o600))
+			equal(t, uint32(unix.S_IFREG|0o600), fileMode(t, path))
+			noError(t, os.Chmod(path, 0o600|fs.ModeSetuid))
+			info, err := os.Lstat(path)
+			noError(t, err)
+			equal(t, fs.FileMode(0o600), info.Mode().Perm())
+			equal(t, uint32(unix.S_IFREG|unix.S_ISUID|0o600), fileMode(t, path))
+		},
+		"success: a sentinel takes a freed descriptor number": func(t *testing.T) {
+			dir := t.TempDir()
+			scratch, err := unix.Open(filepath.Join(dir, "scratch"), unix.O_RDWR|unix.O_CREAT|unix.O_CLOEXEC, 0o600)
+			noError(t, err)
+			noError(t, ownFD(t, scratch)())
+			equal(t, false, descriptorOpen(scratch))
+			sentinel := filepath.Join(dir, "sentinel")
+			closeSentinel := occupy(t, scratch, sentinel)
+			equal(t, true, descriptorOpen(scratch))
+			equal(t, true, sameFileAs(t, sentinel, scratch))
+			flags, err := unix.FcntlInt(uintptr(scratch), unix.F_GETFD, 0)
+			noError(t, err)
+			equal(t, unix.FD_CLOEXEC, flags&unix.FD_CLOEXEC)
+			closeSentinel()
+			equal(t, false, descriptorOpen(scratch))
+		},
+		"success: a fallback runs once, and only when the test did not release": func(t *testing.T) {
+			var armed, disarmed int
+			t.Run("armed", func(t *testing.T) { guardLease(t, func() error { armed++; return nil }) })
+			t.Run("disarmed", func(t *testing.T) {
+				release := guardLease(t, func() error { disarmed++; return nil })
+				noError(t, release())
+				noError(t, release())
+			})
+			equal(t, [2]int{1, 2}, [2]int{armed, disarmed})
+		},
+		"success: a closed descriptor's fallback leaves its reused number open": func(t *testing.T) {
+			dir := t.TempDir()
+			var first, reused int
+			t.Run("owner", func(t *testing.T) {
+				var err error
+				first, err = unix.Open(filepath.Join(dir, "first"), unix.O_RDWR|unix.O_CREAT|unix.O_CLOEXEC, 0o600)
+				noError(t, err)
+				noError(t, ownFD(t, first)())
+				// Not owned by this subtest: its fallback must not close what now holds the number.
+				reused, err = unix.Open(filepath.Join(dir, "second"), unix.O_RDWR|unix.O_CREAT|unix.O_CLOEXEC, 0o600)
+				noError(t, err)
+				if reused != first {
+					// A lower number was free as well; move the new descriptor onto the freed one.
+					placed, err := unix.FcntlInt(uintptr(reused), unix.F_DUPFD_CLOEXEC, first)
+					_ = unix.Close(reused)
+					noError(t, err)
+					reused = placed
+				}
+			})
+			closeReused := ownFD(t, reused)
+			equal(t, first, reused)
+			equal(t, true, descriptorOpen(reused))
+			equal(t, true, sameFileAs(t, filepath.Join(dir, "second"), reused))
+			noError(t, closeReused())
+		},
+	}
+	for name, run := range tests {
+		t.Run(name, run)
+	}
 }
 
 func TestNewStartFence(t *testing.T) {
@@ -313,6 +588,9 @@ func TestStartFenceExcludesHolders(t *testing.T) {
 				synctest.Wait() // The waiter is blocked, not merely slow.
 				select {
 				case r := <-waiter:
+					if r.release != nil {
+						guardLease(t, r.release)
+					}
 					t.Fatalf("second holder entered while the first held the fence (error %v)", r.err)
 				default:
 				}
@@ -372,6 +650,9 @@ func TestStartFenceCancellation(t *testing.T) {
 					synctest.Wait()
 					select {
 					case r := <-waiter:
+						if r.release != nil {
+							guardLease(t, r.release)
+						}
 						t.Fatalf("Acquire returned while another holder held the fence (error %v)", r.err)
 					default:
 					}
@@ -469,26 +750,12 @@ func TestStartFencePerStateRoot(t *testing.T) {
 			firstPath, secondPath := filepath.Join(firstRoot, fenceName), filepath.Join(secondRoot, fenceName)
 			first, second := newFence(t, firstRoot), newFence(t, secondRoot)
 			// Real time, not a synctest bubble: an acquisition blocked on a process-wide mutex would hang a bubble
-			// instead of failing. The watchdog only bounds such a wait; the result is the prompt lease. The context
-			// lives as long as the subtest, so no lease is held under a context that has already ended.
-			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
-			defer cancel()
+			// instead of failing. The evidence is the order of events: each root's lease is acquired while the other
+			// root's fence is still held, as the probes show before and after. Every lease is acquired under
+			// t.Context(), which no deadline ends; the watchdog only aborts an acquisition that never returns.
 			promptly := func(f *lifecycle.StartFence, which string) func() error {
 				t.Helper()
-				var got fenceResult
-				select {
-				case got = <-acquireAsync(t, ctx, f):
-				case <-time.After(30 * time.Second):
-					t.Fatalf("Acquire for the %s root waited on the other root's fence", which)
-				}
-				if t.Failed() {
-					t.FailNow()
-				}
-				checkLease(t, got)
-				if got.err != nil {
-					t.Fatalf("Acquire for the %s root while the other root's fence was held: %v", which, got.err)
-				}
-				return got.release
+				return leaseWithin(t, f, "the "+which+" root's fence while the other root's fence is held")
 			}
 			descriptors := func(held bool) int {
 				if held {
@@ -523,8 +790,10 @@ func TestStartFencePerStateRoot(t *testing.T) {
 }
 
 // TestStartFenceReleaseReportsUnlockFailure makes the unlock call of one release fail. That release reports the
-// failure and still closes its descriptor, which gives the lock up. Calling the same closure again does nothing:
-// it neither unlocks nor closes again, so a later holder whose descriptor may reuse the closed number keeps its lock.
+// failure and still closes its descriptor, which gives the lock up. Calling the same closure again does nothing: it
+// neither unlocks nor closes again. That is shown against the failed holder's descriptor number itself: before the
+// repeated call the number is held by a descriptor the test owns (the later holder's, when it reused the number, or a
+// sentinel placed there), and after it that descriptor is still open and still refers to the same file.
 func TestStartFenceReleaseReportsUnlockFailure(t *testing.T) {
 	state := t.TempDir()
 	path := filepath.Join(state, fenceName)
@@ -548,10 +817,16 @@ func TestStartFenceReleaseReportsUnlockFailure(t *testing.T) {
 
 	failing := holdFence(t, newFence(t, state))
 	onlyCloseOnExec(t, path, 1)
+	var former int
+	for fd := range fenceDescriptors(t, path) {
+		former = fd
+	}
+	// The cause must stay matchable: a caller that logs the failure needs the operating system's error, so the
+	// returned error wraps the unlock call's error instead of only describing it.
 	if err := unfence(t, failing); !errors.Is(err, errUnlock) {
 		t.Fatalf("release whose unlock failed = %v, want an error that wraps the unlock failure", err)
 	}
-	equal(t, 1, len(calls))
+	equal(t, []int{former}, calls)
 	// The descriptor was closed although the unlock failed, and closing the only description gave the lock up.
 	onlyCloseOnExec(t, path, 0)
 	if fenceHeld(t, path) {
@@ -561,9 +836,26 @@ func TestStartFenceReleaseReportsUnlockFailure(t *testing.T) {
 	successor := holdFence(t, newFence(t, state))
 	descriptors := fenceDescriptors(t, path)
 	equal(t, 1, len(descriptors))
+	// The former number is held again before the repeated call: by the later holder when it reused the number (as
+	// its fence descriptor or any other descriptor it keeps open), otherwise by a sentinel the test places there.
+	if !descriptorOpen(former) {
+		closeSentinel := occupy(t, former, filepath.Join(t.TempDir(), "sentinel"))
+		defer closeSentinel()
+	}
+	var witness unix.Stat_t
+	noError(t, unix.Fstat(former, &witness))
+
 	// What a repeated call returns after a failed release is not fixed here; what it does is.
 	_ = unfence(t, failing)
-	equal(t, 1, len(calls))
+	equal(t, []int{former}, calls)
+	if !descriptorOpen(former) {
+		t.Fatalf("a repeated call of a failed release closure closed descriptor %d, which the test held again", former)
+	}
+	var after unix.Stat_t
+	noError(t, unix.Fstat(former, &after))
+	if after.Dev != witness.Dev || after.Ino != witness.Ino {
+		t.Fatalf("descriptor %d refers to another file after a repeated call of a failed release closure", former)
+	}
 	equal(t, descriptors, fenceDescriptors(t, path))
 	if !fenceHeld(t, path) {
 		t.Fatal("a repeated call of a failed release closure released a later holder's fence")
@@ -593,7 +885,13 @@ func TestStartFenceFileRetained(t *testing.T) {
 				noError(t, os.WriteFile(path, []byte(wantData), 0o600))
 			}
 			fence := newFence(t, state)
-			var original fs.FileInfo
+			// original is an unlocked reference to the fence file: the existing file, or the one the first
+			// acquisition creates. Comparing the path with it shows the same file even if a replacement could
+			// have reused a removed file's inode number.
+			original := -1
+			if tt.existing != nil {
+				original = openReference(t, path)
+			}
 			for attempt := range 3 {
 				held := func() func() error {
 					if attempt == 0 && tt.existing == nil {
@@ -609,22 +907,24 @@ func TestStartFenceFileRetained(t *testing.T) {
 				if !info.Mode().IsRegular() {
 					t.Fatalf("fence path has mode %v, want a regular file", info.Mode())
 				}
-				if attempt == 0 {
-					original = info
-					if tt.existing == nil {
-						equal(t, fs.FileMode(0o600), info.Mode().Perm())
+				if original < 0 {
+					original = openReference(t, path)
+					// The complete mode: a regular file with permission bits 0600 and no setuid, setgid or
+					// sticky bit, which a comparison of the permission bits alone would not see.
+					if got := fileMode(t, path); got != unix.S_IFREG|0o600 {
+						t.Fatalf("new fence file has mode %#o, want %#o", got, unix.S_IFREG|0o600)
 					}
-				} else if !os.SameFile(original, info) {
+				} else if !sameFileAs(t, path, original) {
 					t.Fatalf("acquisition %d uses a different file than the first; the fence file was replaced", attempt+1)
 				}
+				onlyCloseOnExec(t, path, 1, original)
 				equal(t, []string{fenceName}, entryNames(t, state))
 				noError(t, unfence(t, held))
 				// The file stays after release; its presence says nothing about whether it is locked.
-				info, err = os.Lstat(path)
-				noError(t, err)
-				if !os.SameFile(original, info) {
+				if !sameFileAs(t, path, original) {
 					t.Fatal("release removed or replaced the fence file")
 				}
+				onlyCloseOnExec(t, path, 0, original)
 				equal(t, wantData, bytesAt(t, path))
 				equal(t, []string{fenceName}, entryNames(t, state))
 				if fenceHeld(t, path) {
@@ -695,6 +995,9 @@ func TestStartFenceRefusesNonRegular(t *testing.T) {
 			case <-time.After(30 * time.Second):
 				t.Fatal("Acquire did not return for a non-regular fence path")
 			}
+			if got.release != nil {
+				got.release = guardLease(t, got.release)
+			}
 			if t.Failed() {
 				t.FailNow()
 			}
@@ -744,15 +1047,10 @@ func TestStartFenceIndependentOfLifecycleLock(t *testing.T) {
 			lock := lockFor(state)
 			lock.Timeout = new(time.Duration(0)) // A lock the fence blocked would fail at once instead of waiting.
 			fence := newFence(t, state)
-			// The watchdog only bounds a fence that waits on the lifecycle lock.
-			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
-			defer cancel()
+			// The lease is acquired under t.Context(), which no deadline ends; the watchdog only aborts a fence
+			// acquisition that waits on the lifecycle lock and never returns.
 			takeFence := func() func() error {
-				r := tryFence(t, ctx, fence)
-				if r.err != nil {
-					t.Fatalf("Acquire of the start fence: %v", r.err)
-				}
-				return r.release
+				return leaseWithin(t, fence, "the start fence beside the lifecycle lock")
 			}
 			var releaseFence func() error
 			var releaseLock func()

@@ -67,9 +67,30 @@ func markerPresent(t testing.TB, f lifecycle.Files) inspection {
 	}
 }
 
+// clearFailure calls ClearStartupFailure on its own goroutine. The watchdog bounds a hang (an open of a named pipe
+// that has no peer, for example) and only aborts the test; a panic is a test failure, not an aborted binary.
 func clearFailure(t testing.TB, f lifecycle.Files) error {
 	t.Helper()
-	return noPanic(t, "ClearStartupFailure", f.ClearStartupFailure)
+	results := make(chan error, 1)
+	go func() {
+		defer func() {
+			if p := recover(); p != nil {
+				t.Errorf("ClearStartupFailure panicked: %v", p)
+				results <- errors.New("ClearStartupFailure panicked")
+			}
+		}()
+		results <- f.ClearStartupFailure()
+	}()
+	select {
+	case err := <-results:
+		if t.Failed() {
+			t.FailNow()
+		}
+		return err
+	case <-time.After(watchdogLimit):
+		t.Fatalf("watchdog: ClearStartupFailure did not return within %v; the test is aborted", watchdogLimit)
+		return nil
+	}
 }
 
 // rootFixture is a state root with an unrelated directory beside it; a case's setup returns the StateDir to use.
@@ -327,6 +348,26 @@ func TestClearStartupFailure(t *testing.T) {
 				noError(t, os.Chmod(filepath.Join(f.state, failureName), 0o400))
 				return f.state
 			},
+			// The record is read-only for this process: opening it for writing (without truncation, so the
+			// probe changes nothing) is refused.
+			denied: func(t *testing.T, f rootFixture) {
+				modeDenies(t, "opening the record for writing", func() error {
+					file, err := os.OpenFile(filepath.Join(f.state, failureName), os.O_WRONLY, 0)
+					if err == nil {
+						_ = file.Close()
+					}
+					return err
+				})
+			},
+			check: func(t *testing.T, f rootFixture) { mustBeAbsent(t, filepath.Join(f.state, failureName)) },
+		},
+		// Clearing unlinks the leaf whatever it is, except a directory. A named pipe without a peer is removed
+		// without being opened; an open for reading or writing would block, and the watchdog would abort the test.
+		"success: named pipe without a peer is removed": {
+			setup: func(t *testing.T, f rootFixture) string {
+				noError(t, unix.Mkfifo(filepath.Join(f.state, failureName), 0o600))
+				return f.state
+			},
 			check: func(t *testing.T, f rootFixture) { mustBeAbsent(t, filepath.Join(f.state, failureName)) },
 		},
 		"success: symbolic link is removed and its target kept": {
@@ -381,13 +422,15 @@ func TestClearStartupFailure(t *testing.T) {
 				return f.state
 			},
 			lock: new(fs.FileMode(0o500)),
+			// The precondition is the operation under test: unlinking the record itself is refused. Creating an
+			// entry is a different right (on macOS an access control list can grant one and not the other). If
+			// the unlink went through, the record is written back before the case fails.
 			denied: func(t *testing.T, f rootFixture) {
-				modeDenies(t, "changing the entries of the state root", func() error {
-					probe := filepath.Join(f.state, "mode-probe")
-					file, err := os.OpenFile(probe, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+				path := filepath.Join(f.state, failureName)
+				modeDenies(t, "unlinking the record from the state root", func() error {
+					err := unix.Unlink(path)
 					if err == nil {
-						_ = file.Close()
-						_ = os.Remove(probe)
+						noError(t, os.WriteFile(path, []byte(record), 0o600))
 					}
 					return err
 				})

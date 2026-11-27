@@ -44,6 +44,21 @@ const (
 // it can be told apart from one that merely mentions a generation.
 const canaryGeneration = "startup-canary-q7x41z"
 
+// The text "café-1" in its two Unicode spellings, written as bytes: composed with U+00E9, and decomposed as "e"
+// followed by U+0301 COMBINING ACUTE ACCENT. Normalization (NFC or NFD) turns one into the other; the proof signs the
+// generation's bytes as given, so the two have different proofs.
+const (
+	composedGeneration   = "caf\xc3\xa9-1"
+	decomposedGeneration = "cafe\xcc\x81-1"
+)
+
+// Proofs of composedGeneration and decomposedGeneration under sequentialKey and sequentialNonce, each computed outside
+// Go twice, with Python's hmac module and with openssl dgst -sha256 -mac HMAC, from the published layout.
+const (
+	composedProof   = "474c7b2a2ed7c1c71638975021ece09c4b0432e0be5553c7e11bc2c9b8499455"
+	decomposedProof = "11d883c3d6a388fa09b12002657f34ccf0599824b3613a02b16a40cd43d9d8f1"
+)
+
 // mac returns the lowercase hex HMAC-SHA-256 of the concatenated parts.
 func mac(key []byte, parts ...[]byte) string {
 	h := hmac.New(sha256.New, key)
@@ -88,7 +103,10 @@ func verify(t testing.TB, token, nonce, generation, proof string) (ok bool) {
 	return controlauth.VerifySupervisorIdentity(token, nonce, generation, proof)
 }
 
-// minLeakInput is the shortest input whose repetition in an error message can be told from ordinary text.
+// minLeakInput is a guard on the fixtures, not a proof of uniqueness: an input shorter than this is too likely to
+// occur in ordinary error text by chance, so a fixture may not use one. A longer input can still occur in ordinary
+// text (an input "identity" would match a message about the identity proof); the fixtures choose distinctive values
+// such as canaryGeneration so that a match means a repetition.
 const minLeakInput = 8
 
 // leakForms returns the spellings in which an error message could repeat input: as it is, escaped as Go
@@ -105,7 +123,8 @@ func leakForms(input string) []string {
 
 // leaks reports which of the secret or caller-supplied inputs an error message repeats, in any form of leakForms
 // and in any letter case (an uppercase token repeated in lowercase is still the token). An empty input cannot be
-// repeated; a nonempty input shorter than minLeakInput fails the test, because no row may go unchecked.
+// repeated; a nonempty input shorter than minLeakInput fails the test as a fixture error, because no row may go
+// unchecked. A match is a repetition only because the fixture inputs are distinctive; see minLeakInput.
 func leaks(t testing.TB, err error, inputs ...string) []string {
 	t.Helper()
 	message := strings.ToLower(err.Error())
@@ -203,6 +222,12 @@ func TestSupervisorIdentityKnownAnswers(t *testing.T) {
 			token: sequentialKey, nonce: sequentialNonce, generation: "g\n-1",
 			pinned: "5deb023c24c52610bb0efee8eed1b3d21cffad4663f744e37ce393fedabdae15",
 		},
+		"success: composed unicode generation": {
+			token: sequentialKey, nonce: sequentialNonce, generation: composedGeneration, pinned: composedProof,
+		},
+		"success: decomposed unicode generation": {
+			token: sequentialKey, nonce: sequentialNonce, generation: decomposedGeneration, pinned: decomposedProof,
+		},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -268,6 +293,55 @@ func TestSupervisorIdentityBinding(t *testing.T) {
 			}
 			if other == proof {
 				t.Fatal("changed inputs produced the same proof")
+			}
+		})
+	}
+}
+
+// TestSupervisorIdentityExactGenerationBytes shows that the generation is signed and verified as the exact bytes given,
+// without Unicode normalization: two spellings of the same text have different proofs, and neither verifies the other.
+func TestSupervisorIdentityExactGenerationBytes(t *testing.T) {
+	// The bytes the external computation signed, so that the fixtures cannot drift from the reference values.
+	spelled := []string{hex.EncodeToString([]byte(composedGeneration)), hex.EncodeToString([]byte(decomposedGeneration))}
+	if diff := gocmp.Diff([]string{"636166c3a92d31", "63616665cc812d31"}, spelled); diff != "" {
+		t.Fatalf("fixture generation bytes (-want +got):\n%s", diff)
+	}
+	tests := map[string]struct {
+		signed, signedProof, presented, presentedProof string
+	}{
+		"error: composed proof presented for the decomposed generation": {
+			signed: composedGeneration, signedProof: composedProof, presented: decomposedGeneration, presentedProof: decomposedProof,
+		},
+		"error: decomposed proof presented for the composed generation": {
+			signed: decomposedGeneration, signedProof: decomposedProof, presented: composedGeneration, presentedProof: composedProof,
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			if diff := gocmp.Diff(tt.signedProof, referenceProof(sequentialKey, sequentialNonce, tt.signed)); diff != "" {
+				t.Fatalf("in-test reference disagrees with the externally computed vector (-want +got):\n%s", diff)
+			}
+			got, err := sign(t, sequentialKey, sequentialNonce, tt.signed)
+			if err != nil {
+				t.Fatalf("SignSupervisorIdentity: %v", err)
+			}
+			if diff := gocmp.Diff(tt.signedProof, got); diff != "" {
+				t.Fatalf("proof of the generation as given (-want +got):\n%s", diff)
+			}
+			// A normalizing signer would give the other spelling the same proof.
+			other, err := sign(t, sequentialKey, sequentialNonce, tt.presented)
+			if err != nil {
+				t.Fatalf("SignSupervisorIdentity(other spelling): %v", err)
+			}
+			if diff := gocmp.Diff(tt.presentedProof, other); diff != "" {
+				t.Fatalf("proof of the other spelling (-want +got):\n%s", diff)
+			}
+			// A normalizing verifier would accept a proof made for the other spelling.
+			if verify(t, sequentialKey, sequentialNonce, tt.presented, tt.signedProof) {
+				t.Fatal("verifier accepted the proof of one Unicode spelling for the other")
+			}
+			if !verify(t, sequentialKey, sequentialNonce, tt.presented, tt.presentedProof) {
+				t.Fatal("verifier rejected the proof of the spelling presented")
 			}
 		})
 	}

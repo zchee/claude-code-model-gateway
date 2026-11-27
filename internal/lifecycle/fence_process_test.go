@@ -38,15 +38,15 @@ import (
 
 // holdStartFence takes the start fence of $HOME/.claude/model-gateway, reports "held <pid>", and keeps it
 // until the parent sends R (then reports "released" and waits for any byte or end of input) or kills it.
+// The lease is acquired under t.Context(), which no deadline ends while the child waits for the parent; the
+// parent's fixture limit bounds the child's whole life instead.
 func holdStartFence(t testing.TB, args []string) {
 	t.Helper()
 	if len(args) != 0 {
 		t.Fatalf("unexpected helper arguments %q", args)
 	}
 	state := filepath.Join(os.Getenv("HOME"), ".claude", "model-gateway")
-	ctx, cancel := context.WithTimeout(t.Context(), 7*time.Second)
-	defer cancel()
-	held := tryFence(t, ctx, newFence(t, state))
+	held := tryFence(t, t.Context(), newFence(t, state))
 	if held.err != nil {
 		t.Fatalf("child Acquire: %v", held.err)
 	}
@@ -155,14 +155,14 @@ func TestStartFenceAcrossProcesses(t *testing.T) {
 			if !fenceHeld(t, path) {
 				t.Fatal("the helper reported the fence held, but worker-start.lock is not locked")
 			}
-			// The file the other process holds; after it gives the lock up, this same file is the fence.
-			heldFile, err := os.Lstat(path)
-			noError(t, err)
+			// An unlocked reference to the file the other process holds, kept open across its end and this
+			// process's reacquisition. While it is open that file cannot be freed and its inode number cannot be
+			// given to a replacement, so a path that still matches it is the same file. The census below counts
+			// it as the test's own descriptor.
+			original := openReference(t, path)
 			sameFile := func(when string) {
 				t.Helper()
-				info, err := os.Lstat(path)
-				noError(t, err)
-				if !os.SameFile(heldFile, info) {
+				if !sameFileAs(t, path, original) {
 					t.Fatalf("%s, worker-start.lock is not the file the other process held; it was replaced", when)
 				}
 			}
@@ -175,7 +175,7 @@ func TestStartFenceAcrossProcesses(t *testing.T) {
 					t.Fatalf("Acquire while another process held the fence: %v, want context.DeadlineExceeded", r.err)
 				}
 			})
-			onlyCloseOnExec(t, path, 0)
+			onlyCloseOnExec(t, path, 0, original)
 
 			if tt.kill {
 				noError(t, holder.cmd.Process.Kill())
@@ -202,19 +202,17 @@ func TestStartFenceAcrossProcesses(t *testing.T) {
 				t.Fatal("worker-start.lock is still locked after its holder gave it up")
 			}
 
-			// The watchdog only bounds a fence that stays locked; success is the result.
-			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
-			defer cancel()
-			r := tryFence(t, ctx, fence)
-			if r.err != nil {
-				t.Fatalf("Acquire after the other process gave up the fence: %v", r.err)
-			}
+			// The lease is acquired under t.Context(), which no deadline ends; the watchdog only aborts an
+			// acquisition that never returns.
+			release := leaseWithin(t, fence, "the fence the other process gave up")
 			if !fenceHeld(t, path) {
 				t.Fatal("Acquire returned without the advisory lock")
 			}
 			sameFile("after this process acquired the fence")
-			noError(t, unfence(t, r.release))
+			onlyCloseOnExec(t, path, 1, original)
+			noError(t, unfence(t, release))
 			sameFile("after this process released the fence")
+			onlyCloseOnExec(t, path, 0, original)
 
 			if !tt.kill {
 				_, err := io.WriteString(holder.input, "X")
