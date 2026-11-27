@@ -181,6 +181,14 @@ func (g *guard) serve() (outcome.Result, error) {
 			}
 			return res, err
 		}
+		// The service may have ended while the attempt was sent: its response is neither committed
+		// to the client nor relayed.
+		if g.ServiceContext.Err() != nil {
+			if resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			return g.shutdown(resp.StatusCode)
+		}
 		res, retry, err := g.attempt(resp)
 		if err != nil || !retry {
 			return res, err
@@ -365,12 +373,14 @@ func (g *guard) attempt(resp *upstream.Response) (outcome.Result, bool, error) {
 	}
 	_ = rd.close()
 	hb.stop()
+	// The service may have ended during the final read, while its data was handled, or as the body
+	// was closed, also when the body ended cleanly: nothing more is retried or flushed.
+	if g.ServiceContext.Err() != nil {
+		res, err := g.shutdown(status)
+		return res, false, err
+	}
 	override := ""
 	if !errors.Is(termErr, io.EOF) {
-		if g.ServiceContext.Err() != nil {
-			res, err := g.shutdown(status)
-			return res, false, err
-		}
 		override = overrideAborted
 	}
 

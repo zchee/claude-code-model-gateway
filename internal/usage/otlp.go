@@ -55,7 +55,9 @@ func otlpValue(value any) (jsonx.WireValue, error) {
 		// outside the signed 64-bit range of intValue.
 		return object(member("intValue", wireString(strconv.FormatInt(v.Int(), 10)))), nil
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		n = float64(v.Uint())
+		// Formatted from the integer itself for the same reason: through a binary64,
+		// 9007199254740993 would be sent as 9007199254740992.
+		return object(member("intValue", wireString(strconv.FormatUint(v.Uint(), 10)))), nil
 	case reflect.Float32, reflect.Float64:
 		n = v.Float()
 	default:

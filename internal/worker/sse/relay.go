@@ -336,7 +336,9 @@ func brokenResult(status int, clientGone bool) (outcome.Result, error) {
 // nothing, not even the head (no early-end 502 either), and no heartbeat. A ctx that has ended
 // before RelayProxy writes the head, including one that ended while the first-event peek decided,
 // closes resp.Body and returns ctx.Err() (nil once the client is gone); with HeadWritten it returns
-// the abort described next. ctx is checked again before every upstream read.
+// the abort described next. ctx is checked again before every upstream read, and once more at the
+// clean end of the body before the stream is finalized: a ctx that ended while the last chunk was
+// written gets no closing events and no synthesized stop, only the shutdown abort.
 // If the upstream breaks after response headers are committed, RelayProxy returns the terminal
 // outcome facts alongside http.ErrAbortHandler rather than panicking.
 // When the first-event peek finds an engine overflow, OnOverflow is called even if the client is
@@ -463,6 +465,12 @@ func RelayProxy(ctx context.Context, w http.ResponseWriter, resp *upstream.Respo
 			return abortResult(ctx, status, s.clientGone())
 		}
 		return brokenResult(status, s.clientGone())
+	}
+	// The last read may have carried data and the end of the body together, and the service may
+	// have ended while that data was written: such a stream is not finalized as a clean one.
+	if ctx.Err() != nil {
+		_ = body.close()
+		return abortResult(ctx, status, s.clientGone())
 	}
 
 	out = out[:0]
@@ -680,9 +688,11 @@ func (d *sideDecoder) abandon() {
 // resp.Body and returns ctx.Err() (nil once the client is gone); ctx is checked again before every
 // upstream read. At a clean end of the body, observation finishes whenever every chunk read was
 // observed, even when the client left after the last one; it is abandoned only when a chunk that
-// arrived after the client left was discarded. If the upstream breaks after response headers are
-// committed, RelayPassthrough returns the terminal outcome facts alongside http.ErrAbortHandler
-// rather than panicking.
+// arrived after the client left was discarded or, with nothing discarded, when ctx ended by then
+// (for example while the last chunk was written), which also returns the shutdown abort instead
+// of a clean status. If the upstream breaks after response headers are committed,
+// RelayPassthrough returns the terminal outcome facts alongside http.ErrAbortHandler rather than
+// panicking.
 func RelayPassthrough(ctx context.Context, w http.ResponseWriter, resp *upstream.Response, opts PassthroughOptions) (outcome.Result, error) {
 	if resp == nil || resp.Body == nil {
 		return outcome.Result{}, errNilResponse
@@ -755,6 +765,13 @@ func RelayPassthrough(ctx context.Context, w http.ResponseWriter, resp *upstream
 			return abortResult(ctx, status, s.clientGone())
 		}
 		return brokenResult(status, s.clientGone())
+	}
+	// The last read may have carried data and the end of the body together, and the service may
+	// have ended while that data was written: such a stream is not finished as a clean one.
+	if ctx.Err() != nil {
+		observer.abandon()
+		_ = body.close()
+		return abortResult(ctx, status, s.clientGone())
 	}
 	observer.finish()
 	return outcome.Result{Status: status}, nil

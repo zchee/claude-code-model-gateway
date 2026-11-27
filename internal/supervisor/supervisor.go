@@ -431,7 +431,10 @@ func writeWorkerFailure(w http.ResponseWriter, bodyTaken bool) {
 }
 
 // FixtureShutdown consumes and closes the inherited fixture channel. Without a test guard it closes it unread.
-// It reports whether the channel carried the fixture's shutdown message before its end.
+// It reports whether the channel's first message is the fixture's shutdown message. Only the first message is
+// decided, as the source listens for one message only (lib/commands.js:2900-2903): after any other first message the
+// channel stays open and later messages are read and dropped until the channel ends, so none of them stops the
+// supervisor.
 func FixtureShutdown(channel io.ReadCloser, guarded bool) (bool, error) {
 	defer func() { _ = channel.Close() }()
 	if !guarded {
@@ -440,8 +443,16 @@ func FixtureShutdown(channel io.ReadCloser, guarded bool) (bool, error) {
 	reader := bufio.NewReader(channel)
 	for {
 		line, err := reader.ReadBytes('\n')
-		if len(bytes.TrimSpace(line)) > 0 && fixtureStop(line) {
-			return true, nil
+		if len(bytes.TrimSpace(line)) > 0 {
+			if fixtureStop(line) {
+				return true, nil
+			}
+			if err == nil {
+				// io.Copy reports the channel's end as a nil error.
+				if _, err = io.Copy(io.Discard, reader); err == nil {
+					return false, nil
+				}
+			}
 		}
 		if errors.Is(err, io.EOF) {
 			return false, nil
