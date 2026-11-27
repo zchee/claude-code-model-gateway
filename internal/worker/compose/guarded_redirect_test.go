@@ -42,7 +42,6 @@ type redirectWireRecorder struct {
 	heads    []int
 	headers  []http.Header
 	body     bytes.Buffer
-	ops      int
 	departed bool
 	late     int
 }
@@ -58,7 +57,6 @@ func (w *redirectWireRecorder) Header() http.Header {
 }
 
 func (w *redirectWireRecorder) countLocked() {
-	w.ops++
 	if w.departed {
 		w.late++
 	}
@@ -99,18 +97,18 @@ func (w *redirectWireRecorder) markDeparted() {
 	w.mu.Unlock()
 }
 
-// redirectWireView is what a recorder holds at one moment.
+// redirectWireView is what a recorder holds at one moment. The number of Write and Flush calls is
+// left out: a different read split or a harmless flush changes it while the heads and bytes do not.
 type redirectWireView struct {
 	Heads []int
 	Body  string
-	Ops   int
 	Late  int
 }
 
 func (w *redirectWireRecorder) view() redirectWireView {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return redirectWireView{Heads: append([]int(nil), w.heads...), Body: w.body.String(), Ops: w.ops, Late: w.late}
+	return redirectWireView{Heads: append([]int(nil), w.heads...), Body: w.body.String(), Late: w.late}
 }
 
 func (w *redirectWireRecorder) firstHeadHeader(name string) []string {
@@ -161,10 +159,22 @@ func redirectRoundTrip(t *testing.T, h *harness, body string) redirectWireAnswer
 	return answer
 }
 
-// redirectResults records every terminal result the worker root delivers.
+// redirectResultsBound is how many terminal results one harness may deliver before the observer
+// counts the rest as overflow; no test here sends more than two requests to one harness.
+const redirectResultsBound = 4
+
+// redirectResults records every terminal result the worker root delivers, and hands each one to a
+// bounded channel at the moment it is delivered, so a test can wait for one request's result before
+// it sends the next request.
 type redirectResults struct {
-	mu      sync.Mutex
-	results []outcome.Result
+	mu        sync.Mutex
+	results   []outcome.Result
+	delivered chan outcome.Result
+	overflow  int
+}
+
+func newRedirectResults() *redirectResults {
+	return &redirectResults{delivered: make(chan outcome.Result, redirectResultsBound)}
 }
 
 func (c *redirectResults) observe(o *worker.Options) {
@@ -180,8 +190,44 @@ func (c *redirectResults) observe(o *worker.Options) {
 			}
 			c.mu.Lock()
 			c.results = append(c.results, v)
+			select {
+			case c.delivered <- v:
+			default:
+				c.overflow++
+			}
 			c.mu.Unlock()
 		}
+	}
+}
+
+// next waits for the next delivered terminal result. The bound only ends a wait for a result that
+// should already have been delivered.
+func (c *redirectResults) next(t *testing.T, what string) outcome.Result {
+	t.Helper()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case v := <-c.delivered:
+		return v
+	case <-timer.C:
+		t.Fatalf("no terminal result was delivered for %s", what)
+		return outcome.Result{}
+	}
+}
+
+// none reports a terminal result delivered beyond the ones a test has received.
+func (c *redirectResults) none(t *testing.T, what string) {
+	t.Helper()
+	c.mu.Lock()
+	overflow := c.overflow
+	c.mu.Unlock()
+	select {
+	case v := <-c.delivered:
+		t.Errorf("%s: an extra terminal result was delivered: %+v", what, redirectFactsOf([]outcome.Result{v}))
+	default:
+	}
+	if overflow != 0 {
+		t.Errorf("%s: %d terminal results beyond the observer's bound", what, overflow)
 	}
 }
 
@@ -265,19 +311,22 @@ type redirectRun struct {
 // whose proxy upstream gives answer, and counts the upstream contacts of each.
 func runRedirectPath(t *testing.T, answer redirectUpstreamAnswer, body string) redirectRun {
 	t.Helper()
-	var results redirectResults
+	results := newRedirectResults()
 	h := newHarness(t, harnessConfig{disableUsage: true, disableTrace: true, proxyHandler: answer.handler, observeOptions: results.observe})
 	var run redirectRun
 	run.wire = redirectRoundTrip(t, h, body)
+	// The client can read a short body to its end while the worker is still in the relay, so the
+	// HTTP request's result is received before the direct request starts.
+	run.wireFacts = redirectFactsOf([]outcome.Result{results.next(t, "the request over HTTP")})
 	run.wireContacts = h.proxyHits.Load()
-	run.wireFacts = redirectFactsOf(results.snapshot())
 
 	rec := newRedirectWireRecorder()
 	serveDirect(t.Context(), t, h, rec, body, nil)
+	run.directFacts = redirectFactsOf([]outcome.Result{results.next(t, "the request served directly")})
 	run.direct = rec.view()
 	run.directHeader = rec.firstHeadHeader("Location")
 	run.directContact = h.proxyHits.Load() - run.wireContacts
-	run.directFacts = redirectFactsOf(results.snapshot())[len(run.wireFacts):]
+	results.none(t, "after both requests")
 	return run
 }
 
@@ -294,52 +343,50 @@ func TestGuardedRedirectRelayedOnce(t *testing.T) {
 
 			wantStatus := answer.status
 			wantCompaction := &outcome.Compaction{Outcome: "upstream_error", ErrorCode: "upstream_http_error", UpstreamStatus: &wantStatus}
-			for _, path := range []struct {
-				label      string
+			paths := map[string]struct {
 				run        redirectRun
 				compaction *outcome.Compaction
 			}{
-				{"guarded", guarded, wantCompaction},
-				{"unguarded", unguarded, nil},
-			} {
+				"guarded":   {guarded, wantCompaction},
+				"unguarded": {unguarded, nil},
+			}
+			for label, path := range paths {
 				run := path.run
 				if diff := gocmp.Diff(answer.status, run.wire.Status); diff != "" {
-					t.Errorf("%s: client status (-want +got):\n%s", path.label, diff)
+					t.Errorf("%s: client status (-want +got):\n%s", label, diff)
 				}
 				if diff := gocmp.Diff(answer.location, run.wire.Header.Get("Location")); diff != "" {
-					t.Errorf("%s: client Location header (-want +got):\n%s", path.label, diff)
+					t.Errorf("%s: client Location header (-want +got):\n%s", label, diff)
 				}
 				if diff := gocmp.Diff("kept", run.wire.Header.Get("X-Redirect-Fixture")); diff != "" {
-					t.Errorf("%s: relayed upstream header (-want +got):\n%s", path.label, diff)
+					t.Errorf("%s: relayed upstream header (-want +got):\n%s", label, diff)
 				}
 				if diff := gocmp.Diff(answer.body, run.wire.Body); diff != "" {
-					t.Errorf("%s: client body bytes (-want +got):\n%s", path.label, diff)
+					t.Errorf("%s: client body bytes (-want +got):\n%s", label, diff)
 				}
 				if diff := gocmp.Diff("", run.wire.ReadErr); diff != "" {
-					t.Errorf("%s: client read (-want +got):\n%s", path.label, diff)
+					t.Errorf("%s: client read (-want +got):\n%s", label, diff)
 				}
 				if diff := gocmp.Diff(int64(1), run.wireContacts); diff != "" {
-					t.Errorf("%s: upstream contacts for one request over HTTP (-want +got):\n%s", path.label, diff)
+					t.Errorf("%s: upstream contacts for one request over HTTP (-want +got):\n%s", label, diff)
 				}
 				wantFacts := []redirectFacts{{Status: answer.status, Contacted: true, Compaction: path.compaction}}
 				if diff := gocmp.Diff(wantFacts, run.wireFacts); diff != "" {
-					t.Errorf("%s: terminal result over HTTP (-want +got):\n%s", path.label, diff)
+					t.Errorf("%s: terminal result over HTTP (-want +got):\n%s", label, diff)
 				}
 
 				wantDirect := redirectWireView{Heads: []int{answer.status}, Body: answer.body}
-				gotDirect := run.direct
-				gotDirect.Ops, gotDirect.Late = 0, 0
-				if diff := gocmp.Diff(wantDirect, gotDirect); diff != "" {
-					t.Errorf("%s: heads and body written to the handler's writer (-want +got):\n%s", path.label, diff)
+				if diff := gocmp.Diff(wantDirect, run.direct); diff != "" {
+					t.Errorf("%s: heads and body written to the handler's writer (-want +got):\n%s", label, diff)
 				}
 				if diff := gocmp.Diff([]string{answer.location}, run.directHeader); diff != "" {
-					t.Errorf("%s: Location committed with the head (-want +got):\n%s", path.label, diff)
+					t.Errorf("%s: Location committed with the head (-want +got):\n%s", label, diff)
 				}
 				if diff := gocmp.Diff(int64(1), run.directContact); diff != "" {
-					t.Errorf("%s: upstream contacts for one request served directly (-want +got):\n%s", path.label, diff)
+					t.Errorf("%s: upstream contacts for one request served directly (-want +got):\n%s", label, diff)
 				}
 				if diff := gocmp.Diff(wantFacts, run.directFacts); diff != "" {
-					t.Errorf("%s: terminal result served directly (-want +got):\n%s", path.label, diff)
+					t.Errorf("%s: terminal result served directly (-want +got):\n%s", label, diff)
 				}
 			}
 
@@ -350,7 +397,7 @@ func TestGuardedRedirectRelayedOnce(t *testing.T) {
 				t.Errorf("upstream contacts, guarded against unguarded (-unguarded +guarded):\n%s", diff)
 			}
 			if diff := gocmp.Diff(unguarded.direct, guarded.direct); diff != "" {
-				t.Errorf("writer operations served directly, guarded against unguarded (-unguarded +guarded):\n%s", diff)
+				t.Errorf("heads, body and late writes served directly, guarded against unguarded (-unguarded +guarded):\n%s", diff)
 			}
 		})
 	}
@@ -379,9 +426,12 @@ func redirectOutcomeLabelOf(c *outcome.Compaction) redirectOutcomeLabel {
 // event stream is settled by the reply handler.
 func TestGuardedStreamControls(t *testing.T) {
 	const (
-		controlStart = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_control\",\"type\":\"message\",\"model\":\"gpt-6.1-sol\",\"usage\":{\"input_tokens\":11}}}\n\n"
+		controlDiscardedStart = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_control_discarded\",\"type\":\"message\",\"model\":\"gpt-6.1-sol\",\"usage\":{\"input_tokens\":11}}}\n\n"
+		controlDiscardedText  = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
+			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"discarded partial summary\"}}\n\n"
+		controlStart = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_control_delivered\",\"type\":\"message\",\"model\":\"gpt-6.1-sol\",\"usage\":{\"input_tokens\":11}}}\n\n"
 		controlText  = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
-			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"summary\"}}\n\n" +
+			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"delivered summary\"}}\n\n" +
 			"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
 		controlDelta = "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n"
 		controlStop  = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
@@ -401,7 +451,8 @@ func TestGuardedStreamControls(t *testing.T) {
 					_, _ = io.Copy(io.Discard, r.Body)
 					w.Header().Set("Content-Type", "text/event-stream")
 					if attempt == 1 {
-						_, _ = io.WriteString(w, controlStart)
+						// Incomplete: no message_stop, so the guard discards this attempt and retries.
+						_, _ = io.WriteString(w, controlDiscardedStart+controlDiscardedText)
 						return
 					}
 					_, _ = io.WriteString(w, controlStart+controlText+controlDelta+controlStop)
@@ -416,6 +467,21 @@ func TestGuardedStreamControls(t *testing.T) {
 				}
 				if diff := gocmp.Diff(1, strings.Count(body, "event: message_start\n")); diff != "" {
 					t.Errorf("start frames delivered; the discarded attempt must not reach the client (-want +got):\n%s", diff)
+				}
+				delivered := map[string]bool{
+					`"msg_control_delivered"`:     strings.Contains(body, `"msg_control_delivered"`),
+					`"delivered summary"`:         strings.Contains(body, `"delivered summary"`),
+					`"msg_control_discarded"`:     strings.Contains(body, `"msg_control_discarded"`),
+					`"discarded partial summary"`: strings.Contains(body, `"discarded partial summary"`),
+				}
+				want := map[string]bool{
+					`"msg_control_delivered"`:     true,
+					`"delivered summary"`:         true,
+					`"msg_control_discarded"`:     false,
+					`"discarded partial summary"`: false,
+				}
+				if diff := gocmp.Diff(want, delivered); diff != "" {
+					t.Errorf("which attempt's id and summary text reached the client (-want +got):\n%s", diff)
 				}
 			},
 			wantFacts:   []redirectFacts{{Status: http.StatusOK, Contacted: true}},
@@ -444,7 +510,7 @@ func TestGuardedStreamControls(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			var results redirectResults
+			results := newRedirectResults()
 			var attempts struct {
 				mu sync.Mutex
 				n  int64
@@ -470,7 +536,8 @@ func TestGuardedStreamControls(t *testing.T) {
 				t.Errorf("upstream contacts (-want +got):\n%s", diff)
 			}
 			tt.check(t, answer.Body)
-			facts := redirectFactsOf(results.snapshot())
+			facts := redirectFactsOf([]outcome.Result{results.next(t, "the guarded request")})
+			results.none(t, "after the guarded request")
 			labels := make([]redirectOutcomeLabel, 0, len(facts))
 			for i := range facts {
 				labels = append(labels, redirectOutcomeLabelOf(facts[i].Compaction))

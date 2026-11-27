@@ -90,7 +90,7 @@ func observeRedirectLifetime(t *testing.T, event, body string) redirectLifetimeO
 		defer unblock()
 		providerDone := make(chan struct{})
 		var contacts atomic.Int32
-		var results redirectResults
+		results := newRedirectResults()
 		h := newHarness(t, harnessConfig{
 			inMemory: true, disableUsage: true, disableTrace: true, heartbeatInterval: 100 * time.Millisecond,
 			observeOptions: results.observe,
@@ -139,7 +139,6 @@ func observeRedirectLifetime(t *testing.T, event, body string) redirectLifetimeO
 		time.Sleep(350 * time.Millisecond)
 		synctest.Wait()
 		obs.BeforeEvent = rec.view()
-		obs.BeforeEvent.Ops = 0
 		obs.LocationAtHead = rec.firstHeadHeader("Location")
 		obs.ContactsBeforeEvent = contacts.Load()
 
@@ -159,7 +158,6 @@ func observeRedirectLifetime(t *testing.T, event, body string) redirectLifetimeO
 		obs.ProviderReturnedAfterEvent = redirectReturned(providerDone)
 		obs.ResultsAfterEvent = redirectFactsWithoutCompaction(results.snapshot())
 		obs.WireAfterEvent = rec.view()
-		obs.WireAfterEvent.Ops = 0
 
 		unblock()
 		synctest.Wait()
@@ -169,7 +167,6 @@ func observeRedirectLifetime(t *testing.T, event, body string) redirectLifetimeO
 		obs.ProviderReturnedAfterRelease = redirectReturned(providerDone)
 		obs.ResultsAfterRelease = redirectFactsWithoutCompaction(results.snapshot())
 		obs.WireAfterRelease = rec.view()
-		obs.WireAfterRelease.Ops = 0
 		obs.ContactsAfterRelease = contacts.Load()
 	})
 	return obs
@@ -192,21 +189,19 @@ func TestGuardedRedirectLifetimeMatchesUnguarded(t *testing.T) {
 			guarded := observeRedirectLifetime(t, tt.event, compactRequestJSON(redirectModel))
 
 			wantBefore := redirectWireView{Heads: []int{http.StatusFound}, Body: redirectLifetimeFirst}
-			for _, path := range []struct {
-				label string
-				obs   redirectLifetimeObservation
-			}{{"unguarded", unguarded}, {"guarded", guarded}} {
-				if diff := gocmp.Diff(wantBefore, path.obs.BeforeEvent); diff != "" {
-					t.Errorf("%s: heads and body before the event (-want +got):\n%s", path.label, diff)
+			paths := map[string]redirectLifetimeObservation{"guarded": guarded, "unguarded": unguarded}
+			for label, obs := range paths {
+				if diff := gocmp.Diff(wantBefore, obs.BeforeEvent); diff != "" {
+					t.Errorf("%s: heads and body before the event (-want +got):\n%s", label, diff)
 				}
-				if diff := gocmp.Diff([]string{redirectLifetimeLocation}, path.obs.LocationAtHead); diff != "" {
-					t.Errorf("%s: Location committed with the head (-want +got):\n%s", path.label, diff)
+				if diff := gocmp.Diff([]string{redirectLifetimeLocation}, obs.LocationAtHead); diff != "" {
+					t.Errorf("%s: Location committed with the head (-want +got):\n%s", label, diff)
 				}
-				if diff := gocmp.Diff(int32(1), path.obs.ContactsBeforeEvent); diff != "" {
-					t.Errorf("%s: upstream contacts before the event (-want +got):\n%s", path.label, diff)
+				if diff := gocmp.Diff(int32(1), obs.ContactsBeforeEvent); diff != "" {
+					t.Errorf("%s: upstream contacts before the event (-want +got):\n%s", label, diff)
 				}
-				if diff := gocmp.Diff(int32(1), path.obs.ContactsAfterRelease); diff != "" {
-					t.Errorf("%s: upstream contacts after the upstream finished (-want +got):\n%s", path.label, diff)
+				if diff := gocmp.Diff(int32(1), obs.ContactsAfterRelease); diff != "" {
+					t.Errorf("%s: upstream contacts after the upstream finished (-want +got):\n%s", label, diff)
 				}
 			}
 			if diff := gocmp.Diff(unguarded, guarded); diff != "" {
