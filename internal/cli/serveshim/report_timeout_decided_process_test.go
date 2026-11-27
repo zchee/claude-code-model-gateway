@@ -1,0 +1,161 @@
+// Copyright 2026 The claude-code-model-gateway Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:build process && (darwin || linux)
+
+package serveshim
+
+import (
+	"bytes"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	gocmp "github.com/google/go-cmp/cmp"
+
+	"github.com/zchee/claude-code-model-gateway/internal/lifecycle"
+	"github.com/zchee/claude-code-model-gateway/internal/procinfo"
+)
+
+// TestReportTimeoutDecisionIsFinal checks, in virtual time and without a race against the scheduler, that a decided
+// report timeout is final until the supervisor stops. After the deadline passed without an eligible worker, a worker
+// whose report arrives later has its pid record published but never becomes the relay endpoint, and a respawn arms no
+// new deadline, so no second timeout is ever decided. The control case publishes the same report before the
+// deadline: the worker becomes the endpoint and no timeout follows. TestReportTimeoutIsFinal shows the same contract
+// through a running supervisor, and TestReportTimeoutAgainstStop the warning a timeout that loses to a stop leaves.
+//
+// The worker's launch is the one step replaced: the state directory has no logs directory, so every launch fails
+// before a process starts, and the test installs the worker a successful launch would have made current. Its pid
+// is this process, whose birth time and executable the pid record can carry.
+func TestReportTimeoutDecisionIsFinal(t *testing.T) {
+	// reportWait restates reportTimeout, the 5000 ms the supervisor gives a worker to report its listener.
+	const reportWait = 5 * time.Second
+	const timeoutText = "model-gateway: shim worker did not report its listener port within 5000ms"
+	const launchFailure = "model-gateway: could not start the shim worker: "
+	const reportedPort = 43117
+	tests := map[string]struct {
+		expire bool
+		want   string // The decided timeout's text, or "" when none is decided.
+	}{
+		"success: report published before the deadline makes the worker the endpoint and no timeout follows":    {},
+		"error: report published after the deadline leaves no endpoint and a respawn decides no second timeout": {expire: true, want: timeoutText},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				state, err := filepath.EvalSymlinks(t.TempDir())
+				if err != nil {
+					t.Fatal(err)
+				}
+				exe, err := os.Executable()
+				if err != nil {
+					t.Fatal(err)
+				}
+				var stderr bytes.Buffer
+				s := &shim{
+					lifetime: t.Context(), state: state, executable: exe, version: "1.2.3", stderr: &stderr, pid: os.Getpid(),
+					startedAt: "2026-01-01T00:00:00.000Z", files: lifecycle.Files{StateDir: state}, fatal: make(chan error, 1),
+				}
+				// takeFatal returns the failure handed to Run, or "" when none is pending.
+				takeFatal := func() string {
+					select {
+					case err := <-s.fatal:
+						return err.Error()
+					default:
+						return ""
+					}
+				}
+
+				// The first launch arms the report deadline; its failure is the one handed to Run so far.
+				s.startWorker()
+				if got := takeFatal(); !strings.HasPrefix(got, launchFailure) {
+					t.Fatalf("first launch handed Run %q; want the launch failure starting with %q", got, launchFailure)
+				}
+				w := &workerProc{pid: os.Getpid(), generation: "fixture-generation", exited: make(chan struct{})}
+				s.mu.Lock()
+				s.current = w
+				s.mu.Unlock()
+
+				if tc.expire {
+					// The deadline passes with no eligible worker; its expiry is decided.
+					time.Sleep(reportWait + time.Millisecond)
+					synctest.Wait()
+				}
+				if err := s.publish(w, reportedPort, true); err != nil {
+					t.Fatalf("publish the worker's report: %v", err)
+				}
+				record, err := procinfo.ReadRecord(state, "shim")
+				if err != nil {
+					t.Fatalf("read the worker pid record: %v", err)
+				}
+				// The record carries the reported port in both cases, so the publication passed its current-worker checks.
+				if diff := gocmp.Diff([]int{os.Getpid(), reportedPort}, []int{record.PID, int(record.Port)}); diff != "" {
+					t.Errorf("published worker pid record pid and port (-want +got):\n%s", diff)
+				}
+				wantEndpoint := reportedPort
+				if tc.expire {
+					wantEndpoint = 0
+				}
+				if diff := gocmp.Diff(wantEndpoint, s.port()); diff != "" {
+					t.Errorf("relay endpoint after the report (-want +got):\n%s", diff)
+				}
+
+				if tc.expire {
+					// The worker exits and its replacement's launch is attempted, as the exit watcher does it.
+					s.mu.Lock()
+					s.current = nil
+					s.endpoint.Store(0)
+					s.mu.Unlock()
+					s.startWorker()
+				}
+				// Two whole report deadlines pass: a deadline still armed, or one the respawn armed, would expire.
+				time.Sleep(2 * reportWait)
+				synctest.Wait()
+				s.tasks.Wait()
+
+				if diff := gocmp.Diff(tc.want, takeFatal()); diff != "" {
+					t.Errorf("failure handed to Run (-want +got):\n%s", diff)
+				}
+				// While the timeout is pending, the respawn's launch failure is printed as a warning, and it is the only
+				// line: a second timeout would add another. Without a timeout nothing is printed.
+				var wantStderr []string
+				if tc.expire {
+					wantStderr = []string{launchFailure}
+				}
+				var gotStderr []string
+				for line := range strings.Lines(stderr.String()) {
+					if strings.HasPrefix(line, launchFailure) {
+						line = launchFailure
+					}
+					gotStderr = append(gotStderr, line)
+				}
+				if diff := gocmp.Diff(wantStderr, gotStderr); diff != "" {
+					t.Errorf("stderr lines, a launch failure shortened to its prefix (-want +got):\n%s\nstderr: %q", diff, stderr.String())
+				}
+
+				s.mu.Lock()
+				s.stopped = true
+				for _, timer := range []*time.Timer{s.respawn, s.reportTimer} {
+					if timer != nil {
+						timer.Stop()
+					}
+				}
+				s.mu.Unlock()
+			})
+		})
+	}
+}

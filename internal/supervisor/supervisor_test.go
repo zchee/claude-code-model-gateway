@@ -68,6 +68,40 @@ func TestFixtureControlRequiresGuard(t *testing.T) {
 	}
 }
 
+// TestFixtureControlFirstMessageOnly checks that the guarded fixture channel acts on its first message alone, as the
+// source's one-time message listener does (lib/commands.js:2900-2903): a shutdown message that follows an unrelated
+// first message does not stop the supervisor, and one that comes first does, whatever follows it. Each input ends at
+// end of file, so a reader that stops after the first message and one that reads on to the end both return.
+func TestFixtureControlFirstMessageOnly(t *testing.T) {
+	const shutdown = "{\"type\":\"fixture-shutdown\"}\n"
+	tests := map[string]struct {
+		input    string
+		wantStop bool
+	}{
+		"success: shutdown after an unrelated object does not stop":        {"{\"type\":\"noop\"}\n" + shutdown, false},
+		"success: shutdown after an object without a type does not stop":   {"{\"kind\":\"fixture-shutdown\"}\n" + shutdown, false},
+		"success: shutdown after a non-object message does not stop":       {"[\"fixture-shutdown\"]\n" + shutdown, false},
+		"success: shutdown after two unrelated messages does not stop":     {"{\"type\":\"noop\"}\n{\"type\":\"listening\"}\n" + shutdown, false},
+		"success: shutdown as the first message stops":                     {shutdown + "{\"type\":\"noop\"}\n", true},
+		"success: shutdown as the first message stops before a second one": {shutdown + shutdown, true},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			ch := &fixtureChannel{Reader: strings.NewReader(tc.input)}
+			stop, err := supervisor.FixtureShutdown(ch, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if diff := gocmp.Diff(tc.wantStop, stop); diff != "" {
+				t.Errorf("shutdown for channel input %q (-want +got): %s", tc.input, diff)
+			}
+			if !ch.closed {
+				t.Error("fixture descriptor was not closed")
+			}
+		})
+	}
+}
+
 func TestListenerNeedsControlToken(t *testing.T) {
 	tests := map[string]struct {
 		token string

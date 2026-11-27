@@ -65,6 +65,7 @@ func (s *shimUnderTest) untilOrStopped(at time.Time) {
 // first is up to the scheduler; whichever it is, the outcome must be one of the two described above. The window in
 // which a supervisor could still act on a late report after deciding the timeout is far shorter than these schedules
 // can aim at, so a case can pass against such a supervisor; no case can fail against a correct one.
+// TestReportTimeoutDecisionIsFinal decides that window in virtual time.
 func TestReportTimeoutIsFinal(t *testing.T) {
 	type schedule struct {
 		// exitAt is when the first worker exits without a report, counted from the report deadline.

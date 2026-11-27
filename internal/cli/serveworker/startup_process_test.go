@@ -50,6 +50,17 @@ func TestWorkerStartupBoundaries(t *testing.T) {
 			wantOrigin: "https://upstream.invalid:8443",
 			forbidden:  []string{"alice", "secret-pass", "/v1/custom", "api_key", "tok", "frag"},
 		},
+		// Both branches of the fallback: a value url.Parse refuses, and one it accepts without a scheme and a host.
+		"success: readiness names an upstream that does not parse without its text": {
+			upstream:   "http://fixture-user:fixture-pass@[::1/fixture-path?fixture-query=yes",
+			wantOrigin: "anthropic (unparsable URL))",
+			forbidden:  []string{"fixture-user", "fixture-pass", "fixture-path", "fixture-query", "::1"},
+		},
+		"success: readiness names an upstream without a scheme and host without its text": {
+			upstream:   "fixture-user:fixture-pass@fixture-host/fixture-path?fixture-query=yes",
+			wantOrigin: "anthropic (unparsable URL))",
+			forbidden:  []string{"fixture-user", "fixture-pass", "fixture-host", "fixture-path", "fixture-query"},
+		},
 		"error: unclean dot state root":       {stateKind: "dot"},
 		"error: symlink traversal state root": {stateKind: "symlink"},
 		"error: trailing slash state root":    {stateKind: "trailing"},

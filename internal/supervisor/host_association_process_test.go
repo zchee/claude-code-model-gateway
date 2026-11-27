@@ -99,6 +99,9 @@ type wireRequest struct {
 	want      verdict
 	// mayClose allows the server to close the connection after this request even if it was relayed.
 	mayClose bool
+	// closes requires the server to answer this request with 403 and Connection: close, before it read the request
+	// body, and then to end the connection without a byte for the next request.
+	closes bool
 }
 
 // outcome is what the client observed for one request on the connection.
@@ -318,14 +321,14 @@ func TestHostAssociationPerRequest(t *testing.T) {
 		},
 		"success: refused request leaves a small body unread": {
 			requests: []wireRequest{
-				{head: "POST /unread HTTP/1.1\r\nHost: {foreign}\r\nX-Probe: {probe}\r\nContent-Length: {len}\r\n\r\n", body: strings.Repeat("u", 1024), want: mustRefuse},
+				{head: "POST /unread HTTP/1.1\r\nHost: {foreign}\r\nX-Probe: {probe}\r\nContent-Length: {len}\r\n\r\n", body: strings.Repeat("u", 1024), want: mustRefuse, closes: true},
 				ownPost("/after"),
 			},
 			pipelined: true,
 		},
 		"success: refused request leaves a body larger than the server discards unread": {
 			requests: []wireRequest{
-				{head: "POST /unread HTTP/1.1\r\nHost: {foreign}\r\nX-Probe: {probe}\r\nContent-Length: {len}\r\n\r\n", body: strings.Repeat("u", 300<<10), want: mustRefuse},
+				{head: "POST /unread HTTP/1.1\r\nHost: {foreign}\r\nX-Probe: {probe}\r\nContent-Length: {len}\r\n\r\n", body: strings.Repeat("u", 300<<10), want: mustRefuse, closes: true},
 				ownPost("/after"),
 			},
 			pipelined: true,
@@ -671,6 +674,8 @@ func checkAssociation(t *testing.T, worker *recordingWorker, requests []wireRequ
 	br := bufio.NewReader(conn)
 	outcomes := make([]outcome, len(requests))
 	statuses := make([]int, len(requests))
+	// closing records which answers said Connection: close.
+	closing := make([]bool, len(requests))
 	written := make(chan error, 1)
 	if pipelined {
 		go func() {
@@ -691,7 +696,7 @@ func checkAssociation(t *testing.T, worker *recordingWorker, requests []wireRequ
 				outcomes[i] = outClosed
 				continue
 			}
-			outcomes[i], statuses[i] = readOutcome(br, requests[i].head, probes[i])
+			outcomes[i], statuses[i], closing[i] = readOutcomeClosing(br, requests[i].head, probes[i])
 			closed = outcomes[i].ended()
 		}
 	} else {
@@ -699,7 +704,7 @@ func checkAssociation(t *testing.T, worker *recordingWorker, requests []wireRequ
 		closed := false
 		for i, r := range requests {
 			if !closed {
-				outcomes[i], statuses[i], closed = sequentialExchange(tcp, br, r, heads[i], bodies[i], probes[i])
+				outcomes[i], statuses[i], closing[i], closed = sequentialExchange(tcp, br, r, heads[i], bodies[i], probes[i])
 			} else {
 				outcomes[i] = outClosed
 			}
@@ -716,7 +721,7 @@ func checkAssociation(t *testing.T, worker *recordingWorker, requests []wireRequ
 		n := seen[probes[i]]
 		delete(seen, probes[i])
 		report[i] = fmt.Sprintf("request %d (%s): %s, status %d, worker received it %d times", i, r.want, outcomes[i], statuses[i], n)
-		fault := judge(requests, outcomes, statuses, i, n)
+		fault := judge(requests, outcomes, statuses, closing, i, n)
 		if fault != "" {
 			faults = append(faults, fmt.Sprintf("request %d: %s", i, fault))
 		}
@@ -729,41 +734,48 @@ func checkAssociation(t *testing.T, worker *recordingWorker, requests []wireRequ
 	}
 }
 
-// sequentialExchange writes one request and reads its answer before the next request is written.
-func sequentialExchange(conn *net.TCPConn, br *bufio.Reader, r wireRequest, head, body, probe string) (outcome, int, bool) {
+// sequentialExchange writes one request and reads its answer before the next request is written. It also reports
+// whether the answer said Connection: close, and whether the connection is known to have ended.
+func sequentialExchange(conn *net.TCPConn, br *bufio.Reader, r wireRequest, head, body, probe string) (outcome, int, bool, bool) {
 	if _, err := io.WriteString(conn, head); err != nil {
-		return outClosed, 0, true
+		return outClosed, 0, false, true
 	}
 	if r.expect100 {
 		resp, err := http.ReadResponse(br, &http.Request{Method: method(head)})
 		if err != nil {
-			return outClosed, 0, true
+			return outClosed, 0, false, true
 		}
 		if resp.StatusCode != http.StatusContinue {
 			// The server answered without asking for the body; the body is not sent.
 			o := classify(resp, probe)
 			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
-			return o, resp.StatusCode, false
+			return o, resp.StatusCode, resp.Close, false
 		}
 	}
 	if _, err := io.WriteString(conn, body); err != nil {
-		return outClosed, 0, true
+		return outClosed, 0, false, true
 	}
-	o, status := readOutcome(br, head, probe)
-	return o, status, o.ended()
+	o, status, closing := readOutcomeClosing(br, head, probe)
+	return o, status, closing, o.ended()
 }
 
 // readOutcome reads the final answer to one request, skipping interim 100 responses. A connection that ends before
 // any byte of the answer is outClosed; bytes that do not make a complete response are outPartial.
 func readOutcome(br *bufio.Reader, head, probe string) (outcome, int) {
+	o, status, _ := readOutcomeClosing(br, head, probe)
+	return o, status
+}
+
+// readOutcomeClosing is readOutcome that also reports whether the answer said Connection: close.
+func readOutcomeClosing(br *bufio.Reader, head, probe string) (outcome, int, bool) {
 	for {
 		if _, err := br.Peek(1); err != nil {
-			return outClosed, 0
+			return outClosed, 0, false
 		}
 		resp, err := http.ReadResponse(br, &http.Request{Method: method(head)})
 		if err != nil {
-			return outPartial, 0
+			return outPartial, 0, false
 		}
 		if resp.StatusCode == http.StatusContinue {
 			continue
@@ -771,10 +783,10 @@ func readOutcome(br *bufio.Reader, head, probe string) (outcome, int) {
 		o := classify(resp, probe)
 		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
 			_ = resp.Body.Close()
-			return outPartial, resp.StatusCode
+			return outPartial, resp.StatusCode, resp.Close
 		}
 		_ = resp.Body.Close()
-		return o, resp.StatusCode
+		return o, resp.StatusCode, resp.Close
 	}
 }
 
@@ -797,11 +809,15 @@ func classify(resp *http.Response, probe string) outcome {
 }
 
 // judge returns why the observed outcome of request i violates its own Host's verdict, or "" when it does not.
-func judge(requests []wireRequest, outcomes []outcome, statuses []int, i, received int) string {
+func judge(requests []wireRequest, outcomes []outcome, statuses []int, closing []bool, i, received int) string {
 	o, want := outcomes[i], requests[i].want
 	switch {
 	case received > 1:
 		return fmt.Sprintf("the worker received it %d times", received)
+	case requests[i].closes && (o != outRefused || statuses[i] != http.StatusForbidden || !closing[i]):
+		return fmt.Sprintf("answered before its body was read, but not with 403 and Connection: close (%s, status %d, Connection: close %t)", o, statuses[i], closing[i])
+	case requests[i].closes && i+1 < len(outcomes) && outcomes[i+1] != outClosed:
+		return fmt.Sprintf("the connection carried an answer to the next request (%s, status %d) after a response sent before this request's body was read", outcomes[i+1], statuses[i+1])
 	case o == outMisrouted:
 		return "the client received the worker's answer to a different request"
 	case o == outAnswered:

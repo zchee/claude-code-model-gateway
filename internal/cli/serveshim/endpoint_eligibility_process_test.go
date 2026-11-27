@@ -753,6 +753,22 @@ func TestEndpointEligibility(t *testing.T) {
 			if s.result == nil {
 				t.Error("supervisor stopped with exit status 0; want 1 when the worker's pid record cannot be published")
 			}
+			// The two publications fail with two distinct diagnostics. The provisional record's failure is a warning, the
+			// only line the supervisor prints; the eligible record's failure is the fatal error Run returns, which its
+			// caller prints, so it never appears on stderr as well.
+			const provisionalWarning = "model-gateway: could not publish the worker pid record: "
+			const eligibleFatal = "model-gateway: the shim worker could not be tracked: "
+			stderr := s.stderr.String()
+			lines := strings.Split(strings.TrimSuffix(stderr, "\n"), "\n")
+			if len(lines) != 1 || !strings.HasPrefix(lines[0], provisionalWarning) || !strings.HasSuffix(stderr, "\n") {
+				t.Errorf("stderr %q; want exactly one line, the provisional record's warning starting with %q", stderr, provisionalWarning)
+			}
+			if s.result != nil && !strings.HasPrefix(s.result.Error(), eligibleFatal) {
+				t.Errorf("supervisor stopped with %q; want the eligible record's fatal error starting with %q", s.result, eligibleFatal)
+			}
+			if strings.Contains(stderr, eligibleFatal) {
+				t.Errorf("stderr %q repeats the fatal error Run returns", stderr)
+			}
 			if a := <-probe.answer; a.err == nil && a.result != retryable {
 				t.Errorf("request in flight while the pid record could not be published: %+v; want the retryable 503 or no answer", a.result)
 			}
