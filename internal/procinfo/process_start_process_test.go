@@ -100,14 +100,16 @@ func holdChild(t *testing.T) (pid int, finish func() error, ended <-chan struct{
 const fixtureLifetime = 30 * time.Second
 
 func TestProcessStartToken(t *testing.T) {
+	// The runner kills the child when its lifetime ends, so every read of the
+	// live child must finish well before then. This deadline starts before the
+	// runner does, so however long the child takes to report its number, it
+	// ends at least a third of the lifetime before the runner's, and it bounds
+	// each probe below the probe budget.
+	live, cancel := context.WithTimeout(t.Context(), fixtureLifetime*2/3)
+	defer cancel()
 	child, finish, ended, output := holdChild(t)
 	// A whole-host table scan needs more than the default probe budget on a busy host.
 	p := New(func(key string) (string, bool) { return "30000", key == "CODEX_GATEWAY_PROBE_TIMEOUT_MS" })
-	// The runner kills the child when its lifetime ends, so every read of the
-	// live child must finish well before then; this deadline leaves a third of
-	// the lifetime as headroom and bounds each probe below the probe budget.
-	live, cancel := context.WithTimeout(t.Context(), fixtureLifetime*2/3)
-	defer cancel()
 	// One census for both processes, taken first, while the child is surely alive.
 	table, err := p.Table(live)
 	if err != nil {
@@ -158,6 +160,9 @@ func TestProcessStartToken(t *testing.T) {
 	childStart, err := kernelStart(child)
 	if err != nil {
 		t.Fatalf("start of the fixture child: %v", err)
+	}
+	if err := live.Err(); err != nil {
+		t.Fatalf("the reads of the live child did not finish within their deadline: %v", err)
 	}
 	select {
 	case <-ended:
