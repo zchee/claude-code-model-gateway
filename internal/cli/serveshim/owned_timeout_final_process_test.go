@@ -57,7 +57,7 @@ func (s *ownedShim) untilOrStopped(at time.Time) {
 	}
 }
 
-// TestReportTimeoutIsFinalOwnedListener carries the report timeout's finality test with every worker's listener
+// TestReportTimeoutIsFinal carries the report timeout's finality test with every worker's listener
 // received from the supervisor. Once the report deadline has passed without a report, it is final until the supervisor
 // stops: a replacement worker that reports afterwards never becomes eligible, so it receives no request, and the
 // timeout is reported once, as the error Run returns, with nothing printed beside it. A replacement whose report is
@@ -67,7 +67,7 @@ func (s *ownedShim) untilOrStopped(at time.Time) {
 // deadline. The replacement reports at a time around the deadline, or starts around it and reports at once, while
 // requests wait at the public listener for an eligible generation. Which of the report and the deadline is decided
 // first is up to the scheduler; whichever it is, the outcome must be one of the two described above.
-func TestReportTimeoutIsFinalOwnedListener(t *testing.T) {
+func TestReportTimeoutIsFinal(t *testing.T) {
 	type schedule struct {
 		// exitAt is when the first worker exits without a report, counted from the report deadline.
 		exitAt time.Duration

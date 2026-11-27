@@ -15,12 +15,22 @@
 package serveworker
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"net"
+	"time"
 
 	"github.com/zchee/claude-code-model-gateway/internal/workerlink"
 )
+
+// drainExchangeBudget bounds the whole drain exchange, the notice's write and the answer's read together: the
+// supervisor's answer is due within the same five seconds a worker has to report its listener.
+const drainExchangeBudget = 5 * time.Second
+
+// aLongTimeAgo is a deadline in the past, which ends an operation in progress at once.
+var aLongTimeAgo = time.Unix(1, 0)
 
 // errUnexpectedDrainAnswer is the cause of an exchange whose answer is a well-formed drain frame other than the
 // retirement of the worker's own generation: a frame in the wrong direction or for another generation.
@@ -34,5 +44,45 @@ var errUnexpectedDrainAnswer = errors.New("the drain answer is not the retiremen
 // workerlink.ErrDrainMessage, an end of file before any byte of the answer with io.EOF, any other well-formed frame at
 // once with errUnexpectedDrainAnswer, and a context that ends first with the context's error.
 func drainExchange(ctx context.Context, conn net.Conn, generation workerlink.Generation) error {
-	panic("not implemented")
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// One deadline for both directions, set once: nothing below restarts it.
+	if err := conn.SetDeadline(time.Now().Add(drainExchangeBudget)); err != nil {
+		return fmt.Errorf("set the drain exchange's deadline: %w", err)
+	}
+	// A context that ends moves the deadline into the past, which ends the write or read in progress at once. The
+	// callback is joined before return, so it never touches conn afterwards.
+	interrupted := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(interrupted)
+		_ = conn.SetDeadline(aLongTimeAgo)
+	})
+	defer func() {
+		if !stop() {
+			<-interrupted
+		}
+	}()
+	err := exchangeDrain(conn, generation)
+	if ctxErr := ctx.Err(); ctxErr != nil && err != nil {
+		return ctxErr
+	}
+	return err
+}
+
+// exchangeDrain writes the notice once and decides on the first answer frame.
+func exchangeDrain(conn net.Conn, generation workerlink.Generation) error {
+	if err := workerlink.EncodeDrain(conn, workerlink.DrainMessage{Type: workerlink.Draining, Generation: generation}); err != nil {
+		return fmt.Errorf("could not write the drain notice: %w", err)
+	}
+	msg, err := workerlink.DecodeDrain(bufio.NewReader(conn))
+	switch {
+	case err != nil:
+		return fmt.Errorf("no answer to the drain notice: %w", err)
+	case msg.Type != workerlink.Retired:
+		return fmt.Errorf("%w: an unexpected %q frame in place of the answer", errUnexpectedDrainAnswer, msg.Type)
+	case msg.Generation != generation:
+		return fmt.Errorf("%w: a retirement for another generation", errUnexpectedDrainAnswer)
+	}
+	return nil
 }

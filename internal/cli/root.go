@@ -44,6 +44,9 @@ type Process struct {
 	Environ    func() []string
 	Home, Cwd  func() (string, error)
 	Executable func() (string, error)
+	// Exit ends the process at once with a status; nil means a command never ends the process itself. Only the
+	// request worker uses it, when its supervisor goes away before it serves.
+	Exit func(int)
 }
 
 // Run dispatches argv, including the executable name, and returns an exit status.
@@ -175,6 +178,7 @@ type invocation struct {
 	environ    func() []string
 	home, cwd  func() (string, error)
 	executable func() (string, error)
+	exit       func(int)
 }
 
 type commandScan struct {
@@ -244,7 +248,7 @@ func newRoot(name string, commands []sourceCommand, p Process) *cobra.Command {
 				stdout, stderr := cmd.OutOrStdout(), cmd.ErrOrStderr()
 				call := invocation{
 					name: spec.name, stdin: cmd.InOrStdin(),
-					lookup: p.Lookup, environ: p.Environ, home: p.Home, cwd: p.Cwd, executable: p.Executable,
+					lookup: p.Lookup, environ: p.Environ, home: p.Home, cwd: p.Cwd, executable: p.Executable, exit: p.Exit,
 				}
 				if spec.mode == scanStdin {
 					call.streams = argscan.Streams{Log: stdout, Output: stdout, Error: stderr}
@@ -313,7 +317,7 @@ func serveShim(call invocation) error {
 func serveWorker(call invocation) error {
 	return reportFatal(call.streams.Error, serveworker.Run(context.Background(), serveworker.Options{
 		Lookup: call.lookup, Home: call.home, Cwd: call.cwd,
-		Version: version.String(), Stdout: call.streams.Output, Stderr: call.streams.Error,
+		Version: version.String(), Stdout: call.streams.Output, Stderr: call.streams.Error, Exit: call.exit,
 	}))
 }
 

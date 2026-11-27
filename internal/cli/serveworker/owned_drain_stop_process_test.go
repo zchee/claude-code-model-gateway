@@ -34,13 +34,13 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/workerlink"
 )
 
-// TestDrainInterruptedByStopOwnedListener carries the cases of the drain-interrupted-by-stop test with the supervised
+// TestDrainInterruptedByStop carries the cases of the drain-interrupted-by-stop test with the supervised
 // worker's listener and drain channel received from its parent. A draining worker with a stalled upload is ended at
 // once by cancellation (standalone, over TCP and over its Unix socket) and by its parent's end of file (supervised):
 // the drain was accepted with the upload counted, the worker announced it once, and the end of file comes while the
 // parent withholds its answer, or after it answered. The worker exits cleanly within moments, with the upload still
 // stalled: it waits neither for an answer nor for the upload.
-func TestDrainInterruptedByStopOwnedListener(t *testing.T) {
+func TestDrainInterruptedByStop(t *testing.T) {
 	tests := map[string]struct {
 		useUnix   bool
 		parentEOF bool

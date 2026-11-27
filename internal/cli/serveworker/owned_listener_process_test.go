@@ -361,11 +361,11 @@ func get(ctx context.Context, port uint16, path string) (int, error) {
 	return resp.StatusCode, err
 }
 
-// TestWorkerModesOwnedListener carries every case of the worker mode table with the supervised worker's listener
+// TestWorkerModes carries every case of the worker mode table with the supervised worker's listener
 // received from its supervisor. Standalone modes are unchanged: the worker binds its own listener. A supervised worker
 // serves on the listener it inherited, at the reserved port, and reports that port; every report and liveness
 // descriptor failure keeps its own diagnostic while the listener and drain descriptors are valid.
-func TestWorkerModesOwnedListener(t *testing.T) {
+func TestWorkerModes(t *testing.T) {
 	tests := map[string]struct{ mode, wantError string }{
 		"success: standalone ignores closed stdin":                 {"standalone", ""},
 		"success: supervised reports port then follows parent EOF": {"supervised", ""},

@@ -27,11 +27,13 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/zchee/claude-code-model-gateway/internal/controlauth"
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
+	"github.com/zchee/claude-code-model-gateway/internal/supervisor/relay"
 	"github.com/zchee/claude-code-model-gateway/internal/workerlink"
 )
 
@@ -81,7 +83,157 @@ func NewHandler(publicPort int, workerPort func() int, token, version string, pi
 // a retry: when that generation is still current as the attempts run out, and also when the connection of the last
 // attempt reached a generation and then failed, whether or not that generation is still current, as the source does.
 func newLeaseHandler(publicPort int, workers workerlink.Source, token, version string, pid int, lost func(workerlink.Generation)) (http.Handler, error) {
-	panic("not implemented")
+	return NewLeaseRelay(publicPort, workers, token, version, pid, lost, nil)
+}
+
+// NewLeaseRelay constructs the handler for an already bound public port that reaches workers only through leases from
+// workers, as newLeaseHandler describes; delivery is the relay package's. It answers the public routes itself as
+// NewHandler does: the Host check, the token check of /restart and /drain, and /restart.
+//
+// beforeDrain is called for an authenticated public POST /drain, once for each lease acquired for that request, after
+// the lease is handed over and before any byte is written on it; nil means no pre-step. An error closes that lease
+// unused and the attempt counts as refused: nothing was sent, so no generation took the request and no loss is
+// reported. The foreground supervisor uses it to withdraw the generation's admission before the worker receives the
+// drain.
+func NewLeaseRelay(publicPort int, workers workerlink.Source, token, version string, pid int, lost func(workerlink.Generation), beforeDrain func(workerlink.Lease) error) (http.Handler, error) {
+	if !validToken(token) {
+		return nil, errors.New("model-gateway: the supervisor needs a valid local control token before serving")
+	}
+	if publicPort <= 0 || publicPort > 65535 || workers == nil {
+		return nil, errors.New("model-gateway: the supervisor needs its public port and a worker lease source")
+	}
+	options := relay.Options{Workers: workers, Wait: waitAttempt, Version: version, SupervisorPID: pid}
+	if lost != nil {
+		options.Lost = func(l relay.Lost) { lost(l.Generation) }
+	}
+	ordinary, err := relay.New(options)
+	if err != nil {
+		return nil, err
+	}
+	drain := ordinary
+	if beforeDrain != nil {
+		options.Workers = drainSource{workers: workers, before: beforeDrain}
+		if drain, err = relay.New(options); err != nil {
+			return nil, err
+		}
+	}
+	return &leaseHandler{publicPort: publicPort, token: token, relay: ordinary, drain: drain}, nil
+}
+
+// leaseHandler answers the public routes and hands every other request to the relay; an authenticated drain goes to
+// a relay whose leases first pass the drain's pre-step.
+type leaseHandler struct {
+	publicPort int
+	token      string
+	relay      http.Handler
+	drain      http.Handler
+}
+
+func (h *leaseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	pathOnly, ok := admitPublic(w, r, h.publicPort, h.token)
+	if !ok {
+		return
+	}
+	if pathOnly == "/drain" && r.Method == http.MethodPost {
+		// One drain request retires at most one generation: its attempts share one record of the generation the
+		// pre-step retired for it.
+		h.drain.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), drainRequestKey{}, &drainRequest{})))
+		return
+	}
+	h.relay.ServeHTTP(w, r)
+}
+
+// drainSource gives the drain relay its leases: each lease the underlying source hands over passes before first; a
+// lease it refuses is closed unused and the refusal is the attempt's result.
+//
+// Once before has accepted a lease for a drain request, that request has retired that lease's generation, and no
+// later attempt of the same request reaches any generation: each one is given a lease that stands for the retired
+// generation and fails before a byte is written, so the relay never delivers the drain to a replacement and, when the
+// retired generation ended without an answer, answers the request as one that generation took, with the 503 that
+// forbids a resend.
+//
+// This breaks the workerlink.Source contract on purpose: the stand-in lease belongs to the generation the relay asked
+// to exclude, which may have ended. It is a private delivery rule for one public drain request and holds only for the
+// relay's current attempt loop (internal/supervisor/relay, deliver); drainSource is not a source to reuse elsewhere.
+// The stand-in's failed reads and writes also replace the class of the error that ended the real attempt, so a loss
+// journal that records an error type, or a stop-aware wait, must not be wired through it unchanged.
+type drainSource struct {
+	workers workerlink.Source
+	before  func(workerlink.Lease) error
+}
+
+// drainRequestKey is the private context key of a drain request's drainRequest.
+type drainRequestKey struct{}
+
+// drainRequest records the generation the pre-step retired for one drain request.
+type drainRequest struct {
+	mu    sync.Mutex
+	taken *takenLease
+}
+
+func (d drainSource) Acquire(ctx context.Context, exclude workerlink.Generation) (workerlink.Lease, error) {
+	req, _ := ctx.Value(drainRequestKey{}).(*drainRequest)
+	if req != nil {
+		req.mu.Lock()
+		taken := req.taken
+		req.mu.Unlock()
+		if taken != nil {
+			return taken, nil
+		}
+	}
+	lease, err := d.workers.Acquire(ctx, exclude)
+	if err != nil || lease == nil {
+		return lease, err
+	}
+	if err := d.before(lease); err != nil {
+		_ = lease.Close()
+		return nil, err
+	}
+	if req != nil {
+		req.mu.Lock()
+		req.taken = &takenLease{generation: lease.Generation(), pid: lease.PID(), authority: lease.Authority(), exited: lease.Exited(), local: lease.LocalAddr(), remote: lease.RemoteAddr()}
+		req.mu.Unlock()
+	}
+	return lease, nil
+}
+
+// errDrainTaken is the failure of every attempt of a drain request after the one whose generation it retired.
+var errDrainTaken = errors.New("model-gateway: this drain request already retired a worker generation and is not sent to another")
+
+// takenLease stands for the generation a drain request retired. It connects to nothing: every read and write fails at
+// once with errDrainTaken, so an attempt on it writes no byte anywhere.
+type takenLease struct {
+	generation    workerlink.Generation
+	pid           int
+	authority     string
+	exited        <-chan struct{}
+	local, remote net.Addr
+}
+
+func (l *takenLease) Read([]byte) (int, error)          { return 0, errDrainTaken }
+func (l *takenLease) Write([]byte) (int, error)         { return 0, errDrainTaken }
+func (l *takenLease) Close() error                      { return nil }
+func (l *takenLease) LocalAddr() net.Addr               { return l.local }
+func (l *takenLease) RemoteAddr() net.Addr              { return l.remote }
+func (l *takenLease) SetDeadline(time.Time) error       { return nil }
+func (l *takenLease) SetReadDeadline(time.Time) error   { return nil }
+func (l *takenLease) SetWriteDeadline(time.Time) error  { return nil }
+func (l *takenLease) Generation() workerlink.Generation { return l.generation }
+func (l *takenLease) PID() int                          { return l.pid }
+func (l *takenLease) Authority() string                 { return l.authority }
+func (l *takenLease) Exited() <-chan struct{}           { return l.exited }
+
+// waitAttempt is the relay's pause between two delivery attempts: a timer that ends early, with the context's error,
+// when the request ends.
+func waitAttempt(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func validToken(token string) bool {
@@ -108,24 +260,33 @@ func refuse(w http.ResponseWriter) {
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	port := strconv.Itoa(h.publicPort)
+	if _, ok := admitPublic(w, r, h.publicPort, h.token); ok {
+		h.relay(w, r)
+	}
+}
+
+// admitPublic answers what the public listener decides before relay: a request whose Host is not this listener's, an
+// unauthenticated /restart or /drain, and /restart, which needs the worker process owner. It returns the request's
+// path and whether the request goes on to the relay.
+func admitPublic(w http.ResponseWriter, r *http.Request, publicPort int, token string) (string, bool) {
+	port := strconv.Itoa(publicPort)
 	if !controlauth.LocalRequestAllowed(r, []string{"127.0.0.1:" + port, "localhost:" + port}) {
 		refuse(w)
-		return
+		return "", false
 	}
 	pathOnly, _, _ := strings.Cut(requestTarget(r), "?")
 	if pathOnly == "/restart" || pathOnly == "/drain" {
-		if !controlauth.Authenticated(r, h.token, []int{h.publicPort}, false) {
+		if !controlauth.Authenticated(r, token, []int{publicPort}, false) {
 			refuse(w)
-			return
+			return "", false
 		}
 	}
 	if pathOnly == "/restart" {
 		// Replacing the worker on request needs the worker process owner, which this handler does not hold.
 		w.WriteHeader(http.StatusNotImplemented)
-		return
+		return "", false
 	}
-	h.relay(w, r)
+	return pathOnly, true
 }
 
 // relay forwards one buffered request to the current worker and streams its answer back.

@@ -67,7 +67,10 @@ func openFixtureChannel(env environment) (*os.File, error) {
 		}
 		return nil, nil
 	}
+	// Marked with forks locked out, so that no worker started meanwhile inherits it.
+	syscall.ForkLock.RLock()
 	unix.CloseOnExec(fd)
+	syscall.ForkLock.RUnlock()
 	if err := unix.SetNonblock(fd, true); err != nil {
 		return nil, fmt.Errorf("model-gateway: could not prepare the fixture channel descriptor %d: %w", fd, err)
 	}
@@ -91,6 +94,25 @@ func checkReadable(fd int) error {
 		return errors.New("open in the wrong direction")
 	}
 	return nil
+}
+
+// openLog opens the worker's log for appending without blocking and without following a symbolic link, creating it as
+// a regular file when it is missing. Anything but a regular file is refused before a worker could write to it: a FIFO
+// would block an ordinary open, or take the worker's output away, and a directory cannot take it at all.
+func openLog(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0o666)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err == nil && !info.Mode().IsRegular() {
+		err = fmt.Errorf("open %s: not a regular file", path)
+	}
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return f, nil
 }
 
 func signalName(sig syscall.Signal) string {

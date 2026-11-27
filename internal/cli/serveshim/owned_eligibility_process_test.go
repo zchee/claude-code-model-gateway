@@ -533,7 +533,7 @@ func startOwnedShim(t *testing.T, env map[string]string, wrap func(context.Conte
 		t.Fatalf("test executable path %q cannot be quoted for the launcher script", exe)
 	}
 	launcher := filepath.Join(home, "worker-launcher")
-	script := "#!/bin/sh\nexec '" + exe + "' -test.run='^TestEndpointEligibilityOwnedListener$'\n"
+	script := "#!/bin/sh\nexec '" + exe + "' -test.run='^TestEndpointEligibility$'\n"
 	if err := os.WriteFile(launcher, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -1118,7 +1118,7 @@ func withHooks(hooks serveshim.Hooks) func(context.Context) context.Context {
 
 func (h *exitHold) free() { h.once.Do(func() { close(h.release) }) }
 
-// TestEndpointEligibilityOwnedListener carries every case of the endpoint eligibility test with the worker's listener
+// TestEndpointEligibility carries every case of the endpoint eligibility test with the worker's listener
 // received from its supervisor, and decides the two windows in which a relay by port number could reach another
 // program. The supervisor reserves each worker generation's listener itself, so its port cannot be taken while the
 // generation lives, also between the worker's exit and the supervisor observing it; and the supervisor retires a
@@ -1129,7 +1129,7 @@ func (h *exitHold) free() { h.once.Do(func() { close(h.release) }) }
 //
 // The case of a request that arrives before any generation is eligible is decided against the public handler alone
 // in internal/supervisor, TestRelayDeliveryFollowsGeneration, "error: no generation is ever eligible".
-func TestEndpointEligibilityOwnedListener(t *testing.T) {
+func TestEndpointEligibility(t *testing.T) {
 	if control := os.Getenv(ownedControlKey); control != "" {
 		// This process is a worker the supervisor under test started, not the test itself.
 		if err := ownedEligibilityChild(t.Context(), control); err != nil {

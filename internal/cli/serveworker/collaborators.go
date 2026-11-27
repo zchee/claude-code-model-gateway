@@ -110,7 +110,12 @@ type lifetime struct {
 	mu       sync.Mutex
 	closed   bool          // no handler is admitted any more; guarded by mu
 	live     int           // admitted handlers whose client has not left; guarded by mu
-	changed  chan struct{} // signalled whenever live drops
+	changed  chan struct{} // signalled whenever live drops or a connection stops being pending
+	// pending holds the connections whose current request has not reached the handler: from the moment a server
+	// accepted them or they became active again until the handler admits the request or the connection is idle,
+	// closed or hijacked; guarded by mu. net/http drops a connection whose request it finishes reading after its
+	// server began to shut down, so release waits for these before the servers are shut down.
+	pending map[net.Conn]struct{}
 
 	stopOnce sync.Once
 }
@@ -124,9 +129,19 @@ func (l *lifetime) serve(listeners []net.Listener, handler http.Handler) {
 	l.served = make(chan error, len(listeners))
 	for _, ln := range listeners {
 		// The general OPTIONS handler would answer "OPTIONS *" itself, past the handler's checks.
-		srv := &http.Server{Handler: tracked, ReadHeaderTimeout: headersTimeout, IdleTimeout: keepAliveTimeout, DisableGeneralOptionsHandler: true}
+		srv := &http.Server{
+			Handler: tracked, ReadHeaderTimeout: headersTimeout, IdleTimeout: keepAliveTimeout, DisableGeneralOptionsHandler: true,
+			ConnContext: func(ctx context.Context, c net.Conn) context.Context { return context.WithValue(ctx, connKey{}, c) },
+			ConnState:   l.connState,
+		}
 		l.servers = append(l.servers, srv)
-		l.serving.Go(func() { l.served <- srv.Serve(ln) })
+		l.serving.Go(func() {
+			err := srv.Serve(ln)
+			if ended, ok := ln.(interface{ serveEnded() }); ok {
+				ended.serveEnded()
+			}
+			l.served <- err
+		})
 	}
 }
 
@@ -139,6 +154,9 @@ func (l *lifetime) track(handler http.Handler) http.Handler {
 			panic(http.ErrAbortHandler)
 		}
 		defer l.handlers.Done()
+		if c, ok := r.Context().Value(connKey{}).(net.Conn); ok {
+			l.settle(c)
+		}
 		leave := sync.OnceFunc(l.leave)
 		stopLeave := context.AfterFunc(r.Context(), leave)
 		defer func() {
@@ -168,6 +186,74 @@ func (l *lifetime) leave() {
 	select {
 	case l.changed <- struct{}{}:
 	default:
+	}
+}
+
+// connKey is the private context key under which a request's context carries its connection.
+type connKey struct{}
+
+// connState records which connections are pending.
+func (l *lifetime) connState(c net.Conn, state http.ConnState) {
+	switch state {
+	case http.StateNew, http.StateActive:
+		l.mu.Lock()
+		if l.pending == nil {
+			l.pending = make(map[net.Conn]struct{})
+		}
+		l.pending[c] = struct{}{}
+		l.mu.Unlock()
+	case http.StateIdle, http.StateClosed, http.StateHijacked:
+		l.settle(c)
+	}
+}
+
+// settle records that a connection's current request reached the handler, or that the connection has none.
+func (l *lifetime) settle(c net.Conn) {
+	l.mu.Lock()
+	_, was := l.pending[c]
+	delete(l.pending, c)
+	l.mu.Unlock()
+	if was {
+		select {
+		case l.changed <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// release ends a supervised drain's admission before the servers shut down: it closes every listener (the worker's own
+// copies only), joins the accept loops, turns keep-alive off, so that no connection takes another request, and waits
+// until every connection that was accepted has had its request admitted or has none, or until now closes. Idle connections are closed meanwhile, and so are
+// connections that sent no request for five seconds, as a shutdown closes them. Only then may stop shut the servers
+// down without dropping a request that arrived before the listener closed.
+func (l *lifetime) release(listeners []net.Listener, now <-chan struct{}) {
+	for _, ln := range listeners {
+		_ = ln.Close()
+	}
+	// Every accept loop returns once its listener is closed, and a server registers each connection it accepted before
+	// it accepts again, so after this join every accepted connection is among the pending ones or already settled.
+	l.serving.Wait()
+	poll := time.Millisecond
+	timer := time.NewTimer(poll)
+	defer timer.Stop()
+	for {
+		for _, srv := range l.servers {
+			srv.SetKeepAlivesEnabled(false)
+		}
+		l.mu.Lock()
+		pending := len(l.pending)
+		l.mu.Unlock()
+		if pending == 0 {
+			return
+		}
+		select {
+		case <-l.changed:
+		case <-timer.C:
+			poll = min(2*poll, 500*time.Millisecond)
+			timer.Reset(poll)
+		case <-now:
+			return
+		}
 	}
 }
 

@@ -45,11 +45,7 @@ const ownedWorkerKey = "SERVESHIM_OWNED_FIXTURE_WORKER"
 func TestMain(m *testing.M) {
 	venue.Require()
 	if slices.Equal(os.Args[1:], []string{"serve-worker"}) && os.Getenv("MODEL_GATEWAY_TEST_SANDBOX") != "" {
-		run := fixtureWorker
-		if os.Getenv(ownedWorkerKey) != "" {
-			run = ownedFixtureWorker
-		}
-		if err := run(); err != nil {
+		if err := ownedFixtureWorker(); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}

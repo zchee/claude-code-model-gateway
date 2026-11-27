@@ -18,16 +18,24 @@ package serveworker
 
 import (
 	"errors"
+	"fmt"
+	"net"
 	"os"
 
 	"github.com/zchee/claude-code-model-gateway/internal/config"
 )
 
-type controlDescriptors struct{ live *os.File }
+type controlDescriptors struct {
+	generation string
+	live       *os.File
+	listener   net.Listener
+	drain      net.Conn
+}
 
+// supervisedDescriptors refuses the supervised mode: an inherited listener and drain channel are Unix descriptors.
 func supervisedDescriptors(lookup config.LookupEnv) (*controlDescriptors, error) {
 	if _, ok := lookup(controlFDsKey); ok {
-		return nil, errors.New("model-gateway: supervised worker descriptors are not supported on this platform")
+		return nil, fmt.Errorf("model-gateway: supervised worker descriptors are not supported on this platform: %w", errors.ErrUnsupported)
 	}
 	return nil, nil
 }
@@ -39,3 +47,9 @@ func (*controlDescriptors) close() {}
 func fixtureChannel(config.LookupEnv) (*os.File, error) { return nil, nil }
 
 func errorCode(err error) string { return err.Error() }
+
+func acceptQueued(net.Listener, <-chan struct{}) ([]net.Conn, error) {
+	return nil, errors.ErrUnsupported
+}
+
+func parentEnded(*os.File) bool { return true }

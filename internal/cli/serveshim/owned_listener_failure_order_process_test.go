@@ -128,14 +128,14 @@ func ownedListenerFailureText(public string) string {
 	return fmt.Sprintf("model-gateway: the public listener stopped: accept tcp4 %s: accept4: invalid argument", public)
 }
 
-// TestListenerFailureOrderingOwnedListener carries the listener failure ordering test under the supervisor's exclusive
+// TestListenerFailureOrdering carries the listener failure ordering test under the supervisor's exclusive
 // reservation of its worker's port. It checks how a failure of the public listener decides the supervisor's outcome against a
 // worker failure and a stop request that came first. The failure that is selected first decides the exit status, and
 // a listener failure that loses is printed once as a warning, never dropped and never turned into the exit status.
 // The worker lingers after its supervisor disconnects it and ignores SIGTERM, so each stop stays in progress until the
 // test releases the worker; the listener fails inside that window, and the worker confirms that it was still running
 // afterwards.
-func TestListenerFailureOrderingOwnedListener(t *testing.T) {
+func TestListenerFailureOrdering(t *testing.T) {
 	tests := map[string]struct {
 		run func(t *testing.T)
 	}{

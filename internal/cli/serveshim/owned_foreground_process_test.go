@@ -153,13 +153,13 @@ func ownedRefusal(t *testing.T, home string) {
 	}
 }
 
-// TestForegroundSupervisorOwnedListener carries every assertion of the foreground supervisor test with the worker's
+// TestForegroundSupervisor carries every assertion of the foreground supervisor test with the worker's
 // listener received from the supervisor: one readiness line, an independent control token per state root, the
 // guardian's and the worker's records and their modes, raw Host results, the health rewrite, stdout and log
 // separation, a clean liveness end of file, and the lifecycle sequence and its fields. Only the worker listener's
 // source changes: the worker serves on the listener it inherited, so its port is the supervisor's reservation, which
 // no other program can bind while the worker runs.
-func TestForegroundSupervisorOwnedListener(t *testing.T) {
+func TestForegroundSupervisor(t *testing.T) {
 	tokens := make(map[[sha256.Size]byte]bool)
 	tests := map[string]struct {
 		signal os.Signal

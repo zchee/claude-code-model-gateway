@@ -37,6 +37,7 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/lifecycle"
 	"github.com/zchee/claude-code-model-gateway/internal/paths"
 	"github.com/zchee/claude-code-model-gateway/internal/supervisor"
+	"github.com/zchee/claude-code-model-gateway/internal/workerlink"
 )
 
 // Options supplies the command's environment, home lookup, child executable, version and output streams.
@@ -52,7 +53,8 @@ type Options struct {
 // Run serves until cancellation, an orderly stop, or a startup failure.
 //
 // It publishes the control token and its own pid record, binds the public listener, prints exactly one readiness line
-// on Stdout and starts the worker with the report and liveness pipes. SIGTERM, SIGINT and, under the test guard,
+// on Stdout and starts the worker with the report and liveness pipes and the listener and drain channel it reserved
+// for the worker's generation; the relay reaches the worker only through that listener. SIGTERM, SIGINT and, under the test guard,
 // the fixture channel's shutdown message stop it in order: the stop is recorded, the worker is disconnected and
 // awaited, then the listener closes (lib/commands.js:2547-2575,2895-2905). Run returns nil after an orderly stop and an
 // error when the supervisor stops with exit status 1. It prints only non-fatal diagnostics on Stderr; the caller
@@ -123,7 +125,7 @@ func Run(ctx context.Context, opts Options) error {
 		// The public listener would relay to itself, or the worker could never bind its port.
 		return samePortError(bound)
 	}
-	handler, err := supervisor.NewHandler(bound, s.port, token, opts.Version, s.pid)
+	handler, err := supervisor.NewLeaseRelay(bound, relayWorkers{s}, token, opts.Version, s.pid, nil, s.retireForDrain)
 	if err != nil {
 		return err
 	}
@@ -137,7 +139,8 @@ func Run(ctx context.Context, opts Options) error {
 	served := make(chan error, 1)
 	go func() { served <- supervisor.Serve(serveCtx, listener, handler) }()
 	_, _ = fmt.Fprintf(stdout, "model-gateway shim supervisor listening on 127.0.0.1:%d\n", bound)
-	s.startWorker()
+	// The first launch runs as one of the supervisor's tasks, so that a stop is acted on while it is under way.
+	s.tasks.Go(s.startWorker)
 
 	var stopErr error
 	signalName := ""
@@ -240,16 +243,26 @@ func (e environment) guarded() bool {
 	return sandbox || runner
 }
 
-// workerEnvironment removes the fixture channel and any inherited control settings, then adds the worker's own.
+// workerEnvironment removes the fixture channel and any inherited handoff settings, then adds the worker's own: its
+// reserved port, the report and liveness descriptors, the listener and drain channel descriptors and its generation.
 func (e environment) workerEnvironment(port int, generation string) []string {
-	drop := map[string]bool{"NODE_CHANNEL_FD": true, "MODEL_GATEWAY_CONTROL_FDS": true, "MODEL_GATEWAY_WORKER_GENERATION": true, "CODEX_GATEWAY_WORKER_PORT": true}
-	out := make([]string, 0, len(e.entries)+3)
+	drop := map[string]bool{
+		"NODE_CHANNEL_FD": true, "MODEL_GATEWAY_CONTROL_FDS": true, "MODEL_GATEWAY_WORKER_GENERATION": true, "CODEX_GATEWAY_WORKER_PORT": true,
+		workerlink.ListenerFDEnv: true, workerlink.DrainFDEnv: true,
+	}
+	out := make([]string, 0, len(e.entries)+5)
 	for _, entry := range e.entries {
 		if name, _, _ := strings.Cut(entry, "="); !drop[name] {
 			out = append(out, entry)
 		}
 	}
-	return append(out, "CODEX_GATEWAY_WORKER_PORT="+strconv.Itoa(port), "MODEL_GATEWAY_CONTROL_FDS=3,4", "MODEL_GATEWAY_WORKER_GENERATION="+generation)
+	return append(out,
+		"CODEX_GATEWAY_WORKER_PORT="+strconv.Itoa(port),
+		"MODEL_GATEWAY_CONTROL_FDS="+strconv.Itoa(workerlink.ReportFD)+","+strconv.Itoa(workerlink.LivenessFD),
+		workerlink.ListenerFDEnv+"="+strconv.Itoa(workerlink.ListenerFD),
+		workerlink.DrainFDEnv+"="+strconv.Itoa(workerlink.DrainFD),
+		"MODEL_GATEWAY_WORKER_GENERATION="+generation,
+	)
 }
 
 func newGeneration() string {

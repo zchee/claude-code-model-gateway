@@ -24,6 +24,7 @@ import (
 func main() {
 	os.Exit(cli.RunProcess(os.Args, os.Stdin, os.Stdout, os.Stderr, cli.Process{
 		Lookup: os.LookupEnv, Environ: os.Environ, Home: os.UserHomeDir, Cwd: physicalWorkingDir, Executable: os.Executable,
+		Exit: os.Exit,
 	}))
 }
 

@@ -19,6 +19,7 @@ package serveworker
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -28,19 +29,30 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/zchee/claude-code-model-gateway/internal/config"
+	"github.com/zchee/claude-code-model-gateway/internal/workerlink"
 )
 
-// controlDescriptors are the supervised worker's report and liveness pipes.
+// controlDescriptors are the supervised worker's report and liveness pipes and the listener and drain channel its
+// supervisor reserved for its generation.
 type controlDescriptors struct {
 	generation string
 	reportFile *os.File
 	live       *os.File
+	listener   net.Listener
+	drain      net.Conn
 	closeOnce  sync.Once
 }
 
-// supervisedDescriptors validates MODEL_GATEWAY_CONTROL_FDS. It returns nil when the worker is not supervised.
-// A descriptor that is missing, a standard stream, not a pipe or socket, or open in the wrong direction is an error:
-// the number may since have been reused by an unrelated descriptor, so it is never used on trust.
+// supervisedDescriptors validates and adopts the supervised handoff. It returns nil when the worker is not supervised:
+// MODEL_GATEWAY_CONTROL_FDS alone selects the supervised mode, the listener and drain settings never do.
+//
+// Every setting is checked before any descriptor is adopted: the report and liveness numbers as before, then the
+// generation, then the listener and drain numbers, which must be canonical decimal numbers above the standard
+// streams, distinct from each other and from the report and liveness numbers, open, and four different endpoints
+// rather than one endpoint under two numbers. A descriptor that fails these checks is never used on trust, as its
+// number may since have been reused by an unrelated descriptor, and there is no fallback to a listener of the worker's
+// own. Once all four are checked the worker owns them: a later failure, such as a listener of the wrong kind or at
+// another port, closes every one of them, the ones already imported included.
 func supervisedDescriptors(lookup config.LookupEnv) (*controlDescriptors, error) {
 	raw, ok := lookup(controlFDsKey)
 	if !ok {
@@ -65,16 +77,114 @@ func supervisedDescriptors(lookup config.LookupEnv) (*controlDescriptors, error)
 	if generation == "" {
 		return nil, fmt.Errorf("model-gateway: a supervised worker needs %s; refusing to start without its generation", generationKey)
 	}
-	reportFile, err := openDescriptor(report, "port report")
+	if _, err := reportLine(0, generation); err != nil {
+		return nil, err
+	}
+	listener, err := handoffNumber(lookup, workerlink.ListenerFDEnv, "listener")
 	if err != nil {
 		return nil, err
 	}
-	liveFile, err := openDescriptor(live, "parent liveness")
+	drain, err := handoffNumber(lookup, workerlink.DrainFDEnv, "drain channel")
 	if err != nil {
-		_ = reportFile.Close()
 		return nil, err
 	}
-	return &controlDescriptors{generation: generation, reportFile: reportFile, live: liveFile}, nil
+	slots := []handoffSlot{{"report", report}, {"liveness", live}, {"listener", listener}, {"drain channel", drain}}
+	if err := distinctSlots(slots); err != nil {
+		return nil, err
+	}
+	port, err := workerPort(lookup)
+	if err != nil {
+		return nil, err
+	}
+	if port == 0 {
+		return nil, errors.New("model-gateway: a supervised worker needs CODEX_GATEWAY_WORKER_PORT, the port of the listener its supervisor reserved")
+	}
+
+	// From here on the four descriptors are the worker's: every path below closes each of them or hands it on. The
+	// imports consume their file on success and on failure alike.
+	c := &controlDescriptors{generation: generation}
+	closeRaw := func(fds ...int) {
+		for _, fd := range fds {
+			_ = unix.Close(fd)
+		}
+	}
+	if c.reportFile, err = openDescriptor(report, "port report"); err != nil {
+		closeRaw(report, live, listener, drain)
+		return nil, err
+	}
+	if c.live, err = openDescriptor(live, "parent liveness"); err != nil {
+		c.close()
+		closeRaw(live, listener, drain)
+		return nil, err
+	}
+	if c.listener, err = workerlink.ImportListener(os.NewFile(uintptr(listener), "inherited listener"), uint16(port)); err != nil {
+		c.close()
+		closeRaw(drain)
+		return nil, fmt.Errorf("model-gateway: the inherited listener descriptor %d is unusable: %w", listener, err)
+	}
+	if c.drain, err = workerlink.ImportDrainChannel(os.NewFile(uintptr(drain), "inherited drain channel")); err != nil {
+		c.close()
+		return nil, fmt.Errorf("model-gateway: the inherited drain channel descriptor %d is unusable: %w", drain, err)
+	}
+	return c, nil
+}
+
+// handoffSlot is one descriptor of the supervised handoff with the role a diagnostic names it by.
+type handoffSlot struct {
+	role string
+	fd   int
+}
+
+// handoffNumber parses the descriptor number one handoff setting names: a canonical unsigned decimal number above the
+// standard streams.
+func handoffNumber(lookup config.LookupEnv, name, role string) (int, error) {
+	spelling, ok := lookup(name)
+	if !ok {
+		return 0, fmt.Errorf("model-gateway: a supervised worker needs %s; the inherited %s descriptor is missing", name, role)
+	}
+	fd, err := strconv.Atoi(spelling)
+	if err != nil || fd < 0 || strconv.Itoa(fd) != spelling {
+		return 0, fmt.Errorf("model-gateway: %s has a malformed %s descriptor %q; want an unsigned decimal number", name, role, spelling)
+	}
+	if fd <= 2 {
+		return 0, fmt.Errorf("model-gateway: %s names standard stream %d as the %s descriptor; the worker never uses stdin, stdout or stderr for it", name, fd, role)
+	}
+	return fd, nil
+}
+
+// distinctSlots refuses a handoff in which two roles share a descriptor number or two numbers refer to one endpoint,
+// judged by the device and inode fstat reports. Linux gives every socket an inode of its own, and both ends of one
+// pipe share theirs, so a duplicate under another number is found. macOS gives each pipe end and each local socket
+// its own inode, but reports device and inode zero for every IP socket (xnu bsd/kern/sys_socket.c soo_stat,
+// bsd/kern/uipc_socket2.c pru_sense_null): there two IP sockets always compare equal. A valid handoff has two pipes,
+// one TCP listener and one local socket, which compare distinct on both systems; only a handoff that passes an IP
+// socket in a second role is refused there as an alias, which it is unless it is a second TCP socket, itself invalid.
+func distinctSlots(slots []handoffSlot) error {
+	type identity struct {
+		dev uint64
+		ino uint64
+	}
+	ids := make([]identity, len(slots))
+	for i, s := range slots {
+		for _, other := range slots[:i] {
+			if other.fd == s.fd {
+				return fmt.Errorf("model-gateway: the %s and %s settings name the same descriptor %d", other.role, s.role, s.fd)
+			}
+		}
+		var st unix.Stat_t
+		if err := unix.Fstat(s.fd, &st); err != nil {
+			return fmt.Errorf("model-gateway: the %s descriptor %d is unusable: %w", s.role, s.fd, err)
+		}
+		ids[i] = identity{uint64(st.Dev), uint64(st.Ino)} //nolint:gosec,unconvert // Stat_t.Dev is signed on some platforms.
+	}
+	for i, s := range slots {
+		for j, other := range slots[:i] {
+			if ids[j] == ids[i] {
+				return fmt.Errorf("model-gateway: the %s descriptor %d and the %s descriptor %d are the same endpoint under two numbers", other.role, other.fd, s.role, s.fd)
+			}
+		}
+	}
+	return nil
 }
 
 // descriptor parses and checks one inherited descriptor. access is the direction the worker uses it in.
@@ -113,7 +223,10 @@ func checkDescriptor(fd, access int) error {
 // openDescriptor takes ownership of a checked descriptor. It is made close-on-exec and non-blocking, so that closing
 // the returned file ends a read that is waiting on it.
 func openDescriptor(fd int, name string) (*os.File, error) {
+	// Marked with forks locked out, so that no process this one starts meanwhile inherits it.
+	syscall.ForkLock.RLock()
 	unix.CloseOnExec(fd)
+	syscall.ForkLock.RUnlock()
 	if err := unix.SetNonblock(fd, true); err != nil {
 		return nil, fmt.Errorf("model-gateway: could not prepare the %s descriptor %d: %w", name, fd, err)
 	}
@@ -135,10 +248,20 @@ func (c *controlDescriptors) report(port int) error {
 	return nil
 }
 
+// close closes every descriptor of the handoff that is still open; the listener is closed by its servers first.
 func (c *controlDescriptors) close() {
 	c.closeOnce.Do(func() {
-		_ = c.reportFile.Close()
-		_ = c.live.Close()
+		for _, f := range []*os.File{c.reportFile, c.live} {
+			if f != nil {
+				_ = f.Close()
+			}
+		}
+		if c.listener != nil {
+			_ = c.listener.Close()
+		}
+		if c.drain != nil {
+			_ = c.drain.Close()
+		}
 	})
 }
 
@@ -181,4 +304,88 @@ func errorCode(err error) string {
 		}
 	}
 	return err.Error()
+}
+
+// acceptQueued accepts the connections already queued on ln through its descriptor, which is non-blocking, until the
+// accept would block. It never waits for a connection, ignores the listener's deadline and changes nothing about the
+// listening socket, which the supervisor's copy shares. An immediate stop (now closed) is checked before every accept;
+// it ends the sweep and closes what the sweep took.
+func acceptQueued(ln net.Listener, now <-chan struct{}) ([]net.Conn, error) {
+	sc, ok := ln.(syscall.Conn)
+	if !ok {
+		return nil, errors.New("the worker's listener has no descriptor for its final sweep")
+	}
+	raw, err := sc.SyscallConn()
+	if err != nil {
+		return nil, err
+	}
+	var conns []net.Conn
+	var acceptErr error
+	controlErr := raw.Control(func(fd uintptr) {
+		for {
+			select {
+			case <-now:
+				for _, conn := range conns {
+					_ = conn.Close()
+				}
+				conns = nil
+				return
+			default:
+			}
+			// The accepted descriptor is marked close-on-exec with forks locked out, as no process this one starts may
+			// inherit it.
+			syscall.ForkLock.RLock()
+			n, _, err := unix.Accept(int(fd))
+			if err == nil {
+				unix.CloseOnExec(n)
+			}
+			syscall.ForkLock.RUnlock()
+			switch {
+			case errors.Is(err, unix.EINTR) || errors.Is(err, unix.ECONNABORTED):
+				continue
+			case errors.Is(err, unix.EAGAIN):
+				return
+			case err != nil:
+				acceptErr = os.NewSyscallError("accept", err)
+				return
+			}
+			f := os.NewFile(uintptr(n), "swept connection")
+			conn, err := net.FileConn(f)
+			_ = f.Close()
+			if err != nil {
+				acceptErr = err
+				return
+			}
+			conns = append(conns, conn)
+		}
+	})
+	return conns, errors.Join(controlErr, acceptErr)
+}
+
+// parentEnded reports, without waiting, whether the liveness pipe reached end of file. It reads the non-blocking
+// descriptor directly until the read would block or ends: the supervisor writes nothing there that the worker uses,
+// end of file stays end of file for a watcher reading the pipe at the same time, and the direct read does not wait
+// for the watcher's read. A descriptor that cannot be read counts as ended.
+func parentEnded(live *os.File) bool {
+	raw, err := live.SyscallConn()
+	if err != nil {
+		return true
+	}
+	ended := true
+	_ = raw.Control(func(fd uintptr) {
+		var buf [512]byte
+		for {
+			n, err := unix.Read(int(fd), buf[:])
+			switch {
+			case errors.Is(err, unix.EINTR):
+				continue
+			case errors.Is(err, unix.EAGAIN):
+				ended = false
+				return
+			case err != nil || n == 0:
+				return
+			}
+		}
+	})
+	return ended
 }
