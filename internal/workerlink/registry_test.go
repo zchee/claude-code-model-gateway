@@ -132,13 +132,15 @@ func (r *recordingDials) checkNetworks(t *testing.T) {
 func acquire(t *testing.T, src workerlink.Source, exclude workerlink.Generation) workerlink.Lease {
 	t.Helper()
 	lease, err := src.Acquire(t.Context(), exclude)
+	if lease != nil {
+		t.Cleanup(func() { _ = lease.Close() })
+	}
 	if err != nil {
 		t.Fatalf("Acquire(%q): %v", exclude, err)
 	}
 	if lease == nil {
 		t.Fatalf("Acquire(%q) returned no lease", exclude)
 	}
-	t.Cleanup(func() { _ = lease.Close() })
 	return lease
 }
 
@@ -192,7 +194,7 @@ func TestReserveBindsLoopbackListener(t *testing.T) {
 			if !ok {
 				t.Fatalf("bound listener %T exposes no descriptor", bound[0])
 			}
-			want := socketKind{Family: "127.0.0.1", Type: unix.SOCK_STREAM, Listening: true, Port: int(got)}
+			want := socketKind{Family: "127.0.0.1", Type: unix.SOCK_STREAM, Listening: wantListening(true), Port: int(got)}
 			if diff := gocmp.Diff(want, describeSocket(t, sc)); diff != "" {
 				t.Errorf("the reserved socket (-want +got):\n%s", diff)
 			}
@@ -204,9 +206,11 @@ func TestReserveBindsLoopbackListener(t *testing.T) {
 }
 
 // TestReserveRefuses checks that a failed bind gives no reservation and reports its cause, that an occupied fixed
-// port is refused rather than shared, and that a listener the listen function returns for another endpoint than
-// the requested one (not the IPv4 loopback, or not the requested fixed port) is refused and closed. A refusal
-// leaves nothing eligible. The error of a wrong-endpoint refusal is not decided here.
+// port is refused rather than shared, that a listener the listen function returns for another endpoint than the
+// requested one (any address other than exactly 127.0.0.1, also another loopback address, not the requested fixed
+// port, or port zero) is refused and closed, and that a reservation whose drain channel pair cannot be created is
+// rolled back: its listener is closed and a Reserve of the same generation then succeeds. A refusal leaves nothing
+// eligible. The error of a wrong-endpoint refusal and of a pair failure is not decided here.
 func TestReserveRefuses(t *testing.T) {
 	errListen := errors.New("listen failed")
 	// wrongEndpoint returns a listen function that hands over a fake listener at addr for any call.
@@ -217,11 +221,15 @@ func TestReserveRefuses(t *testing.T) {
 		}
 	}
 	tests := map[string]struct {
-		port   uint16
+		port uint16
+		// listen returns the listen function and the fake listener it hands over, if any; nil binds fake listeners
+		// on the requested ports.
 		listen func(t *testing.T) (workerlink.ListenFunc, *fakeListener)
 		// occupied binds the requested port first and keeps it.
 		occupied bool
-		want     error
+		// pairFails makes the creation of the reservation's drain channel pair fail.
+		pairFails bool
+		want      error
 	}{
 		"error: listen fails": {
 			listen: func(*testing.T) (workerlink.ListenFunc, *fakeListener) {
@@ -241,6 +249,20 @@ func TestReserveRefuses(t *testing.T) {
 		"error: listener on the wildcard address for a selected port": {
 			listen: wrongEndpoint(&net.TCPAddr{IP: net.IPv4zero, Port: 41001}),
 		},
+		"error: listener on another loopback address": {
+			port:   41001,
+			listen: wrongEndpoint(&net.TCPAddr{IP: net.IPv4(127, 0, 0, 2), Port: 41001}),
+		},
+		"error: listener on another loopback address for a selected port": {
+			listen: wrongEndpoint(&net.TCPAddr{IP: net.IPv4(127, 0, 0, 2), Port: 41001}),
+		},
+		"error: listener that reports port zero for a selected port": {
+			listen: wrongEndpoint(&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}),
+		},
+		"error: drain channel pair cannot be created": {
+			port:      41001,
+			pairFails: true,
+		},
 		"error: listener on the IPv6 loopback": {
 			port:   41001,
 			listen: wrongEndpoint(&net.TCPAddr{IP: net.IPv6loopback, Port: 41001}),
@@ -256,12 +278,22 @@ func TestReserveRefuses(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			listen, fake := tt.listen(t)
+			listens := newFakeListens()
+			var listen workerlink.ListenFunc = listens.listen
+			var fake *fakeListener
+			if tt.listen != nil {
+				listen, fake = tt.listen(t)
+			}
 			port := tt.port
 			if tt.occupied {
 				port = tcpPort(t, listenTCP(t, "tcp4", "127.0.0.1:0").Addr())
 			}
 			reg := workerlink.NewRegistry(listen, realDial)
+			fail := 0
+			if tt.pairFails {
+				fail = 1
+			}
+			pairs := newDrainPairs(t, reg, false, fail)
 			res, err := reg.Reserve(t.Context(), "gen-a", port)
 			if res != nil {
 				_ = res.End()
@@ -277,7 +309,27 @@ func TestReserveRefuses(t *testing.T) {
 				t.Error("the refused listener was left open")
 			}
 			if lease, err := reg.Acquire(t.Context(), ""); lease != nil || !errors.Is(err, workerlink.ErrUnavailable) {
+				if lease != nil {
+					_ = lease.Close()
+				}
 				t.Errorf("Acquire after a refused Reserve = %v, %v; want %v", lease, err, workerlink.ErrUnavailable)
+			}
+			if !tt.pairFails {
+				return
+			}
+			if pairs.count() == 0 {
+				t.Fatal("Reserve never created its drain channel pair through the registry's factory")
+			}
+			// Whether the listener was bound before the pair failed is the implementation's; one it got is closed.
+			listens.mu.Lock()
+			got := listens.listeners[loopback(port)]
+			listens.mu.Unlock()
+			if got != nil && !isClosed(got.closed) {
+				t.Error("the listener of the rolled-back reservation was left open")
+			}
+			retry := reserve(t, reg, "gen-a", port)
+			if retry.Port() != port {
+				t.Errorf("Port() of the retried reservation = %d, want %d", retry.Port(), port)
 			}
 		})
 	}
@@ -328,7 +380,7 @@ func TestFileIsIndependentDuplicate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("File: %v", err)
 	}
-	want := socketKind{Family: "127.0.0.1", Type: unix.SOCK_STREAM, Listening: true, Port: int(port)}
+	want := socketKind{Family: "127.0.0.1", Type: unix.SOCK_STREAM, Listening: wantListening(true), Port: int(port)}
 	if diff := gocmp.Diff(want, describeSocket(t, f)); diff != "" {
 		t.Errorf("duplicate (-want +got):\n%s", diff)
 	}
@@ -448,6 +500,9 @@ func TestLeaseReachesItsGeneration(t *testing.T) {
 		t.Fatalf("End gen-b: %v", err)
 	}
 	if lease, err := reg.Acquire(t.Context(), ""); err == nil || lease != nil {
+		if lease != nil {
+			_ = lease.Close()
+		}
 		t.Fatalf("Acquire with both generations ended = %v, %v; want no lease", lease, err)
 	}
 	if diff := gocmp.Diff(wantDials, dials.addresses()); diff != "" {

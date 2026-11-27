@@ -53,7 +53,12 @@ type Source interface {
 }
 
 // Registry holds the reservations of the worker generations and gives leases to the eligible one.
-type Registry struct{}
+type Registry struct {
+	// drainPair creates the drain channel pair of each reservation: the parent's connection and the child's file.
+	// It is newDrainPair unless the package's own tests replace it, so that they can make one pair fail or watch
+	// the parent's writes.
+	drainPair func() (parent net.Conn, child *os.File, err error)
+}
 
 // Reservation is the supervisor's retained listener and drain channel for one worker generation.
 type Reservation struct{}

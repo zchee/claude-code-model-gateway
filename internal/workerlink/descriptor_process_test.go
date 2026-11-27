@@ -20,14 +20,14 @@ import (
 	json "encoding/json/v2"
 	"errors"
 	"fmt"
+	"net"
 	"os"
-	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
 	gocmp "github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"golang.org/x/sys/unix"
 
 	"github.com/zchee/claude-code-model-gateway/internal/gatewaytest"
@@ -36,19 +36,19 @@ import (
 
 // The tests in this file start a child process through gatewaytest. A descriptor of this process that is not
 // close-on-exec is inherited by that child, so the sockets the child finds open are the ones that would leak into
-// the children of a supervisor or of a worker. The child also isolates checks that change process-wide state
-// (the descriptor limit) or count every descriptor of the process.
+// the children of a supervisor or of a worker. The child also isolates checks that read the set of every descriptor
+// of the process.
 
 // helperLinePrefix marks the lines a helper reports; the rest of its output is the test framework's.
 const helperLinePrefix = "workerlink-helper: "
 
-// inheritedSocket is one socket descriptor the child found open.
+// inheritedSocket is one socket descriptor the child found open. Its listening state is not recorded: macOS does
+// not answer that question (see listeningOf), so a listener is identified by its family and bound port.
 type inheritedSocket struct {
-	FD        int    `json:"fd"`
-	Family    string `json:"family,omitzero"`
-	Type      int    `json:"type,omitzero"`
-	Listening bool   `json:"listening,omitzero"`
-	Port      int    `json:"port,omitzero"`
+	FD     int    `json:"fd"`
+	Family string `json:"family,omitzero"`
+	Type   int    `json:"type,omitzero"`
+	Port   int    `json:"port,omitzero"`
 	// Pending is what is queued for reading on the socket, peeked without consuming it.
 	Pending string `json:"pending,omitzero"`
 }
@@ -56,8 +56,9 @@ type inheritedSocket struct {
 func TestGatewayFixtureHelper(t *testing.T) {
 	gatewaytest.DispatchHelper(t, map[string]gatewaytest.HelperFunc{
 		"inherited-sockets":   inheritedSocketsHelper,
+		"descriptor-sets":     descriptorSetsHelper,
 		"reserve-descriptors": reserveDescriptorsHelper,
-		"descriptor-limit":    descriptorLimitHelper,
+		"reserve-rollback":    reserveRollbackHelper,
 	})
 }
 
@@ -78,28 +79,39 @@ func report(t *testing.T, format string, args ...any) {
 	}
 }
 
-// inheritedSocketsHelper reports every socket descriptor open in the child.
+// nothingToRead reports whether a failed peek means only that the socket has nothing to read: EAGAIN for a socket
+// with an empty queue; ENOTCONN for a TCP socket that is listening or not connected (Linux tcp(7) receive; macOS
+// soreceive, xnu bsd/kern/uipc_socket.c:3470-3472); EINVAL for a local stream socket that is listening or not
+// connected (Linux unix_stream_recvmsg).
+func nothingToRead(err error) bool {
+	return errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.ENOTCONN) || errors.Is(err, unix.EINVAL)
+}
+
+// inheritedSocketsHelper reports every socket descriptor open in the child. Any inspection that fails for another
+// reason than the ones nothingToRead names fails the helper, so that a socket cannot hide behind an error.
 func inheritedSocketsHelper(tb testing.TB, _ []string) {
 	t := helperT(tb)
-	entries, err := os.ReadDir("/dev/fd")
+	fds, err := openDescriptors()
 	if err != nil {
-		t.Fatalf("read /dev/fd: %v", err)
+		t.Fatalf("descriptors: %v", err)
 	}
-	for _, entry := range entries {
-		fd, err := strconv.Atoi(entry.Name())
-		if err != nil {
-			continue
-		}
+	for _, fd := range fds {
 		var st unix.Stat_t
-		// The directory ReadDir read through is closed again; any descriptor that is gone is skipped.
-		if err := unix.Fstat(fd, &st); err != nil || st.Mode&unix.S_IFMT != unix.S_IFSOCK {
+		if err := unix.Fstat(fd, &st); err != nil {
+			t.Fatalf("fstat %d: %v", fd, err)
+		}
+		if st.Mode&unix.S_IFMT != unix.S_IFSOCK {
 			continue
 		}
 		s := inheritedSocket{FD: fd}
-		s.Type, _ = unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_TYPE)
-		listening, _ := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_ACCEPTCONN)
-		s.Listening = listening != 0
-		switch sa, _ := unix.Getsockname(fd); sa := sa.(type) {
+		if s.Type, err = unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_TYPE); err != nil {
+			t.Fatalf("SO_TYPE of %d: %v", fd, err)
+		}
+		sa, err := unix.Getsockname(fd)
+		if err != nil {
+			t.Fatalf("getsockname of %d: %v", fd, err)
+		}
+		switch sa := sa.(type) {
 		case *unix.SockaddrInet4:
 			s.Family, s.Port = "inet4", sa.Port
 		case *unix.SockaddrInet6:
@@ -109,11 +121,12 @@ func inheritedSocketsHelper(tb testing.TB, _ []string) {
 		default:
 			s.Family = "other"
 		}
-		if !s.Listening {
-			buf := make([]byte, 256)
-			if n, _, err := unix.Recvfrom(fd, buf, unix.MSG_PEEK|unix.MSG_DONTWAIT); err == nil && n > 0 {
-				s.Pending = string(buf[:n])
-			}
+		buf := make([]byte, 256)
+		switch n, _, err := unix.Recvfrom(fd, buf, unix.MSG_PEEK|unix.MSG_DONTWAIT); {
+		case err == nil:
+			s.Pending = string(buf[:n])
+		case !nothingToRead(err):
+			t.Fatalf("peek of %d: %v", fd, err)
 		}
 		line, err := json.Marshal(s)
 		if err != nil {
@@ -123,51 +136,78 @@ func inheritedSocketsHelper(tb testing.TB, _ []string) {
 	}
 }
 
-// descriptorBalance runs one reservation cycle and returns how many more descriptors are open after it than
-// before it.
-func descriptorBalance(t *testing.T, cycle func()) int {
+// descriptorChangeOf reads the open descriptors before and after fn.
+func descriptorChangeOf(t *testing.T, fn func()) descriptorChange {
 	t.Helper()
-	before, err := countOpenDescriptors()
+	before, err := openDescriptors()
 	if err != nil {
-		t.Fatalf("count: %v", err)
+		t.Fatalf("descriptors: %v", err)
 	}
-	cycle()
-	after, err := countOpenDescriptors()
+	fn()
+	after, err := openDescriptors()
 	if err != nil {
-		t.Fatalf("count: %v", err)
+		t.Fatalf("descriptors: %v", err)
 	}
-	return after - before
+	return changeBetween(before, after)
 }
 
-// reserveDescriptorsHelper reports the descriptor balance of reservation cycles that end with End: one that
-// takes nothing, one that takes both transfer files and closes them, and one that is published and leased.
+// descriptorSetsHelper reports what the child's descriptor sets show for nothing, for a file kept open, for the
+// file closed again, and for a socket pair kept open.
+func descriptorSetsHelper(tb testing.TB, _ []string) {
+	t := helperT(tb)
+	report(t, "nothing: %v", descriptorChangeOf(t, func() {}))
+	var f *os.File
+	opened := descriptorChangeOf(t, func() {
+		var err error
+		if f, err = os.Open(os.DevNull); err != nil {
+			t.Fatalf("open: %v", err)
+		}
+	})
+	report(t, "an open file adds its number: %t", gocmp.Equal(descriptorChange{Opened: []int{int(f.Fd())}, Closed: []int{}}, opened))
+	closed := descriptorChangeOf(t, func() { _ = f.Close() })
+	report(t, "closing it removes that number: %t", gocmp.Equal(descriptorChange{Opened: []int{}, Closed: opened.Opened}, closed))
+	var a, b *os.File
+	pair := descriptorChangeOf(t, func() { a, b = socketPair(t, unix.SOCK_STREAM) })
+	report(t, "a socket pair adds its two numbers: %t", gocmp.Equal(descriptorChange{Opened: []int{int(a.Fd()), int(b.Fd())}, Closed: []int{}}, pair, cmpopts.SortSlices(func(x, y int) bool { return x < y })))
+}
+
+// reserveDescriptorsHelper reports how the descriptor set changes across reservation cycles that end with End:
+// one that takes nothing, one that takes both transfer files and closes them, and one that is published and leased.
 func reserveDescriptorsHelper(tb testing.TB, _ []string) {
 	t := helperT(tb)
 	reg := workerlink.NewRegistry(realListen, realDial)
 	cycle := func(generation workerlink.Generation, take func(res *workerlink.Reservation)) func() {
 		return func() {
 			res, err := reg.Reserve(t.Context(), generation, 0)
+			if res != nil {
+				defer func() {
+					if err := res.End(); err != nil {
+						t.Fatalf("End %s: %v", generation, err)
+					}
+				}()
+			}
 			if err != nil {
 				t.Fatalf("Reserve %s: %v", generation, err)
 			}
 			take(res)
-			if err := res.End(); err != nil {
-				t.Fatalf("End %s: %v", generation, err)
-			}
 		}
 	}
 	untaken := func(*workerlink.Reservation) {}
 	taken := func(res *workerlink.Reservation) {
 		f, err := res.File()
+		if f != nil {
+			_ = f.Close()
+		}
 		if err != nil {
 			t.Fatalf("File: %v", err)
 		}
-		_ = f.Close()
 		_, child, err := res.DrainChannel()
+		if child != nil {
+			_ = child.Close()
+		}
 		if err != nil {
 			t.Fatalf("DrainChannel: %v", err)
 		}
-		_ = child.Close()
 	}
 	leased := func(res *workerlink.Reservation) {
 		taken(res)
@@ -175,111 +215,67 @@ func reserveDescriptorsHelper(tb testing.TB, _ []string) {
 			t.Fatalf("Publish: %v", err)
 		}
 		lease, err := reg.Acquire(t.Context(), "")
+		if lease != nil {
+			_ = lease.Close()
+		}
 		if err != nil {
 			t.Fatalf("Acquire: %v", err)
 		}
-		_ = lease.Close()
 		res.Retire()
 	}
 	// The first cycle opens whatever the runtime opens once, such as the network poller.
 	cycle("warm-up", leased)()
-	report(t, "untaken %d", descriptorBalance(t, cycle("untaken", untaken)))
-	report(t, "taken %d", descriptorBalance(t, cycle("taken", taken)))
-	report(t, "leased %d", descriptorBalance(t, cycle("leased", leased)))
+	report(t, "untaken %v", descriptorChangeOf(t, cycle("untaken", untaken)))
+	report(t, "taken %v", descriptorChangeOf(t, cycle("taken", taken)))
+	report(t, "leased %v", descriptorChangeOf(t, cycle("leased", leased)))
 }
 
-// lowerDescriptorLimit sets the soft descriptor limit to the lowest free descriptor number, so that no further
-// descriptor can be opened, and returns the function that restores the limit.
-func lowerDescriptorLimit(t *testing.T) func() {
-	t.Helper()
-	var limit syscall.Rlimit
-	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &limit); err != nil {
-		t.Fatalf("getrlimit: %v", err)
-	}
-	lowest, err := unix.Dup(0)
-	if err != nil {
-		t.Fatalf("dup: %v", err)
-	}
-	_ = unix.Close(lowest)
-	lowered := limit
-	lowered.Cur = uint64(lowest)
-	if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &lowered); err != nil {
-		t.Fatalf("setrlimit: %v", err)
-	}
-	return func() {
-		if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &limit); err != nil {
-			t.Fatalf("restoring the descriptor limit: %v", err)
-		}
-	}
-}
-
-func probeSocketPair() error {
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
-	if err == nil {
-		_ = unix.Close(fds[0])
-		_ = unix.Close(fds[1])
-	}
-	return err
-}
-
-// descriptorLimitHelper runs with the descriptor limit lowered so that no socket pair can be created. With the
-// argument "probe" it only reports that the limit does that and that restoring it undoes it; with "reserve" it
-// reports what a Reserve whose listener needs no descriptor does when its socket pair cannot be created.
-func descriptorLimitHelper(tb testing.TB, args []string) {
+// reserveRollbackHelper reports what a Reserve does when the creation of its drain channel pair fails, after a
+// warm-up cycle: the descriptor set across the failed Reserve, whether a listener it got was left open, whether
+// anything became eligible, and whether a Reserve of the same generation then succeeds.
+func reserveRollbackHelper(tb testing.TB, _ []string) {
 	t := helperT(tb)
-	if len(args) != 1 || (args[0] != "probe" && args[0] != "reserve") {
-		t.Fatalf("descriptor-limit arguments %q, want probe or reserve", args)
-	}
-	if args[0] == "probe" {
-		restore := lowerDescriptorLimit(t)
-		lowered := probeSocketPair()
-		restore()
-		report(t, "limit refuses a socket pair: %t", errors.Is(lowered, unix.EMFILE))
-		report(t, "restored limit allows a socket pair: %t", probeSocketPair() == nil)
-		return
-	}
-	listens := newFakeListens()
+	listens := newRecordingListens()
 	reg := workerlink.NewRegistry(listens.listen, realDial)
-	warm, err := reg.Reserve(t.Context(), "warm-up", 41001)
+	pairs := newDrainPairs(t, reg, false, 2)
+	warm, err := reg.Reserve(t.Context(), "warm-up", 0)
+	if warm != nil {
+		defer func() { _ = warm.End() }()
+	}
 	if err != nil {
 		t.Fatalf("Reserve warm-up: %v", err)
 	}
 	if err := warm.End(); err != nil {
 		t.Fatalf("End warm-up: %v", err)
 	}
-	before, err := countOpenDescriptors()
-	if err != nil {
-		t.Fatalf("count: %v", err)
-	}
-	restore := lowerDescriptorLimit(t)
-	refused := errors.Is(probeSocketPair(), unix.EMFILE)
-	res, err := reg.Reserve(t.Context(), "gen-a", 41002)
-	restore()
-	report(t, "limit refuses a socket pair: %t", refused)
-	report(t, "reservation returned: %t", res != nil)
-	report(t, "reserve failed: %t", err != nil)
+	var res *workerlink.Reservation
+	change := descriptorChangeOf(t, func() { res, err = reg.Reserve(t.Context(), "gen-a", 0) })
 	if res != nil {
 		_ = res.End()
 	}
-	listens.mu.Lock()
-	l := listens.listeners[loopback(41002)]
-	listens.mu.Unlock()
-	report(t, "listener left open: %t", l != nil && !isClosed(l.closed))
+	report(t, "the failing pair was asked for: %t", pairs.count() == 2)
+	report(t, "reservation returned: %t", res != nil)
+	report(t, "reserve failed: %t", err != nil)
+	report(t, "descriptors %v", change)
+	// A listener the failed Reserve bound must already be closed: closing it again fails.
+	_, bound := listens.snapshot()
+	left := false
+	for _, l := range bound[1:] {
+		if err := l.Close(); !errors.Is(err, net.ErrClosed) {
+			left = true
+		}
+	}
+	report(t, "listener left open: %t", left)
 	lease, err := reg.Acquire(t.Context(), "")
-	report(t, "acquire unavailable: %t", lease == nil && errors.Is(err, workerlink.ErrUnavailable))
 	if lease != nil {
 		_ = lease.Close()
 	}
-	after, err := countOpenDescriptors()
-	if err != nil {
-		t.Fatalf("count: %v", err)
-	}
-	report(t, "descriptors left open: %d", after-before)
-	retry, err := reg.Reserve(t.Context(), "gen-a", 41002)
-	report(t, "reserve after the limit is restored: %t", err == nil && retry != nil)
+	report(t, "acquire unavailable: %t", lease == nil && errors.Is(err, workerlink.ErrUnavailable))
+	retry, err := reg.Reserve(t.Context(), "gen-a", 0)
 	if retry != nil {
 		_ = retry.End()
 	}
+	report(t, "reserve after the failure: %t", err == nil && retry != nil)
 }
 
 // runHelper runs a helper in a child process and returns the lines it reported.
@@ -353,13 +349,13 @@ func holdLowDescriptors(t *testing.T) {
 	}
 }
 
-// leakedInto describes which of the test's marks the child found: a listening IPv4 socket on a port, or a socket
-// with a tag queued for reading.
+// leakedInto describes which of the test's marks the child found: an IPv4 socket bound to the port of the test's
+// isolated listener (identified by its port, in any state), or a socket with a tag queued for reading.
 func leakedInto(sockets []inheritedSocket, port int, tag string) []string {
 	var found []string
 	for _, s := range sockets {
-		if port != 0 && s.Listening && s.Family == "inet4" && s.Port == port {
-			found = append(found, fmt.Sprintf("descriptor %d listening on port %d", s.FD, port))
+		if port != 0 && s.Family == "inet4" && s.Port == port {
+			found = append(found, fmt.Sprintf("descriptor %d bound to port %d", s.FD, port))
 		}
 		if tag != "" && strings.Contains(s.Pending, tag) {
 			found = append(found, fmt.Sprintf("descriptor %d with %q queued", s.FD, tag))
@@ -401,11 +397,16 @@ func TestFixtureChildSeesInheritedSockets(t *testing.T) {
 	}
 }
 
-// TestFixtureChildDescriptorLimit checks the lowered descriptor limit the rollback check relies on: it refuses a
-// socket pair, and restoring it allows one again.
-func TestFixtureChildDescriptorLimit(t *testing.T) {
-	want := []string{"limit refuses a socket pair: true", "restored limit allows a socket pair: true"}
-	if diff := gocmp.Diff(want, runHelper(t, "descriptor-limit", "probe")); diff != "" {
+// TestFixtureChildDescriptorSets checks the descriptor sets the balance checks of the child rely on: nothing done
+// changes nothing, an open file adds exactly its number and closing it removes it, and a socket pair adds its two.
+func TestFixtureChildDescriptorSets(t *testing.T) {
+	want := []string{
+		"nothing: {[] []}",
+		"an open file adds its number: true",
+		"closing it removes that number: true",
+		"a socket pair adds its two numbers: true",
+	}
+	if diff := gocmp.Diff(want, runHelper(t, "descriptor-sets")); diff != "" {
 		t.Errorf("helper report (-want +got):\n%s", diff)
 	}
 }
@@ -484,30 +485,32 @@ func TestImportedDescriptorsNotInherited(t *testing.T) {
 }
 
 // TestReserveReleasesEveryDescriptor checks, in a child process where nothing else opens descriptors, that a
-// reservation ended with End leaves no descriptor open: not when nothing was taken (End closes the untransferred
-// child end), not when both transfer files were taken and closed, and not after publication and a lease.
+// reservation ended with End leaves the set of open descriptors as it found it: not when nothing was taken (End
+// closes the untransferred child end), not when both transfer files were taken and closed, and not after
+// publication and a lease. The sets are compared, not counted, so that a leak cannot be offset by another closure.
 func TestReserveReleasesEveryDescriptor(t *testing.T) {
-	want := []string{"untaken 0", "taken 0", "leased 0"}
+	want := []string{"untaken {[] []}", "taken {[] []}", "leased {[] []}"}
 	if diff := gocmp.Diff(want, runHelper(t, "reserve-descriptors")); diff != "" {
-		t.Errorf("descriptors left open after End, per cycle (-want +got):\n%s", diff)
+		t.Errorf("descriptor changes across End, per cycle (-want +got):\n%s", diff)
 	}
 }
 
-// TestReserveRollsBackWhenPairFails checks a Reserve whose drain channel cannot be created, because the child's
-// descriptor limit leaves no room for a socket pair: it fails, returns no reservation, closes a listener it got,
-// leaves no descriptor open and nothing eligible, and a Reserve of the same generation succeeds once the limit is
-// restored. Which error it returns is not decided here.
+// TestReserveRollsBackWhenPairFails checks a Reserve whose drain channel pair cannot be created, through the
+// registry's pair factory made to fail for that one reservation, in a child process: the Reserve reaches the
+// failing factory, fails, returns no reservation, leaves the descriptor set as it was (its listener, bound for real,
+// is closed), leaves nothing eligible, and a Reserve of the same generation then succeeds. Either order of binding
+// and pair creation passes. Which error it returns is not decided here.
 func TestReserveRollsBackWhenPairFails(t *testing.T) {
 	want := []string{
-		"limit refuses a socket pair: true",
+		"the failing pair was asked for: true",
 		"reservation returned: false",
 		"reserve failed: true",
+		"descriptors {[] []}",
 		"listener left open: false",
 		"acquire unavailable: true",
-		"descriptors left open: 0",
-		"reserve after the limit is restored: true",
+		"reserve after the failure: true",
 	}
-	if diff := gocmp.Diff(want, runHelper(t, "descriptor-limit", "reserve")); diff != "" {
+	if diff := gocmp.Diff(want, runHelper(t, "reserve-rollback")); diff != "" {
 		t.Errorf("helper report (-want +got):\n%s", diff)
 	}
 }

@@ -19,9 +19,11 @@ package workerlink_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -166,21 +168,85 @@ func peekPending(c syscall.Conn) (int, error) {
 	return n, peekErr
 }
 
-// countOpenDescriptors counts the descriptors open in this process. The directory it reads is open during both of
-// two counts, so a difference of two counts is exact.
-func countOpenDescriptors() (int, error) {
-	entries, err := os.ReadDir("/dev/fd")
+// openDescriptors returns the sorted numbers of the descriptors open in this process. It reads the names of
+// /dev/fd and parses them as numbers, without a stat of each entry: on macOS os.ReadDir stats the entries and drops
+// the ones that fail, such as a kqueue descriptor, where Readdirnames returns every name. The directory's own
+// descriptor is left out, so that two sets taken at different times compare exactly.
+func openDescriptors() ([]int, error) {
+	dir, err := os.Open("/dev/fd")
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return len(entries), nil
+	own := int(dir.Fd())
+	names, err := dir.Readdirnames(-1)
+	if closeErr := dir.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return nil, err
+	}
+	fds := make([]int, 0, len(names))
+	for _, name := range names {
+		fd, err := strconv.Atoi(name)
+		if err != nil {
+			return nil, fmt.Errorf("descriptor name %q: %w", name, err)
+		}
+		if fd != own {
+			fds = append(fds, fd)
+		}
+	}
+	slices.Sort(fds)
+	return fds, nil
 }
 
-// socketKind describes a socket descriptor: its family, type and whether it listens.
+// descriptorChange is how the set of open descriptors changed between two readings.
+type descriptorChange struct {
+	Opened, Closed []int
+}
+
+func changeBetween(before, after []int) descriptorChange {
+	change := descriptorChange{Opened: []int{}, Closed: []int{}}
+	for _, fd := range after {
+		if !slices.Contains(before, fd) {
+			change.Opened = append(change.Opened, fd)
+		}
+	}
+	for _, fd := range before {
+		if !slices.Contains(after, fd) {
+			change.Closed = append(change.Closed, fd)
+		}
+	}
+	return change
+}
+
+// listenState is what the system says about a socket's listening state. It is empty where the system does not
+// answer the question: macOS does not implement the SO_ACCEPTCONN socket option (see listeningOf).
+type listenState string
+
+const (
+	isListening  listenState = "listening"
+	notListening listenState = "not listening"
+)
+
+// wantListening is the state describeSocket reports for a socket that listens or does not, on this system.
+func wantListening(listening bool) listenState {
+	switch {
+	case !listeningObservable:
+		return ""
+	case listening:
+		return isListening
+	default:
+		return notListening
+	}
+}
+
+// socketKind describes a socket descriptor: its family (the IPv4 address for an IPv4 socket), its type, whether it
+// listens, whether it has a peer, and its port.
 type socketKind struct {
 	Family    string
 	Type      int
-	Listening bool
+	Listening listenState
+	Connected bool
 	Port      int
 }
 
@@ -193,11 +259,15 @@ func describeSocket(t *testing.T, c syscall.Conn) socketKind {
 			t.Fatalf("SO_TYPE: %v", err)
 		}
 		kind.Type = typ
-		listening, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_ACCEPTCONN)
-		if err != nil {
-			t.Fatalf("SO_ACCEPTCONN: %v", err)
+		if kind.Listening, err = listeningOf(fd); err != nil {
+			t.Fatalf("listening state: %v", err)
 		}
-		kind.Listening = listening != 0
+		switch _, err := unix.Getpeername(fd); {
+		case err == nil:
+			kind.Connected = true
+		case !errors.Is(err, unix.ENOTCONN):
+			t.Fatalf("getpeername: %v", err)
+		}
 		sa, err := unix.Getsockname(fd)
 		if err != nil {
 			t.Fatalf("getsockname: %v", err)
@@ -239,42 +309,63 @@ func fileConn(t *testing.T, f *os.File) net.Conn {
 	return c
 }
 
-// fillUntilBlocked writes to c until not one more byte fits and returns the number of bytes written. Large writes
-// fill the buffers; the last write is a one-byte write that took nothing and ended at its deadline, which the
-// runtime reports only after the socket itself refused the byte (EAGAIN) and stayed full until the deadline. The
-// write deadline is cleared on return.
-func fillUntilBlocked(t *testing.T, c net.Conn) int {
+// saturate fills the local stream socket behind c until it refuses a single byte, and returns the number of bytes
+// it sent. Every send is a nonblocking send on c's own descriptor: the descriptor must already be nonblocking (Go
+// makes every socket it polls nonblocking), and the call also carries MSG_DONTWAIT. The loop ends only when a
+// one-byte send returns EAGAIN, so on return not one more byte fits until the peer reads. On Linux a nonblocking
+// send that would block returns EAGAIN (send(2)); on macOS sosendcheck returns EWOULDBLOCK, which is EAGAIN there,
+// for a socket in nonblocking mode (xnu bsd/kern/uipc_socket.c:1964-1966; fcntl O_NONBLOCK sets that mode through
+// FIONBIO, bsd/kern/sys_socket.c:206).
+func saturate(t *testing.T, c syscall.Conn) int {
 	t.Helper()
-	defer func() { _ = c.SetWriteDeadline(time.Time{}) }()
 	total := 0
-	chunk := make([]byte, 64<<10)
-	for full := false; !full; {
-		if total > 1<<30 {
-			t.Fatal("the channel never filled")
+	control(t, c, func(fd int) {
+		flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFL, 0)
+		if err != nil {
+			t.Fatalf("F_GETFL: %v", err)
 		}
-		_ = c.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
-		n, err := c.Write(chunk)
-		total += n
-		switch {
-		case errors.Is(err, os.ErrDeadlineExceeded):
-			full = true
-		case err != nil:
-			t.Fatalf("filling the channel: %v", err)
+		if flags&unix.O_NONBLOCK == 0 {
+			t.Fatalf("descriptor %d is blocking; saturate needs a nonblocking socket", fd)
 		}
-	}
-	for range 1 << 16 {
-		_ = c.SetWriteDeadline(time.Now().Add(20 * time.Millisecond))
-		n, err := c.Write([]byte{'f'})
-		total += n
-		switch {
-		case n == 0 && errors.Is(err, os.ErrDeadlineExceeded):
-			return total
-		case err != nil && !errors.Is(err, os.ErrDeadlineExceeded):
-			t.Fatalf("filling the channel byte by byte: %v", err)
+		for _, size := range []int{64 << 10, 1} {
+			chunk := make([]byte, size)
+			for {
+				n, err := unix.SendmsgN(fd, chunk, nil, nil, unix.MSG_DONTWAIT)
+				if errors.Is(err, unix.EAGAIN) {
+					break
+				}
+				if errors.Is(err, unix.EINTR) {
+					continue
+				}
+				if err != nil {
+					t.Fatalf("nonblocking send of %d bytes: %v", size, err)
+				}
+				total += n
+				if total > 1<<30 {
+					t.Fatal("the channel never filled")
+				}
+			}
 		}
-	}
-	t.Fatal("the channel still took single bytes after 65536 of them")
+	})
 	return total
+}
+
+// refusesOneByte reports whether a nonblocking one-byte send on c returns EAGAIN, without blocking. A send that
+// succeeds is counted in sent.
+func refusesOneByte(t *testing.T, c syscall.Conn) (refused bool, sent int) {
+	t.Helper()
+	control(t, c, func(fd int) {
+		n, err := unix.SendmsgN(fd, []byte{'x'}, nil, nil, unix.MSG_DONTWAIT)
+		switch {
+		case errors.Is(err, unix.EAGAIN):
+			refused = true
+		case err != nil:
+			t.Fatalf("nonblocking one-byte send: %v", err)
+		default:
+			sent = n
+		}
+	})
+	return refused, sent
 }
 
 // readExactly reads n bytes under the watchdog deadline.
@@ -573,13 +664,15 @@ func endAtCleanup(t *testing.T, res *workerlink.Reservation) {
 func reserve(t *testing.T, reg *workerlink.Registry, generation workerlink.Generation, port uint16) *workerlink.Reservation {
 	t.Helper()
 	res, err := reg.Reserve(t.Context(), generation, port)
+	if res != nil {
+		endAtCleanup(t, res)
+	}
 	if err != nil {
 		t.Fatalf("Reserve(%q, %d): %v", generation, port, err)
 	}
 	if res == nil {
 		t.Fatalf("Reserve(%q, %d) returned no reservation", generation, port)
 	}
-	endAtCleanup(t, res)
 	return res
 }
 
@@ -587,5 +680,211 @@ func publish(t *testing.T, res *workerlink.Reservation, pid int) {
 	t.Helper()
 	if err := res.Publish(pid); err != nil {
 		t.Fatalf("Publish(%d): %v", pid, err)
+	}
+}
+
+// gatedConn is the parent's end of a drain channel as a test supplies it through the registry's pair factory. It
+// passes everything to a real end, except that a Write first records the bytes it was asked to write and announces
+// that it began, and then waits, as a write to a peer that has stopped reading does, until the test opens the gate
+// (the bytes then go to the real end), its write deadline passes, or the connection is closed. A deadline set before
+// or during the Write is honoured, and one that is not in the future ends the Write at once with nothing written,
+// as a net.Conn does.
+type gatedConn struct {
+	net.Conn
+	// entered is closed when the first Write begins.
+	entered chan struct{}
+
+	mu sync.Mutex
+	// changed is closed and replaced whenever the gate, the write deadline or closure changes.
+	changed  chan struct{}
+	open     bool
+	closed   bool
+	deadline time.Time
+	offered  []byte
+	writes   int
+}
+
+func newGatedConn(real net.Conn) *gatedConn {
+	return &gatedConn{Conn: real, entered: make(chan struct{}), changed: make(chan struct{})}
+}
+
+func (c *gatedConn) notifyLocked() {
+	close(c.changed)
+	c.changed = make(chan struct{})
+}
+
+func (c *gatedConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	c.writes++
+	c.offered = append(c.offered, p...)
+	if c.writes == 1 {
+		close(c.entered)
+	}
+	for {
+		switch {
+		case c.closed:
+			c.mu.Unlock()
+			return 0, &net.OpError{Op: "write", Net: "unix", Err: net.ErrClosed}
+		case !c.deadline.IsZero() && !time.Now().Before(c.deadline):
+			c.mu.Unlock()
+			return 0, &net.OpError{Op: "write", Net: "unix", Err: os.ErrDeadlineExceeded}
+		case c.open:
+			c.mu.Unlock()
+			return c.Conn.Write(p)
+		}
+		changed, deadline := c.changed, c.deadline
+		c.mu.Unlock()
+		var expired <-chan time.Time
+		var timer *time.Timer
+		if !deadline.IsZero() {
+			timer = time.NewTimer(time.Until(deadline))
+			expired = timer.C
+		}
+		select {
+		case <-changed:
+		case <-expired:
+		}
+		if timer != nil {
+			timer.Stop()
+		}
+		c.mu.Lock()
+	}
+}
+
+func (c *gatedConn) setWriteDeadline(t time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.deadline = t
+	c.notifyLocked()
+}
+
+func (c *gatedConn) SetDeadline(t time.Time) error {
+	c.setWriteDeadline(t)
+	return c.Conn.SetDeadline(t)
+}
+
+func (c *gatedConn) SetWriteDeadline(t time.Time) error {
+	c.setWriteDeadline(t)
+	return c.Conn.SetWriteDeadline(t)
+}
+
+func (c *gatedConn) Close() error {
+	c.mu.Lock()
+	if !c.closed {
+		c.closed = true
+		c.notifyLocked()
+	}
+	c.mu.Unlock()
+	return c.Conn.Close()
+}
+
+// openGate lets every waiting and later Write through to the real end.
+func (c *gatedConn) openGate() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.open = true
+	c.notifyLocked()
+}
+
+// attempts returns the bytes every Write so far was asked to write, whether or not they went through, and the
+// number of Write calls.
+func (c *gatedConn) attempts() (offered string, writes int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return string(c.offered), c.writes
+}
+
+// errPair is the failure drainPairs injects.
+var errPair = errors.New("drain channel pair not created")
+
+// drainPairs is a registry's drain channel pair factory under the test's control. Every pair is a real one, made
+// as the registry makes it by default; the test keeps its own handle on each parent end. With gate set the parent
+// end is handed to the registry wrapped in a gatedConn. The call whose number, counted from one, is fail returns
+// errPair and creates nothing.
+type drainPairs struct {
+	t    *testing.T
+	gate bool
+	fail int
+
+	mu      sync.Mutex
+	calls   int
+	parents []net.Conn
+	gated   []*gatedConn
+}
+
+// newDrainPairs installs a factory on reg; it must be called before the first Reserve of reg.
+func newDrainPairs(t *testing.T, reg *workerlink.Registry, gate bool, fail int) *drainPairs {
+	p := &drainPairs{t: t, gate: gate, fail: fail}
+	workerlink.ReplaceDrainPair(reg, p.pair)
+	return p
+}
+
+func (p *drainPairs) pair() (net.Conn, *os.File, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls++
+	if p.calls == p.fail {
+		return nil, nil, errPair
+	}
+	parent, child, err := workerlink.NewDrainPair()
+	if err != nil {
+		return nil, nil, err
+	}
+	// The reservation owns both ends; closing them again at the end of the test only keeps a leak from outliving it.
+	p.t.Cleanup(func() { _ = parent.Close(); _ = child.Close() })
+	p.parents = append(p.parents, parent)
+	if !p.gate {
+		return parent, child, nil
+	}
+	g := newGatedConn(parent)
+	p.gated = append(p.gated, g)
+	return g, child, nil
+}
+
+// parent returns the test's own handle on the real parent end of the i-th pair made, counted from zero.
+func (p *drainPairs) parent(t *testing.T, i int) net.Conn {
+	t.Helper()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if i >= len(p.parents) {
+		t.Fatalf("pair %d was not made; %d were", i, len(p.parents))
+	}
+	return p.parents[i]
+}
+
+// gatedAt returns the gated parent end of the i-th pair made, counted from zero.
+func (p *drainPairs) gatedAt(t *testing.T, i int) *gatedConn {
+	t.Helper()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if i >= len(p.gated) {
+		t.Fatalf("gated pair %d was not made; %d were", i, len(p.gated))
+	}
+	return p.gated[i]
+}
+
+// closeGated closes every gated parent end, so that no Write stays parked after a failed assertion.
+func (p *drainPairs) closeGated() {
+	p.mu.Lock()
+	gated := slices.Clone(p.gated)
+	p.mu.Unlock()
+	for _, g := range gated {
+		_ = g.Close()
+	}
+}
+
+func (p *drainPairs) count() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.calls
+}
+
+// untouched reports whether nothing happened on ch: it is neither closed nor holding a value.
+func untouched(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return false
+	default:
+		return true
 	}
 }

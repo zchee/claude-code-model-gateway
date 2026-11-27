@@ -17,6 +17,8 @@
 package workerlink_test
 
 import (
+	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -185,8 +187,8 @@ func closedFile(t *testing.T) (*os.File, uint16) {
 	return f, port
 }
 
-// acceptWithin accepts one connection on any listener; the watchdog closes the listener to end a hang.
-func acceptWithin(t *testing.T, l net.Listener) net.Conn {
+// acceptOutcome runs one Accept on any listener; the watchdog closes the listener to end a hang and then fails.
+func acceptOutcome(t *testing.T, l net.Listener) (net.Conn, error) {
 	t.Helper()
 	type accepted struct {
 		c   net.Conn
@@ -197,18 +199,30 @@ func acceptWithin(t *testing.T, l net.Listener) net.Conn {
 		c, err := l.Accept()
 		out <- accepted{c, err}
 	}()
-	var a accepted
 	select {
-	case a = <-out:
+	case a := <-out:
+		return a.c, a.err
 	case <-time.After(watchdog):
 		_ = l.Close()
-		a = <-out
+		if a := <-out; a.c != nil {
+			_ = a.c.Close()
+		}
+		t.Fatalf("Accept did not return within %v", watchdog)
+		return nil, nil
 	}
-	if a.err != nil {
-		t.Fatalf("accept: %v", a.err)
+}
+
+// acceptWithin accepts one connection on any listener.
+func acceptWithin(t *testing.T, l net.Listener) net.Conn {
+	t.Helper()
+	c, err := acceptOutcome(t, l)
+	if c != nil {
+		t.Cleanup(func() { _ = c.Close() })
 	}
-	t.Cleanup(func() { _ = a.c.Close() })
-	return a.c
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	return c
 }
 
 func noFile(*testing.T) (*os.File, uint16) { return nil, 1 }
@@ -235,19 +249,23 @@ func TestImportListenerAccepts(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			f, port := tcpListenerFile(tt.network, "127.0.0.1:0")(t)
 			l, err := workerlink.ImportListener(f, port)
+			if l != nil {
+				t.Cleanup(func() { _ = l.Close() })
+			}
 			if err != nil {
 				t.Fatalf("ImportListener: %v", err)
 			}
-			t.Cleanup(func() { _ = l.Close() })
 			checkConsumed(t, f)
 			if diff := gocmp.Diff(loopback(port), l.Addr().String()); diff != "" {
 				t.Errorf("address (-want +got):\n%s", diff)
 			}
 			c, err := realDial(t.Context(), "tcp4", loopback(port))
+			if c != nil {
+				t.Cleanup(func() { _ = c.Close() })
+			}
 			if err != nil {
 				t.Fatalf("dial: %v", err)
 			}
-			t.Cleanup(func() { _ = c.Close() })
 			if _, err := c.Write([]byte("hello")); err != nil {
 				t.Fatalf("write: %v", err)
 			}
@@ -259,17 +277,24 @@ func TestImportListenerAccepts(t *testing.T) {
 }
 
 // TestImportListenerRefuses checks every refusal of the inherited listener. A refusal returns no listener (there
-// is no fallback bind) and still consumes the inherited file.
+// is no fallback bind) and still consumes the inherited file. A bound TCP socket that is not listening is refused
+// by the import where the system reports the listening state (Linux). On macOS, which does not (see listeningOf),
+// it may pass the import, and then its first Accept fails at once; the worker command treats that as a failed start.
+// A listener on another loopback address than exactly 127.0.0.1 is refused; that case runs where 127.0.0.2 can be
+// bound without configuration (Linux, see otherLoopbackBindable).
 func TestImportListenerRefuses(t *testing.T) {
-	tests := map[string]struct {
+	type refusal struct {
 		fixture  fixtureFile
 		expected func(port uint16) uint16
-	}{
+		// orFirstAccept also accepts a listener whose first Accept fails.
+		orFirstAccept bool
+	}
+	tests := map[string]refusal{
 		"error: expected port is zero":                  {fixture: tcpListenerFile("tcp4", "127.0.0.1:0"), expected: func(uint16) uint16 { return 0 }},
 		"error: listener on another port":               {fixture: tcpListenerFile("tcp4", "127.0.0.1:0"), expected: otherPort},
 		"error: listener on the wildcard address":       {fixture: tcpListenerFile("tcp4", "0.0.0.0:0")},
 		"error: connected TCP stream":                   {fixture: connectedTCPFile},
-		"error: bound TCP socket that is not listening": {fixture: boundTCPFile},
+		"error: bound TCP socket that is not listening": {fixture: boundTCPFile, orFirstAccept: !listeningObservable},
 		"error: UDP socket":                             {fixture: udpFile},
 		"error: Unix stream listener":                   {fixture: unixListenerFile},
 		"error: drain channel given as the listener":    {fixture: socketPairFile(unix.SOCK_STREAM)},
@@ -277,6 +302,9 @@ func TestImportListenerRefuses(t *testing.T) {
 		"error: pipe":                                   {fixture: pipeFile},
 		"error: closed file":                            {fixture: closedFile},
 		"error: no file":                                {fixture: noFile},
+	}
+	if otherLoopbackBindable {
+		tests["error: listener on another loopback address"] = refusal{fixture: tcpListenerFile("tcp4", "127.0.0.2:0")}
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -286,7 +314,14 @@ func TestImportListenerRefuses(t *testing.T) {
 			}
 			l, err := workerlink.ImportListener(f, port)
 			if l != nil {
-				_ = l.Close()
+				t.Cleanup(func() { _ = l.Close() })
+			}
+			if l != nil && err == nil && tt.orFirstAccept {
+				checkConsumed(t, f)
+				checkAcceptFails(t, l)
+				return
+			}
+			if l != nil {
 				t.Errorf("ImportListener returned listener %v; a refused handoff must return none", l.Addr())
 			}
 			if err == nil {
@@ -297,30 +332,66 @@ func TestImportListenerRefuses(t *testing.T) {
 	}
 }
 
+// checkAcceptFails asserts that the first Accept on l fails; the watchdog of acceptOutcome only aborts a hang.
+func checkAcceptFails(t *testing.T, l net.Listener) {
+	t.Helper()
+	c, err := acceptOutcome(t, l)
+	if c != nil {
+		_ = c.Close()
+	}
+	if err == nil {
+		t.Fatal("the imported socket that is not listening accepted a connection")
+	}
+}
+
 // TestImportDrainChannelAccepts checks the worker's side of the drain channel: a connected local stream socket
-// becomes an independent duplex connection, and the inherited file is consumed. The connection may be any
-// net.Conn; that it is not inherited by the worker's own children is decided by TestImportedDescriptorsNotInherited.
+// becomes an independent duplex connection, and the inherited file is consumed. The import checks the kind of
+// socket only, so a channel whose parent has already shut down its writing side is accepted too, and the direction
+// that remains works. The connection may be any net.Conn; that it is not inherited by the worker's own children is
+// decided by TestImportedDescriptorsNotInherited.
 func TestImportDrainChannelAccepts(t *testing.T) {
-	child, parent := socketPair(t, unix.SOCK_STREAM)
-	c, err := workerlink.ImportDrainChannel(child)
-	if err != nil {
-		t.Fatalf("ImportDrainChannel: %v", err)
+	tests := map[string]struct {
+		// parentShutWrite shuts down the parent's writing side before the import.
+		parentShutWrite bool
+	}{
+		"success: both directions open":                      {},
+		"success: the parent has shut down its writing side": {parentShutWrite: true},
 	}
-	t.Cleanup(func() { _ = c.Close() })
-	checkConsumed(t, child)
-	peer := fileConn(t, parent)
-	if _, err := peer.Write([]byte("to-child\n")); err != nil {
-		t.Fatalf("parent write: %v", err)
-	}
-	if got := readExactly(t, c, 9); got != "to-child\n" {
-		t.Errorf("child read %q", got)
-	}
-	_ = c.SetWriteDeadline(time.Now().Add(watchdog))
-	if _, err := c.Write([]byte("to-parent\n")); err != nil {
-		t.Fatalf("child write: %v", err)
-	}
-	if got := readExactly(t, peer, 10); got != "to-parent\n" {
-		t.Errorf("parent read %q", got)
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			child, parent := socketPair(t, unix.SOCK_STREAM)
+			if tt.parentShutWrite {
+				control(t, parent, func(fd int) {
+					if err := unix.Shutdown(fd, unix.SHUT_WR); err != nil {
+						t.Fatalf("shutdown: %v", err)
+					}
+				})
+			}
+			c, err := workerlink.ImportDrainChannel(child)
+			if c != nil {
+				t.Cleanup(func() { _ = c.Close() })
+			}
+			if err != nil {
+				t.Fatalf("ImportDrainChannel: %v", err)
+			}
+			checkConsumed(t, child)
+			peer := fileConn(t, parent)
+			if tt.parentShutWrite {
+				_ = c.SetReadDeadline(time.Now().Add(watchdog))
+				if n, err := c.Read(make([]byte, 1)); n != 0 || !errors.Is(err, io.EOF) {
+					t.Errorf("child read after the parent shut down its writing side = %d, %v; want end of file", n, err)
+				}
+			} else {
+				writeAll(t, peer, "to-child\n")
+				if got := readExactly(t, c, 9); got != "to-child\n" {
+					t.Errorf("child read %q", got)
+				}
+			}
+			writeAll(t, c, "to-parent\n")
+			if got := readExactly(t, peer, 10); got != "to-parent\n" {
+				t.Errorf("parent read %q", got)
+			}
+		})
 	}
 }
 

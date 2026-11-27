@@ -274,6 +274,9 @@ func TestAcquireDialFailure(t *testing.T) {
 	reg := workerlink.NewRegistry(listens.listen, dials.dial)
 	publish(t, reserve(t, reg, "gen-a", 41001), 4101)
 	lease, err := reg.Acquire(t.Context(), "")
+	if lease != nil {
+		_ = lease.Close()
+	}
 	if lease != nil || !errors.Is(err, errDial) {
 		t.Fatalf("Acquire = %v, %v; want no lease and %v", lease, err, errDial)
 	}
@@ -319,6 +322,9 @@ func TestRetireKeepsPinnedDial(t *testing.T) {
 					t.Fatalf("Acquire returned %+v before its dial completed", r)
 				}
 				if lease, err := reg.Acquire(t.Context(), ""); lease != nil || !errors.Is(err, workerlink.ErrRetired) {
+					if lease != nil {
+						_ = lease.Close()
+					}
 					t.Fatalf("Acquire after Retire = %v, %v; want %v", lease, err, workerlink.ErrRetired)
 				}
 				if n := dials.count.Load(); n != 1 {
@@ -331,6 +337,9 @@ func TestRetireKeepsPinnedDial(t *testing.T) {
 					answer(attempt, dialReply{conn: conn})
 				}
 				r := <-out
+				if r.lease != nil {
+					t.Cleanup(func() { _ = r.lease.Close() })
+				}
 				synctest.Wait()
 				if tt.fail {
 					if r.lease != nil || !errors.Is(r.err, errDial) {
@@ -341,7 +350,6 @@ func TestRetireKeepsPinnedDial(t *testing.T) {
 				if r.err != nil || r.lease == nil {
 					t.Fatalf("Acquire = %v, %v; a dial that pinned before retirement must be handed over", r.lease, r.err)
 				}
-				t.Cleanup(func() { _ = r.lease.Close() })
 				if diff := gocmp.Diff(leaseFields{"gen-a", 4101, "127.0.0.1:41001"}, fieldsOf(r.lease)); diff != "" {
 					t.Errorf("handed-over lease (-want +got):\n%s", diff)
 				}
@@ -432,10 +440,12 @@ func TestEndCancelsPinnedDial(t *testing.T) {
 					first := acquireAsync(t.Context(), reg, "")
 					answer(<-dials.attempts, dialReply{conn: newTrackedConn(t)})
 					r := await(t, first, "an earlier Acquire")
+					if r.lease != nil {
+						t.Cleanup(func() { _ = r.lease.Close() })
+					}
 					if r.err != nil || r.lease == nil {
 						t.Fatalf("earlier Acquire %d = %v, %v", i+1, r.lease, r.err)
 					}
-					t.Cleanup(func() { _ = r.lease.Close() })
 					earlier = append(earlier, r.lease)
 				}
 				woke := exitWaiters(earlier...)
@@ -529,6 +539,9 @@ func TestEndIsFinal(t *testing.T) {
 		t.Errorf("DrainChannel after End = %v, %v, %v; want an error and no handles", parent, child, err)
 	}
 	if lease, err := reg.Acquire(t.Context(), ""); lease != nil || !errors.Is(err, workerlink.ErrUnavailable) {
+		if lease != nil {
+			_ = lease.Close()
+		}
 		t.Errorf("Acquire after End = %v, %v; want %v", lease, err, workerlink.ErrUnavailable)
 	}
 	if dials.count() != 0 {
@@ -578,33 +591,41 @@ func TestNoLockHeldAcrossDial(t *testing.T) {
 	}
 	var second acquireResult
 	within(t, "a second Acquire", func() { second.lease, second.err = reg.Acquire(t.Context(), "") })
+	if second.lease != nil {
+		t.Cleanup(func() { _ = second.lease.Close() })
+	}
 	if second.err != nil || second.lease == nil || second.lease.Generation() != "gen-a" {
 		t.Fatalf("second Acquire = %v, %v; want a lease to gen-a", second.lease, second.err)
 	}
-	t.Cleanup(func() { _ = second.lease.Close() })
 	var c, b *workerlink.Reservation
 	var errC, errB, errPublish error
 	within(t, "Reserve", func() { c, errC = reg.Reserve(t.Context(), "gen-c", 41003) })
+	if c != nil {
+		endAtCleanup(t, c)
+	}
 	if errC != nil {
 		t.Fatalf("Reserve gen-c: %v", errC)
 	}
-	endAtCleanup(t, c)
 	within(t, "Retire", a.Retire)
 	within(t, "Reserve and Publish", func() {
 		if b, errB = reg.Reserve(t.Context(), "gen-b", 41002); errB == nil {
 			errPublish = b.Publish(4102)
 		}
 	})
+	if b != nil {
+		endAtCleanup(t, b)
+	}
 	if errB != nil || errPublish != nil {
 		t.Fatalf("Reserve and Publish gen-b: %v, %v", errB, errPublish)
 	}
-	endAtCleanup(t, b)
 	var replacement acquireResult
 	within(t, "Acquire of the replacement", func() { replacement.lease, replacement.err = reg.Acquire(t.Context(), "") })
+	if replacement.lease != nil {
+		t.Cleanup(func() { _ = replacement.lease.Close() })
+	}
 	if replacement.err != nil || replacement.lease == nil || replacement.lease.Generation() != "gen-b" {
 		t.Fatalf("Acquire after the replacement = %v, %v; want a lease to gen-b", replacement.lease, replacement.err)
 	}
-	t.Cleanup(func() { _ = replacement.lease.Close() })
 	var errEnd error
 	within(t, "End of another generation", func() { errEnd = c.End() })
 	if errEnd != nil {
@@ -617,10 +638,12 @@ func TestNoLockHeldAcrossDial(t *testing.T) {
 	case <-time.After(watchdog):
 		t.Fatal("the parked Acquire did not return after its dial completed")
 	}
+	if r.lease != nil {
+		t.Cleanup(func() { _ = r.lease.Close() })
+	}
 	if r.err != nil || r.lease == nil {
 		t.Fatalf("parked Acquire = %v, %v; its dial pinned gen-a before retirement", r.lease, r.err)
 	}
-	t.Cleanup(func() { _ = r.lease.Close() })
 	if got := r.lease.Generation(); got != "gen-a" {
 		t.Errorf("parked lease reached %q, want gen-a", got)
 	}

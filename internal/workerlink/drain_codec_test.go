@@ -544,17 +544,21 @@ func TestDecodeDrainReadFailure(t *testing.T) {
 	}
 }
 
-// closeRecorder is a writer that counts its writes and remembers whether it was closed.
+// closeRecorder is a writer that counts its writes and remembers whether it was closed. Its buffer is a named
+// field, not an embedded one, so that Write is the only way to give it bytes: an embedded bytes.Buffer would also
+// offer WriteString, which io.WriteString uses without passing through the counted Write.
 type closeRecorder struct {
-	bytes.Buffer
+	buf    bytes.Buffer
 	writes int
 	closed bool
 }
 
 func (w *closeRecorder) Write(p []byte) (int, error) {
 	w.writes++
-	return w.Buffer.Write(p)
+	return w.buf.Write(p)
 }
+
+func (w *closeRecorder) String() string { return w.buf.String() }
 
 func (w *closeRecorder) Close() error {
 	w.closed = true
