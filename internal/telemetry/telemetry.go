@@ -43,18 +43,23 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/config"
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/outcome"
+	"github.com/zchee/claude-code-model-gateway/internal/worker/upstream"
 )
 
 // exportTimeout bounds one collector post, including draining its reply.
 const exportTimeout = 500 * time.Millisecond
 
 // Options supplies the environment, resolved audit path, diagnostics, clock and entropy.
+// Transport, when non-nil, carries the trace posts, so that their connections belong to the caller; it
+// should keep no idle connection, consult no proxy and ask for no compression, as the recorder's own
+// transport does.
 type Options struct {
 	Lookup      config.LookupEnv
 	LogPath     string
 	Diagnostics io.Writer
 	Now         func() time.Time
 	Random      io.Reader
+	Transport   http.RoundTripper
 }
 
 // Recorder owns local route logging and asynchronous trace delivery for one worker.
@@ -105,6 +110,9 @@ func newRecorder(options Options, dialContext func(context.Context, string, stri
 		r.client = &http.Client{
 			Transport:     &http.Transport{DialContext: dialContext, DisableKeepAlives: true, DisableCompression: true},
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		}
+		if options.Transport != nil {
+			r.client.Transport = options.Transport
 		}
 	}
 	return r
@@ -302,6 +310,10 @@ func (r *Recorder) post(payload []byte) {
 	req.Header.Set("User-Agent", "")
 	resp, err := r.client.Do(req)
 	if err != nil {
+		return
+	}
+	// The deadline would not end the drain of a connection that switched protocols.
+	if upstream.RefuseSwitch(resp) != nil {
 		return
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)

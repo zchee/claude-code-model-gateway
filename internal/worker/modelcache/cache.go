@@ -77,11 +77,14 @@ const (
 
 // directTransport carries the cache's requests when the injected client has no transport of its own
 // or names the process-wide default. It never consults the environment's proxy settings and keeps no
-// idle connections, so it outlives no request.
+// idle connections, so it outlives no request. It neither asks for nor decodes a compressed body, as
+// the source sends no Accept-Encoding and reads the bytes as sent, so the size bounds count the
+// bytes on the wire.
 var directTransport = &http.Transport{
-	Proxy:             nil,
-	DialContext:       (&net.Dialer{}).DialContext,
-	DisableKeepAlives: true,
+	Proxy:              nil,
+	DialContext:        (&net.Dialer{}).DialContext,
+	DisableKeepAlives:  true,
+	DisableCompression: true,
 }
 
 // defaultModels are the Codex backends advertised before a listing was read (lib/request-worker.js:226-228).

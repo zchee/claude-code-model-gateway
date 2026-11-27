@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/zchee/claude-code-model-gateway/internal/config"
+	"github.com/zchee/claude-code-model-gateway/internal/worker/upstream"
 )
 
 // exportTimeout bounds one collector post, including draining its reply.
@@ -52,6 +53,17 @@ type Emitter struct {
 // NewEmitter resolves log settings and shares one builder across captures.
 func NewEmitter(lookup config.LookupEnv, builder *Builder) *Emitter {
 	return newEmitter(lookup, builder, nil)
+}
+
+// NewEmitterWithTransport is NewEmitter whose collector posts go through transport, so that their
+// connections belong to the caller. The transport should keep no idle connection, consult no proxy and
+// ask for no compression, as the package's own transport does. A nil transport is NewEmitter.
+func NewEmitterWithTransport(lookup config.LookupEnv, builder *Builder, transport http.RoundTripper) *Emitter {
+	e := newEmitter(lookup, builder, nil)
+	if e.client != nil && transport != nil {
+		e.client.Transport = transport
+	}
+	return e
 }
 
 // A nil dial function uses the standard network dialer.
@@ -182,6 +194,10 @@ func (e *Emitter) post(payload []byte) {
 	req.Header.Set("User-Agent", "")
 	resp, err := e.client.Do(req)
 	if err != nil {
+		return
+	}
+	// The deadline would not end the drain of a connection that switched protocols.
+	if upstream.RefuseSwitch(resp) != nil {
 		return
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)

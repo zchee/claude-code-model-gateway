@@ -77,16 +77,17 @@ const (
 	// maxStatusOutput bounds each output stream of an auth status command: Node's execFile default
 	// maxBuffer, which the source's call keeps.
 	maxStatusOutput = 1 << 20
-	// establishTimeout bounds the dial and TLS handshake of a catalog, listing or readiness connection.
-	// No request on those transports waits longer than a catalog page, and with keep-alives off a
-	// connection that arrives after its request gave up serves no other request.
+	// establishTimeout bounds the dial and TLS handshake of a connection of the worker-owned transports:
+	// catalog, listing, readiness and the two exporters. No request on those transports waits longer
+	// than a catalog page, and with keep-alives off a connection that arrives after its request gave up
+	// serves no other request.
 	establishTimeout = modelcache.AnthropicPageTimeout
 )
 
 // lifetime owns everything of one worker that outlives a single call: the servers and their Serve
 // loops, every request handler, the service context, the background catalog and readiness work and
-// their connections, the Grok credential refresh, the upstream client and the exporters. stop is the
-// only place it ends.
+// their connections, the Grok credential refresh, the upstream client, and the exporters and their
+// connections. stop is the only place it ends.
 type lifetime struct {
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -96,7 +97,8 @@ type lifetime struct {
 	grok      *grok.Branch
 	upstream  *upstream.Client
 	auth      *http.Transport
-	dials     *dials
+	dials     *dials // catalog, listing and readiness connections; they end with the service
+	exports   *dials // usage and trace export connections; they end after the exporters are joined
 	usage     *usage.Emitter
 	telemetry *telemetry.Recorder
 
@@ -199,7 +201,8 @@ func (l *lifetime) awaitLive(now <-chan struct{}) {
 //     deadline and stores its result, a discovery has ended with the service;
 //  7. close the upstream client and the credential transport's idle connections, and end and join
 //     the connection establishment of the catalog and readiness transports;
-//  8. join the readiness check, the model cache, the usage exporter and the trace exporter.
+//  8. join the readiness check, the model cache, the usage exporter and the trace exporter, then end
+//     and join the connection establishment of the exporters' transports.
 //
 // A nil stopper stops at once. Nothing of the worker runs after stop returns.
 func (l *lifetime) stop(stop *stopper) {
@@ -235,13 +238,13 @@ func (l *lifetime) stop(stop *stopper) {
 		if l.telemetry != nil {
 			l.telemetry.Wait()
 		}
+		l.exports.close()
 	})
 }
 
-// dials owns the transports of the worker's catalog, listing and readiness requests. Their
-// connections are bound to its context, which ends with the service: no dial starts afterwards, a dial
-// or TLS handshake in progress is cancelled and every connection closes, the connection of a response
-// that switched protocols included. net/http carries on a dial after the request that started it
+// dials owns a group of the worker's transports. Their connections are bound to its context: once it
+// ends no dial starts, a dial or TLS handshake in progress is cancelled and every connection closes, the
+// connection of a response that switched protocols included. net/http carries on a dial after the request that started it
 // ended, so close also waits for every dial and handshake still running; what net/http does with the
 // result once the dial function returned is not part of that wait. Unlike the package transports these
 // replace, establishment is also bounded by establishTimeout.
@@ -259,12 +262,14 @@ func newDials(parent context.Context) *dials {
 }
 
 // transport returns a new transport of the upstream policy bound to d. Like the package transports
-// it replaces, it never consults the environment's proxy settings, keeps no idle connection and asks
-// for a gzip body that net/http decodes. It never returns a response that switched protocols.
+// it replaces, it never consults the environment's proxy settings, keeps no idle connection and puts
+// no cap on concurrent connections to a host; the upstream policy already neither asks for nor
+// decodes a compressed body, as the source's requests send no Accept-Encoding. It never returns a
+// response that switched protocols.
 func (d *dials) transport() http.RoundTripper {
 	t := upstream.NewLifetimeTransport(upstream.Options{}, d.ctx)
 	t.DisableKeepAlives = true
-	t.DisableCompression = false
+	t.MaxConnsPerHost = 0
 	t.DialContext = d.track(t.DialContext)
 	t.DialTLSContext = d.track(t.DialTLSContext)
 	return refusingSwitch{t}
@@ -381,7 +386,10 @@ func buildWorker(s workerSetup) (worker.Options, *lifetime, error) {
 	authTransport := upstream.NewTransport(upstream.Options{})
 	// The catalog, listing and readiness requests get transports of their own, bound to the service.
 	owned := newDials(serviceCtx)
-	life := &lifetime{ctx: serviceCtx, cancel: cancel, upstream: client, auth: authTransport, dials: owned, changed: make(chan struct{}, 1)}
+	// The exporters post records of handlers that finish after the service ended, so their connections
+	// outlive the service and end only once the exporters were joined.
+	exports := newDials(context.Background())
+	life := &lifetime{ctx: serviceCtx, cancel: cancel, upstream: client, auth: authTransport, dials: owned, exports: exports, changed: make(chan struct{}, 1)}
 	fail := func(err error) (worker.Options, *lifetime, error) {
 		life.stop(nil)
 		return worker.Options{}, nil, err
@@ -463,7 +471,7 @@ func buildWorker(s workerSetup) (worker.Options, *lifetime, error) {
 	}
 
 	projects, _ := s.resolver.TranscriptsDir()
-	life.usage = usage.NewEmitter(s.lookup, usage.NewBuilder(usage.Options{ProjectsDir: projects, Now: now}))
+	life.usage = usage.NewEmitterWithTransport(s.lookup, usage.NewBuilder(usage.Options{ProjectsDir: projects, Now: now}), exports.transport())
 	var highWater *usage.HighWater
 	if dir, err := s.resolver.RequestBodyDir(); err == nil {
 		highWater = usage.NewHighWater(dir, now)
@@ -472,7 +480,7 @@ func buildWorker(s workerSetup) (worker.Options, *lifetime, error) {
 	if config.RequestLog.Get(s.lookup) {
 		logPath, _ = s.resolver.RequestLogPath()
 	}
-	life.telemetry = telemetry.NewRecorder(telemetry.Options{Lookup: s.lookup, LogPath: logPath, Diagnostics: s.stderr, Now: now})
+	life.telemetry = telemetry.NewRecorder(telemetry.Options{Lookup: s.lookup, LogPath: logPath, Diagnostics: s.stderr, Now: now, Transport: exports.transport()})
 
 	// The shared proxy and Codex auth check behind /healthz runs under the service context
 	// (lib/request-worker.js:47-61,102-114,1229).
