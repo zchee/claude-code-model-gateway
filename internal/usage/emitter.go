@@ -234,15 +234,27 @@ func (e *Emitter) send() {
 	}
 }
 
-// post sends one record under ctx and calls written once: when the request has been written, or
-// when the post ends without that.
+// post sends one record under ctx and calls written once: when the whole request is on the
+// connection, or when the post ends without that.
+//
+// The body is an opaque reader of known length, not a *bytes.Reader. This relies on net/http
+// behaviour that is implemented but not documented: for a body it does not recognise as in-memory,
+// the transport flushes the headers before the body and copies the body straight onto the
+// connection, so WroteRequest fires only once the request has left the transport's write buffer.
+// With a *bytes.Reader it fires while the request is still in that buffer, and the next post can
+// start before this one reached the collector. TestEmitterSubmissionOrder fails if that changes.
 func (e *Emitter) post(ctx context.Context, payload []byte, written func()) {
 	defer written()
 	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{WroteRequest: func(httptrace.WroteRequestInfo) { written() }})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.endpoint.String(), bytes.NewReader(payload))
+	opaque := func() io.Reader { return struct{ io.Reader }{bytes.NewReader(payload)} }
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.endpoint.String(), opaque())
 	if err != nil {
 		return
 	}
+	// NewRequest sets neither for a body type it does not know: keep the fixed length (no chunked
+	// encoding), and keep the request rewindable as a *bytes.Reader body would be.
+	req.ContentLength = int64(len(payload))
+	req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(opaque()), nil }
 	req.Header.Set("Content-Type", "application/json")
 	// An empty value suppresses Go's default User-Agent; the source sends none.
 	req.Header.Set("User-Agent", "")
