@@ -14,23 +14,25 @@
 
 package lifecycle
 
-import "context"
+import "io/fs"
+
+// fenceName is the start fence's lock file in the state root. It is created once and never truncated, renamed or
+// removed, so every holder locks the same file; its presence says nothing about whether it is locked.
+const fenceName = "worker-start.lock"
 
 // StartFence serializes worker process starts with intentional stop and resume in one state root.
-type StartFence struct{}
+type StartFence struct{ stateDir string }
 
 // unlockFence is the unlock call of a fence release, given the descriptor that holds the lock. It is a variable so
 // that a test can make the unlock fail and observe that the release still closes the descriptor exactly once.
 var unlockFence = func(fd int) error {
-	panic("not implemented")
+	return unlockFenceDescriptor(fd)
 }
 
 // NewStartFence validates a clean absolute state root without acquiring a lock.
 func NewStartFence(stateDir string) (*StartFence, error) {
-	panic("not implemented")
-}
-
-// Acquire takes the root's advisory fence or returns a context or filesystem error without a lease.
-func (f *StartFence) Acquire(ctx context.Context) (release func() error, err error) {
-	panic("not implemented")
+	if !validStateDir(stateDir) {
+		return nil, &fs.PathError{Op: "start fence", Path: stateDir, Err: fs.ErrInvalid}
+	}
+	return &StartFence{stateDir: stateDir}, nil
 }

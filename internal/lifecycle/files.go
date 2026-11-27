@@ -19,6 +19,7 @@ import (
 	"encoding/json/jsontext"
 	json "encoding/json/v2"
 	"errors"
+	"fmt"
 	"io/fs"
 	"math"
 	"os"
@@ -80,8 +81,25 @@ func (f Files) Stopped() bool {
 }
 
 // StopMarkerPresent distinguishes a missing stop marker from a failure to inspect the state root.
+// It answers by the entry alone, without following a symbolic link and without opening or reading the marker: a
+// regular file is present even when it cannot be read, a missing entry is absent, and any other kind of entry or a
+// failed inspection is an error. With an error the result is also true, so that a caller which looks only at the
+// result still does not start a worker.
 func (f Files) StopMarkerPresent() (bool, error) {
-	panic("not implemented")
+	if !validStateDir(f.StateDir) {
+		return true, &fs.PathError{Op: "inspect stop marker", Path: f.StateDir, Err: fs.ErrInvalid}
+	}
+	path := filepath.Join(f.StateDir, stopMarker)
+	info, err := os.Lstat(path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return false, nil
+	case err != nil:
+		return true, err
+	case !info.Mode().IsRegular():
+		return true, fmt.Errorf("stop marker %s is a %v, not a regular file", path, info.Mode().Type())
+	}
+	return true, nil
 }
 
 // Stop records an intentional stop.
