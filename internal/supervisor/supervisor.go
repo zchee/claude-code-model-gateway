@@ -433,8 +433,12 @@ func writeWorkerFailure(w http.ResponseWriter, bodyTaken bool) {
 // FixtureShutdown consumes and closes the inherited fixture channel. Without a test guard it closes it unread.
 // It reports whether the channel's first message is the fixture's shutdown message. Only the first message is
 // decided, as the source listens for one message only (lib/commands.js:2900-2903): after any other first message the
-// channel stays open and later messages are read and dropped until the channel ends, so none of them stops the
-// supervisor. A failure of the channel other than its end is returned with false.
+// channel stays open and later messages are read and dropped until the channel ends or fails, so none of them stops
+// the supervisor. A failure of the channel other than its end returns false with that error, also when it comes while
+// the rest is drained after a first message that is not the shutdown message; a shutdown message that arrives
+// together with a failure still returns true. The first message is read line by line through a buffered reader, so a
+// channel that returns bufio.ErrBufferFull itself before that message is complete is read again, as for a line longer
+// than the buffer; every other channel error, and any error after the first message, is returned as described.
 func FixtureShutdown(channel io.ReadCloser, guarded bool) (bool, error) {
 	defer func() { _ = channel.Close() }()
 	if !guarded {
@@ -448,10 +452,12 @@ func FixtureShutdown(channel io.ReadCloser, guarded bool) (bool, error) {
 				return true, nil
 			}
 			// The rest is drained through the reader itself, so an error it already holds is returned
-			// and the channel is not read again after it.
+			// and the channel is not read again after it. Peek(1) waits for input and returns only the
+			// channel's own errors, so no error value of the channel is mistaken for the reader's
+			// buffer state.
 			for err == nil {
-				if _, err = reader.ReadSlice('\n'); errors.Is(err, bufio.ErrBufferFull) {
-					err = nil
+				if _, err = reader.Peek(1); err == nil {
+					_, _ = reader.Discard(reader.Buffered())
 				}
 			}
 		}
