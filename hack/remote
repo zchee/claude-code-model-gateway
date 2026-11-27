@@ -387,12 +387,17 @@ remote_parse_args() {
             ;;
         run)
             [[ $# -gt 0 ]] || usage_fail 'run requires at least one make target'
-            local arg
+            local arg has_bench=0
             for arg do
                 if [[ $arg == conformance ]]; then has_conformance=1; fi
+                if [[ $arg == bench ]]; then has_bench=1; fi
             done
             for arg do
-                if [[ $arg == *=* ]]; then
+                if [[ $arg == BENCH_PROBE=* ]]; then
+                    # Selects one probe of bench instead of the whole baseline.
+                    (( has_bench && ! has_conformance )) || usage_fail 'BENCH_PROBE requires bench without conformance'
+                    [[ $arg == BENCH_PROBE=half-close ]] || usage_fail 'invalid bench probe'
+                elif [[ $arg == *=* ]]; then
                     (( has_conformance )) || usage_fail 'invalid make target'
                     if [[ $arg == TARGET=binary:* && ( ${arg#TARGET=binary:} == *//* || ${arg#TARGET=binary:} == */ || ${arg#TARGET=binary:} =~ (^|/)\.\.?(/|$) ) ]]; then
                         usage_fail 'binary target must be a clean absolute path'
