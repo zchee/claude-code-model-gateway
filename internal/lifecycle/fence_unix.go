@@ -39,9 +39,10 @@ const fenceRetry = 20 * time.Millisecond
 //
 // Each call opens its own open file description of the retained lock file and takes a nonblocking exclusive flock
 // on it, so two acquisitions exclude each other in one process as well as across processes. The descriptor is
-// close-on-exec, so no child inherits the lock and the kernel gives it up when its holder dies. While another
-// holder has the lock, Acquire waits on a timer and on ctx, never in a blocking system call. A missing state root
-// is created as the lifecycle lock creates it.
+// close-on-exec: a forked child shares it only until it execs, and no executed program retains it. The kernel gives
+// the lock up when the last reference to that open file description goes away, so also when its holder dies. While
+// another holder has the lock, Acquire waits on a timer and on ctx, never in a blocking system call, and it checks
+// ctx before every attempt. A missing state root is created as the lifecycle lock creates it.
 func (f *StartFence) Acquire(ctx context.Context) (release func() error, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -58,6 +59,11 @@ func (f *StartFence) Acquire(ctx context.Context) (release func() error, err err
 		}
 	}()
 	for {
+		// Checked before every attempt, also after a timer wake and after an interrupted call, so that an ended
+		// context never takes the lock, not even for an instant.
+		if err := ctx.Err(); err != nil {
+			return nil, closeFence(err, fd, path)
+		}
 		err = unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB)
 		if errors.Is(err, unix.EINTR) {
 			continue
@@ -66,8 +72,7 @@ func (f *StartFence) Acquire(ctx context.Context) (release func() error, err err
 			break
 		}
 		if !errors.Is(err, unix.EWOULDBLOCK) {
-			_ = unix.Close(fd)
-			return nil, &fs.PathError{Op: "lock", Path: path, Err: err}
+			return nil, closeFence(&fs.PathError{Op: "lock", Path: path, Err: err}, fd, path)
 		}
 		if timer == nil {
 			timer = time.NewTimer(fenceRetry)
@@ -76,15 +81,16 @@ func (f *StartFence) Acquire(ctx context.Context) (release func() error, err err
 		}
 		select {
 		case <-ctx.Done():
-			_ = unix.Close(fd)
-			return nil, ctx.Err()
+			return nil, closeFence(ctx.Err(), fd, path)
 		case <-timer.C:
 		}
 	}
 	release = sync.OnceValue(func() error { return releaseFence(fd, path) })
 	// A context that ended while the lock was being taken gets no lease: the lock is given up before returning.
 	if err := ctx.Err(); err != nil {
-		_ = release()
+		if releaseErr := release(); releaseErr != nil {
+			return nil, errors.Join(err, releaseErr)
+		}
 		return nil, err
 	}
 	return release, nil
@@ -114,30 +120,34 @@ func (f *StartFence) open() (int, error) {
 	}
 	var st unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
-		_ = unix.Close(fd)
-		return -1, &fs.PathError{Op: "fstat", Path: path, Err: err}
+		return -1, closeFence(&fs.PathError{Op: "fstat", Path: path, Err: err}, fd, path)
 	}
 	if st.Mode&unix.S_IFMT != unix.S_IFREG {
-		_ = unix.Close(fd)
-		return -1, fmt.Errorf("start fence %s is not a regular file", path)
+		return -1, closeFence(fmt.Errorf("start fence %s is not a regular file", path), fd, path)
 	}
 	return fd, nil
 }
 
 // releaseFence unlocks the descriptor that holds the fence and then closes it, also when the unlock fails, so that
-// the descriptor is closed exactly once. The unlock comes first because a child process that is between fork and
-// exec still shares the open file description; closing alone would leave the lock held until that child execs.
+// the descriptor is closed exactly once. The unlock comes first because a forked child that has not yet called exec
+// still shares the open file description, and the lock lasts until the last reference to it goes away; closing
+// alone would leave the lock held until that child execs.
 func releaseFence(fd int, path string) error {
-	var unlockErr, closeErr error
+	var unlockErr error
 	if err := unlockFence(fd); err != nil {
 		unlockErr = &fs.PathError{Op: "unlock", Path: path, Err: err}
 	}
-	// A close is never retried: the descriptor is gone even when close reports an error, and its number may
-	// already belong to another open.
+	return closeFence(unlockErr, fd, path)
+}
+
+// closeFence closes fd once and returns cause, joined with the close's error when the close fails, so that a close
+// failure is reported and errors.Is still finds cause. The close is never retried: after a failed close the
+// descriptor number may already have been reused by another open, which a second close would destroy.
+func closeFence(cause error, fd int, path string) error {
 	if err := unix.Close(fd); err != nil {
-		closeErr = &fs.PathError{Op: "close", Path: path, Err: err}
+		return errors.Join(cause, &fs.PathError{Op: "close", Path: path, Err: err})
 	}
-	return errors.Join(unlockErr, closeErr)
+	return cause
 }
 
 func unlockFenceDescriptor(fd int) error {

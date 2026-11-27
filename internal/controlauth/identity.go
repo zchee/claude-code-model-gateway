@@ -91,13 +91,8 @@ func supervisorIdentityMAC(token, nonce, generation string) ([]byte, error) {
 // canonicalHex decodes s only when it is exactly size bytes spelled as lowercase hexadecimal. Every other spelling
 // of the same bytes (uppercase, a prefix, white space) is refused before decoding, so it can never verify.
 func canonicalHex(s string, size int) ([]byte, bool) {
-	if len(s) != hex.EncodedLen(size) {
+	if !lowerHex(s, size) {
 		return nil, false
-	}
-	for i := range len(s) {
-		if b := s[i]; (b < '0' || b > '9') && (b < 'a' || b > 'f') {
-			return nil, false
-		}
 	}
 	decoded, err := hex.DecodeString(s)
 	return decoded, err == nil

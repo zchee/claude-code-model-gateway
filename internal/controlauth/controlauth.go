@@ -37,13 +37,16 @@ const (
 	tokenBytes    = 32
 )
 
-func validToken(token string) bool {
-	if len(token) != tokenBytes*2 {
+func validToken(token string) bool { return lowerHex(token, tokenBytes) }
+
+// lowerHex reports whether s spells exactly size bytes in lowercase hexadecimal. Token loading, the identity
+// challenge and the identity proof all use it, so the spellings they accept cannot drift apart.
+func lowerHex(s string, size int) bool {
+	if len(s) != hex.EncodedLen(size) {
 		return false
 	}
-	for i := range len(token) {
-		b := token[i]
-		if (b < '0' || b > '9') && (b < 'a' || b > 'f') {
+	for i := range len(s) {
+		if b := s[i]; (b < '0' || b > '9') && (b < 'a' || b > 'f') {
 			return false
 		}
 	}
