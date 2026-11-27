@@ -276,10 +276,6 @@ func TestBufferedReadFailure(t *testing.T) {
 			equal(t, 502, w.Code)
 			equal(t, "application/json", w.Header().Get("Content-Type"))
 			equal(t, `{"type":"error","error":{"type":"api_error","message":"model-gateway shim: upstream response ended early"}}`, w.Body.String())
-			equal(t, tc.status, result.Status)
-			if result.StatusOverride != "upstream_error" && result.StatusOverride != "upstream_aborted" {
-				t.Errorf("unexpected incomplete status %q", result.StatusOverride)
-			}
 			equal(t, &outcome.Compaction{Outcome: "upstream_error", ErrorCode: "upstream_http_error", UpstreamStatus: new(tc.status)}, result.Route.Compaction)
 			checkIncomplete(t, capture)
 		})

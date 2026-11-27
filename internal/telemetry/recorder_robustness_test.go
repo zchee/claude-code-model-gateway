@@ -714,12 +714,17 @@ func TestTraceStalledReplyBody(t *testing.T) {
 		// trickle sends one more body byte at each interval after the response headers; zero
 		// sends nothing more. 90ms does not divide the 500ms bound, so no byte coincides with it.
 		trickle time.Duration
+		// headerDelay holds the response headers back after the whole post was read, so a bound
+		// timed from the headers instead of from the start of the export would end later than 500ms.
+		headerDelay time.Duration
 		// wantProgress is the number of trickled bytes the exporter reads before the bound.
 		wantProgress int32
 	}{
 		"error: collector on a pipe stalls after its response headers": {},
+		// The headers arrive at 100ms and the bytes at 100ms + k*90ms: 190, 280, 370 and 460ms are
+		// read before the bound, and the next one, at 550ms, is not. No byte lands at 500ms.
 		"error: collector on a pipe trickles its reply body more often than the bound": {
-			trickle: 90 * time.Millisecond, wantProgress: 5,
+			trickle: 90 * time.Millisecond, headerDelay: 100 * time.Millisecond, wantProgress: 4,
 		},
 	}
 	for name, tt := range tests {
@@ -742,6 +747,7 @@ func TestTraceStalledReplyBody(t *testing.T) {
 						_, err = io.Copy(io.Discard, req.Body)
 					}
 					if err == nil {
+						time.Sleep(tt.headerDelay)
 						_, err = io.WriteString(peer, reply)
 					}
 					headers <- err

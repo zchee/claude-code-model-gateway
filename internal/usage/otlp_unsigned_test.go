@@ -26,9 +26,12 @@ import (
 // TestOTLPIntegerAttributesExact checks that an integer attribute value of any Go integer type is
 // exported as the exact decimal of that value. A binary64 holds every integer only up to 2^53, so
 // an unsigned value sent through a float would lose its last digits: 9007199254740993 would be
-// exported as 9007199254740992. Only values inside the signed 64-bit range of OTLP's intValue are
-// checked.
+// exported as 9007199254740992. The kind of the value decides, not its declared type, so named
+// integer types and uintptr are checked as well as the predeclared ones.
 func TestOTLPIntegerAttributesExact(t *testing.T) {
+	type namedUint64 uint64
+	type namedUint16 uint16
+	type namedUintptr uintptr
 	tests := map[string]struct {
 		value any
 		want  string
@@ -56,6 +59,32 @@ func TestOTLPIntegerAttributesExact(t *testing.T) {
 		"success: largest unsigned 8-bit value": {
 			value: uint8(math.MaxUint8),
 			want:  "255",
+		},
+		// The largest 64-bit unsigned value lies above the range of a signed 64-bit integer, which
+		// is the range of an OTLP integer value; it still keeps every one of its digits.
+		"success: largest unsigned 64-bit value": {
+			value: uint64(math.MaxUint64),
+			want:  "18446744073709551615",
+		},
+		"success: named type of kind uint64 one above 2^53": {
+			value: namedUint64(9007199254740993),
+			want:  "9007199254740993",
+		},
+		"success: named type of kind uint16 at its largest value": {
+			value: namedUint16(math.MaxUint16),
+			want:  "65535",
+		},
+		"success: largest unsigned 16-bit value": {
+			value: uint16(math.MaxUint16),
+			want:  "65535",
+		},
+		"success: uintptr value one above 2^53": {
+			value: uintptr(9007199254740993),
+			want:  "9007199254740993",
+		},
+		"success: named type of kind uintptr at the largest 64-bit unsigned value": {
+			value: namedUintptr(math.MaxUint64),
+			want:  "18446744073709551615",
 		},
 		"success: unsigned zero": {
 			value: uint64(0),
