@@ -127,6 +127,46 @@ func (d *directory) Rename(from, to string) error {
 	return nil
 }
 
+// renameInto renames from in d to to in dest, which is on the same filesystem.
+func (d *directory) renameInto(from string, dest *directory, to string) error {
+	if !validBase(from) {
+		return &DestinationError{from}
+	}
+	if !validBase(to) {
+		return &DestinationError{to}
+	}
+	err := unix.Renameat(int(d.handle.Fd()), from, int(dest.handle.Fd()), to)
+	runtime.KeepAlive(d)
+	runtime.KeepAlive(dest)
+	if err != nil {
+		return &os.LinkError{Op: "rename", Old: d.path(from), New: dest.path(to), Err: err}
+	}
+	return nil
+}
+
+// openStaging opens d's existing [StagingDirName] subdirectory without following a symlink, and
+// refuses it unless it is a directory owned by the effective user with no access for others.
+func (d *directory) openStaging() (*directory, error) {
+	fd, err := retryEINTR(func() (int, error) {
+		return unix.Openat(int(d.handle.Fd()), StagingDirName, directoryFlags|unix.O_NOFOLLOW, 0)
+	})
+	runtime.KeepAlive(d)
+	path := d.path(StagingDirName)
+	if err != nil {
+		return nil, &os.PathError{Op: "open staging directory", Path: path, Err: err}
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		_ = unix.Close(fd)
+		return nil, &os.PathError{Op: "stat staging directory", Path: path, Err: err}
+	}
+	if st.Uid != uint32(os.Geteuid()) || st.Mode&0o077 != 0 {
+		_ = unix.Close(fd)
+		return nil, &os.PathError{Op: "open staging directory", Path: path, Err: fs.ErrPermission}
+	}
+	return &directory{os.NewFile(uintptr(fd), path)}, nil
+}
+
 func (d *directory) entryNames() ([]string, error) {
 	// A plain dup shares its directory offset. Reopen dot relative to the pinned fd so each sweep starts at the beginning.
 	fd, err := retryEINTR(func() (int, error) { return unix.Openat(int(d.handle.Fd()), ".", directoryFlags, 0) })

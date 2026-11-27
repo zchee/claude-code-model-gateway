@@ -82,6 +82,24 @@ type writer struct {
 	remove                func(preparedFile) error
 	afterOpen, beforeLink func()
 	skipSync              bool
+	privateStaging        bool
+	// stage is the opened staging subdirectory of a [PrivateStaging] write; nil stages beside
+	// the destination.
+	stage *directory
+}
+
+// StagingDirName names the private subdirectory, inside a destination's directory, in which a
+// [PrivateStaging] write stages its file.
+const StagingDirName = ".model-gateway-staging"
+
+// PrivateStaging stages the new file in the destination directory's [StagingDirName]
+// subdirectory instead of beside the destination, then renames it into place. A watcher of the
+// destination directory sees no staging name: no event reaches it before the rename that puts the
+// finished file in place. The subdirectory must already exist, be a real directory owned by the
+// caller and be inaccessible to others; it is not created here, and a missing or unusable
+// subdirectory fails the write. [CreateStagingDir] creates it.
+func PrivateStaging() WriteOption {
+	return func(w *writer) { w.privateStaging = true }
 }
 
 func newWriter(opts ...WriteOption) writer {

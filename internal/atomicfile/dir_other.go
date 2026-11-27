@@ -28,6 +28,9 @@ func OpenDir(path string) (*Dir, error) { return nil, errors.ErrUnsupported }
 // OpenDirCreate returns errors.ErrUnsupported on non-Unix platforms.
 func OpenDirCreate(path string, perm fs.FileMode) (*Dir, error) { return nil, errors.ErrUnsupported }
 
+// CreateStagingDir returns errors.ErrUnsupported on non-Unix platforms.
+func CreateStagingDir(path string, perm fs.FileMode) error { return errors.ErrUnsupported }
+
 // OpenDirectoryFile returns errors.ErrUnsupported on non-Unix platforms.
 func OpenDirectoryFile(path string, perm fs.FileMode) (*os.File, error) {
 	return nil, errors.ErrUnsupported

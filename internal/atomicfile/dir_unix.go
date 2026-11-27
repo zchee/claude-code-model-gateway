@@ -55,6 +55,29 @@ func OpenDirCreate(path string, perm fs.FileMode) (*Dir, error) {
 	return openDirCreate(path, perm, nil)
 }
 
+// CreateStagingDir opens path as [OpenDirCreate] does with perm, then creates inside it the
+// private [StagingDirName] subdirectory (mode 0o700, subject to the creation mask) that
+// [PrivateStaging] writes stage their files in. An existing subdirectory is kept and checked as
+// [PrivateStaging] checks it. Creating the subdirectory is itself an event in path for a watcher
+// of path, so it belongs before any reader watches, not before a write.
+func CreateStagingDir(path string, perm fs.FileMode) error {
+	d, err := OpenDirCreate(path, perm)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = d.Close() }()
+	fd := int(d.root.handle.Fd())
+	_, err = retryEINTR(func() (int, error) { return 0, unix.Mkdirat(fd, StagingDirName, 0o700) })
+	if err != nil && !errors.Is(err, fs.ErrExist) {
+		return &os.PathError{Op: "mkdir", Path: d.root.path(StagingDirName), Err: err}
+	}
+	staging, err := d.root.openStaging()
+	if err != nil {
+		return err
+	}
+	return staging.Close()
+}
+
 func openDirCreate(path string, perm fs.FileMode, afterOpen func(string)) (*Dir, error) {
 	f, err := openDirectoryFile(path, perm, afterOpen)
 	if err != nil {

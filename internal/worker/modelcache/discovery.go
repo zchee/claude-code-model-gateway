@@ -18,6 +18,7 @@ import (
 	"encoding/json/jsontext"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -106,16 +107,26 @@ func (c *Cache) SyncDiscoveryCache(force bool) (DiscoverySyncResult, error) {
 	if err != nil {
 		return result, err
 	}
-	if err := os.MkdirAll(filepath.Dir(c.discoveryPath), 0o777); err != nil {
-		return result, err
+	// A missing directory has no watcher yet, so this write creates it with its staging
+	// subdirectory; an existing one got that subdirectory when the cache was created.
+	if dir := filepath.Dir(c.discoveryPath); !exists(dir) {
+		if err := atomicfile.CreateStagingDir(dir, 0o777); err != nil {
+			return result, err
+		}
 	}
-	// Like the Anthropic catalog, the discovery cache is rebuilt from the catalogs, and a reader
-	// may watch its directory, so it is published without the staging sync.
-	if err := atomicfile.WriteFile(c.discoveryPath, data, 0o600, atomicfile.SkipSync()); err != nil {
+	// Like the Anthropic catalog, the discovery cache is rebuilt from the catalogs, so it is not
+	// synced, and a reader may watch its directory, so it is staged out of that view and renamed in.
+	if err := atomicfile.WriteFile(c.discoveryPath, data, 0o600, atomicfile.SkipSync(), atomicfile.PrivateStaging()); err != nil {
 		return result, err
 	}
 	result.State = "wrote"
 	return result, nil
+}
+
+// exists reports whether path names an existing file system entry, following symlinks.
+func exists(path string) bool {
+	_, err := os.Stat(path)
+	return !errors.Is(err, fs.ErrNotExist)
 }
 
 // syncDiscovery runs a sync for refresh paths, which report a failure only to the log.

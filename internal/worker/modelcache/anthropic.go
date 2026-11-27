@@ -27,6 +27,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf16"
 	"unicode/utf8"
 
@@ -52,6 +53,9 @@ type catalogFlight struct {
 // ModelsResponse builds the GET /v1/models JSON response body using allowed credential headers from incoming.
 // When serving stale cached rows immediately, any background refresh runs under the worker context from Start rather than ctx.
 func (c *Cache) ModelsResponse(ctx context.Context, incoming http.Header) (jsontext.Value, error) {
+	if err := c.awaitFirstListing(ctx); err != nil {
+		return nil, err
+	}
 	anthropicRows, count, flight := c.anthropicRows(incoming)
 	// A cold cache waits for the shared refresh; the request context ends only this wait
 	// (lib/anthropic-catalog.js:96-104).
@@ -78,6 +82,40 @@ func (c *Cache) ModelsResponse(ctx context.Context, incoming http.Header) (jsont
 	body = append(body, data...)
 	body = append(body, `,"has_more":false}`...)
 	return body, nil
+}
+
+// awaitFirstListing holds an answer given after Start until the first proxy listing has been
+// refreshed, so an answer just after startup does not list the built-in Codex defaults while the
+// listing is still on its way. The wait ends at the latest when the listing's own timeout after
+// Start has passed, and a failed or timed-out listing leaves the fallback to answer. Once the first
+// refresh ended or that bound passed, no answer waits; before Start none does. The request context
+// ends only this wait. The source answers at once from the fallback; this wait is a deliberate
+// difference.
+func (c *Cache) awaitFirstListing(ctx context.Context) error {
+	c.mu.Lock()
+	started, deadline := c.started, c.firstDeadline
+	c.mu.Unlock()
+	if !started {
+		return nil
+	}
+	select {
+	case <-c.firstListing:
+		return nil
+	default:
+	}
+	wait := time.Until(deadline)
+	if wait <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-c.firstListing:
+	case <-timer.C:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return nil
 }
 
 // TriggerAnthropicRefresh initiates a non-blocking Anthropic catalog refresh under the worker context from Start when stale and credentials are present.

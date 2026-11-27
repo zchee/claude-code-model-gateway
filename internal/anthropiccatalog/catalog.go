@@ -21,6 +21,7 @@ import (
 	json "encoding/json/v2"
 	"errors"
 	"io"
+	"io/fs"
 	"math"
 	"path/filepath"
 	"slices"
@@ -205,14 +206,24 @@ func write(path string, obj jsonx.WireValue) error {
 		return err
 	}
 	parent, name := filepath.Split(path)
-	dir, err := atomicfile.OpenDirCreate(cmp.Or(parent, "."), 0o777)
+	parent = cmp.Or(parent, ".")
+	dir, err := atomicfile.OpenDir(parent)
+	if errors.Is(err, fs.ErrNotExist) {
+		// No reader can watch a directory that does not exist yet, so the write that creates it
+		// also creates its staging subdirectory. In an existing directory the cache creates that
+		// subdirectory when it starts, and a write never does.
+		if err = atomicfile.CreateStagingDir(parent, 0o777); err == nil {
+			dir, err = atomicfile.OpenDir(parent)
+		}
+	}
 	if err != nil {
 		return err
 	}
 	defer func() { _ = dir.Close() }()
-	// The catalog is a cache the next refresh fetches again, and a reader watching the
-	// directory must find the new content as soon as the staging file wakes it.
-	return dir.WriteFile(name, data, 0o600, atomicfile.SkipSync())
+	// The catalog is a cache the next refresh fetches again, so it is not synced. It is staged out
+	// of the view of a directory watcher and renamed into place, so a reader woken by the change
+	// finds the new content.
+	return dir.WriteFile(name, data, 0o600, atomicfile.SkipSync(), atomicfile.PrivateStaging())
 }
 
 // WithCached puts the advertised cached rows before models, which lose on an ID collision.

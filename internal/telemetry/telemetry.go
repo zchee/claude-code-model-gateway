@@ -28,6 +28,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"path/filepath"
 	"regexp"
@@ -76,6 +77,17 @@ type Recorder struct {
 	randomMu    sync.Mutex
 	random      io.Reader
 	pending     sync.WaitGroup
+
+	queueMu sync.Mutex // guards queue and sending
+	queue   []queuedPost
+	sending bool // a sender is draining queue
+}
+
+// queuedPost is one span waiting for the sender. Its export bound started when it was submitted.
+type queuedPost struct {
+	ctx     context.Context
+	cancel  context.CancelFunc
+	payload []byte
 }
 
 // NewRecorder creates a recorder from the worker's isolated configuration.
@@ -295,17 +307,76 @@ func (s *Span) Finish(route Route, statusCode int, statusOverride string) {
 	if err != nil {
 		return
 	}
-	r.pending.Go(func() { r.post(payload) })
+	r.submit(payload)
 }
 
-// post sends one span; every failure, including a timeout or a refused connection, is silent.
-func (r *Recorder) post(payload []byte) {
+// submit queues one span for export in the background and returns at once. Spans reach the
+// collector in submission order, as the source starts its posts in order: one sender starts each
+// post and waits only until its request is written, or the post ended, before starting the next.
+// Replies are read concurrently, so a slow collector delays no later post. Each post's bound starts
+// at submission, and a span still queued when its bound expires is dropped. The usage emitter
+// sends its records the same way.
+func (r *Recorder) submit(payload []byte) {
 	ctx, cancel := context.WithTimeout(context.Background(), exportTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.endpoint.String(), bytes.NewReader(payload))
+	r.queueMu.Lock()
+	r.queue = append(r.queue, queuedPost{ctx: ctx, cancel: cancel, payload: payload})
+	start := !r.sending
+	r.sending = true
+	r.queueMu.Unlock()
+	if start {
+		r.pending.Go(r.send)
+	}
+}
+
+// send starts the queued posts one at a time, in queue order, until the queue is empty. It is
+// counted in pending, so every post it starts is added to pending before Wait can return.
+func (r *Recorder) send() {
+	for {
+		r.queueMu.Lock()
+		if len(r.queue) == 0 {
+			r.queue, r.sending = nil, false
+			r.queueMu.Unlock()
+			return
+		}
+		next := r.queue[0]
+		r.queue[0] = queuedPost{}
+		r.queue = r.queue[1:]
+		r.queueMu.Unlock()
+		if next.ctx.Err() != nil {
+			next.cancel()
+			continue
+		}
+		written := make(chan struct{})
+		r.pending.Go(func() {
+			defer next.cancel()
+			r.post(next.ctx, next.payload, sync.OnceFunc(func() { close(written) }))
+		})
+		<-written
+	}
+}
+
+// post sends one span under ctx and calls written once: when the whole request is on the
+// connection, or when the post ends without that. Every failure, including a timeout or a refused
+// connection, is silent.
+//
+// The body is an opaque reader of known length, not a *bytes.Reader. This relies on net/http
+// behaviour that is implemented but not documented: for a body it does not recognise as in-memory,
+// the transport flushes the headers before the body and copies the body straight onto the
+// connection, so WroteRequest fires only once the request has left the transport's write buffer.
+// With a *bytes.Reader it fires while the request is still in that buffer, and the next post can
+// start before this one reached the collector. The span order test fails if that changes.
+func (r *Recorder) post(ctx context.Context, payload []byte, written func()) {
+	defer written()
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{WroteRequest: func(httptrace.WroteRequestInfo) { written() }})
+	opaque := func() io.Reader { return struct{ io.Reader }{bytes.NewReader(payload)} }
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.endpoint.String(), opaque())
 	if err != nil {
 		return
 	}
+	// NewRequest sets neither for a body type it does not know: keep the fixed length (no chunked
+	// encoding), and keep the request rewindable as a *bytes.Reader body would be.
+	req.ContentLength = int64(len(payload))
+	req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(opaque()), nil }
 	req.Header.Set("Content-Type", "application/json")
 	// An empty value suppresses Go's default User-Agent; the source sends none.
 	req.Header.Set("User-Agent", "")

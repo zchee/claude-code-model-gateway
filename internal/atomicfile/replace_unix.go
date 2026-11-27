@@ -33,14 +33,22 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// stagedFile is a staged file named name in root, published as target in dest, or in root when
+// dest is nil.
 type stagedFile struct {
 	root         *directory
 	name, target string
+	dest         *directory
 }
 
-func (s stagedFile) Name() string                  { return s.root.path(s.name) }
-func (s stagedFile) CloseAtomicallyReplace() error { return s.root.Rename(s.name, s.target) }
-func (s stagedFile) remove() error                 { return s.root.removeIfPresent(s.name) }
+func (s stagedFile) Name() string { return s.root.path(s.name) }
+func (s stagedFile) CloseAtomicallyReplace() error {
+	if s.dest != nil {
+		return s.root.renameInto(s.name, s.dest, s.target)
+	}
+	return s.root.Rename(s.name, s.target)
+}
+func (s stagedFile) remove() error { return s.root.removeIfPresent(s.name) }
 
 func createSibling(root *directory, base string, mode fs.FileMode) (*os.File, string, error) {
 	for {
@@ -146,11 +154,16 @@ func verifyMetadata(f *os.File, path string, mode fs.FileMode, owner ownership) 
 }
 
 func (w writer) replace(root *directory, base string, data []byte, mode fs.FileMode, oldOwner *ownership, retainMode bool, check func(preparedFile) error) (err error) {
-	file, name, err := createSibling(root, base, 0o600)
+	staging := root
+	var dest *directory
+	if w.stage != nil {
+		staging, dest = w.stage, root
+	}
+	file, name, err := createSibling(staging, base, 0o600)
 	if err != nil {
 		return err
 	}
-	stage := stagedFile{root, name, base}
+	stage := stagedFile{root: staging, name: name, target: base, dest: dest}
 	published := false
 	defer func() {
 		if !published {
@@ -164,7 +177,7 @@ func (w writer) replace(root *directory, base string, data []byte, mode fs.FileM
 		err = preserveOwner(file, root.path(base), ownerOf(info), *oldOwner)
 	}
 	if err == nil && !retainMode {
-		mode, err = creationMode(root, base, mode, info)
+		mode, err = creationMode(staging, base, mode, info)
 	}
 	if err == nil {
 		_, err = file.Write(data)
@@ -196,7 +209,9 @@ func (w writer) replace(root *directory, base string, data []byte, mode fs.FileM
 		err = w.commit(stage, root.path(base))
 		if err == nil {
 			published = true
-			sweep(root, base, name, w.now())
+			// A private staging directory is swept instead of the destination's, so the sweep
+			// adds no event in the directory a reader watches.
+			sweep(staging, base, name, w.now())
 			return nil
 		}
 		retry := errors.Is(err, unix.EBUSY) || errors.Is(err, unix.EACCES) || errors.Is(err, unix.EPERM)
@@ -224,6 +239,14 @@ func (w writer) writeFileAt(root *directory, base string, data []byte, mode fs.F
 	var owner *ownership
 	if info != nil {
 		owner = &ownership{info.Uid, info.Gid}
+	}
+	if w.privateStaging {
+		staging, err := root.openStaging()
+		if err != nil {
+			return err
+		}
+		defer func() { _ = staging.Close() }()
+		w.stage = staging
 	}
 	return w.replace(root, base, data, mode, owner, false, nil)
 }

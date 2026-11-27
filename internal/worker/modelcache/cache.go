@@ -33,6 +33,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/zchee/claude-code-model-gateway/internal/atomicfile"
 	"github.com/zchee/claude-code-model-gateway/internal/config"
 	"github.com/zchee/claude-code-model-gateway/internal/localprov"
 	"github.com/zchee/claude-code-model-gateway/internal/paths"
@@ -206,9 +207,17 @@ type Cache struct {
 	// nil until Start.
 	workerDone <-chan struct{}
 	started    bool
+	// firstDeadline, set by Start, is the latest instant a models answer waits for the first
+	// listing: the listing's own timeout after Start.
+	firstDeadline time.Time
 	// closed is set by Wait; no background work is registered afterwards.
 	closed bool
 	wg     sync.WaitGroup
+
+	// firstListing is closed, through firstListingDone, once the first refresh after Start ended,
+	// whatever its outcome, or the refresh loop stopped.
+	firstListing     chan struct{}
+	firstListingDone func()
 }
 
 // New initializes the fallback model catalog and publishes generation 1 to Routes and Sentry.
@@ -239,6 +248,8 @@ func New(opts Options) (*Cache, error) {
 	}
 	c.life, c.stopLife = context.WithCancel(context.Background())
 	c.lifeDone = c.life.Done()
+	c.firstListing = make(chan struct{})
+	c.firstListingDone = sync.OnceFunc(func() { close(c.firstListing) })
 	if c.lookup == nil {
 		c.lookup = func(string) (string, bool) { return "", false }
 	}
@@ -265,6 +276,20 @@ func New(opts Options) (*Cache, error) {
 	c.globalConfig, _ = opts.Paths.GlobalConfigPath()
 	if dir, err := opts.Paths.ProxyConfigDir(); err == nil && filepath.IsAbs(dir) && filepath.Clean(dir) == dir {
 		c.proxyConfigDir = dir
+	}
+	// Both catalog caches stage their files in a private subdirectory of their own directory, so a
+	// reader watching that directory sees only the rename that puts a finished file in place.
+	// Creating the subdirectory is itself an event in that directory: it happens here, while the
+	// worker starts and before it answers any request, and a write into an existing directory never
+	// creates it. A subdirectory that cannot be created makes the later writes fail as cache
+	// writes fail today.
+	for _, dir := range []string{c.stateDir, filepath.Dir(c.discoveryPath)} {
+		if dir == "" || dir == "." {
+			continue
+		}
+		if err := atomicfile.CreateStagingDir(dir, 0o777); err != nil {
+			c.logf("model-gateway: could not prepare a catalog cache directory (%s)", errorClass(err))
+		}
 	}
 
 	// The startup catalog lists the Codex defaults only, before any listing was read
@@ -335,6 +360,7 @@ func (c *Cache) Start(ctx context.Context) {
 	}
 	c.started = true
 	c.workerDone = done
+	c.firstDeadline = time.Now().Add(ProxyListingTimeout)
 	c.wg.Go(func() { c.run(ctx) })
 	c.mu.Unlock()
 	// A catalog refresh already running, or started later, ends with the worker.
@@ -366,7 +392,10 @@ func (c *Cache) run(ctx context.Context) {
 			delay = min(delay*2, MaxRetryDelay)
 		}
 	}
-	if err := c.refresh(ctx, onListing); err == nil {
+	defer c.firstListingDone()
+	err := c.refresh(ctx, onListing)
+	c.firstListingDone()
+	if err == nil {
 		c.logSentryPolicies()
 	}
 	for {
