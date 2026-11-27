@@ -79,6 +79,9 @@ type Runner struct {
 // Request describes a prepared proxy request. Next invokes the bound reply handler;
 // its bool argument says whether the client has already received response headers.
 // A nil response is a settled verdict; a non-nil response transfers body ownership.
+// Next may settle a response by relaying it to the client itself, as it does with one that
+// is not an event stream; Serve returns such a verdict unchanged, so service shutdown and
+// client departure during that relay are Next's to handle, not the guard's.
 //
 // Serve takes its stream settings from Stream except HeadWritten, ClientDone and Usage:
 // it tracks header commitment itself, learns about the client from Serve's ctx, and

@@ -137,6 +137,12 @@ func (c *composer) proxy(client http.ResponseWriter, r *http.Request, snap route
 		SentryTarget:      prep.Target,
 		Usage:             optional[sse.UsageCapture](capture),
 	}
+	pass := sse.PassthroughOptions{
+		ProxyProvider: provider,
+		SessionKey:    session,
+		Sentry:        c.opts.Sentry,
+		SentryTarget:  prep.Target,
+	}
 
 	var res outcome.Result
 	// The conditions of compactguard.ShouldGuard, over the classification above.
@@ -153,6 +159,14 @@ func (c *composer) proxy(client http.ResponseWriter, r *http.Request, snap route
 				attempt := req
 				attempt.HeadWritten = headWritten
 				out, err := reply.Handle(ctx, w, attempt, send)
+				// An open response that is not an event stream, a redirect in practice, is no stream
+				// attempt: it is relayed once, untouched, as the unguarded path relays it, and the
+				// guard returns that settled verdict as it is. Only a first attempt gets here, because
+				// the reply handler answers anything but an event stream in band once a head is written.
+				if out.Stream != nil && err == nil && !eventStream(out.Stream) {
+					res, err := c.passthrough(w, r, attempt, out, pass)
+					return nil, res, err
+				}
 				return out.Stream, out.Result, err
 			},
 			Stream: stream,
@@ -160,12 +174,7 @@ func (c *composer) proxy(client http.ResponseWriter, r *http.Request, snap route
 		})
 	} else {
 		stream.OnOverflow = overflowResponder(req)
-		res, err = c.reply(w, r, req, send, stream, sse.PassthroughOptions{
-			ProxyProvider: provider,
-			SessionKey:    session,
-			Sentry:        c.opts.Sentry,
-			SentryTarget:  prep.Target,
-		})
+		res, err = c.reply(w, r, req, send, stream, pass)
 	}
 	c.delivered(w, err, capture)
 	return settle(prep.Route, res), err
@@ -293,17 +302,25 @@ func (c *composer) reply(w http.ResponseWriter, r *http.Request, req reply.Reque
 		}
 		return out.Result, err
 	}
-	var res outcome.Result
-	if req.Provider != "" && eventStream(out.Stream) {
-		res, err = sse.RelayProxy(c.opts.ServiceContext, w, out.Stream, stream)
-	} else {
-		pass.HeartbeatInterval = c.heartbeat
-		pass.MaxObserveBytes = c.maxObserveBytes
-		pass.ClientDone = r.Context().Done()
-		pass.Usage = optional[sse.UsageCapture](usageOf(req))
-		res, err = sse.RelayPassthrough(c.opts.ServiceContext, w, out.Stream, pass)
+	if req.Provider == "" || !eventStream(out.Stream) {
+		return c.passthrough(w, r, req, out, pass)
 	}
+	res, err := sse.RelayProxy(c.opts.ServiceContext, w, out.Stream, stream)
 	res.Contacted = res.Contacted || out.Contacted
+	return res, err
+}
+
+// passthrough relays the open response reply.Handle left untouched on the service context, which
+// takes over and closes its body. The result is the relay's, with the upstream contact and the
+// compaction outcome the reply handler recorded for a status that is no success kept.
+func (c *composer) passthrough(w http.ResponseWriter, r *http.Request, req reply.Request, out reply.Result, pass sse.PassthroughOptions) (outcome.Result, error) {
+	pass.HeartbeatInterval = c.heartbeat
+	pass.MaxObserveBytes = c.maxObserveBytes
+	pass.ClientDone = r.Context().Done()
+	pass.Usage = optional[sse.UsageCapture](usageOf(req))
+	res, err := sse.RelayPassthrough(c.opts.ServiceContext, w, out.Stream, pass)
+	res.Contacted = res.Contacted || out.Contacted
+	res.Route.Compaction = out.Route.Compaction
 	return res, err
 }
 
