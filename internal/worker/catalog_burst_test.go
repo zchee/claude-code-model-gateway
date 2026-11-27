@@ -73,7 +73,10 @@ func readDiscoveryFile(t *testing.T, path string) (discoveryFile, []byte) {
 // replacement itself: the source does not have that property either, because its discovery write runs synchronously
 // on the event loop.
 //
-// The listing is published by a completed refresh first. Then an explicit SyncDiscoveryCache is paused in
+// The listing is published by a completed refresh first. The refresh's own discovery synchronization may run
+// after Refresh returns, so the test waits for its first, unpaused EffectiveBaseURL call and then completes an explicit
+// unpaused synchronization: that one waits behind the refresh's on the same mutex, so once it returns no automatic
+// write is left that could take the pause, and the baseline file exists. Then an explicit SyncDiscoveryCache is paused in
 // EffectiveBaseURL, the first step it takes after locking the mutex that serializes discovery writes, and before it
 // compares or replaces the file (internal/worker/modelcache/discovery.go). Only SyncDiscoveryCache calls
 // EffectiveBaseURL, so the paused caller is that synchronization. The burst must complete while the pause is held,
@@ -126,10 +129,12 @@ func TestCatalogBurstNoWriteWait(t *testing.T) {
 			clock := func() time.Time { return base.Add(time.Duration(ticks.Add(1)) * time.Millisecond) }
 
 			var (
-				armed    atomic.Bool
-				parked   = make(chan struct{})
-				released = make(chan struct{})
-				release  = sync.OnceFunc(func() { close(released) })
+				armed     atomic.Bool
+				firstCall = make(chan struct{})
+				noteCall  = sync.OnceFunc(func() { close(firstCall) })
+				parked    = make(chan struct{})
+				released  = make(chan struct{})
+				release   = sync.OnceFunc(func() { close(released) })
 			)
 			store := &route.Store{}
 			cache, err := modelcache.New(modelcache.Options{
@@ -142,6 +147,7 @@ func TestCatalogBurstNoWriteWait(t *testing.T) {
 				Routes:         store,
 				Sentry:         &sentry.State{},
 				EffectiveBaseURL: func() (string, error) {
+					noteCall()
 					if armed.CompareAndSwap(true, false) {
 						close(parked)
 						<-released
@@ -170,6 +176,15 @@ func TestCatalogBurstNoWriteWait(t *testing.T) {
 			}
 			if source, _ := cache.HealthCatalog(); source != "proxy" {
 				t.Fatalf("catalog source after the refresh = %q, want the proxy listing", source)
+			}
+			// This deadline only reports a refresh that never starts its discovery synchronization.
+			select {
+			case <-firstCall:
+			case <-time.After(30 * time.Second):
+				t.Fatal("the refresh did not start a discovery synchronization within 30s")
+			}
+			if fence, err := cache.SyncDiscoveryCache(true); err != nil || fence.State != "wrote" {
+				t.Fatalf("baseline SyncDiscoveryCache = (%+v, %v), want a written file", fence, err)
 			}
 			before, beforeRaw := readDiscoveryFile(t, discoveryPath)
 
