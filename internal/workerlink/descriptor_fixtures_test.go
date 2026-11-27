@@ -22,6 +22,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"testing/synctest"
@@ -98,19 +99,31 @@ func TestFixtureDescribeSocket(t *testing.T) {
 // address is free once the last copy closes, also with an unaccepted connection still queued.
 func TestFixtureAddressFreedByLastCopy(t *testing.T) {
 	l, err := realListen(t.Context(), "tcp4", "127.0.0.1:0")
+	if l != nil {
+		t.Cleanup(func() { _ = l.Close() })
+	}
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 	port := tcpPort(t, l.Addr())
-	f, err := l.(*net.TCPListener).File()
+	tcp, ok := l.(*net.TCPListener)
+	if !ok {
+		t.Fatalf("listen returned %T", l)
+	}
+	f, err := tcp.File()
+	if f != nil {
+		t.Cleanup(func() { _ = f.Close() })
+	}
 	if err != nil {
 		t.Fatalf("File: %v", err)
 	}
 	c, err := realDial(t.Context(), "tcp4", loopback(port))
+	if c != nil {
+		t.Cleanup(func() { _ = c.Close() })
+	}
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	t.Cleanup(func() { _ = c.Close() })
 	if err := l.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
@@ -121,16 +134,83 @@ func TestFixtureAddressFreedByLastCopy(t *testing.T) {
 	bindAndKeep(t, port, "after the last copy closed")
 }
 
-// TestFixtureFilledChannelBlocksWrites checks that a filled channel accepts no further byte, so an
-// acknowledgment written to it can only end through its deadline.
+// TestFixtureFilledChannelBlocksWrites checks the saturation the acknowledgment tests rely on, through a
+// connection over a local stream socket pair as the drain channel is: once fillUntilBlocked returns, not one more
+// byte fits, and the peer then reads exactly the bytes it reported and nothing more.
 func TestFixtureFilledChannelBlocksWrites(t *testing.T) {
-	a, _ := socketPair(t, unix.SOCK_STREAM)
-	c := fileConn(t, a)
-	fillUntilBlocked(t, c)
-	_ = c.SetWriteDeadline(time.Now().Add(50 * time.Millisecond))
-	if _, err := c.Write([]byte("x")); !errors.Is(err, os.ErrDeadlineExceeded) {
-		t.Fatalf("write to a filled channel: %v, want a deadline error", err)
+	a, b := socketPair(t, unix.SOCK_STREAM)
+	c, peer := fileConn(t, a), fileConn(t, b)
+	filled := fillUntilBlocked(t, c)
+	if filled <= 0 {
+		t.Fatalf("filled %d bytes", filled)
 	}
+	_ = c.SetWriteDeadline(time.Now().Add(50 * time.Millisecond))
+	if n, err := c.Write([]byte("x")); n != 0 || !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("write to a filled channel = %d, %v; want nothing written and a deadline error", n, err)
+	}
+	_ = c.SetWriteDeadline(time.Time{})
+	if got := readExactly(t, peer, filled); len(got) != filled {
+		t.Fatalf("peer read %d bytes, want %d", len(got), filled)
+	}
+	if n := pending(t, peer.(syscall.Conn)); n != 0 {
+		t.Errorf("%d bytes beyond the reported fill", n)
+	}
+}
+
+// TestFixtureCountsDescriptors checks the descriptor count the balance check relies on: one more open file is
+// one more descriptor, and closing it restores the count.
+func TestFixtureCountsDescriptors(t *testing.T) {
+	before, err := countOpenDescriptors()
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	f, err := os.Open(os.DevNull)
+	if f != nil {
+		t.Cleanup(func() { _ = f.Close() })
+	}
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	open, err := countOpenDescriptors()
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	after, err := countOpenDescriptors()
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if diff := gocmp.Diff([]int{1, 0}, []int{open - before, after - before}); diff != "" {
+		t.Errorf("count differences with a file open and after closing it (-want +got):\n%s", diff)
+	}
+}
+
+// TestFixtureClosedChannel checks the closure observations: a closed channel is reported closed on every receive,
+// a value sent on an open channel is not closure, and await lets a sleeping goroutine of the bubble run its timer.
+func TestFixtureClosedChannel(t *testing.T) {
+	closed := make(chan struct{})
+	close(closed)
+	checkClosedEachTime(t, func() <-chan struct{} { return closed }, "closed channel")
+	sent := make(chan struct{}, 1)
+	sent <- struct{}{}
+	if isClosed(sent) {
+		t.Error("a value sent on an open channel was reported as closure")
+	}
+	if isClosed(sent) {
+		t.Error("an open, empty channel was reported closed")
+	}
+	synctest.Test(t, func(t *testing.T) {
+		late := make(chan int, 1)
+		go func() {
+			time.Sleep(time.Second)
+			late <- 7
+		}()
+		if got := await(t, late, "a value sent after a sleep"); got != 7 {
+			t.Errorf("await = %d, want 7", got)
+		}
+	})
 }
 
 // TestFixtureBubble checks, inside a synctest bubble, the real-socket reads used there and the fakes' behaviour.
@@ -159,23 +239,35 @@ func TestFixtureBubble(t *testing.T) {
 		if err, ok := ready(errs); !ok || !errors.Is(err, context.Canceled) {
 			t.Fatalf("cancelled gated dial = %v (returned %t)", err, ok)
 		}
+		// The dial that ignores cancellation is checked with a context that is cancelled while it is parked.
 		ignoring := newGatedDials(false)
+		ignoredCtx, cancelIgnored := context.WithCancel(t.Context())
 		go func() {
-			_, err := ignoring.dial(t.Context(), "tcp4", "127.0.0.1:41001")
+			_, err := ignoring.dial(ignoredCtx, "tcp4", "127.0.0.1:41001")
 			errs <- err
 		}()
-		<-ignoring.attempts
+		parked := <-ignoring.attempts
+		cancelIgnored()
 		synctest.Wait()
+		if parked.ctx.Err() == nil {
+			t.Fatal("the parked attempt does not see its context's cancellation")
+		}
 		if _, ok := ready(errs); ok {
-			t.Fatal("a gated dial that ignores cancellation returned unanswered")
+			t.Fatal("a gated dial that ignores cancellation returned when its context was cancelled")
 		}
 		ignoring.release()
-		synctest.Wait()
-		if err, ok := ready(errs); !ok || err == nil {
-			t.Fatalf("released gated dial = %v (returned %t)", err, ok)
+		if err := await(t, errs, "the released gated dial"); err == nil {
+			t.Fatal("released gated dial returned no error")
 		}
 
 		l := newFakeListener(41001)
+		var hookRuns atomic.Int32
+		l.onClose(func() {
+			if isClosed(l.closed) {
+				t.Error("the close hook ran after the listener reported itself closed")
+			}
+			hookRuns.Add(1)
+		})
 		accepted := make(chan error, 1)
 		go func() {
 			_, err := l.Accept()
@@ -189,9 +281,12 @@ func TestFixtureBubble(t *testing.T) {
 			t.Fatal("fake Accept returned before Close")
 		}
 		_ = l.Close()
-		synctest.Wait()
-		if err, ok := ready(accepted); !ok || !errors.Is(err, net.ErrClosed) {
-			t.Fatalf("fake Accept after Close = %v (returned %t)", err, ok)
+		_ = l.Close()
+		if err := await(t, accepted, "fake Accept after Close"); !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("fake Accept after Close = %v", err)
+		}
+		if diff := gocmp.Diff([]int32{1, 2}, []int32{hookRuns.Load(), l.closings.Load()}); diff != "" {
+			t.Errorf("close hook runs and closings after two Closes (-want +got):\n%s", diff)
 		}
 		tc := newTrackedConn(t)
 		_ = tc.Close()

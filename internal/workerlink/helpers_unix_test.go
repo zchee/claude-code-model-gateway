@@ -134,20 +134,46 @@ func checkCloseOnExec(t *testing.T, c syscall.Conn, what string) {
 // pending returns the number of bytes queued for reading on c, up to 4096, without consuming them or blocking.
 func pending(t *testing.T, c syscall.Conn) int {
 	t.Helper()
+	n, err := peekPending(c)
+	if err != nil {
+		t.Fatalf("peek: %v", err)
+	}
+	return n
+}
+
+// peekPending is pending without a test: it may run on a goroutine of the code under test.
+func peekPending(c syscall.Conn) (int, error) {
+	raw, err := c.SyscallConn()
+	if err != nil {
+		return -1, err
+	}
 	n := -1
-	control(t, c, func(fd int) {
+	var peekErr error
+	if err := raw.Control(func(fd uintptr) {
 		buf := make([]byte, 4096)
-		got, _, err := unix.Recvfrom(fd, buf, unix.MSG_PEEK|unix.MSG_DONTWAIT)
+		got, _, err := unix.Recvfrom(int(fd), buf, unix.MSG_PEEK|unix.MSG_DONTWAIT)
 		switch {
 		case errors.Is(err, unix.EAGAIN):
 			n = 0
 		case err != nil:
-			t.Fatalf("peek: %v", err)
+			peekErr = err
 		default:
 			n = got
 		}
-	})
-	return n
+	}); err != nil {
+		return -1, err
+	}
+	return n, peekErr
+}
+
+// countOpenDescriptors counts the descriptors open in this process. The directory it reads is open during both of
+// two counts, so a difference of two counts is exact.
+func countOpenDescriptors() (int, error) {
+	entries, err := os.ReadDir("/dev/fd")
+	if err != nil {
+		return 0, err
+	}
+	return len(entries), nil
 }
 
 // socketKind describes a socket descriptor: its family, type and whether it listens.
@@ -213,6 +239,44 @@ func fileConn(t *testing.T, f *os.File) net.Conn {
 	return c
 }
 
+// fillUntilBlocked writes to c until not one more byte fits and returns the number of bytes written. Large writes
+// fill the buffers; the last write is a one-byte write that took nothing and ended at its deadline, which the
+// runtime reports only after the socket itself refused the byte (EAGAIN) and stayed full until the deadline. The
+// write deadline is cleared on return.
+func fillUntilBlocked(t *testing.T, c net.Conn) int {
+	t.Helper()
+	defer func() { _ = c.SetWriteDeadline(time.Time{}) }()
+	total := 0
+	chunk := make([]byte, 64<<10)
+	for full := false; !full; {
+		if total > 1<<30 {
+			t.Fatal("the channel never filled")
+		}
+		_ = c.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+		n, err := c.Write(chunk)
+		total += n
+		switch {
+		case errors.Is(err, os.ErrDeadlineExceeded):
+			full = true
+		case err != nil:
+			t.Fatalf("filling the channel: %v", err)
+		}
+	}
+	for range 1 << 16 {
+		_ = c.SetWriteDeadline(time.Now().Add(20 * time.Millisecond))
+		n, err := c.Write([]byte{'f'})
+		total += n
+		switch {
+		case n == 0 && errors.Is(err, os.ErrDeadlineExceeded):
+			return total
+		case err != nil && !errors.Is(err, os.ErrDeadlineExceeded):
+			t.Fatalf("filling the channel byte by byte: %v", err)
+		}
+	}
+	t.Fatal("the channel still took single bytes after 65536 of them")
+	return total
+}
+
 // readExactly reads n bytes under the watchdog deadline.
 func readExactly(t *testing.T, c net.Conn, n int) string {
 	t.Helper()
@@ -242,41 +306,93 @@ func acceptOne(t *testing.T, l *net.TCPListener) net.Conn {
 func childListener(t *testing.T, res *workerlink.Reservation) *net.TCPListener {
 	t.Helper()
 	f, err := res.File()
+	if f != nil {
+		t.Cleanup(func() { _ = f.Close() })
+	}
 	if err != nil {
 		t.Fatalf("File: %v", err)
 	}
 	l, err := net.FileListener(f)
+	if l != nil {
+		t.Cleanup(func() { _ = l.Close() })
+	}
 	if closeErr := f.Close(); closeErr != nil {
 		t.Fatalf("closing the duplicate: %v", closeErr)
 	}
 	if err != nil {
 		t.Fatalf("FileListener: %v", err)
 	}
-	t.Cleanup(func() { _ = l.Close() })
-	return l.(*net.TCPListener)
+	tcp, ok := l.(*net.TCPListener)
+	if !ok {
+		t.Fatalf("the duplicate is a %T listener, want TCP", l)
+	}
+	return tcp
 }
 
-// isClosed reports whether ch is closed, without waiting.
+// isClosed reports whether ch is closed, without waiting. A value sent on ch is not closure and reports false.
 func isClosed(ch <-chan struct{}) bool {
 	select {
-	case <-ch:
-		return true
+	case _, ok := <-ch:
+		return !ok
 	default:
 		return false
 	}
 }
 
-// fakeListener is a listener the registry may hold but must never accept on. It records closing and accepting.
+// checkClosedEachTime asserts that the channel get returns is closed, on a second receive from the same channel
+// and on a channel got again: closure, not a value sent once, wakes every waiter.
+func checkClosedEachTime(t *testing.T, get func() <-chan struct{}, what string) {
+	t.Helper()
+	ch := get()
+	for i := range 2 {
+		if !isClosed(ch) {
+			t.Errorf("%s: receive %d does not report a closed channel", what, i+1)
+		}
+	}
+	if !isClosed(get()) {
+		t.Errorf("%s: the channel got again is not closed", what)
+	}
+}
+
+// await waits for the value on ch. In a synctest bubble the watchdog is virtual time, so code that waits on its
+// own timers gets to run them before the test gives up; outside one it is real time. It only aborts a hang.
+func await[T any](t *testing.T, ch <-chan T, what string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(watchdog):
+		t.Fatalf("%s did not happen within %v", what, watchdog)
+		var zero T
+		return zero
+	}
+}
+
+// fakeListener is a listener the registry may hold but must never accept on. It records closing and accepting,
+// and runs the hook set by onClose once, at the first Close, before it reports itself closed.
 type fakeListener struct {
-	addr     *net.TCPAddr
+	addr     net.Addr
 	once     sync.Once
 	closed   chan struct{}
 	accepts  atomic.Int32
 	closings atomic.Int32
+	mu       sync.Mutex
+	hook     func()
 }
 
 func newFakeListener(port uint16) *fakeListener {
-	return &fakeListener{addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(port)}, closed: make(chan struct{})}
+	return newFakeListenerAt(&net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(port)})
+}
+
+func newFakeListenerAt(addr net.Addr) *fakeListener {
+	return &fakeListener{addr: addr, closed: make(chan struct{})}
+}
+
+// onClose sets the hook the first Close runs.
+func (l *fakeListener) onClose(hook func()) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.hook = hook
 }
 
 func (l *fakeListener) Accept() (net.Conn, error) {
@@ -287,7 +403,15 @@ func (l *fakeListener) Accept() (net.Conn, error) {
 
 func (l *fakeListener) Close() error {
 	l.closings.Add(1)
-	l.once.Do(func() { close(l.closed) })
+	l.once.Do(func() {
+		l.mu.Lock()
+		hook := l.hook
+		l.mu.Unlock()
+		if hook != nil {
+			hook()
+		}
+		close(l.closed)
+	})
 	return nil
 }
 

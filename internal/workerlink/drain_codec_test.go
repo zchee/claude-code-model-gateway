@@ -38,6 +38,12 @@ func fillGeneration(typ string, size int) string {
 	return strings.Repeat("a", size-len(frame(typ, "")))
 }
 
+// jsonEscape returns the JSON escape of the UTF-16 code unit with the given four hexadecimal digits, a backslash,
+// u and the digits, spelled out so that the test's input holds the escape itself and not the character.
+func jsonEscape(hex string) string {
+	return "\\" + "u" + hex
+}
+
 // sentinels are the codec's declared failures; a decision names exactly one of them, or none.
 var codecSentinels = []error{workerlink.ErrDrainMessage, workerlink.ErrDrainLineTooLong, io.EOF}
 
@@ -126,6 +132,9 @@ func TestEncodeDrain(t *testing.T) {
 			if diff := gocmp.Diff(tt.want, out.String()); diff != "" {
 				t.Errorf("written bytes (-want +got):\n%s", diff)
 			}
+			if tt.err != nil && out.writes != 0 {
+				t.Errorf("EncodeDrain called Write %d times for a message it refused; it must validate and bound before writing", out.writes)
+			}
 			if tt.err == nil && len(out.String()) > workerlink.DrainLineLimit {
 				t.Errorf("frame of %d bytes exceeds the %d-byte limit", len(out.String()), workerlink.DrainLineLimit)
 			}
@@ -183,9 +192,9 @@ func TestEncodeDrainWriterFailures(t *testing.T) {
 			wants: []error{errWriter},
 		},
 		"error: writer takes part of the frame without an error": {
-			// A later write fails, so a writer that retries the remainder still sees a failure, never success.
-			w:     &shortWriter{err: errWriter},
-			wants: []error{io.ErrShortWrite, errWriter},
+			// A later write would succeed, so only the encoder's own check reports the short write.
+			w:     &shortWriter{},
+			wants: []error{io.ErrShortWrite},
 		},
 	}
 	for name, tt := range tests {
@@ -241,8 +250,12 @@ func TestDecodeDrain(t *testing.T) {
 			want:  workerlink.DrainMessage{Type: workerlink.Draining, Generation: "a\nb\"c\\dé😀"},
 		},
 		"success: escaped type name and value": {
-			input: `{"type":"retired","generation":"g1"}` + "\n",
+			input: `{"` + jsonEscape("0074") + `ype":"r` + jsonEscape("0065") + `tired","generation":"g1"}` + "\n",
 			want:  workerlink.DrainMessage{Type: workerlink.Retired, Generation: "g1"},
+		},
+		"success: escaped surrogate pair": {
+			input: `{"type":"draining","generation":"g` + jsonEscape("d83d") + jsonEscape("de00") + `"}` + "\n",
+			want:  workerlink.DrainMessage{Type: workerlink.Draining, Generation: "g\U0001F600"},
 		},
 		"success: raw non-ASCII generation": {
 			input: frame("retired", "世代-1"),
@@ -309,7 +322,7 @@ func TestDecodeDrain(t *testing.T) {
 			err:   workerlink.ErrDrainMessage,
 		},
 		"error: duplicate member spelled with an escape": {
-			input: `{"type":"draining","type":"draining","generation":"g1"}` + "\n",
+			input: `{"type":"draining","` + jsonEscape("0074") + `ype":"draining","generation":"g1"}` + "\n",
 			err:   workerlink.ErrDrainMessage,
 		},
 		"error: trailing value": {
@@ -460,8 +473,10 @@ func TestDecodeDrainLiveChannel(t *testing.T) {
 			write: frame("retired", "g1"),
 			want:  workerlink.DrainMessage{Type: workerlink.Retired, Generation: "g1"},
 		},
-		"error: excess on an open channel": {
-			write: strings.Repeat("x", workerlink.DrainLineLimit+44),
+		"error: limit reached without a line feed on an open channel": {
+			// Exactly the limit of otherwise valid JSON and no line feed: the frame cannot fit any more, so the
+			// reader answers without waiting for a byte the writer never sends.
+			write: strings.TrimSuffix(frame("draining", fillGeneration(workerlink.Draining, workerlink.DrainLineLimit+1)), "\n"),
 			err:   workerlink.ErrDrainLineTooLong,
 		},
 	}
@@ -529,10 +544,16 @@ func TestDecodeDrainReadFailure(t *testing.T) {
 	}
 }
 
-// closeRecorder is a writer that remembers whether it was closed.
+// closeRecorder is a writer that counts its writes and remembers whether it was closed.
 type closeRecorder struct {
 	bytes.Buffer
+	writes int
 	closed bool
+}
+
+func (w *closeRecorder) Write(p []byte) (int, error) {
+	w.writes++
+	return w.Buffer.Write(p)
 }
 
 func (w *closeRecorder) Close() error {
@@ -544,9 +565,8 @@ type failingWriter struct{ err error }
 
 func (w *failingWriter) Write([]byte) (int, error) { return 0, w.err }
 
-// shortWriter takes half of its first write without reporting an error, then fails every later write.
+// shortWriter takes half of its first write without reporting an error, then takes every later write whole.
 type shortWriter struct {
-	err   error
 	calls int
 }
 
@@ -555,7 +575,7 @@ func (w *shortWriter) Write(p []byte) (int, error) {
 	if w.calls == 1 {
 		return len(p) / 2, nil
 	}
-	return 0, w.err
+	return len(p), nil
 }
 
 type failingReader struct{ err error }

@@ -20,7 +20,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"syscall"
 	"testing"
 	"time"
 
@@ -37,6 +36,9 @@ func tcpListenerFile(network, address string) fixtureFile {
 	return func(t *testing.T) (*os.File, uint16) {
 		l := listenTCP(t, network, address)
 		f, err := l.File()
+		if f != nil {
+			t.Cleanup(func() { _ = f.Close() })
+		}
 		if err != nil {
 			t.Fatalf("File: %v", err)
 		}
@@ -49,11 +51,20 @@ func tcpListenerFile(network, address string) fixtureFile {
 func connectedTCPFile(t *testing.T) (*os.File, uint16) {
 	l := listenTCP(t, "tcp4", "127.0.0.1:0")
 	c, err := realDial(t.Context(), "tcp4", l.Addr().String())
+	if c != nil {
+		t.Cleanup(func() { _ = c.Close() })
+	}
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	t.Cleanup(func() { _ = c.Close() })
-	f, err := c.(*net.TCPConn).File()
+	tcp, ok := c.(*net.TCPConn)
+	if !ok {
+		t.Fatalf("dial returned %T, want TCP", c)
+	}
+	f, err := tcp.File()
+	if f != nil {
+		t.Cleanup(func() { _ = f.Close() })
+	}
 	if err != nil {
 		t.Fatalf("File: %v", err)
 	}
@@ -83,15 +94,24 @@ func boundTCPFile(t *testing.T) (*os.File, uint16) {
 
 func udpFile(t *testing.T) (*os.File, uint16) {
 	pc, err := new(net.ListenConfig).ListenPacket(t.Context(), "udp4", "127.0.0.1:0")
+	if pc != nil {
+		t.Cleanup(func() { _ = pc.Close() })
+	}
 	if err != nil {
 		t.Fatalf("listen udp: %v", err)
 	}
-	t.Cleanup(func() { _ = pc.Close() })
-	f, err := pc.(*net.UDPConn).File()
+	udp, ok := pc.(*net.UDPConn)
+	if !ok {
+		t.Fatalf("listen udp returned %T", pc)
+	}
+	f, err := udp.File()
+	if f != nil {
+		t.Cleanup(func() { _ = f.Close() })
+	}
 	if err != nil {
 		t.Fatalf("File: %v", err)
 	}
-	return f, uint16(pc.LocalAddr().(*net.UDPAddr).Port)
+	return f, uint16(udp.LocalAddr().(*net.UDPAddr).Port)
 }
 
 func unixListenerFile(t *testing.T) (*os.File, uint16) {
@@ -101,14 +121,36 @@ func unixListenerFile(t *testing.T) (*os.File, uint16) {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	l, err := new(net.ListenConfig).Listen(t.Context(), "unix", filepath.Join(dir, "s"))
+	if l != nil {
+		t.Cleanup(func() { _ = l.Close() })
+	}
 	if err != nil {
 		t.Fatalf("listen unix: %v", err)
 	}
-	t.Cleanup(func() { _ = l.Close() })
-	f, err := l.(*net.UnixListener).File()
+	ul, ok := l.(*net.UnixListener)
+	if !ok {
+		t.Fatalf("listen unix returned %T", l)
+	}
+	f, err := ul.File()
+	if f != nil {
+		t.Cleanup(func() { _ = f.Close() })
+	}
 	if err != nil {
 		t.Fatalf("File: %v", err)
 	}
+	return f, 1
+}
+
+// unconnectedUnixStreamFile is a local stream socket that is neither connected nor listening: of the right family
+// and type for the drain channel, but not connected to anything.
+func unconnectedUnixStreamFile(t *testing.T) (*os.File, uint16) {
+	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("socket: %v", err)
+	}
+	unix.CloseOnExec(fd)
+	f := os.NewFile(uintptr(fd), "unconnected")
+	t.Cleanup(func() { _ = f.Close() })
 	return f, 1
 }
 
@@ -179,7 +221,9 @@ func otherPort(port uint16) uint16 {
 }
 
 // TestImportListenerAccepts checks the worker's side of a valid handoff: the inherited duplicate becomes an
-// independent, close-on-exec listener on the selected loopback port, and the inherited file is consumed.
+// independent listener on the selected loopback port that accepts, and the inherited file is consumed. The
+// listener may be any net.Listener; that it is not inherited by the worker's own children is decided by
+// TestImportedDescriptorsNotInherited.
 func TestImportListenerAccepts(t *testing.T) {
 	tests := map[string]struct {
 		network string
@@ -199,11 +243,6 @@ func TestImportListenerAccepts(t *testing.T) {
 			if diff := gocmp.Diff(loopback(port), l.Addr().String()); diff != "" {
 				t.Errorf("address (-want +got):\n%s", diff)
 			}
-			sc, ok := l.(syscall.Conn)
-			if !ok {
-				t.Fatalf("imported listener %T exposes no descriptor", l)
-			}
-			checkCloseOnExec(t, sc, "imported listener")
 			c, err := realDial(t.Context(), "tcp4", loopback(port))
 			if err != nil {
 				t.Fatalf("dial: %v", err)
@@ -259,7 +298,8 @@ func TestImportListenerRefuses(t *testing.T) {
 }
 
 // TestImportDrainChannelAccepts checks the worker's side of the drain channel: a connected local stream socket
-// becomes an independent, close-on-exec duplex connection, and the inherited file is consumed.
+// becomes an independent duplex connection, and the inherited file is consumed. The connection may be any
+// net.Conn; that it is not inherited by the worker's own children is decided by TestImportedDescriptorsNotInherited.
 func TestImportDrainChannelAccepts(t *testing.T) {
 	child, parent := socketPair(t, unix.SOCK_STREAM)
 	c, err := workerlink.ImportDrainChannel(child)
@@ -268,11 +308,6 @@ func TestImportDrainChannelAccepts(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = c.Close() })
 	checkConsumed(t, child)
-	sc, ok := c.(syscall.Conn)
-	if !ok {
-		t.Fatalf("imported drain channel %T exposes no descriptor", c)
-	}
-	checkCloseOnExec(t, sc, "imported drain channel")
 	peer := fileConn(t, parent)
 	if _, err := peer.Write([]byte("to-child\n")); err != nil {
 		t.Fatalf("parent write: %v", err)
@@ -290,7 +325,8 @@ func TestImportDrainChannelAccepts(t *testing.T) {
 }
 
 // TestImportDrainChannelRefuses checks every refusal of the inherited drain channel, including a descriptor that
-// aliases the listener. A refusal returns no connection and still consumes the inherited file.
+// aliases the listener and a local stream socket that is not connected. A refusal returns no connection and still
+// consumes the inherited file.
 func TestImportDrainChannelRefuses(t *testing.T) {
 	tests := map[string]fixtureFile{
 		"error: listener given as the drain channel": tcpListenerFile("tcp4", "127.0.0.1:0"),
@@ -298,6 +334,7 @@ func TestImportDrainChannelRefuses(t *testing.T) {
 		"error: UDP socket":                          udpFile,
 		"error: Unix stream listener":                unixListenerFile,
 		"error: Unix datagram socket pair":           socketPairFile(unix.SOCK_DGRAM),
+		"error: unconnected Unix stream socket":      unconnectedUnixStreamFile,
 		"error: regular file":                        regularFile,
 		"error: pipe":                                pipeFile,
 		"error: closed file":                         closedFile,

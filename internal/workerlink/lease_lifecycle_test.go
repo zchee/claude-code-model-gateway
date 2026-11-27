@@ -19,6 +19,7 @@ package workerlink_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync/atomic"
@@ -75,13 +76,15 @@ func answer(a *dialAttempt, r dialReply) {
 }
 
 // TestAcquireAdmission checks when the registry refuses a lease: nothing reserved, nothing published, the only
-// eligible generation excluded, a retired generation, an ended one and a cancelled caller. A refusal gives no
-// lease and, except for the cancelled caller, never dials.
+// eligible generation excluded, a retired generation, an ended one, and a caller whose context was cancelled or
+// whose deadline has passed. A refusal gives no lease, answers without advancing the bubble's clock (the relay owns
+// any waiting) and, except for the caller that has gone, never dials.
 func TestAcquireAdmission(t *testing.T) {
 	tests := map[string]struct {
 		setup   func(t *testing.T, reg *workerlink.Registry)
 		exclude workerlink.Generation
-		cancel  bool
+		// context derives the caller's context; nil keeps the test's.
+		context func(t *testing.T, ctx context.Context) context.Context
 		want    error
 	}{
 		"error: nothing reserved": {
@@ -178,34 +181,53 @@ func TestAcquireAdmission(t *testing.T) {
 			setup: func(t *testing.T, reg *workerlink.Registry) {
 				publish(t, reserve(t, reg, "gen-a", 41001), 4101)
 			},
-			cancel: true,
-			want:   context.Canceled,
+			context: func(_ *testing.T, ctx context.Context) context.Context {
+				ctx, cancel := context.WithCancel(ctx)
+				cancel()
+				return ctx
+			},
+			want: context.Canceled,
+		},
+		"error: caller's deadline already passed": {
+			setup: func(t *testing.T, reg *workerlink.Registry) {
+				publish(t, reserve(t, reg, "gen-a", 41001), 4101)
+			},
+			context: func(t *testing.T, ctx context.Context) context.Context {
+				ctx, cancel := context.WithDeadline(ctx, time.Now().Add(-time.Second))
+				t.Cleanup(cancel)
+				return ctx
+			},
+			want: context.DeadlineExceeded,
 		},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			listens := newFakeListens()
-			dials := &immediateDials{t: t}
-			reg := workerlink.NewRegistry(listens.listen, dials.dial)
-			tt.setup(t, reg)
-			ctx := t.Context()
-			if tt.cancel {
-				var cancel context.CancelFunc
-				ctx, cancel = context.WithCancel(ctx)
-				cancel()
-			}
-			lease, err := reg.Acquire(ctx, tt.exclude)
-			if lease != nil {
-				_ = lease.Close()
-				t.Errorf("Acquire returned a lease to %q", lease.Generation())
-			}
-			if !errors.Is(err, tt.want) {
-				t.Fatalf("Acquire error = %v, want %v", err, tt.want)
-			}
-			if !tt.cancel && dials.count() != 0 {
-				t.Errorf("a refused Acquire dialed %d times", dials.count())
-			}
-			listens.checkNeverAccepted(t)
+			synctest.Test(t, func(t *testing.T) {
+				listens := newFakeListens()
+				dials := &immediateDials{t: t}
+				reg := workerlink.NewRegistry(listens.listen, dials.dial)
+				tt.setup(t, reg)
+				ctx := t.Context()
+				if tt.context != nil {
+					ctx = tt.context(t, ctx)
+				}
+				start := time.Now()
+				lease, err := reg.Acquire(ctx, tt.exclude)
+				if waited := time.Since(start); waited != 0 {
+					t.Errorf("Acquire took %v of the bubble's time; a refusal answers at once", waited)
+				}
+				if lease != nil {
+					_ = lease.Close()
+					t.Errorf("Acquire returned a lease to %q", lease.Generation())
+				}
+				if !errors.Is(err, tt.want) {
+					t.Fatalf("Acquire error = %v, want %v", err, tt.want)
+				}
+				if tt.context == nil && dials.count() != 0 {
+					t.Errorf("a refused Acquire dialed %d times", dials.count())
+				}
+				listens.checkNeverAccepted(t)
+			})
 		})
 	}
 }
@@ -335,7 +357,32 @@ func TestRetireKeepsPinnedDial(t *testing.T) {
 	}
 }
 
-// TestExitedFollowsEndNotRetire checks that waiters on Exited stay asleep through retirement and wake at End.
+// exitWaiters starts one waiter per lease on the Exited channel each lease returns now. A waiter reports whether
+// its receive saw a closed channel, so that one value sent on a channel cannot pass for closure.
+func exitWaiters(leases ...workerlink.Lease) <-chan bool {
+	woke := make(chan bool, len(leases))
+	for _, lease := range leases {
+		ch := lease.Exited()
+		go func() {
+			_, ok := <-ch
+			woke <- !ok
+		}()
+	}
+	return woke
+}
+
+// checkExitWaitersWoke waits for n waiters and asserts that each one saw its channel closed.
+func checkExitWaitersWoke(t *testing.T, woke <-chan bool, n int) {
+	t.Helper()
+	for i := range n {
+		if closed := await(t, woke, "an Exited waiter"); !closed {
+			t.Errorf("Exited waiter %d received a value from an open channel; End must close Exited", i+1)
+		}
+	}
+}
+
+// TestExitedFollowsEndNotRetire checks that waiters on the Exited channels of two leases stay asleep through
+// retirement and all wake at End, because End closes those channels.
 func TestExitedFollowsEndNotRetire(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		listens := newFakeListens()
@@ -343,30 +390,27 @@ func TestExitedFollowsEndNotRetire(t *testing.T) {
 		reg := workerlink.NewRegistry(listens.listen, dials.dial)
 		res := reserve(t, reg, "gen-a", 41001)
 		publish(t, res, 4101)
-		lease := acquire(t, reg, "")
-		woke := make(chan struct{})
-		go func() {
-			<-lease.Exited()
-			close(woke)
-		}()
+		leases := []workerlink.Lease{acquire(t, reg, ""), acquire(t, reg, "")}
+		woke := exitWaiters(leases...)
 		res.Retire()
 		synctest.Wait()
-		if isClosed(woke) {
+		if _, ok := ready(woke); ok {
 			t.Fatal("an Exited waiter woke at retirement")
 		}
 		if err := res.End(); err != nil {
 			t.Fatalf("End: %v", err)
 		}
-		synctest.Wait()
-		if !isClosed(woke) {
-			t.Fatal("End did not wake the Exited waiter")
+		checkExitWaitersWoke(t, woke, len(leases))
+		for i, lease := range leases {
+			checkClosedEachTime(t, lease.Exited, fmt.Sprintf("Exited of lease %d after End", i+1))
 		}
 	})
 }
 
-// TestEndCancelsPinnedDial checks End against a dial in progress on a generation that ends without a drain: the
-// dial is cancelled, a success that arrives anyway is closed and not handed over, End returns and releases the
-// listener only after the dial has finished, and every Exited waiter wakes.
+// TestEndCancelsPinnedDial checks End against a dial in progress on a generation that ends without a drain: End
+// denies admission at once, cancels the dial, keeps the listener and does not return while the dial runs, closes
+// a connection that completes anyway, and wakes the Exited waiters of every earlier lease. The pending Acquire
+// may fail at once or after its dial settles; it never returns a lease.
 func TestEndCancelsPinnedDial(t *testing.T) {
 	tests := map[string]struct {
 		honourCancel bool
@@ -383,31 +427,33 @@ func TestEndCancelsPinnedDial(t *testing.T) {
 				res := reserve(t, reg, "gen-a", 41001)
 				publish(t, res, 4101)
 				t.Cleanup(dials.release)
-				first := acquireAsync(t.Context(), reg, "")
-				answer(<-dials.attempts, dialReply{conn: newTrackedConn(t)})
-				earlier := <-first
-				if earlier.err != nil {
-					t.Fatalf("first Acquire: %v", earlier.err)
+				var earlier []workerlink.Lease
+				for i := range 2 {
+					first := acquireAsync(t.Context(), reg, "")
+					answer(<-dials.attempts, dialReply{conn: newTrackedConn(t)})
+					r := await(t, first, "an earlier Acquire")
+					if r.err != nil || r.lease == nil {
+						t.Fatalf("earlier Acquire %d = %v, %v", i+1, r.lease, r.err)
+					}
+					t.Cleanup(func() { _ = r.lease.Close() })
+					earlier = append(earlier, r.lease)
 				}
-				t.Cleanup(func() { _ = earlier.lease.Close() })
-				woke := make(chan struct{})
-				go func() {
-					<-earlier.lease.Exited()
-					close(woke)
-				}()
+				woke := exitWaiters(earlier...)
 				out := acquireAsync(t.Context(), reg, "")
 				attempt := <-dials.attempts
 				listener := listens.at(t, 41001)
 				ended := make(chan error, 1)
 				go func() { ended <- res.End() }()
-				synctest.Wait()
-				if attempt.ctx.Err() == nil {
-					t.Error("End did not cancel the dial in progress")
-				}
+				await(t, attempt.ctx.Done(), "the cancellation of the dial in progress")
 				late := newTrackedConn(t)
+				var r acquireResult
+				settled := false
 				if !tt.honourCancel {
-					if r, ok := ready(out); ok {
-						t.Fatalf("Acquire returned %+v while its dial was still running", r)
+					synctest.Wait()
+					// The pending Acquire may already have given up; it must not have produced a lease.
+					if r, settled = ready(out); settled && r.lease != nil {
+						_ = r.lease.Close()
+						t.Fatalf("Acquire handed over a lease to %q after End", r.lease.Generation())
 					}
 					if err, ok := ready(ended); ok {
 						t.Fatalf("End returned %v while a dial still pinned the generation", err)
@@ -415,12 +461,20 @@ func TestEndCancelsPinnedDial(t *testing.T) {
 					if isClosed(listener.closed) {
 						t.Fatal("End released the listener while a dial still pinned it")
 					}
+					before := dials.count.Load()
+					if lease, err := reg.Acquire(t.Context(), ""); lease != nil || err == nil {
+						if lease != nil {
+							_ = lease.Close()
+						}
+						t.Fatalf("Acquire while End waits for the dial = %v, %v; End denies admission first", lease, err)
+					}
+					if n := dials.count.Load(); n != before {
+						t.Errorf("Acquire while End waits for the dial dialed %d times", n-before)
+					}
 					answer(attempt, dialReply{conn: late})
-					synctest.Wait()
 				}
-				r, ok := ready(out)
-				if !ok {
-					t.Fatal("Acquire did not return after End and the dial finished")
+				if !settled {
+					r = await(t, out, "the pending Acquire")
 				}
 				if r.lease != nil {
 					_ = r.lease.Close()
@@ -429,49 +483,49 @@ func TestEndCancelsPinnedDial(t *testing.T) {
 				if r.err == nil {
 					t.Fatal("Acquire returned neither a lease nor an error")
 				}
+				if err := await(t, ended, "End"); err != nil {
+					t.Errorf("End: %v", err)
+				}
 				if !tt.honourCancel && !isClosed(late.closed) {
 					t.Error("the connection that completed after End was left open")
-				}
-				err, ok := ready(ended)
-				if !ok {
-					t.Fatal("End did not return after the dial finished")
-				}
-				if err != nil {
-					t.Errorf("End: %v", err)
 				}
 				if !isClosed(listener.closed) {
 					t.Error("End did not release the listener")
 				}
-				if !isClosed(woke) {
-					t.Error("End did not wake the Exited waiter")
-				}
+				checkExitWaitersWoke(t, woke, len(earlier))
 				listens.checkNeverAccepted(t)
 			})
 		})
 	}
 }
 
-// TestEndIsFinal checks that an ended reservation stays ended: a repeated End and a late Retire are harmless,
-// and Publish and DrainChannel refuse without handing out anything. File after End is decided on a real listener
-// in TestReservedAddressHeldUntilEnd.
+// TestEndIsFinal checks that an ended reservation stays ended: a repeated End and a late Retire are harmless and
+// the cleanup happens once, and Publish and DrainChannel refuse without handing out anything. What a repeated End
+// returns is not decided here. File after End is decided on a real listener in TestReservedAddressHeldUntilEnd.
 func TestEndIsFinal(t *testing.T) {
 	listens := newFakeListens()
 	dials := &immediateDials{t: t}
 	reg := workerlink.NewRegistry(listens.listen, dials.dial)
 	res := reserve(t, reg, "gen-a", 41001)
-	for i := range 2 {
-		if err := res.End(); err != nil {
-			t.Fatalf("End %d: %v", i+1, err)
-		}
+	if err := res.End(); err != nil {
+		t.Fatalf("End: %v", err)
 	}
-	if !isClosed(listens.at(t, 41001).closed) {
+	_ = res.End()
+	listener := listens.at(t, 41001)
+	if !isClosed(listener.closed) {
 		t.Error("End did not release the listener")
+	}
+	if n := listener.closings.Load(); n != 1 {
+		t.Errorf("the listener was closed %d times by two Ends, want once", n)
 	}
 	res.Retire()
 	if err := res.Publish(4101); err == nil {
 		t.Error("Publish after End succeeded")
 	}
 	if parent, child, err := res.DrainChannel(); err == nil || parent != nil || child != nil {
+		if child != nil {
+			_ = child.Close()
+		}
 		t.Errorf("DrainChannel after End = %v, %v, %v; want an error and no handles", parent, child, err)
 	}
 	if lease, err := reg.Acquire(t.Context(), ""); lease != nil || !errors.Is(err, workerlink.ErrUnavailable) {
