@@ -20,6 +20,8 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -164,10 +166,14 @@ func TestCacheRequestsNeverUseInjectedCookieJar(t *testing.T) {
 	}
 }
 
-// TestCatalogBaseURLWithUserinfoIsRefused configures an Anthropic base URL that carries userinfo. The
-// cache either refuses it when constructed or never sends a catalog request to it, so no Basic
-// credential is synthesized from the URL.
+// TestCatalogBaseURLWithUserinfoIsRefused configures an Anthropic base URL that carries userinfo,
+// with a stale saved catalog and request credentials that would otherwise start a refresh. The cache
+// is constructed and logs the refusal once, in a fixed text that names neither the userinfo nor the
+// address. It never sends a catalog request, so no Basic credential is synthesized from the URL; it
+// keeps serving the saved rows and leaves the saved catalog as it was, with no failure recorded.
 func TestCatalogBaseURLWithUserinfoIsRefused(t *testing.T) {
+	// refusalLog restates the line the cache logs when it refuses such a base URL.
+	const refusalLog = "model-gateway: the Anthropic catalog base URL carries credentials; the catalog is not refreshed\n"
 	tests := map[string]struct {
 		incoming http.Header
 	}{
@@ -190,6 +196,9 @@ func TestCatalogBaseURLWithUserinfoIsRefused(t *testing.T) {
 			base := strings.Replace(anthropic.URL, "http://", "http://catalog-user:catalog-pass@", 1)
 
 			_, lookup, resolver := newTestPaths(t, nil)
+			catalogPath := filepath.Join(stateDirOf(t, resolver), "anthropic-models.json")
+			writeTestFile(t, catalogPath, []byte(seededCatalog))
+			var logs logCapture
 			cache, err := modelcache.New(modelcache.Options{
 				Lookup:           lookup,
 				Paths:            resolver,
@@ -197,20 +206,38 @@ func TestCatalogBaseURLWithUserinfoIsRefused(t *testing.T) {
 				AnthropicBaseURL: base,
 				DefaultBaseURL:   "http://127.0.0.1:19999",
 				Client:           newTestClient(t),
-				Clock:            time.Now,
+				Clock:            func() time.Time { return time.UnixMilli(staleCatalogNow) },
 				Routes:           &route.Store{},
 				Sentry:           &sentry.State{},
+				Logf:             logs.logf,
 			})
 			if err != nil {
-				// Refusing the configuration outright is one accepted outcome.
-				return
+				t.Fatalf("New with a base URL that carries userinfo: %s, want the cache constructed with refresh disabled", redactTestMarkers(err.Error()))
 			}
-			if _, err := cache.ModelsResponse(t.Context(), tt.incoming); err != nil {
+			body, err := cache.ModelsResponse(t.Context(), tt.incoming)
+			if err != nil {
 				t.Fatalf("ModelsResponse: %s", redactTestMarkers(err.Error()))
 			}
+			cache.TriggerAnthropicRefresh(tt.incoming)
 			cache.Wait()
 			if got := log.requests(); len(got) != 0 {
 				t.Errorf("catalog server received %d request(s) through a base URL with userinfo, want none: %+v", len(got), got)
+			}
+			if ids := responseRowIDs(t, body); !slices.Contains(ids, "claude-cached-1") {
+				t.Errorf("listing with refresh disabled = %q, want the saved row claude-cached-1", ids)
+			}
+			if saved, err := os.ReadFile(catalogPath); err != nil || string(saved) != seededCatalog {
+				t.Errorf("saved catalog after the refused refresh = %q (err %v), want it unchanged %q", saved, err, seededCatalog)
+			}
+			logged := string(logs.bytes())
+			if logged != refusalLog {
+				t.Errorf("log = %q, want exactly the refusal %q", redactTestMarkers(logged), refusalLog)
+			}
+			host := strings.TrimPrefix(anthropic.URL, "http://")
+			for _, leaked := range []string{"catalog-user", "catalog-pass", host} {
+				if strings.Contains(logged, leaked) {
+					t.Errorf("log names %q from the refused base URL, want it redacted", leaked)
+				}
 			}
 		})
 	}

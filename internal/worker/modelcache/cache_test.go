@@ -2782,6 +2782,16 @@ func TestDiscoveryCacheSync(t *testing.T) {
 				effectiveURL: baseURLFunc("http://api.anthropic.com"),
 				wantReason:   "gateway-not-wired",
 			},
+			"success: shadow mode answers shadow before it resolves the legacy compat URL": {
+				shadow:       true,
+				effectiveURL: baseURLFunc("http://api.anthropic.com"),
+				wantReason:   "shadow",
+			},
+			"success: shadow mode answers shadow before an EffectiveBaseURL error": {
+				shadow:       true,
+				effectiveURL: func() (string, error) { return "", errors.New("settings unreadable") },
+				wantReason:   "shadow",
+			},
 			"success: unwired base URL": {
 				effectiveURL: baseURLFunc("https://api.anthropic.com"),
 				wantReason:   "gateway-not-wired",
@@ -2830,18 +2840,28 @@ func TestDiscoveryCacheSync(t *testing.T) {
 							return http.ErrUseLastResponse
 						},
 					}
+					// urlCalls counts how often a sync resolves the effective base URL, and pinCalls how often
+					// it reads the current pins, one of the inputs only a sync that passed its gate reads.
+					var urlCalls, pinCalls atomic.Int32
 
 					cache, err := modelcache.New(modelcache.Options{
-						Lookup:           lookup,
-						Paths:            resolver,
-						ProxyBaseURL:     proxySrv.URL,
-						DefaultBaseURL:   defaultURL,
-						Shadow:           tt.shadow,
-						Client:           client,
-						Clock:            func() time.Time { return time.UnixMilli(1234567890) },
-						Routes:           &route.Store{},
-						Sentry:           &sentry.State{},
-						EffectiveBaseURL: tt.effectiveURL,
+						Lookup:         lookup,
+						Paths:          resolver,
+						ProxyBaseURL:   proxySrv.URL,
+						DefaultBaseURL: defaultURL,
+						Shadow:         tt.shadow,
+						Client:         client,
+						Clock:          func() time.Time { return time.UnixMilli(1234567890) },
+						Routes:         &route.Store{},
+						Sentry:         &sentry.State{},
+						EffectiveBaseURL: func() (string, error) {
+							urlCalls.Add(1)
+							return tt.effectiveURL()
+						},
+						CurrentPins: func() map[string]string {
+							pinCalls.Add(1)
+							return nil
+						},
 					})
 					if err != nil {
 						t.Fatalf("New: %v", err)
@@ -2898,6 +2918,15 @@ func TestDiscoveryCacheSync(t *testing.T) {
 							}
 						}
 						checkFileUnchanged(fmt.Sprintf("after SyncDiscoveryCache(%v)", force))
+					}
+					if n := pinCalls.Load(); n != 0 {
+						t.Errorf("skipped or failed syncs read the current pins %d time(s), want none before the gate passes", n)
+					}
+					switch n := urlCalls.Load(); {
+					case tt.shadow && n != 0:
+						t.Errorf("shadow syncs resolved the effective base URL %d time(s), want none: shadow is answered first", n)
+					case !tt.shadow && n == 0:
+						t.Errorf("test precondition: syncs outside shadow mode never resolved the effective base URL")
 					}
 				})
 			}

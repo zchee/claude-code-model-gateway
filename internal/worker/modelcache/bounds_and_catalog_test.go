@@ -254,6 +254,7 @@ func TestListingSizeBound(t *testing.T) {
 
 // TestBoundedReadsSizeBoundary pads each of the three bounded files with trailing whitespace to the
 // bound or one byte past it. A file at the bound is read; a larger regular file is treated as absent.
+// The saved Anthropic catalog has no such bound: padded one byte past it, it is still read.
 func TestBoundedReadsSizeBoundary(t *testing.T) {
 	tests := map[string]struct {
 		run  func(t *testing.T, size int) string
@@ -289,6 +290,11 @@ func TestBoundedReadsSizeBoundary(t *testing.T) {
 			run:  discoveryCacheAtSize,
 			size: cacheFileBound + 1,
 			want: "wrote",
+		},
+		"success: a saved Anthropic catalog one byte over the bound is still read": {
+			run:  savedCatalogAtSize,
+			size: cacheFileBound + 1,
+			want: "saved row listed",
 		},
 	}
 	for name, tt := range tests {
@@ -485,6 +491,9 @@ func TestCatalogRefreshFailureMessages(t *testing.T) {
 // values and with one name in several spellings. Names are sorted before lowercasing and the last
 // spelling in that order wins; within it authorization and user-agent keep their first value and the
 // other allowed names join theirs with ", ". The default API version applies only without an override.
+// A spelling whose value slice is nil or empty is skipped, while one empty string is a value that wins
+// its collision and overrides the default version. The headers are compared as the upstream receives
+// them: a winning empty user-agent leaves the request with no User-Agent field at all.
 func TestCatalogRequestHeaderMerge(t *testing.T) {
 	allowed := []string{"Authorization", "X-Api-Key", "Anthropic-Version", "Anthropic-Beta", "Anthropic-Workspace-Id", "User-Agent"}
 	tests := map[string]struct {
@@ -567,6 +576,65 @@ func TestCatalogRequestHeaderMerge(t *testing.T) {
 			want: map[string][]string{
 				"X-Api-Key":         {"key-lower"},
 				"Anthropic-Version": {"2099-12-31, 2098-01-01"},
+			},
+		},
+		"success: a nil value slice is skipped, so an earlier spelling wins": {
+			incoming: http.Header{
+				"Authorization":     {"Bearer nil-case-marker"},
+				"Anthropic-Beta":    {"beta-canonical"},
+				"anthropic-beta":    nil,
+				"X-Api-Key":         {"key-canonical"},
+				"x-api-key":         nil,
+				"anthropic-version": nil,
+			},
+			want: map[string][]string{
+				"Authorization":     {"Bearer nil-case-marker"},
+				"X-Api-Key":         {"key-canonical"},
+				"Anthropic-Version": {"2023-06-01"},
+				"Anthropic-Beta":    {"beta-canonical"},
+			},
+		},
+		"success: an empty value slice is skipped, so an earlier spelling wins": {
+			incoming: http.Header{
+				"Authorization":          {"Bearer empty-slice-marker"},
+				"Anthropic-Beta":         {"beta-canonical"},
+				"anthropic-beta":         {},
+				"Anthropic-Workspace-Id": {"workspace-canonical"},
+				"anthropic-workspace-id": {},
+				"anthropic-version":      {},
+			},
+			want: map[string][]string{
+				"Authorization":          {"Bearer empty-slice-marker"},
+				"Anthropic-Version":      {"2023-06-01"},
+				"Anthropic-Beta":         {"beta-canonical"},
+				"Anthropic-Workspace-Id": {"workspace-canonical"},
+			},
+		},
+		"success: one empty string is a value and wins over an earlier spelling": {
+			incoming: http.Header{
+				"Authorization":     {"Bearer empty-string-marker"},
+				"Anthropic-Beta":    {"beta-canonical"},
+				"anthropic-beta":    {""},
+				"X-Api-Key":         {"key-canonical"},
+				"x-api-key":         {""},
+				"anthropic-version": {""},
+			},
+			want: map[string][]string{
+				"Authorization":     {"Bearer empty-string-marker"},
+				"X-Api-Key":         {""},
+				"Anthropic-Version": {""},
+				"Anthropic-Beta":    {""},
+			},
+		},
+		"success: an empty user-agent wins over an earlier spelling and no user-agent is sent": {
+			incoming: http.Header{
+				"Authorization": {"Bearer empty-agent-marker"},
+				"User-Agent":    {"agent-canonical"},
+				"user-agent":    {""},
+			},
+			want: map[string][]string{
+				"Authorization":     {"Bearer empty-agent-marker"},
+				"Anthropic-Version": {"2023-06-01"},
 			},
 		},
 	}
@@ -723,4 +791,22 @@ func privateCreateMode(t *testing.T, dir string) os.FileMode {
 		t.Fatalf("stat the mode probe: %v", err)
 	}
 	return info.Mode().Perm()
+}
+
+// savedCatalogAtSize pads a valid saved Anthropic catalog to size bytes and reports whether its row is
+// listed. No Anthropic base URL is configured, so the listing reads the saved catalog without starting
+// a refresh.
+func savedCatalogAtSize(t *testing.T, size int) string {
+	_, lookup, resolver := newTestPaths(t, nil)
+	writeTestFile(t, filepath.Join(stateDirOf(t, resolver), "anthropic-models.json"), padJSON(t, seededCatalog, size))
+	cache := newBoundedReadCache(t, resolver, modelcache.Options{Lookup: lookup})
+	body, err := cache.ModelsResponse(t.Context(), http.Header{"X-Api-Key": {apiKeyMarker}})
+	cache.Wait()
+	if err != nil {
+		t.Fatalf("ModelsResponse: %s", redactTestMarkers(err.Error()))
+	}
+	if slices.Contains(responseRowIDs(t, body), "claude-cached-1") {
+		return "saved row listed"
+	}
+	return "saved row not listed"
 }
