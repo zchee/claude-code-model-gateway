@@ -23,6 +23,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -94,19 +95,25 @@ func validToken(token string) bool {
 	return true
 }
 
-// ListenUnix binds path, reclaiming a refused socket but never a live owner or non-socket file.
+// ListenUnix binds a Unix listener and holds its pathname reclamation lock until Close.
 //
 // A worker that died without closing leaves its socket file behind, and binding over it fails with EADDRINUSE although
 // nothing answers there. Only a refused connection to an actual socket proves that no process owns the path
 // (lib/request-worker.js:1180-1206). A bind creates the socket file before listen makes it accept connections, and a
-// connection in between is refused exactly as by a stale socket. Every starter therefore holds an advisory lock on the
-// sibling file path+".lock" from its first bind until it listens, and probes, unlinks and rebinds only while holding
-// it, so no starter can take another's half-bound socket for a stale one. A path that changed identity between the
-// checks is not reclaimed. Any other bind failure is returned unchanged. Three further rules hold:
+// connection in between is refused exactly as by a stale socket; a live owner whose accept queue is full is refused on
+// some systems as well. Every starter therefore holds an advisory lock on the sibling file path+".lock" from before its
+// first bind until its listener is closed, and probes, unlinks and rebinds only while holding it, so no starter can
+// take another's half-bound or busy socket for a stale one. A path that changed identity between the checks is not
+// reclaimed. Any other bind failure is returned unchanged, after the lock is released. Four further rules hold:
 //
-//   - On Unix a starter that cannot take the lock does not bind at all and returns the lock failure, which names the
-//     lock file: a socket bound without the lock could itself be taken for stale by a starter that holds it. Only a
-//     platform with no lock at all binds the path once, unlocked, and never reclaims it.
+//   - On Unix a starter that finds the lock held, by another starter or by a listener not yet closed, does not wait,
+//     probe, bind or unlink: it returns an error whose first system error number is EADDRINUSE, as a bind onto a live
+//     socket does. A starter that cannot take the lock for any other reason does not bind at all and returns the lock
+//     failure, which names the lock file: a socket bound without the lock could itself be taken for stale by a starter
+//     that holds it. Only a platform with no lock at all binds the path once, unlocked, and never reclaims it.
+//   - The returned listener's Close closes the socket, which removes its file, and only then releases the lock, once,
+//     however often it is called; no Close returns before the release has finished. The lock file itself is left in
+//     place, so that every starter locks the same file.
 //   - When the probe after a refused bind finds the path gone, because its previous owner closed in between, the path
 //     is bound once more under the lock without unlinking anything.
 //   - On Linux and Android, the systems this program supports that have an abstract namespace, a name starting with
@@ -118,20 +125,21 @@ func ListenUnix(path string) (net.Listener, error) {
 	if err != nil {
 		return nil, err
 	}
-	if locked {
-		defer unlock()
-	}
 	ln, err := net.ListenUnix("unix", addr)
-	if err == nil {
+	if !locked {
+		if err != nil {
+			return nil, err
+		}
 		return ln, nil
 	}
-	if !locked || !errors.Is(err, syscall.EADDRINUSE) || !reclaimPath(path) {
+	if err != nil && errors.Is(err, syscall.EADDRINUSE) && reclaimPath(path) {
+		ln, err = net.ListenUnix("unix", addr)
+	}
+	if err != nil {
+		unlock()
 		return nil, err
 	}
-	if ln, err = net.ListenUnix("unix", addr); err != nil {
-		return nil, err
-	}
-	return ln, nil
+	return lockedUnixListener(ln, unlock), nil
 }
 
 // lockedUnixListener returns ln, the Unix listener ListenUnix bound, as a listener that holds the pathname reclamation
@@ -140,7 +148,40 @@ func ListenUnix(path string) (net.Listener, error) {
 // called. Every Close returns the result of that one close of ln, and none returns before unlock has returned. Accept
 // and Addr are those of ln.
 func lockedUnixListener(ln net.Listener, unlock func()) net.Listener {
-	panic("not implemented")
+	return &lockedListener{Listener: ln, unlock: unlock, released: make(chan struct{})}
+}
+
+// lockedListener is the listener lockedUnixListener returns. Accept and Addr are promoted from the embedded listener.
+type lockedListener struct {
+	net.Listener
+	unlock func()
+	// closing is set by the one Close call that closes the listener and releases the lock.
+	closing atomic.Bool
+	// released is closed once that call has stored err and unlock has returned. Waiting on it holds no lock, so a
+	// second Close never contends for a mutex that is held across the close or the release.
+	released chan struct{}
+	// err is the result of the one close of the embedded listener. It is written before released is closed and read
+	// only after, so the channel close orders the two.
+	err error
+}
+
+// Close closes the listener and then releases its lock, the first time it is called, and returns the result of that
+// close every time, once the release has finished.
+func (l *lockedListener) Close() error {
+	if l.closing.CompareAndSwap(false, true) {
+		l.release()
+	}
+	<-l.released
+	return l.err
+}
+
+// release closes the embedded listener, which removes its socket file, before it unlocks, so that a starter that gets
+// the lock never finds this listener's socket. The deferred close of released wakes waiting Close calls even if the
+// close or the unlock panics.
+func (l *lockedListener) release() {
+	defer close(l.released)
+	l.err = l.Listener.Close()
+	l.unlock()
 }
 
 // staleProbeTimeout bounds the connection attempt that decides whether a socket file still has an owner.
