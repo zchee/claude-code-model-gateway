@@ -15,6 +15,7 @@
 package workerlink
 
 import (
+	"fmt"
 	"os"
 
 	"golang.org/x/sys/unix"
@@ -28,4 +29,21 @@ func listeningState(fd int) (listening, known bool, err error) {
 		return false, false, os.NewSyscallError("getsockopt", err)
 	}
 	return v != 0, true, nil
+}
+
+// tcpProtocol refuses an IPv4 stream socket whose transport is not TCP. On Linux the family and the stream type
+// also describe a one-to-one SCTP socket (sctp(7)), and Go's net.FileListener wraps it as a TCP listener, since it
+// classifies by family and type only; the protocol is read through SO_PROTOCOL (socket(7)). Multipath TCP is
+// accepted besides plain TCP: since Go 1.24 net.ListenConfig creates an IPPROTO_MPTCP socket for "tcp" and "tcp4"
+// whenever the kernel supports it (src/net/dial.go:32 defaultMPTCPEnabledListen, src/net/mptcpsock_linux.go:76-84),
+// so the supervisor's own listener is of that protocol on such a kernel, and MPTCP serves a plain TCP client.
+func tcpProtocol(fd int) error {
+	protocol, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_PROTOCOL)
+	if err != nil {
+		return os.NewSyscallError("getsockopt", err)
+	}
+	if protocol != unix.IPPROTO_TCP && protocol != unix.IPPROTO_MPTCP {
+		return fmt.Errorf("a stream socket of protocol %d, not TCP", protocol)
+	}
+	return nil
 }

@@ -26,14 +26,17 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// importListener checks that file is a loopback IPv4 stream socket bound to exactly 127.0.0.1 at expected, with no
-// peer and, where the system can say so, listening, and returns a listener over its own duplicate. The caller closes
-// file.
+// importListener takes ownership of file and closes it on every path. It marks the descriptor close-on-exec first,
+// then checks that it is a loopback IPv4 TCP stream socket bound to exactly 127.0.0.1 at expected, with no peer and,
+// where the system can say so, listening, and returns a listener over its own duplicate.
 func importListener(file *os.File, expected uint16) (net.Listener, error) {
-	if expected == 0 {
-		return nil, errors.New("the expected worker port is zero")
+	if err := adoptInherited(file); err != nil {
+		return nil, err
 	}
-	err := inspectInherited(file, func(fd int) error {
+	err := inspect(file, func(fd int) error {
+		if expected == 0 {
+			return errors.New("the expected worker port is zero")
+		}
 		if err := streamSocket(fd); err != nil {
 			return err
 		}
@@ -44,6 +47,9 @@ func importListener(file *os.File, expected uint16) (net.Listener, error) {
 		in4, ok := sa.(*unix.SockaddrInet4)
 		if !ok {
 			return errors.New("not an IPv4 socket")
+		}
+		if err := tcpProtocol(fd); err != nil {
+			return err
 		}
 		if _, err := loopbackPort(&net.TCPAddr{IP: net.IP(in4.Addr[:]), Port: in4.Port}, expected); err != nil {
 			return err
@@ -63,20 +69,27 @@ func importListener(file *os.File, expected uint16) (net.Listener, error) {
 		}
 		return nil
 	})
-	if err != nil {
-		return nil, err
+	var l net.Listener
+	if err == nil {
+		l, err = net.FileListener(file)
 	}
-	l, err := net.FileListener(file)
+	if closeErr := file.Close(); err == nil && closeErr != nil {
+		_ = l.Close()
+		err = fmt.Errorf("close the inherited descriptor: %w", closeErr)
+	}
 	if err != nil {
 		return nil, err
 	}
 	return l, nil
 }
 
-// importDrainChannel checks that file is a connected local stream socket and returns a connection over its own
-// duplicate. The caller closes file.
+// importDrainChannel takes ownership of file and closes it on every path. It marks the descriptor close-on-exec
+// first, then checks that it is a connected local stream socket and returns a connection over its own duplicate.
 func importDrainChannel(file *os.File) (net.Conn, error) {
-	err := inspectInherited(file, func(fd int) error {
+	if err := adoptInherited(file); err != nil {
+		return nil, err
+	}
+	err := inspect(file, func(fd int) error {
 		if err := streamSocket(fd); err != nil {
 			return err
 		}
@@ -98,40 +111,52 @@ func importDrainChannel(file *os.File) (net.Conn, error) {
 		}
 		return nil
 	})
-	if err != nil {
-		return nil, err
+	var c net.Conn
+	if err == nil {
+		c, err = net.FileConn(file)
 	}
-	c, err := net.FileConn(file)
+	if closeErr := file.Close(); err == nil && closeErr != nil {
+		_ = c.Close()
+		err = fmt.Errorf("close the inherited descriptor: %w", closeErr)
+	}
 	if err != nil {
 		return nil, err
 	}
 	return c, nil
 }
 
-// inspectInherited marks the inherited descriptor close-on-exec, then runs check on it. An inherited descriptor
-// arrives with close-on-exec cleared; it is marked under syscall.ForkLock, so that no process this one starts from
-// then on inherits it, before anything else is done with it. net.FileListener and net.FileConn then duplicate it
-// with F_DUPFD_CLOEXEC, so the imported handle is close-on-exec too.
-func inspectInherited(file *os.File, check func(fd int) error) error {
+// adoptInherited marks the inherited descriptor close-on-exec before anything else is done with it. An inherited
+// descriptor arrives with close-on-exec cleared, so the mark is made with forks locked out (syscall.ForkLock): no
+// process this one starts from then on inherits it. When the mark fails the descriptor may still be inheritable, so
+// forks stay locked out until it is closed; the close happens after RawConn.Control has returned, because closing
+// waits for the descriptor reference that Control holds. On failure file is closed and the error returned.
+// net.FileListener and net.FileConn later duplicate the marked descriptor with F_DUPFD_CLOEXEC.
+func adoptInherited(file *os.File) error {
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
+	err := inspect(file, markCloseOnExec)
+	if err != nil {
+		_ = file.Close()
+	}
+	return err
+}
+
+// inspect runs check on the descriptor behind file and returns the first failure.
+func inspect(file *os.File, check func(fd int) error) error {
 	raw, err := file.SyscallConn()
 	if err != nil {
 		return err
 	}
 	var checkErr error
-	if err := raw.Control(func(fd uintptr) {
-		if checkErr = markCloseOnExec(int(fd)); checkErr == nil {
-			checkErr = check(int(fd))
-		}
-	}); err != nil {
+	if err := raw.Control(func(fd uintptr) { checkErr = check(int(fd)) }); err != nil {
 		return err
 	}
 	return checkErr
 }
 
-// markCloseOnExec adds FD_CLOEXEC to the descriptor's flags and keeps any other descriptor flag it has.
+// markCloseOnExec adds FD_CLOEXEC to the descriptor's flags and keeps any other descriptor flag it has. The caller
+// holds syscall.ForkLock.
 func markCloseOnExec(fd int) error {
-	syscall.ForkLock.RLock()
-	defer syscall.ForkLock.RUnlock()
 	flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
 	if err != nil {
 		return os.NewSyscallError("fcntl", err)

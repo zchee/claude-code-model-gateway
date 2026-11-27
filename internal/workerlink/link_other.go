@@ -29,12 +29,16 @@ func newDrainPair() (parent net.Conn, child *os.File, err error) {
 	return nil, nil, fmt.Errorf("a drain channel pair: %w", errors.ErrUnsupported)
 }
 
-// importListener refuses every inherited listener: descriptor inheritance by number is a Unix mechanism.
-func importListener(*os.File, uint16) (net.Listener, error) {
+// importListener closes file and refuses every inherited listener: descriptor inheritance by number is a Unix
+// mechanism.
+func importListener(file *os.File, _ uint16) (net.Listener, error) {
+	_ = file.Close()
 	return nil, fmt.Errorf("an inherited worker listener: %w", errors.ErrUnsupported)
 }
 
-// importDrainChannel refuses every inherited drain channel: descriptor inheritance by number is a Unix mechanism.
-func importDrainChannel(*os.File) (net.Conn, error) {
+// importDrainChannel closes file and refuses every inherited drain channel: descriptor inheritance by number is a
+// Unix mechanism.
+func importDrainChannel(file *os.File) (net.Conn, error) {
+	_ = file.Close()
 	return nil, fmt.Errorf("an inherited drain channel: %w", errors.ErrUnsupported)
 }

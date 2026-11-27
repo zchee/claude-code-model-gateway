@@ -61,8 +61,16 @@ func drainLine(msg DrainMessage) ([]byte, error) {
 	if msg.Type != Draining && msg.Type != Retired {
 		return nil, fmt.Errorf("%w: unknown type %q", ErrDrainMessage, msg.Type)
 	}
-	if msg.Generation == "" || !utf8.ValidString(string(msg.Generation)) {
-		return nil, fmt.Errorf("%w: the generation is empty or not UTF-8", ErrDrainMessage)
+	if msg.Generation == "" {
+		return nil, fmt.Errorf("%w: the generation is empty", ErrDrainMessage)
+	}
+	// Every byte of the generation takes at least one byte on the wire, so a generation longer than the room the
+	// frame leaves is refused before it is scanned or escaped, and its value stays out of the error.
+	if room := DrainLineLimit - len(`{"type":"`+msg.Type+`","generation":""}`+"\n"); len(msg.Generation) > room {
+		return nil, fmt.Errorf("%w: a generation of %d bytes, at most %d fit", ErrDrainLineTooLong, len(msg.Generation), room)
+	}
+	if !utf8.ValidString(string(msg.Generation)) {
+		return nil, fmt.Errorf("%w: the generation is not UTF-8", ErrDrainMessage)
 	}
 	line := make([]byte, 0, DrainLineLimit)
 	line = append(line, `{"type":`...)
@@ -150,9 +158,11 @@ func readDrainLine(r *bufio.Reader) ([]byte, error) {
 
 // parseDrainLine parses the body of one line, without its LF, as exactly one message.
 func parseDrainLine(body []byte) (DrainMessage, error) {
-	// JSON counts a carriage return as white space, so a CRLF line would otherwise pass.
-	if bytes.IndexByte(body, '\r') >= 0 {
-		return DrainMessage{}, fmt.Errorf("%w: carriage return in the line", ErrDrainMessage)
+	// JSON counts a carriage return as white space, so a line ended by CRLF would otherwise pass. Only a CR right
+	// before the LF is that terminator; any other CR is white space between tokens or, inside a string, refused by
+	// the parser.
+	if len(body) > 0 && body[len(body)-1] == '\r' {
+		return DrainMessage{}, fmt.Errorf("%w: the line ends with CRLF", ErrDrainMessage)
 	}
 	var msg DrainMessage
 	// The defaults of encoding/json/v2 already refuse invalid UTF-8 and lone surrogate escapes, duplicate member
@@ -195,20 +205,16 @@ func (r *Reservation) DrainChannel() (parent net.Conn, child *os.File, err error
 
 // ImportDrainChannel consumes the inherited file and returns the worker's owned duplex connection.
 //
-// The file is closed on success and on failure; the returned connection holds its own close-on-exec duplicate. Only
-// the kind of socket is checked, a connected local stream socket, not whether both directions are still open.
+// The file is closed on success and on failure; it is marked close-on-exec before anything else is checked, and the
+// returned connection holds its own close-on-exec duplicate. Only the kind of socket is checked, a connected local
+// stream socket, not whether both directions are still open.
 func ImportDrainChannel(file *os.File) (net.Conn, error) {
 	if file == nil {
 		return nil, errors.New("workerlink: no inherited drain channel descriptor")
 	}
 	c, err := importDrainChannel(file)
-	closeErr := file.Close()
 	if err != nil {
 		return nil, fmt.Errorf("workerlink: inherited drain channel refused: %w", err)
-	}
-	if closeErr != nil {
-		_ = c.Close()
-		return nil, fmt.Errorf("workerlink: close the inherited drain channel descriptor: %w", closeErr)
 	}
 	return c, nil
 }
@@ -217,11 +223,14 @@ func ImportDrainChannel(file *os.File) (net.Conn, error) {
 //
 // It refuses before writing unless the generation was retired and has not ended. It waits, outside the registry's
 // lock, until every dial that pinned the generation has settled, giving up when ctx ends or End begins; then one
-// caller writes the line and every concurrent caller joins that writer through its channel, so one line at most is
-// ever written. The write is bounded by the registry's budget and ends at once when ctx ends or End closes the
-// channel; the call returns only after its Write has returned. Once a write was entered its outcome is final: a
+// caller claims the write and every concurrent caller joins that writer through its channel, so one line at most is
+// ever written. A cancellation, a passed caller deadline or an End that comes before the Write is admitted makes no
+// Write call and releases the claim, so a later call may try again. Once a Write was entered its outcome is final: a
 // failed acknowledgment keeps the listener and is never retried, because part of the line may be on the channel.
-// Issued leases and their Exited channels are left alone.
+// The write is bounded by the earlier of the caller's deadline and the registry's budget, and ends at once when ctx
+// ends or End closes the channel; the first of these interruptions decides the error, and the call returns only
+// after its Write has returned. Success is reported only after the listener's Close has returned. Issued leases and
+// their Exited channels are left alone.
 func (r *Reservation) AcknowledgeDrain(ctx context.Context) error {
 	reg := r.reg
 	for {
@@ -233,7 +242,7 @@ func (r *Reservation) AcknowledgeDrain(ctx context.Context) error {
 		switch {
 		case r.ended:
 			reg.mu.Unlock()
-			return fmt.Errorf("workerlink: no acknowledgment for generation %q, which has ended: %w", r.generation, ErrUnavailable)
+			return r.endedAckError()
 		case !r.retired:
 			reg.mu.Unlock()
 			return fmt.Errorf("workerlink: no acknowledgment for generation %q, whose admission was not retired", r.generation)
@@ -262,28 +271,119 @@ func (r *Reservation) AcknowledgeDrain(ctx context.Context) error {
 		}
 		r.ack = ackWriting
 		r.ackDone = make(chan struct{})
+		r.ackCause, r.ackCauseAt, r.ackInterruptErr = nil, time.Time{}, nil
 		reg.mu.Unlock()
 		return r.writeAck(ctx)
 	}
 }
 
-// writeAck writes the one acknowledgment line as the claimed writer, releases the listener when the line went out
-// completely, records the outcome and wakes the joiners.
+// errAckBudget is the cause of an acknowledgment whose write outlived the registry's budget.
+var errAckBudget = errors.New("the drain acknowledgment's write budget is spent")
+
+// endedAckError is the error of an acknowledgment that the generation's End refused or interrupted.
+func (r *Reservation) endedAckError() error {
+	return fmt.Errorf("workerlink: no acknowledgment for generation %q, which has ended: %w", r.generation, ErrUnavailable)
+}
+
+// interruptAckLocked records cause as the interruption of the claimed acknowledgment write, unless an earlier one
+// was recorded: the first interruption decides the write's error.
+func (r *Reservation) interruptAckLocked(cause error) {
+	if r.ack == ackWriting && r.ackCause == nil {
+		r.ackCause, r.ackCauseAt = cause, time.Now()
+	}
+}
+
+// writeAck writes the one acknowledgment line as the claimed writer. It arms the write deadline, admits the Write
+// only if nothing has interrupted it yet, classifies the outcome by the first interruption, releases the listener
+// when the line went out completely, and then records the outcome and wakes the joiners.
 func (r *Reservation) writeAck(ctx context.Context) error {
 	reg := r.reg
 	parent := r.parent
+	line, err := drainLine(DrainMessage{Type: Retired, Generation: r.generation})
+	if err != nil {
+		// Reserve refuses a generation that cannot be framed, so this is not reached; nothing was written.
+		return r.releaseAckClaim(fmt.Errorf("workerlink: acknowledgment of generation %q: %w", r.generation, err))
+	}
+	deadline, callerDeadline := time.Now().Add(reg.ackBudget), false
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline, callerDeadline = d, true
+	}
 	// Only the write deadline: the manager may be reading this connection at the same time.
-	_ = parent.SetWriteDeadline(time.Now().Add(reg.ackBudget))
+	if err := parent.SetWriteDeadline(deadline); err != nil {
+		return r.releaseAckClaim(fmt.Errorf("workerlink: acknowledgment of generation %q: its write deadline cannot be armed: %w", r.generation, err))
+	}
 	interrupted := make(chan struct{})
 	stop := context.AfterFunc(ctx, func() {
-		_ = parent.SetWriteDeadline(aLongTimeAgo)
-		close(interrupted)
+		defer close(interrupted)
+		reg.mu.Lock()
+		r.interruptAckLocked(fmt.Errorf("workerlink: acknowledgment of generation %q interrupted: %w", r.generation, ctx.Err()))
+		reg.mu.Unlock()
+		if err := parent.SetWriteDeadline(aLongTimeAgo); err != nil {
+			// The Write cannot be ended through its deadline, so it is ended by closing the channel.
+			closeErr := parent.Close()
+			reg.mu.Lock()
+			r.ackInterruptErr = errors.Join(fmt.Errorf("workerlink: end the acknowledgment write through its deadline: %w", err), closeErr)
+			reg.mu.Unlock()
+		}
 	})
-	err := EncodeDrain(parent, DrainMessage{Type: Retired, Generation: r.generation})
-	byCaller := !stop()
-	if byCaller {
-		// The callback has started; wait for it so that it does not outlive this call.
-		<-interrupted
+	joinCallback := func() {
+		if !stop() {
+			<-interrupted
+		}
+	}
+
+	// The admission point: the last check before the Write, made under the lock that the cancellation callback and
+	// End take to record an interruption, so that one recorded before here makes no Write call.
+	reg.mu.Lock()
+	refusal := r.ackCause
+	switch {
+	case refusal != nil:
+	case r.ended:
+		refusal = r.endedAckError()
+	case ctx.Err() != nil:
+		refusal = fmt.Errorf("workerlink: acknowledgment of generation %q interrupted: %w", r.generation, ctx.Err())
+	case callerDeadline && !time.Now().Before(deadline):
+		refusal = fmt.Errorf("workerlink: acknowledgment of generation %q interrupted: %w", r.generation, context.DeadlineExceeded)
+	}
+	reg.mu.Unlock()
+	if refusal != nil {
+		joinCallback()
+		return r.releaseAckClaim(refusal)
+	}
+
+	n, werr := parent.Write(line)
+	returned := time.Now()
+	// The callback is joined before the interruption is read: when it ends the Write by closing the channel, it
+	// records why only after that close.
+	joinCallback()
+	reg.mu.Lock()
+	cause, causeAt, interruptErr := r.ackCause, r.ackCauseAt, r.ackInterruptErr
+	reg.mu.Unlock()
+
+	switch {
+	case werr == nil && n == len(line):
+		err = nil
+	case werr == nil:
+		err = fmt.Errorf("workerlink: acknowledgment of generation %q: %d of %d bytes written: %w", r.generation, n, len(line), io.ErrShortWrite)
+	default:
+		// An interruption recorded after the Write returned did not end it.
+		recorded := cause != nil && !causeAt.After(returned)
+		timedOut := errors.Is(werr, os.ErrDeadlineExceeded)
+		switch {
+		case timedOut && (!recorded || !causeAt.Before(deadline)):
+			// The armed deadline passed before any other interruption: it decides.
+			if callerDeadline {
+				err = fmt.Errorf("workerlink: acknowledgment of generation %q interrupted: %w", r.generation, context.DeadlineExceeded)
+			} else {
+				err = fmt.Errorf("workerlink: acknowledgment of generation %q not written: %w: %w", r.generation, errAckBudget, werr)
+			}
+		case recorded && interruptErr != nil:
+			err = errors.Join(cause, interruptErr)
+		case recorded:
+			err = cause
+		default:
+			err = fmt.Errorf("workerlink: acknowledgment of generation %q not written: %w", r.generation, werr)
+		}
 	}
 	if err == nil {
 		reg.mu.Lock()
@@ -295,18 +395,6 @@ func (r *Reservation) writeAck(ctx context.Context) error {
 				err = fmt.Errorf("workerlink: acknowledgment of generation %q written, but its listener not released: %w", r.generation, closeErr)
 			}
 		}
-	} else {
-		reg.mu.Lock()
-		ended := r.ended
-		reg.mu.Unlock()
-		switch {
-		case byCaller:
-			err = fmt.Errorf("workerlink: acknowledgment of generation %q interrupted: %w", r.generation, ctx.Err())
-		case ended:
-			err = fmt.Errorf("workerlink: acknowledgment of generation %q ended with the generation: %w", r.generation, ErrUnavailable)
-		default:
-			err = fmt.Errorf("workerlink: acknowledgment of generation %q not written: %w", r.generation, err)
-		}
 	}
 	reg.mu.Lock()
 	if err == nil {
@@ -316,5 +404,16 @@ func (r *Reservation) writeAck(ctx context.Context) error {
 	}
 	close(r.ackDone)
 	reg.mu.Unlock()
+	return err
+}
+
+// releaseAckClaim gives up a claim whose Write was never entered: the acknowledgment is left as never tried, the
+// joiners wake to try again, and err is returned.
+func (r *Reservation) releaseAckClaim(err error) error {
+	r.reg.mu.Lock()
+	r.ack = ackNone
+	r.ackCause, r.ackCauseAt, r.ackInterruptErr = nil, time.Time{}, nil
+	close(r.ackDone)
+	r.reg.mu.Unlock()
 	return err
 }

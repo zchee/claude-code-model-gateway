@@ -95,13 +95,14 @@ type Registry struct {
 	eligible *Reservation
 }
 
-// ackState is how far a reservation's drain acknowledgment has got. The zero value means no acknowledgment has
-// entered its write yet.
+// ackState is how far a reservation's drain acknowledgment has got.
 type ackState int
 
 const (
-	// ackWriting means one acknowledgment is writing the line; others join it.
-	ackWriting ackState = iota + 1
+	// ackNone means no acknowledgment holds the claim or has entered a write; one may try.
+	ackNone ackState = iota
+	// ackWriting means one acknowledgment holds the claim to write the line; others join it.
+	ackWriting
 	// ackSent means the line was written completely and the listener was released.
 	ackSent
 	// ackFailed means a write was entered and failed; the line may be partial, so it is never written again.
@@ -134,9 +135,15 @@ type Reservation struct {
 	// listenerReleased records that the acknowledgment or End has taken the listener to close it.
 	listenerReleased bool
 	ack              ackState
-	// ackDone is closed when the acknowledgment's write has returned and its outcome is recorded in ackErr.
+	// ackDone is closed when the claimed writer has finished: its outcome is recorded in ackErr, or its claim was
+	// released before any Write.
 	ackDone chan struct{}
 	ackErr  error
+	// ackCause is the first interruption of the claimed write, recorded by the cancellation callback or by End at
+	// ackCauseAt; ackInterruptErr is a failure to end that write through its deadline.
+	ackCause        error
+	ackCauseAt      time.Time
+	ackInterruptErr error
 	// endDone is closed when the first End has finished; endErr is its result.
 	endDone chan struct{}
 	endErr  error
@@ -179,7 +186,8 @@ func NewRegistry(listen ListenFunc, dial DialFunc) *Registry {
 // for the child.
 func (r *Registry) Reserve(ctx context.Context, generation Generation, port uint16) (*Reservation, error) {
 	if _, err := drainLine(DrainMessage{Type: Draining, Generation: generation}); err != nil {
-		return nil, fmt.Errorf("workerlink: generation %q cannot be reserved: %w", generation, err)
+		// The length, not the value: a generation that cannot be framed may be arbitrarily long.
+		return nil, fmt.Errorf("workerlink: a generation of %d bytes cannot be reserved: %w", len(generation), err)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -415,10 +423,11 @@ func (r *Reservation) Retire() {
 
 // End finally stops the generation: it cancels unfinished dials, wakes Exited waiters and releases its files.
 //
-// It denies admission first, then closes every lease's Exited channel, cancels the pinned dials and closes the drain
-// channel's parent end, which also ends an acknowledgment write in progress. It keeps the listener until every pinned
-// dial has settled and the acknowledgment's writer has left its Write. A repeated End waits for the first and returns
-// its result.
+// It denies admission first and records itself as the interruption of a claimed acknowledgment write, then closes
+// every lease's Exited channel, cancels the pinned dials and closes the drain channel's parent end, which also ends an
+// acknowledgment write in progress. It keeps the listener until every pinned dial has settled and the acknowledgment's
+// writer has finished; only then does it take the listener, unless that writer already released it. A repeated End
+// waits for the first and returns its result.
 func (r *Reservation) End() error {
 	reg := r.reg
 	reg.mu.Lock()
@@ -430,6 +439,7 @@ func (r *Reservation) End() error {
 	}
 	r.endDone = make(chan struct{})
 	r.ended = true
+	r.interruptAckLocked(r.endedAckError())
 	if reg.eligible == r {
 		reg.eligible = nil
 	}
@@ -446,15 +456,19 @@ func (r *Reservation) End() error {
 	}
 	// The context never ends here: only the pins themselves release this wait.
 	_ = r.awaitPins(context.Background(), nil)
+	// No acknowledgment claims the write after ended is set, so one wait covers every writer. The listener is taken
+	// only after that writer has finished, so a writer whose line went out closes it itself and reports that Close.
 	reg.mu.Lock()
 	writing := r.ack == ackWriting
 	ackDone := r.ackDone
-	release := !r.listenerReleased
-	r.listenerReleased = true
 	reg.mu.Unlock()
 	if writing {
 		<-ackDone
 	}
+	reg.mu.Lock()
+	release := !r.listenerReleased
+	r.listenerReleased = true
+	reg.mu.Unlock()
 	if release {
 		if err := r.listener.Close(); err != nil {
 			errs = append(errs, err)
@@ -490,20 +504,18 @@ func (l *lease) Exited() <-chan struct{} { return l.res.endCtx.Done() }
 // ImportListener consumes an inherited listener descriptor and returns the listener when it is a listening
 // loopback IPv4 TCP socket on the expected port.
 //
-// The file is closed on success and on failure; the returned listener holds its own close-on-exec duplicate. A
-// refused descriptor gives no listener and there is no fallback bind.
+// The file is closed on success and on failure; it is marked close-on-exec before anything else is checked, and the
+// returned listener holds its own close-on-exec duplicate. A refused descriptor gives no listener and there is no
+// fallback bind. Linux reports the listening state, so a socket that is not listening is refused there. macOS does
+// not report it: there a bound loopback TCP socket that is not listening is returned too, and its first Accept
+// fails, which the caller treats as a failed start.
 func ImportListener(file *os.File, expected uint16) (net.Listener, error) {
 	if file == nil {
 		return nil, errors.New("workerlink: no inherited listener descriptor")
 	}
 	l, err := importListener(file, expected)
-	closeErr := file.Close()
 	if err != nil {
 		return nil, fmt.Errorf("workerlink: inherited listener refused: %w", err)
-	}
-	if closeErr != nil {
-		_ = l.Close()
-		return nil, fmt.Errorf("workerlink: close the inherited listener descriptor: %w", closeErr)
 	}
 	return l, nil
 }

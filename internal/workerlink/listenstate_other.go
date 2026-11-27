@@ -23,3 +23,8 @@ package workerlink
 // which retries only EINTR, EAGAIN and ECONNABORTED). The other Unix systems take the same path, which is safe for
 // the same reason.
 func listeningState(int) (listening, known bool, err error) { return false, false, nil }
+
+// tcpProtocol accepts every IPv4 stream socket. On macOS the IPv4 domain has exactly one stream protocol, TCP (xnu
+// bsd/netinet/in_proto.c:141-143), and MPTCP sockets belong to their own domain, PF_MULTIPATH (mp_proto.c:60), so
+// the family and the type already establish TCP. The other Unix systems are not checked here.
+func tcpProtocol(int) error { return nil }
