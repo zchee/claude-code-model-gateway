@@ -26,6 +26,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	gocmp "github.com/google/go-cmp/cmp"
 )
@@ -42,9 +43,9 @@ const (
 )
 
 // authStatusOutput is the helper behind authStatusHelper. Its arguments are the stream to write
-// ("stdout" or "stderr"), the number of bytes to write, "exit" or "hold", and the file that receives
-// its process ID. The output is a run of lines that name an account, so whatever is read of it
-// matches the auth status pattern. With "hold" the helper keeps running after its output until it is
+// ("stdout" or "stderr"), the number of bytes to write, "exit", "hold" or "exit-invalid-utf8", and the
+// file that receives its process ID. The output is statusOutput's, so whatever is read of it matches
+// the auth status pattern. With "hold" the helper keeps running after its output until it is
 // stopped, or until statusHoldLimit. The helper ends the process itself, so the test binary's own
 // result line never adds to the stream and the byte count stays exact.
 func authStatusOutput(t testing.TB, args []string) {
@@ -62,14 +63,36 @@ func authStatusOutput(t testing.TB, args []string) {
 	if err := os.WriteFile(args[3], []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	line := []byte("signed in to account fixture\n")
-	data := bytes.Repeat(line, size/len(line)+1)[:size]
+	data := statusOutput(size, args[2] == "exit-invalid-utf8")
 	// A write that fails because the reader stopped reading is what a capped stream looks like.
 	_, _ = out.Write(data)
 	if args[2] == "hold" {
 		time.Sleep(statusHoldLimit)
 	}
 	syscall.Exit(0)
+}
+
+// statusOutput is what the auth status helper prints: size bytes of lines that name an account or,
+// with invalid, one such line followed by lines that each hold a single byte that is never valid
+// UTF-8, cut to size.
+func statusOutput(size int, invalid bool) []byte {
+	line := []byte("signed in to account fixture\n")
+	if !invalid {
+		return bytes.Repeat(line, size/len(line)+1)[:size]
+	}
+	return append(line, bytes.Repeat([]byte("\xff\n"), size/2+1)...)[:size]
+}
+
+// decodedLen is the length in bytes of p once decoded as UTF-8 with every invalid byte replaced by
+// U+FFFD, as a Node stream with the 'utf8' encoding hands its text over.
+func decodedLen(p []byte) int {
+	n := 0
+	for len(p) > 0 {
+		r, size := utf8.DecodeRune(p)
+		n += utf8.RuneLen(r)
+		p = p[size:]
+	}
+	return n
 }
 
 // shellQuote quotes s for a POSIX shell.
@@ -131,9 +154,22 @@ func TestAuthStatusOutputIsCapped(t *testing.T) {
 		"error: a command still running after more than the limit on standard error is stopped and reaped": {
 			stream: "stderr", size: maxStatusOutput + 4096, mode: "hold",
 		},
+		// The worker counts the raw bytes a stream carries. The source decodes each stream as UTF-8
+		// first and counts the bytes of the decoded text, where every invalid byte has become a
+		// three-byte replacement character, so it would refuse this output as over the limit and
+		// report no sign-in. The two counts agree for every output that is valid UTF-8.
+		"success: output under the limit in raw bytes names the signed-in account although its decoded text is over the limit": {
+			stream: "stdout", size: maxStatusOutput - 4096, mode: "exit-invalid-utf8", wantAuth: true,
+		},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
+			if tt.mode == "exit-invalid-utf8" {
+				out := statusOutput(tt.size, true)
+				if raw, decoded := len(out), decodedLen(out); raw > maxStatusOutput || decoded <= maxStatusOutput {
+					t.Fatalf("test precondition: output of %d raw bytes decodes to %d bytes; want at most %d raw and more than %d decoded", raw, decoded, maxStatusOutput, maxStatusOutput)
+				}
+			}
 			home, env, state := sandbox(t)
 			pidFile := filepath.Join(home, "status-fixture.pid")
 			installStatusFixture(t, home, state, tt.stream, strconv.Itoa(tt.size), tt.mode, pidFile)

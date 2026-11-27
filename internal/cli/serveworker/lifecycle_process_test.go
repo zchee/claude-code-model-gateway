@@ -323,7 +323,7 @@ func (s *heldSink) Write(p []byte) (int, error) {
 
 func TestForcedStopJoinsRequestHandlers(t *testing.T) {
 	tests := map[string]struct{ marker string }{
-		"success: a forced stop returns only after a handler blocked on its diagnostic stream has finished": {
+		"success: a forced stop returns only after a request handler's blocked diagnostic write has ended": {
 			marker: "unambiguous OpenAI rejection",
 		},
 	}
