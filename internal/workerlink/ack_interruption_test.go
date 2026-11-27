@@ -24,6 +24,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -136,14 +137,20 @@ func parentClosed(g *gatedConn) bool {
 }
 
 // pausingDeadlineConn parks, once armed, the next call that sets a deadline on the parent end: the call announces
-// itself on inside and waits for release before it sets the deadline on the gated end. The acknowledgment's claimed
-// writer arms its write deadline before it enters Write, so a test that acts while the call is parked acts between
-// the claim and the Write.
+// itself on inside and waits for release; then it fails with failPaused when that is set, and otherwise sets the
+// deadline on the gated end. The acknowledgment's claimed writer arms its write deadline before it enters Write, so a
+// test that acts while the call is parked acts between the claim and the Write. With rejectPast, every later call that
+// asks for a deadline that is not in the future is refused and counted, as by a connection that cannot be interrupted
+// through its deadline; the zero time, which clears the deadline, is passed on.
 type pausingDeadlineConn struct {
 	*gatedConn
-	inside chan struct{}
-	resume chan struct{}
-	once   sync.Once
+	failPaused error
+	rejectPast bool
+	inside     chan struct{}
+	resume     chan struct{}
+	once       sync.Once
+	// pastAsked counts the calls refused for asking a deadline that is not in the future.
+	pastAsked atomic.Int32
 
 	mu    sync.Mutex
 	armed bool
@@ -160,7 +167,8 @@ func (c *pausingDeadlineConn) arm() {
 	c.armed = true
 }
 
-func (c *pausingDeadlineConn) pause() {
+// pause parks the call if it is the armed one, and returns the error the call is to return instead of setting t.
+func (c *pausingDeadlineConn) pause(t time.Time) error {
 	c.mu.Lock()
 	armed := c.armed
 	c.armed = false
@@ -168,36 +176,63 @@ func (c *pausingDeadlineConn) pause() {
 	if armed {
 		close(c.inside)
 		<-c.resume
+		return c.failPaused
 	}
+	if c.rejectPast && !t.IsZero() && !t.After(time.Now()) {
+		c.pastAsked.Add(1)
+		return errPastDeadline
+	}
+	return nil
 }
 
 func (c *pausingDeadlineConn) release() { c.once.Do(func() { close(c.resume) }) }
 
 func (c *pausingDeadlineConn) SetWriteDeadline(t time.Time) error {
-	c.pause()
+	if err := c.pause(t); err != nil {
+		return err
+	}
 	return c.gatedConn.SetWriteDeadline(t)
 }
 
 func (c *pausingDeadlineConn) SetDeadline(t time.Time) error {
-	c.pause()
+	if err := c.pause(t); err != nil {
+		return err
+	}
 	return c.gatedConn.SetDeadline(t)
 }
+
+// errPastDeadline is the refusal of a deadline that is not in the future.
+var errPastDeadline = errors.New("a deadline that has passed is refused by the connection")
+
+// errArm is the refusal of the deadline call the test parks.
+var errArm = errors.New("the write deadline is refused by the connection")
 
 // TestAcknowledgeDrainInterruptedBeforeWrite checks an interruption that arrives after an acknowledgment claimed the
 // write and before it entered Write. The test parks the acknowledgment inside the first call that sets a deadline on
 // the parent end, which the claimed writer makes before its Write, and there cancels the context or starts End; it
 // lets the bubble settle before the call goes on. That is an interruption before the write: no Write call at all. A
 // cancellation returns the context's error and keeps the listener, and the acknowledgment stays retryable: a second
-// call on the same reservation writes the one line, releases the listener and succeeds. After End the call fails, and
-// End returns and releases the listener. The End case assumes that the deadline is set outside the registry's lock,
-// which the package holds only to read or change state.
+// call on the same reservation writes the one line, releases the listener and succeeds. That holds also on a
+// connection that accepts the initial arm and refuses a deadline in the past: the cancellation, which came before the
+// write was admitted, neither sets a deadline on the parent end nor closes it, so the second call succeeds on the same
+// live connection. When the parked call is an arm that fails, the cancellation that coincides with it is still what
+// the call returns, and the second call succeeds. After End the call fails, and End returns and releases the listener.
+// The End case relies on the rule that the deadline is set outside the registry's lock.
 func TestAcknowledgeDrainInterruptedBeforeWrite(t *testing.T) {
 	tests := map[string]struct {
 		// end interrupts with End instead of the caller's cancellation.
 		end bool
+		// rejectPast refuses every later call that asks for a deadline in the past.
+		rejectPast bool
+		// failArm makes the parked arm itself fail.
+		failArm bool
 	}{
 		"error: the caller cancels between the claim and the Write, and a second acknowledgment succeeds": {},
 		"error: the generation ends between the claim and the Write":                                      {end: true},
+		"error: the caller cancels during the initial arm on a connection that refuses a past deadline, and a second acknowledgment succeeds on it": {
+			rejectPast: true,
+		},
+		"error: the caller cancels during an arm that fails, and a second acknowledgment succeeds": {failArm: true},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -207,6 +242,10 @@ func TestAcknowledgeDrainInterruptedBeforeWrite(t *testing.T) {
 				var pausing *pausingDeadlineConn
 				g := r.reserve(t, "gen-a", 41001, 4101, reserveOptions{wrap: func(gc *gatedConn) net.Conn {
 					pausing = newPausingDeadlineConn(gc)
+					pausing.rejectPast = tt.rejectPast
+					if tt.failArm {
+						pausing.failPaused = errArm
+					}
 					return pausing
 				}})
 				ctx, cancel := context.WithCancel(t.Context())
@@ -246,6 +285,12 @@ func TestAcknowledgeDrainInterruptedBeforeWrite(t *testing.T) {
 				if !errors.Is(err, context.Canceled) {
 					t.Errorf("AcknowledgeDrain cancelled before its Write = %v, want %v", err, context.Canceled)
 				}
+				if n := pausing.pastAsked.Load(); n != 0 {
+					t.Errorf("a deadline in the past was asked of the parent end %d times after a cancellation that came before the write was admitted; it must not set a deadline on the parent end", n)
+				}
+				if parentClosed(g.parent) {
+					t.Error("the parent end was closed by a cancellation that came before the write was admitted; it must stay live")
+				}
 				if isClosed(g.listener.closed) {
 					t.Fatal("the acknowledgment cancelled before its Write released the listener")
 				}
@@ -253,7 +298,7 @@ func TestAcknowledgeDrainInterruptedBeforeWrite(t *testing.T) {
 				at("the second acknowledgment")
 				g.parent.openGate()
 				if err := startAck(t.Context(), g.res).wait(t, "the second AcknowledgeDrain"); err != nil {
-					t.Fatalf("second AcknowledgeDrain after a cancellation before the write = %v; the acknowledgment must stay retryable", err)
+					t.Fatalf("second AcknowledgeDrain after a cancellation before the write = %v; the acknowledgment must stay retryable on the same live connection", err)
 				}
 				want := frame("retired", "gen-a")
 				if offered, writes := g.parent.attempts(); offered != want {
@@ -511,6 +556,105 @@ func TestAcknowledgeDrainFirstInterruptionDecides(t *testing.T) {
 	}
 }
 
+// failedWriteConn fails every Write with err, an error the Write chooses itself before anything else can happen, and
+// holds the first such Write after that choice and before it returns, until release. returning is closed when the
+// first Write has chosen its error.
+type failedWriteConn struct {
+	*gatedConn
+	err       error
+	returning chan struct{}
+	proceed   chan struct{}
+	writes    atomic.Int32
+
+	first, once sync.Once
+}
+
+func newFailedWriteConn(g *gatedConn, err error) *failedWriteConn {
+	return &failedWriteConn{gatedConn: g, err: err, returning: make(chan struct{}), proceed: make(chan struct{})}
+}
+
+func (c *failedWriteConn) Write([]byte) (int, error) {
+	c.writes.Add(1)
+	park := false
+	c.first.Do(func() {
+		park = true
+		close(c.returning)
+	})
+	if park {
+		<-c.proceed
+	}
+	return 0, c.err
+}
+
+func (c *failedWriteConn) release() { c.once.Do(func() { close(c.proceed) }) }
+
+// TestAcknowledgeDrainKeepsWriteError checks a Write that fails by itself: the connection's Write has already chosen
+// EPIPE, the error of a peer that is gone, and is held after that choice and before it returns. While it is held the
+// caller cancels, or End begins, and only then does the Write return. Neither the cancellation nor End caused that
+// error, so the acknowledgment returns an error that matches EPIPE and not the later cancellation or End. Only a
+// timeout of a deadline the acknowledgment armed, or the close error of its own interruption, may be translated.
+func TestAcknowledgeDrainKeepsWriteError(t *testing.T) {
+	errPipe := &net.OpError{Op: "write", Net: "unix", Err: os.NewSyscallError("write", syscall.EPIPE)}
+	tests := map[string]struct {
+		// end interrupts with End instead of the caller's cancellation.
+		end bool
+		// later is the error of the later interruption, which the result must not match.
+		later error
+	}{
+		"error: a cancellation after the Write chose EPIPE keeps EPIPE": {later: context.Canceled},
+		"error: an End after the Write chose EPIPE keeps EPIPE":         {end: true, later: workerlink.ErrUnavailable},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			guardedBubble(t, func(t *testing.T, at func(string)) {
+				at("setting up the reservation")
+				r := newWrappedRegistry(t, nil)
+				var failing *failedWriteConn
+				g := r.reserve(t, "gen-a", 41001, 4101, reserveOptions{wrap: func(gc *gatedConn) net.Conn {
+					failing = newFailedWriteConn(gc, errPipe)
+					return failing
+				}})
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				ack := startAck(ctx, g.res)
+				at("waiting for the Write to choose its error")
+				await(t, failing.returning, "the Write that chose EPIPE")
+				var ended chan error
+				if tt.end {
+					ended = make(chan error, 1)
+					go func() { ended <- g.res.End() }()
+				} else {
+					cancel()
+				}
+				at("the later interruption while the failed Write is held")
+				synctest.Wait()
+				if ack.poll() {
+					t.Fatalf("AcknowledgeDrain returned %v while its Write had not returned yet", ack.err)
+				}
+				failing.release()
+				err := ack.wait(t, "AcknowledgeDrain")
+				if tt.end {
+					if endErr := await(t, ended, "End"); endErr != nil {
+						t.Errorf("End: %v", endErr)
+					}
+				}
+				if n := failing.writes.Load(); n != 1 {
+					t.Errorf("%d Write calls, want the one that failed", n)
+				}
+				if !errors.Is(err, syscall.EPIPE) {
+					t.Errorf("AcknowledgeDrain = %v; want an error that matches the Write's own %v", err, syscall.EPIPE)
+				}
+				if errors.Is(err, tt.later) {
+					t.Errorf("AcknowledgeDrain = %v matches %v, which came after the Write had chosen its error and did not cause it", err, tt.later)
+				}
+				if !tt.end {
+					checkFailedAckKeeps(t, r.reg, g.gatedReservation)
+				}
+			})
+		})
+	}
+}
+
 // entryDeadlineConn records the write deadline the gated end below it holds when the first Write begins.
 type entryDeadlineConn struct {
 	*gatedConn
@@ -617,18 +761,23 @@ func TestAcknowledgeDrainArmsCallerDeadline(t *testing.T) {
 	}
 }
 
-// refusingDeadlineConn refuses deadline calls with err instead of passing them to the gated end below it: every call,
-// or, with afterEntry, every call made once the held Write has begun. It counts the refusals.
+// refusingDeadlineConn refuses deadline calls with err instead of passing them to the gated end below it: every call;
+// with afterEntry, every call made once the held Write has begun; with once, only the first call. It counts the
+// refusals.
 type refusingDeadlineConn struct {
 	*gatedConn
 	err        error
 	afterEntry bool
+	once       bool
 	refusals   atomic.Int32
 }
 
 func (c *refusingDeadlineConn) refuse() bool {
-	if c.afterEntry && !isClosed(c.entered) {
+	switch {
+	case c.afterEntry && !isClosed(c.entered):
 		return false
+	case c.once:
+		return c.refusals.CompareAndSwap(0, 1)
 	}
 	c.refusals.Add(1)
 	return true
@@ -650,17 +799,21 @@ func (c *refusingDeadlineConn) SetDeadline(t time.Time) error {
 
 // TestAcknowledgeDrainRefusedDeadline checks a parent end that refuses to set a deadline. When no deadline can be set
 // at all, the budget cannot be armed: the acknowledgment fails before it enters Write, its error carries the refusal,
-// and the listener and the retirement are kept. When the deadline is armed but every deadline call after the Write
-// began is refused, the caller's cancellation still ends the Write at once, by closing the parent end, and the
-// acknowledgment returns the context's error after its Write has left, at the instant of the cancellation. Whether
-// that error also carries the refusal is logged, not asserted.
+// and the listener and the retirement are kept. When the arm is refused only once, nothing was written, so a second
+// acknowledgment on the same reservation arms the deadline, writes the one line and succeeds. When the deadline is
+// armed but every deadline call after the Write began is refused, the caller's cancellation still ends the Write at
+// once, by closing the parent end, and the acknowledgment returns, at the instant of the cancellation and after its
+// Write has left, an error that matches both the context's error and the refusal.
 func TestAcknowledgeDrainRefusedDeadline(t *testing.T) {
 	errDeadline := errors.New("deadline refused by the connection")
 	tests := map[string]struct {
 		// afterEntry refuses only the deadline calls made once the Write began.
 		afterEntry bool
+		// once refuses only the first deadline call, and a second acknowledgment follows.
+		once bool
 	}{
 		"error: the budget cannot be armed":                                        {},
+		"error: the arm is refused once, and a second acknowledgment succeeds":     {once: true},
 		"error: the cancellation cannot set the deadline on the Write in progress": {afterEntry: true},
 	}
 	for name, tt := range tests {
@@ -670,7 +823,7 @@ func TestAcknowledgeDrainRefusedDeadline(t *testing.T) {
 				r := newWrappedRegistry(t, nil)
 				var refusing *refusingDeadlineConn
 				g := r.reserve(t, "gen-a", 41001, 4101, reserveOptions{park: tt.afterEntry, wrap: func(gc *gatedConn) net.Conn {
-					refusing = &refusingDeadlineConn{gatedConn: gc, err: errDeadline, afterEntry: tt.afterEntry}
+					refusing = &refusingDeadlineConn{gatedConn: gc, err: errDeadline, afterEntry: tt.afterEntry, once: tt.once}
 					return refusing
 				}})
 				ctx, cancel := context.WithCancel(t.Context())
@@ -697,6 +850,24 @@ func TestAcknowledgeDrainRefusedDeadline(t *testing.T) {
 						t.Errorf("AcknowledgeDrain = %v; want an error that carries the refusal %v", ack.err, errDeadline)
 					}
 					checkFailedAckKeeps(t, r.reg, g.gatedReservation)
+					if !tt.once {
+						return
+					}
+					at("the second acknowledgment after the refused arm")
+					g.parent.openGate()
+					if err := startAck(t.Context(), g.res).wait(t, "the second AcknowledgeDrain"); err != nil {
+						t.Fatalf("second AcknowledgeDrain after an arm refused once = %v; a refused arm writes nothing, so the acknowledgment must stay retryable", err)
+					}
+					want := frame("retired", "gen-a")
+					if offered, writes := g.parent.attempts(); offered != want {
+						t.Errorf("bytes offered to the drain channel %q in %d Write calls, want the one line %q", offered, writes, want)
+					}
+					if got := readExactly(t, g.child, len(want)); got != want {
+						t.Errorf("acknowledgment %q, want %q", got, want)
+					}
+					if !isClosed(g.listener.closed) {
+						t.Error("the second acknowledgment did not release the listener")
+					}
 					return
 				}
 
@@ -719,10 +890,9 @@ func TestAcknowledgeDrainRefusedDeadline(t *testing.T) {
 				if !parentClosed(g.parent) {
 					t.Error("the parent end was not closed although the cancellation could not set its deadline")
 				}
-				if !errors.Is(err, context.Canceled) {
-					t.Errorf("AcknowledgeDrain = %v, want %v", err, context.Canceled)
+				if !errors.Is(err, context.Canceled) || !errors.Is(err, errDeadline) {
+					t.Errorf("AcknowledgeDrain = %v; want an error that matches both %v and the refusal %v (%d deadline calls refused after the Write began)", err, context.Canceled, errDeadline, refusing.refusals.Load())
 				}
-				t.Logf("deadline calls refused after the Write began: %d; the error %v carries the refusal: %t", refusing.refusals.Load(), err, errors.Is(err, errDeadline))
 				checkFailedAckKeeps(t, r.reg, g.gatedReservation)
 			})
 		})

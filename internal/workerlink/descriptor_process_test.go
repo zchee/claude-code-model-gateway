@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -85,7 +86,12 @@ func report(t *testing.T, format string, args ...any) {
 // with ENOTCONN means no peer (Linux getpeername(2); xnu bsd/kern/uipc_syscalls.c:3239-3243); a connected local
 // stream socket with an empty queue answers a nonblocking peek with EAGAIN (Linux recv(2); xnu soreceive,
 // bsd/kern/uipc_socket.c:3477-3481, where EWOULDBLOCK is EAGAIN), and a peek interrupted by a signal is repeated. Any
-// other failure of an inspection fails the helper, so that a socket cannot hide behind an error.
+// other failure of an inspection fails the helper, so that a socket cannot hide behind an error. The one exception is
+// a macOS socket that has no name, which is reported as unnamed (see below). getpeername, SO_TYPE and the peek need no
+// such exception: SO_TYPE is answered at the socket level for every protocol (xnu sogetoptlock); getpeername is asked
+// only of a socket that has a name, and every protocol of xnu that has a name also has a peer address handler (only
+// the kernel control and kernel event sockets lack pru_sockaddr, and only the kernel event socket lacks pru_peeraddr);
+// and the peek is made only on a connected local stream socket, which is of the link's own kind.
 func inheritedSocketsHelper(tb testing.TB, _ []string) {
 	t := helperT(tb)
 	fds, err := openDescriptors()
@@ -105,6 +111,27 @@ func inheritedSocketsHelper(tb testing.TB, _ []string) {
 			t.Fatalf("SO_TYPE of %d: %v", fd, err)
 		}
 		sa, err := unix.Getsockname(fd)
+		if runtime.GOOS == "darwin" && errors.Is(err, unix.EOPNOTSUPP) {
+			// A socket whose protocol has no name at all: on macOS getsockname answers EOPNOTSUPP only through
+			// the default pru_sockaddr_notsupp (xnu bsd/kern/uipc_syscalls.c:3163, bsd/kern/uipc_socket2.c:2204,
+			// :2265), which only the PF_SYSTEM kernel control and kernel event sockets keep (bsd/kern/kern_control.c:171,
+			// bsd/kern/kern_event.c:8611); the hosted runner hands the child such a socket. The link's sockets cannot
+			// answer it: a local socket names itself or fails with EINVAL (uipc_sockaddr, bsd/kern/uipc_usrreq.c:793-806),
+			// an IPv4 TCP socket the same (in_getsockaddr, bsd/netinet/in_pcb.c:2159-2181), also when its flow is
+			// diverted or it is an MPTCP subflow, whose tables copy TCP's (bsd/netinet/flow_divert.c:4976,
+			// bsd/netinet/mptcp_subr.c:6952) and keep that handler, and the socket filter hook
+			// that runs after the protocol is implemented by no filter in the kernel's own tree. So a socket answered this
+			// way is not one of the link's, and passing over it cannot hide a leaked link descriptor: it is reported as
+			// unnamed, which no leak check matches, and any other error still fails the helper. Linux
+			// keeps every getsockname error fatal: no such socket has been seen there.
+			s.Family = "unnamed"
+			line, err := json.Marshal(s)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			report(t, "%s", line)
+			continue
+		}
 		if err != nil {
 			t.Fatalf("getsockname of %d: %v", fd, err)
 		}

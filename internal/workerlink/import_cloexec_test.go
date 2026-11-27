@@ -103,7 +103,8 @@ func descriptorFlags(fd int) (int, error) {
 }
 
 // TestFixtureHeldDescriptorOutlivesClose checks heldInheritedListener: after the file's Close returned, its
-// descriptor is still open, still the listener at its port and still inheritable, and only release closes it.
+// descriptor is still open, still the listener at its port and still inheritable. Its number is not examined after
+// release: once the last reference is dropped the number is free, and any open in the process may reuse it.
 func TestFixtureHeldDescriptorOutlivesClose(t *testing.T) {
 	h := holdInheritedListener(t)
 	if err := h.file.Close(); err != nil {
@@ -124,9 +125,6 @@ func TestFixtureHeldDescriptorOutlivesClose(t *testing.T) {
 		t.Errorf("descriptor %d is bound to %#v after the file's Close, want the listener at port %d", h.fd, sa, h.port)
 	}
 	h.release()
-	if _, err := descriptorFlags(h.fd); !errors.Is(err, unix.EBADF) {
-		t.Errorf("F_GETFD of descriptor %d after release = %v, want EBADF: release must drop the last reference", h.fd, err)
-	}
 }
 
 // TestImportListenerRefusalMarksDescriptor checks that an import marks the inherited descriptor close-on-exec before

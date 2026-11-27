@@ -15,6 +15,7 @@
 package workerlink_test
 
 import (
+	"errors"
 	"os"
 	"testing"
 
@@ -25,25 +26,28 @@ import (
 
 // sctpListenerFile returns a listening one-to-one SCTP socket bound to 127.0.0.1 at a port the system selects, and
 // that port: an IPv4 stream socket that listens and has no peer, like a TCP listener, but whose transport protocol is
-// not TCP (socket(AF_INET, SOCK_STREAM, IPPROTO_SCTP), sctp(7)). It returns false, after logging why, when this kernel
-// cannot create, bind or listen on such a socket, for example because SCTP is not built or its module is not
-// available. A socket that is created but is not what the case needs fails the test.
+// not TCP (socket(AF_INET, SOCK_STREAM, IPPROTO_SCTP), sctp(7)). It returns false, after logging why, only when this
+// kernel cannot create such a socket at all: socket(2) then fails with EPROTONOSUPPORT (the protocol is not built or
+// its module cannot be loaded), ESOCKTNOSUPPORT or EAFNOSUPPORT. Any other failure, such as running out of
+// descriptors or memory, or a bind or listen that fails, is a failure of the fixture and fails the test, and so does a
+// socket that is not what the case needs.
 func sctpListenerFile(t *testing.T) (*os.File, uint16, bool) {
 	t.Helper()
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, unix.IPPROTO_SCTP)
-	if err != nil {
-		t.Logf("a one-to-one SCTP socket could not be created on this kernel (%v); the case was not constructed and asserts nothing", err)
+	switch {
+	case errors.Is(err, unix.EPROTONOSUPPORT), errors.Is(err, unix.ESOCKTNOSUPPORT), errors.Is(err, unix.EAFNOSUPPORT):
+		t.Logf("this kernel cannot create a one-to-one SCTP socket (%v); the case was not constructed and asserts nothing", err)
 		return nil, 0, false
+	case err != nil:
+		t.Fatalf("socket for the SCTP fixture: %v", err)
 	}
 	f := os.NewFile(uintptr(fd), "sctp-listener")
 	t.Cleanup(func() { _ = f.Close() })
 	if err := unix.Bind(fd, &unix.SockaddrInet4{Addr: [4]byte{127, 0, 0, 1}}); err != nil {
-		t.Logf("the SCTP socket could not be bound to 127.0.0.1 (%v); the case was not constructed and asserts nothing", err)
-		return nil, 0, false
+		t.Fatalf("bind of the SCTP socket to 127.0.0.1: %v", err)
 	}
 	if err := unix.Listen(fd, 1); err != nil {
-		t.Logf("the SCTP socket could not listen (%v); the case was not constructed and asserts nothing", err)
-		return nil, 0, false
+		t.Fatalf("listen on the SCTP socket: %v", err)
 	}
 	sa, err := unix.Getsockname(fd)
 	if err != nil {
@@ -70,8 +74,8 @@ func sctpListenerFile(t *testing.T) (*os.File, uint16, bool) {
 			t.Fatalf("%s of the SCTP socket = %d, want %d", opt.name, got, opt.want)
 		}
 	}
-	if _, err := unix.Getpeername(fd); err == nil {
-		t.Fatal("the listening SCTP socket has a peer")
+	if _, err := unix.Getpeername(fd); !errors.Is(err, unix.ENOTCONN) {
+		t.Fatalf("getpeername of the listening SCTP socket = %v, want ENOTCONN: the socket must have no peer", err)
 	}
 	t.Logf("constructed a listening one-to-one SCTP socket at 127.0.0.1:%d", in4.Port)
 	return f, uint16(in4.Port), true
