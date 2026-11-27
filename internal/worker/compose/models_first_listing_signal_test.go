@@ -124,18 +124,20 @@ func (h *heldPersistence) effectiveBaseURL() (string, error) {
 	return "", nil
 }
 
-// TestModelsFirstAnswerFollowsCommit decides what releases the first GET /v1/models after startup:
-// the first proxy listing being committed, not the refresh that committed it returning. The refresh
-// publishes the snapshot and then persists the discovery cache before it returns; with that
-// persistence held, the snapshot is already what every reader sees, so the first request answers
-// at once with the proxy rows. When a newer refresh commits while the first listing is still held,
-// its commit is what releases the request, with its rows, although the first refresh never
-// commits. Persistence runs only outside shadow mode.
+// TestModelsFirstAnswerFollowsCommit decides what releases a first GET /v1/models that is already
+// waiting after startup: the first proxy listing being committed, not the refresh that committed it
+// returning. The refresh publishes the snapshot and then persists the discovery cache before it
+// returns; with that persistence held, the snapshot is already what every reader sees, so the
+// waiting request answers at once with the proxy rows. When a newer refresh commits while the first
+// listing is still held, its commit is what releases the waiting request, with its rows, although
+// the first refresh never commits. The request is sent while the first listing is held and shown
+// to wait, so a fast path for requests that arrive after a commit cannot pass for the wake-up.
+// Persistence runs only outside shadow mode.
 func TestModelsFirstAnswerFollowsCommit(t *testing.T) {
 	const newerRows = `{"data":[{"id":"kimi-k4","display_name":"kimi-k4 (kimi)"}]}`
 	tests := map[string]struct {
-		// newer holds the first listing and lets a newer refresh, whose listing answers
-		// newerRows, commit first.
+		// newer lets a newer refresh, whose listing answers newerRows, commit while the first
+		// listing stays held; otherwise the first listing is released.
 		newer bool
 		// wantID is a model the answer must list.
 		wantID string
@@ -151,11 +153,8 @@ func TestModelsFirstAnswerFollowsCommit(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				persistence := newHeldPersistence()
-				gate := newFirstListingGate()
-				if tt.newer {
-					gate.arm(0, listingHold)
-					gate.setRows(1, newerRows)
-				}
+				gate := newFirstListingGate(listingHold)
+				gate.setRows(1, newerRows)
 				w, cleanup, ok := newFirstListingWorker(t, t.Context(), gate, false, persistence.effectiveBaseURL)
 				defer cleanup()
 				// Deferred after cleanup, so it runs first: the cache's Wait in cleanup needs every
@@ -164,11 +163,19 @@ func TestModelsFirstAnswerFollowsCommit(t *testing.T) {
 				if !ok {
 					return
 				}
+				if !awaitEntered(t, gate, "the first listing") {
+					return
+				}
+				answers := getModels(t.Context(), w.handler)
+				synctest.Wait()
+				if a, ok := answered(answers); ok {
+					t.Errorf("test precondition: the first GET /v1/models answered (%v) while the first listing was held, want it waiting", a)
+					return
+				}
 				if tt.newer {
-					if !awaitEntered(t, gate, "the first listing") {
-						return
-					}
 					go func() { _ = w.cache.Refresh(t.Context()) }()
+				} else {
+					gate.unhold()
 				}
 				select {
 				case <-persistence.entered:
@@ -176,11 +183,10 @@ func TestModelsFirstAnswerFollowsCommit(t *testing.T) {
 					t.Error("no refresh reached its discovery persistence after committing its listing")
 					return
 				}
-				answers := getModels(t.Context(), w.handler)
 				synctest.Wait()
 				a, ok := answered(answers)
 				if !ok {
-					t.Error("the first GET /v1/models waited although a proxy listing was committed and only its discovery persistence was pending")
+					t.Error("the waiting first GET /v1/models was not released although a proxy listing was committed and only its discovery persistence was pending")
 					persistence.unhold()
 					gate.unhold()
 					if a, ok = awaitAnswer(t, answers, "the first GET /v1/models"); ok {
@@ -242,16 +248,22 @@ func TestModelsColdCatalogOverlapsFirstListing(t *testing.T) {
 					t.Errorf("the first GET /v1/models answered (%v) while the first listing and the catalog were pending", a)
 					return
 				}
+				if n := gate.catalogCalls.Load(); n != 1 {
+					t.Errorf("%d Anthropic catalog request(s) reached the upstream while the first listing was pending, want the cold catalog fetch started at once", n)
+				}
 				if tt.cancel {
 					canceled := time.Now()
 					cancelRequest()
 					if a, ok := awaitAnswer(t, answers, "the canceled GET /v1/models"); ok && !a.at.Equal(canceled) {
 						t.Errorf("the canceled GET /v1/models returned %s after its context ended, want at once", a.at.Sub(canceled))
 					}
+					// The catalog fetch is shared and runs under the worker's context, so the
+					// caller's cancellation ends neither it nor the listing.
+					synctest.Wait()
+					if listing, catalog := gate.holding.Load(), gate.catalogHolding.Load(); listing != 1 || catalog != 1 {
+						t.Errorf("after the canceled request returned: %d listing(s) and %d catalog request(s) held, want both still held", listing, catalog)
+					}
 					return
-				}
-				if n := gate.catalogCalls.Load(); n != 1 {
-					t.Errorf("%d Anthropic catalog request(s) reached the upstream while the first listing was pending, want the cold catalog fetch started at once", n)
 				}
 				first, second := gate.unhold, gate.unholdCatalog
 				firstName, secondName := "listing", "catalog"

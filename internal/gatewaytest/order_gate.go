@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -172,12 +173,13 @@ func (g *OrderGate) record(post gatePost) {
 // HandOff decides when the sender starts its second post, which must already be submitted after
 // the first, and returns what it found wrong. The first post must be the only one parked; while
 // its last body byte is still unread no second post may start, because the first is not yet on
-// its connection; once that byte is read, the second post must start although the first post's
-// reply is still withheld, because a sender waits for no reply. The request is read byte by byte
-// up to the end of its headers and then to one byte short of its length, so no buffer reads
-// ahead of what the test means to consume. HandOff then records and answers the first post and
-// leaves every other connection parked for Serve. It must run inside the bubble, from its test
-// goroutine.
+// its connection; once that byte is read, the second post must start and its whole request,
+// body included, must arrive although the first post's reply is still withheld, because a sender
+// waits for no reply. The first request is read byte by byte up to the end of its headers and then
+// to one byte short of its length, so no buffer reads ahead of what the test means to consume; the
+// second is read by its own goroutine while the reply is withheld. HandOff then records and answers
+// the first post, then the second, and leaves every other connection parked for Serve. It must run
+// inside the bubble, from its test goroutine.
 func (g *OrderGate) HandOff() []string {
 	var findings []string
 	synctest.Wait()
@@ -219,11 +221,38 @@ func (g *OrderGate) HandOff() []string {
 	}
 
 	synctest.Wait()
-	g.mu.Lock()
-	started := len(g.parked)
-	g.mu.Unlock()
-	if started == 0 {
+	next := g.takeParked()
+	if len(next) == 0 {
 		findings = append(findings, "no next post started once the first post was written, while its reply was withheld")
+	}
+	// The second request is read by its own goroutine, so that a sender that holds it back until
+	// the first reply leaves the test goroutine free to find that out and release the reply.
+	type read struct {
+		body []byte
+		err  error
+	}
+	var second chan read
+	if len(next) > 0 {
+		g.repark(next[1:])
+		second = make(chan read, 1)
+		go func() {
+			req, err := http.ReadRequest(bufio.NewReader(next[0]))
+			var body []byte
+			if err == nil {
+				body, err = io.ReadAll(req.Body)
+			}
+			second <- read{body, err}
+		}()
+		synctest.Wait()
+	}
+	var secondRead *read
+	if second != nil {
+		select {
+		case r := <-second:
+			secondRead = &r
+		default:
+			findings = append(findings, "the next post's request did not arrive while the first post's reply was withheld")
+		}
 	}
 	post, err := g.named(first, body)
 	if err != nil {
@@ -232,6 +261,30 @@ func (g *OrderGate) HandOff() []string {
 		return findings
 	}
 	g.record(post)
+	if second == nil {
+		return findings
+	}
+	if secondRead == nil {
+		// Virtual time; the bound only aborts a sender that never writes its next request.
+		select {
+		case r := <-second:
+			secondRead = &r
+		case <-time.After(time.Hour):
+			g.errs = append(g.errs, errors.New("the next post's request never arrived after the first reply"))
+			_ = next[0].Close()
+			return findings
+		}
+	}
+	var nextPost gatePost
+	if err = secondRead.err; err == nil {
+		nextPost, err = g.named(next[0], secondRead.body)
+	}
+	if err != nil {
+		g.errs = append(g.errs, fmt.Errorf("read the next post: %w", err))
+		_ = next[0].Close()
+		return findings
+	}
+	g.record(nextPost)
 	return findings
 }
 

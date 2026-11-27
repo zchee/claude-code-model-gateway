@@ -87,8 +87,10 @@ type firstListingGate struct {
 
 	// holdCatalog makes the Anthropic catalog page answer one row once releaseCatalog closes, or
 	// end with its request's context; otherwise the catalog answers 404.
-	holdCatalog    bool
-	catalogCalls   atomic.Int32
+	holdCatalog  bool
+	catalogCalls atomic.Int32
+	// catalogHolding counts the catalog requests held at the gate now.
+	catalogHolding atomic.Int32
 	catalogEntered chan struct{}
 	releaseCatalog chan struct{}
 	unholdCatalog  func()
@@ -127,6 +129,8 @@ func (g *firstListingGate) setRows(call int, body string) {
 func (g *firstListingGate) RoundTrip(r *http.Request) (*http.Response, error) {
 	if r.URL.Host == firstListingCatalogHost && r.URL.Path == "/v1/models" && g.holdCatalog {
 		g.catalogCalls.Add(1)
+		g.catalogHolding.Add(1)
+		defer g.catalogHolding.Add(-1)
 		g.catalogEntered <- struct{}{}
 		select {
 		case <-g.releaseCatalog:

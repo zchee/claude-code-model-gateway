@@ -39,7 +39,7 @@ import (
 // configuration directory, which belongs to the Claude Code installation the shadow instance must
 // leave untouched. Shadow mode never writes the discovery cache there, so it needs no staging
 // directory there either. The cache is created, started, and refreshed once more after its first
-// listing; a watch installed before the cache was created observes any creation under the Claude
+// listing, then ended and joined; a watch installed before the cache was created observes any creation under the Claude
 // configuration directory, and the directory is checked afterwards as well. Without shadow mode
 // the same cache creates the discovery cache's staging directory there, which shows the watch and
 // the checks see such a creation; that control leaves the gateway unwired, so its discovery cache
@@ -115,15 +115,19 @@ func TestShadowCacheStaysInItsRoot(t *testing.T) {
 				t.Fatalf("New: %v", err)
 			}
 			ctx, cancel := context.WithCancel(t.Context())
-			defer func() {
+			stop := sync.OnceFunc(func() {
 				cancel()
 				cache.Wait()
-			}()
+			})
+			defer stop()
 			cache.Start(ctx)
 			awaitSignal(t, routes.committed, "the first listing to commit")
 			if err := cache.Refresh(ctx); err != nil {
 				t.Fatalf("Refresh: %v", err)
 			}
+			// The cache is ended and joined before anything is observed, so no background work of
+			// its start can change the directory after the checks.
+			stop()
 
 			if observable {
 				var created []cacheDirEvent

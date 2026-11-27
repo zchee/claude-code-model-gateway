@@ -117,6 +117,9 @@ const (
 	sendWhenHeadersWritten
 	// sendWhenAnswered starts the next post only after the previous reply was read.
 	sendWhenAnswered
+	// sendDialedWhenAnswered dials the next post's connection once the previous request is
+	// written, but writes the next request only after the previous reply was read.
+	sendDialedWhenAnswered
 	// sendTogether starts every post at once.
 	sendTogether
 )
@@ -144,6 +147,19 @@ func sendRaw(t *testing.T, g *gatewaytest.OrderGate, mode rawSender, payloads []
 	go func() {
 		defer close(done)
 		defer posts.Wait()
+		if mode == sendDialedWhenAnswered {
+			conn, _ := g.Dial(t.Context(), "tcp", "127.0.0.1:1")
+			for i, payload := range payloads {
+				write(conn, fmt.Appendf(nil, "POST /v1/logs HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(payload), payload))
+				var next net.Conn
+				if i+1 < len(payloads) {
+					next, _ = g.Dial(t.Context(), "tcp", "127.0.0.1:1")
+				}
+				answer(conn)
+				conn = next
+			}
+			return
+		}
 		for _, payload := range payloads {
 			head := fmt.Appendf(nil, "POST /v1/logs HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", len(payload))
 			body := []byte(payload)
@@ -178,8 +194,9 @@ func sendRaw(t *testing.T, g *gatewaytest.OrderGate, mode rawSender, payloads []
 
 // TestOrderGateHandOff shows that HandOff tells the required hand-off apart from its near misses:
 // a sender that starts the next post once the previous request is wholly written passes, and a
-// sender that starts it once only the headers are written, one that waits for each reply, and one
-// that sends both posts at once are each reported.
+// sender that starts it once only the headers are written, one that waits for each reply, one that
+// dials the next connection at once but writes the next request only after the reply, and one that
+// sends both posts at once are each reported.
 func TestOrderGateHandOff(t *testing.T) {
 	tests := map[string]struct {
 		mode         rawSender
@@ -198,6 +215,11 @@ func TestOrderGateHandOff(t *testing.T) {
 		"error: a sender that waits for each reply is reported": {
 			mode:         sendWhenAnswered,
 			wantFindings: []string{"no next post started once the first post was written, while its reply was withheld"},
+			wantOrder:    []string{"post-a", "post-b"},
+		},
+		"error: a sender that dials the next post at once but writes it only after the reply is reported": {
+			mode:         sendDialedWhenAnswered,
+			wantFindings: []string{"the next post's request did not arrive while the first post's reply was withheld"},
 			wantOrder:    []string{"post-a", "post-b"},
 		},
 		"error: a sender with both posts outstanding at once is reported": {
