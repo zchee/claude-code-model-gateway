@@ -25,7 +25,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// cacheDirWatch records the entries created, modified or moved into one directory, through a
+// cacheDirWatch records every change of one directory's entries that can wake a reader watching
+// it (created, modified, metadata changed, moved in, moved away or deleted) through a
 // non-recursive inotify watch, as a reader that waits for a file to appear watches its directory.
 // The kernel queues each event during the system call that causes it, so a drain right after the
 // writer returned sees every event of the write.
@@ -44,7 +45,8 @@ func watchCacheDir(t *testing.T, dir string) (*cacheDirWatch, bool) {
 	t.Cleanup(func() { _ = unix.Close(fd) })
 	// Opens, reads and closes are left out: a writer may read the file it replaces first, which
 	// names the final file without changing what a reader finds.
-	if _, err := unix.InotifyAddWatch(fd, dir, unix.IN_CREATE|unix.IN_MODIFY|unix.IN_MOVED_TO); err != nil {
+	mask := uint32(unix.IN_CREATE | unix.IN_MODIFY | unix.IN_ATTRIB | unix.IN_MOVED_TO | unix.IN_MOVED_FROM | unix.IN_DELETE)
+	if _, err := unix.InotifyAddWatch(fd, dir, mask); err != nil {
 		t.Fatalf("watch %s: %v", dir, err)
 	}
 	return &cacheDirWatch{fd: fd}, true
@@ -75,8 +77,14 @@ func (w *cacheDirWatch) events(t *testing.T) []cacheDirEvent {
 			switch {
 			case event.Mask&unix.IN_MOVED_TO != 0:
 				op = "rename into the directory"
+			case event.Mask&unix.IN_MOVED_FROM != 0:
+				op = "rename out of the directory"
 			case event.Mask&unix.IN_CREATE != 0:
 				op = "create"
+			case event.Mask&unix.IN_DELETE != 0:
+				op = "delete"
+			case event.Mask&unix.IN_ATTRIB != 0:
+				op = "metadata change"
 			}
 			out = append(out, cacheDirEvent{Op: op, Name: name, Dir: event.Mask&unix.IN_ISDIR != 0})
 		}

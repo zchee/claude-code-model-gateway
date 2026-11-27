@@ -15,166 +15,35 @@
 package telemetry
 
 import (
-	"bufio"
 	"bytes"
-	"cmp"
 	"context"
 	json "encoding/json/v2"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
-	"slices"
-	"sync"
 	"testing"
 	"testing/synctest"
-	"time"
 
 	gocmp "github.com/google/go-cmp/cmp"
 	"go.uber.org/goleak"
+
+	"github.com/zchee/claude-code-model-gateway/internal/gatewaytest"
 )
 
-// spanGateCollector serves every trace collector connection over an in-memory pipe inside a
-// synctest bubble and decides when each post reaches it. A new connection is parked unread, so the
-// post's sender stays blocked writing it, until every goroutine of the bubble is blocked. Then the
-// collector takes every parked post. One parked post is recorded as it is. Several parked posts were
-// outstanding together: nothing their sender did fixes the order in which independent connections
-// reach a collector, so the collector records them in the reverse of their submission order, which
-// a network is free to do. A sender that starts a post only after the previous one is on its
-// connection (on a pipe, read by the collector) has its posts recorded in submission order, whatever
-// the scheduler does, and a sender with two posts outstanding at once never does.
-type spanGateCollector struct {
-	// rank is the submission index of each span key the test submits.
-	rank map[string]int
-	// dialed is signalled, without blocking, whenever a connection is parked.
-	dialed chan struct{}
+// spanGateReply is the collector's answer to every post.
+const spanGateReply = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 
-	mu     sync.Mutex // guards parked
-	parked []net.Conn
-
-	// The fields below are used only by the bubble's test goroutine.
-	keys   []string // span keys in the order the collector took the posts
-	bodies [][]byte // the posts' bodies, in the same order
-	errs   []error
-}
-
-func newSpanGateCollector(want []string) *spanGateCollector {
-	c := &spanGateCollector{rank: make(map[string]int, len(want)), dialed: make(chan struct{}, 1)}
-	for i, key := range want {
-		c.rank[key] = i
-	}
-	return c
-}
-
-// dial hands the sender one side of a new pipe and parks the other side unread.
-func (c *spanGateCollector) dial(context.Context, string, string) (net.Conn, error) {
-	peer, client := net.Pipe()
-	c.mu.Lock()
-	c.parked = append(c.parked, peer)
-	c.mu.Unlock()
-	select {
-	case c.dialed <- struct{}{}:
-	default:
-	}
-	return client, nil
-}
-
-// spanGatePost is one post the collector has read and not yet answered.
-type spanGatePost struct {
-	conn net.Conn
-	key  string
-	body []byte
-	rank int
-}
-
-// take reads, records and answers every parked post, and reports whether there was any. It must run
-// only when every other goroutine of the bubble is blocked, so that the parked set is every post
-// outstanding at that point.
-func (c *spanGateCollector) take() bool {
-	c.mu.Lock()
-	batch := c.parked
-	c.parked = nil
-	c.mu.Unlock()
-	posts := make([]spanGatePost, 0, len(batch))
-	for _, conn := range batch {
-		post, err := c.read(conn)
-		if err != nil {
-			c.errs = append(c.errs, err)
-			_ = conn.Close()
-			continue
-		}
-		posts = append(posts, post)
-	}
-	slices.SortFunc(posts, func(a, b spanGatePost) int { return cmp.Compare(b.rank, a.rank) })
-	for _, post := range posts {
-		c.keys = append(c.keys, post.key)
-		c.bodies = append(c.bodies, post.body)
-		// A write on the pipe returns once the sender has read all of it.
-		if _, err := io.WriteString(post.conn, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"); err != nil {
-			c.errs = append(c.errs, fmt.Errorf("answer %s: %w", post.key, err))
-		}
-		_ = post.conn.Close()
-	}
-	return len(batch) > 0
-}
-
-func (c *spanGateCollector) read(conn net.Conn) (spanGatePost, error) {
-	req, err := http.ReadRequest(bufio.NewReader(conn))
-	if err != nil {
-		return spanGatePost{}, fmt.Errorf("read post: %w", err)
-	}
-	body, err := io.ReadAll(req.Body)
-	if err != nil {
-		return spanGatePost{}, fmt.Errorf("read post body: %w", err)
-	}
-	key, err := spanOrderKey(body)
-	if err != nil {
-		return spanGatePost{}, err
-	}
-	rank, ok := c.rank[key]
-	if !ok {
-		return spanGatePost{}, fmt.Errorf("collector received the span of %q, which the test did not submit", key)
-	}
-	return spanGatePost{conn: conn, key: key, body: body, rank: rank}, nil
-}
-
-// serve answers posts until waited is closed and no post is parked, so that no connection is left
-// open when the bubble ends on every path where the sender posts or lets Wait return. The bound is
-// virtual time and only aborts a sender that does neither.
-func (c *spanGateCollector) serve(t *testing.T, waited <-chan struct{}) {
+// spanGateRecorder returns a recorder that exports spans through g, with entropy for spans spans.
+func spanGateRecorder(t *testing.T, g *gatewaytest.OrderGate, spans int) *Recorder {
 	t.Helper()
-	abort := time.After(time.Hour)
-	for {
-		synctest.Wait()
-		if c.take() {
-			continue
-		}
-		select {
-		case <-waited:
-			return
-		case <-c.dialed:
-		case <-abort:
-			t.Error("the trace exporter neither posted nor returned from Wait within an hour of virtual time")
-			return
-		}
+	opts := recorderOptions(map[string]string{"CODEX_GATEWAY_TELEMETRY_ENDPOINT": "http://127.0.0.1:1/v1/traces", "CLAUDE_CODE_PROPAGATE_TRACEPARENT": "1"})
+	// Each unlinked span reads a trace id, a span id and a route id: 40 bytes.
+	opts.Random = bytes.NewReader(bytes.Repeat([]byte{0x11}, 40*spans))
+	r := newRecorder(opts, func(ctx context.Context, network, addr string) (net.Conn, error) { return g.Dial(ctx, network, addr) })
+	if !r.Enabled() {
+		t.Fatal("test precondition: the recorder does not export spans")
 	}
-}
-
-// check reports the collector's failures, then compares the spans it took with want: first as sets,
-// so that a lost or extra span is told apart from a reordering, then in order.
-func (c *spanGateCollector) check(t *testing.T, want []string) {
-	t.Helper()
-	for _, err := range c.errs {
-		t.Errorf("span gate collector: %v", err)
-	}
-	sortedWant, sortedGot := slices.Sorted(slices.Values(want)), slices.Sorted(slices.Values(c.keys))
-	if d := gocmp.Diff(sortedWant, sortedGot); d != "" {
-		t.Errorf("spans the collector received, ignoring order (-want +got):\n%s", d)
-		return
-	}
-	if d := gocmp.Diff(want, c.keys); d != "" {
-		t.Errorf("spans reached the collector out of submission order (-submitted +received):\n%s", d)
-	}
+	return r
 }
 
 // spanOrderKey names a posted span by its selected_model attribute. It returns an error instead of
@@ -206,16 +75,11 @@ func spanOrderKey(payload []byte) (string, error) {
 	return "", fmt.Errorf("post %s has no selected_model attribute", payload)
 }
 
-// spanOrderPayload is the smallest trace export spanOrderKey accepts, for the collector's control.
-func spanOrderPayload(model string) []byte {
-	return []byte(`{"resourceSpans":[{"scopeSpans":[{"spans":[{"attributes":[{"key":"selected_model","value":{"stringValue":"` + model + `"}}]}]}]}]}`)
-}
-
 // TestTraceSubmissionOrder checks that the route spans the recorder is given reach the collector in
 // the order they finished, as in the source: a request's span is posted when its route finishes
 // (lib/request-worker.js:1106), and each post starts at once in that call (:984-1008), so spans
-// leave in finish order, not start order. The collector parks every post until the bubble is quiet
-// and records posts that were outstanding together in reverse, so the test does not depend on how
+// leave in finish order, not start order. The collector (gatewaytest.OrderGate) parks every post until the
+// bubble is quiet and records posts that were outstanding together in reverse, so the test does not depend on how
 // the goroutines happen to be scheduled.
 func TestTraceSubmissionOrder(t *testing.T) {
 	tests := map[string]struct {
@@ -241,14 +105,8 @@ func TestTraceSubmissionOrder(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 			synctest.Test(t, func(t *testing.T) {
-				c := newSpanGateCollector(tt.want)
-				opts := recorderOptions(map[string]string{"CODEX_GATEWAY_TELEMETRY_ENDPOINT": "http://127.0.0.1:1/v1/traces", "CLAUDE_CODE_PROPAGATE_TRACEPARENT": "1"})
-				// Each unlinked span reads a trace id, a span id and a route id: 40 bytes.
-				opts.Random = bytes.NewReader(bytes.Repeat([]byte{0x11}, 40*len(tt.started)))
-				r := newRecorder(opts, c.dial)
-				if !r.Enabled() {
-					t.Fatal("test precondition: the recorder does not export spans")
-				}
+				g := gatewaytest.NewOrderGate(tt.want, spanOrderKey, spanGateReply)
+				r := spanGateRecorder(t, g, len(tt.started))
 				spans := make([]*Span, len(tt.started))
 				for i := range tt.started {
 					spans[i] = r.Start(nil)
@@ -263,80 +121,46 @@ func TestTraceSubmissionOrder(t *testing.T) {
 					defer close(waited)
 					r.Wait()
 				}()
-				c.serve(t, waited)
-				c.check(t, tt.want)
+				g.Serve(t, waited)
+				g.Check(t, tt.want)
 			})
 		})
 	}
 }
 
-// TestSpanGateCollector shows that the collector of TestTraceSubmissionOrder records exactly what it
-// receives: posts sent one after another, each after the previous one was answered, are recorded in
-// that order with their bodies intact, and posts outstanding together are recorded in reverse,
-// however the goroutines that sent them were scheduled.
-func TestSpanGateCollector(t *testing.T) {
+// TestTraceHandOff decides when the recorder moves from one span to the next: it starts the next
+// post once the previous request is wholly on its connection, not when only its headers are
+// written and not after waiting for the collector's reply, as the source starts each post without
+// waiting for an earlier one's reply (lib/request-worker.js:984-1008). Two spans are finished; the
+// collector holds back the first post's last body byte and then its reply.
+func TestTraceHandOff(t *testing.T) {
 	tests := map[string]struct {
-		together bool
+		models []string
 	}{
-		"success: posts sent one after another are recorded in that order": {},
-		"success: posts outstanding together are recorded in reverse":      {together: true},
+		"success: the second span is posted once the first is written and before its reply": {
+			models: []string{"model-first", "model-second"},
+		},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 			synctest.Test(t, func(t *testing.T) {
-				submitted := []string{"model-a", "model-b", "model-c"}
-				payloads := make([][]byte, len(submitted))
-				for i, model := range submitted {
-					payloads[i] = spanOrderPayload(model)
-					if key, err := spanOrderKey(payloads[i]); err != nil || key != model {
-						t.Fatalf("test precondition: payload %d is %q (%v), want %q", i, key, err, model)
-					}
+				g := gatewaytest.NewOrderGate(tt.models, spanOrderKey, spanGateReply)
+				r := spanGateRecorder(t, g, len(tt.models))
+				for _, model := range tt.models {
+					r.Start(nil).Finish(Route{Backend: "codex", SelectedModel: model}, http.StatusOK, "")
 				}
-				c := newSpanGateCollector(submitted)
-				client := &http.Client{Transport: &http.Transport{DialContext: c.dial, DisableKeepAlives: true, DisableCompression: true}}
-				post := func(payload []byte) {
-					req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://127.0.0.1:1/v1/traces", bytes.NewReader(payload))
-					if err != nil {
-						t.Errorf("post: %v", err)
-						return
-					}
-					req.Header.Set("Content-Type", "application/json")
-					resp, err := client.Do(req)
-					if err != nil {
-						t.Errorf("post: %v", err)
-						return
-					}
-					_, _ = io.Copy(io.Discard, resp.Body)
-					_ = resp.Body.Close()
-				}
-				var senders sync.WaitGroup
-				if tt.together {
-					for _, payload := range payloads {
-						senders.Go(func() { post(payload) })
-					}
-				} else {
-					senders.Go(func() {
-						for _, payload := range payloads {
-							post(payload)
-						}
-					})
-				}
+				findings := g.HandOff()
 				waited := make(chan struct{})
 				go func() {
 					defer close(waited)
-					senders.Wait()
+					r.Wait()
 				}()
-				c.serve(t, waited)
-				want, wantBodies := slices.Clone(submitted), slices.Clone(payloads)
-				if tt.together {
-					slices.Reverse(want)
-					slices.Reverse(wantBodies)
+				g.Serve(t, waited)
+				if d := gocmp.Diff([]string(nil), findings); d != "" {
+					t.Errorf("how the recorder hands one post over to the next (-want +got):\n%s", d)
 				}
-				c.check(t, want)
-				if d := gocmp.Diff(wantBodies, c.bodies); d != "" {
-					t.Errorf("bodies the collector recorded (-sent +recorded):\n%s", d)
-				}
+				g.Check(t, tt.models)
 			})
 		})
 	}

@@ -15,174 +15,30 @@
 package usage
 
 import (
-	"bufio"
-	"bytes"
-	"cmp"
 	"context"
 	json "encoding/json/v2"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
-	"slices"
 	"strings"
-	"sync"
 	"testing"
 	"testing/synctest"
-	"time"
 
 	gocmp "github.com/google/go-cmp/cmp"
 	"go.uber.org/goleak"
+
+	"github.com/zchee/claude-code-model-gateway/internal/gatewaytest"
 )
 
-// orderGateCollector serves every collector connection over an in-memory pipe inside a synctest
-// bubble and decides when each post reaches it. A new connection is parked unread, so the post's
-// sender stays blocked writing it, until every goroutine of the bubble is blocked. Then the
-// collector takes every parked post. One parked post is recorded as it is. Several parked posts
-// were outstanding together: nothing their sender did fixes the order in which independent
-// connections reach a collector, so the collector records them in the reverse of their submission
-// order, which a network is free to do. A sender that starts a post only after the collector took
-// the previous one therefore has its posts recorded in submission order, whatever the scheduler
-// does, and a sender with two posts outstanding at once never does.
-type orderGateCollector struct {
-	// rank is the submission index of each record key the test submits.
-	rank map[string]int
-	// dialed is signalled, without blocking, whenever a connection is parked.
-	dialed chan struct{}
+// orderGateReply is the collector's answer to every post.
+const orderGateReply = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"
 
-	mu     sync.Mutex // guards parked
-	parked []net.Conn
-
-	// The fields below are used only by the bubble's test goroutine.
-	keys   []string // record keys in the order the collector took the posts
-	bodies [][]byte // the posts' bodies, in the same order
-	errs   []error
-}
-
-func newOrderGateCollector(want []string) *orderGateCollector {
-	c := &orderGateCollector{rank: make(map[string]int, len(want)), dialed: make(chan struct{}, 1)}
-	for i, key := range want {
-		c.rank[key] = i
-	}
-	return c
-}
-
-// dial hands the sender one side of a new pipe and parks the other side unread.
-func (c *orderGateCollector) dial(context.Context, string, string) (net.Conn, error) {
-	peer, client := net.Pipe()
-	c.mu.Lock()
-	c.parked = append(c.parked, peer)
-	c.mu.Unlock()
-	select {
-	case c.dialed <- struct{}{}:
-	default:
-	}
-	return client, nil
-}
-
-func (c *orderGateCollector) emitter(builder *Builder) *Emitter {
+// orderGateEmitter returns an emitter whose collector posts all go through g.
+func orderGateEmitter(g *gatewaytest.OrderGate, builder *Builder) *Emitter {
 	return newEmitter(func(k string) (string, bool) {
 		return "http://127.0.0.1:1/v1/logs", k == "CODEX_GATEWAY_USAGE_ENDPOINT"
-	}, builder, c.dial)
-}
-
-// gatePost is one post the collector has read and not yet answered.
-type gatePost struct {
-	conn net.Conn
-	key  string
-	body []byte
-	rank int
-}
-
-// take reads, records and answers every parked post, and reports whether there was any. It must
-// run only when every other goroutine of the bubble is blocked, so that the parked set is every
-// post outstanding at that point.
-func (c *orderGateCollector) take() bool {
-	c.mu.Lock()
-	batch := c.parked
-	c.parked = nil
-	c.mu.Unlock()
-	posts := make([]gatePost, 0, len(batch))
-	for _, conn := range batch {
-		post, err := c.read(conn)
-		if err != nil {
-			c.errs = append(c.errs, err)
-			_ = conn.Close()
-			continue
-		}
-		posts = append(posts, post)
-	}
-	slices.SortFunc(posts, func(a, b gatePost) int { return cmp.Compare(b.rank, a.rank) })
-	for _, post := range posts {
-		c.keys = append(c.keys, post.key)
-		c.bodies = append(c.bodies, post.body)
-		// A write on the pipe returns once the sender has read all of it.
-		if _, err := io.WriteString(post.conn, "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"); err != nil {
-			c.errs = append(c.errs, fmt.Errorf("answer %s: %w", post.key, err))
-		}
-		_ = post.conn.Close()
-	}
-	return len(batch) > 0
-}
-
-func (c *orderGateCollector) read(conn net.Conn) (gatePost, error) {
-	req, err := http.ReadRequest(bufio.NewReader(conn))
-	if err != nil {
-		return gatePost{}, fmt.Errorf("read post: %w", err)
-	}
-	body, err := io.ReadAll(req.Body)
-	if err != nil {
-		return gatePost{}, fmt.Errorf("read post body: %w", err)
-	}
-	key, err := orderRecordKey(body)
-	if err != nil {
-		return gatePost{}, err
-	}
-	rank, ok := c.rank[key]
-	if !ok {
-		return gatePost{}, fmt.Errorf("collector received %q, which the test did not submit", key)
-	}
-	return gatePost{conn: conn, key: key, body: body, rank: rank}, nil
-}
-
-// serve answers posts until waited is closed and no post is parked, so that no connection is left
-// open when the bubble ends. The bound is virtual time and only aborts a sender that neither posts
-// nor lets Wait return.
-func (c *orderGateCollector) serve(t *testing.T, waited <-chan struct{}) {
-	t.Helper()
-	abort := time.After(time.Hour)
-	for {
-		synctest.Wait()
-		if c.take() {
-			continue
-		}
-		select {
-		case <-waited:
-			return
-		case <-c.dialed:
-		case <-abort:
-			t.Error("the emitter neither posted nor returned from Wait within an hour of virtual time")
-			return
-		}
-	}
-}
-
-// check reports the collector's failures, then compares the records it took with want: first as
-// sets, so that a lost or extra record is told apart from a reordering, then in order.
-func (c *orderGateCollector) check(t *testing.T, want []string) {
-	t.Helper()
-	for _, err := range c.errs {
-		t.Errorf("order gate collector: %v", err)
-	}
-	sortedWant, sortedGot := slices.Sorted(slices.Values(want)), slices.Sorted(slices.Values(c.keys))
-	if d := gocmp.Diff(sortedWant, sortedGot); d != "" {
-		t.Errorf("records the collector received, ignoring order (-want +got):\n%s", d)
-		return
-	}
-	if d := gocmp.Diff(want, c.keys); d != "" {
-		t.Errorf("records reached the collector out of submission order (-submitted +received):\n%s", d)
-	}
+	}, builder, func(ctx context.Context, network, addr string) (net.Conn, error) { return g.Dial(ctx, network, addr) })
 }
 
 // orderRecordKey names a posted record by its event, session and MCP server. It returns an error
@@ -256,9 +112,9 @@ func footprintServers(r *Record) ([]string, error) {
 // its MCP footprint records, and the records of several requests follow the order in which the
 // requests finished, not the order in which they started. The source schedules each post with
 // setImmediate, which runs callbacks in the order they were queued, and each callback starts its
-// post at once (lib/usage-observability.js:1005-1036, 674-689). The collector parks every post
-// until the bubble is quiet and records posts that were outstanding together in reverse, so the
-// test does not depend on how the goroutines happen to be scheduled.
+// post at once (lib/usage-observability.js:1005-1036, 674-689). The collector (gatewaytest.OrderGate)
+// parks every post until the bubble is quiet and records posts that were outstanding together in
+// reverse, so the test does not depend on how the goroutines happen to be scheduled.
 func TestEmitterSubmissionOrder(t *testing.T) {
 	type turn struct {
 		session string
@@ -301,8 +157,8 @@ func TestEmitterSubmissionOrder(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 			synctest.Test(t, func(t *testing.T) {
-				c := newOrderGateCollector(tt.want)
-				e := c.emitter(sharedBuilder(t))
+				g := gatewaytest.NewOrderGate(tt.want, orderRecordKey, orderGateReply)
+				e := orderGateEmitter(g, sharedBuilder(t))
 				captures := make([]*Capture, len(tt.turns))
 				for i, turn := range tt.turns {
 					body := wire(t, `{}`)
@@ -324,7 +180,7 @@ func TestEmitterSubmissionOrder(t *testing.T) {
 					defer close(waited)
 					e.Wait()
 				}()
-				c.serve(t, waited)
+				g.Serve(t, waited)
 				for i, index := range tt.finish {
 					var want []string
 					if tt.turns[index].mcp {
@@ -339,93 +195,54 @@ func TestEmitterSubmissionOrder(t *testing.T) {
 						t.Errorf("test precondition: %s footprint servers in primary record order (-want +got):\n%s", tt.turns[index].session, d)
 					}
 				}
-				c.check(t, tt.want)
+				g.Check(t, tt.want)
 			})
 		})
 	}
 }
 
-// TestOrderGateCollector shows that the collector of TestEmitterSubmissionOrder records exactly
-// what it receives: posts sent one after another, each after the previous one was answered, are
-// recorded in that order with their bodies intact, and posts outstanding together are recorded in
-// reverse, however the goroutines that sent them were scheduled.
-func TestOrderGateCollector(t *testing.T) {
+// TestEmitterHandOff decides when the emitter moves from one record to the next: it starts the
+// next post once the previous request is wholly on its connection, not when only its headers are
+// written and not after waiting for the collector's reply, as the source starts each post without
+// waiting for an earlier one's reply (lib/usage-observability.js:674-689). Two requests' records
+// are submitted; the collector holds back the first post's last body byte and then its reply.
+func TestEmitterHandOff(t *testing.T) {
 	tests := map[string]struct {
-		together bool
-		// reverse requires the reverse of the submission order.
-		reverse bool
+		sessions []string
 	}{
-		"success: posts sent one after another are recorded in that order": {},
-		"success: posts outstanding together are recorded in reverse":      {together: true, reverse: true},
+		"success: the second record is posted once the first is written and before its reply": {
+			sessions: []string{"session-first", "session-second"},
+		},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 			synctest.Test(t, func(t *testing.T) {
-				records := NewBuilder(options(t)).Build(Request{Body: wire(t, orderToolsBody), Headers: http.Header{"X-Claude-Code-Session-Id": {"session-control"}}, StatusCode: http.StatusOK, WireUsage: wire(t, `{"input_tokens":41}`)})
-				submitted := []string{
-					"gateway.token.usage session-control",
-					"gateway.mcp.footprint session-control aa",
-					"gateway.mcp.footprint session-control z",
+				want := make([]string, len(tt.sessions))
+				for i, session := range tt.sessions {
+					want[i] = "gateway.token.usage " + session
 				}
-				if len(records) != len(submitted) {
-					t.Fatalf("test precondition: Build returned %d records, want %d", len(records), len(submitted))
+				g := gatewaytest.NewOrderGate(want, orderRecordKey, orderGateReply)
+				e := orderGateEmitter(g, sharedBuilder(t))
+				for _, session := range tt.sessions {
+					capture := e.Start(Request{Body: wire(t, `{}`), Headers: http.Header{"X-Claude-Code-Session-Id": {session}}})
+					capture.SetResponse(http.StatusOK, nil)
+					capture.ObserveJSON([]byte(`{"usage":{"input_tokens":41,"output_tokens":1}}`))
+					if capture.Finish() == nil {
+						t.Errorf("test precondition: %s: Finish returned no primary record", session)
+					}
 				}
-				payloads := make([][]byte, len(records))
-				for i := range records {
-					payload, err := records[i].OTLP()
-					if err != nil {
-						t.Fatal(err)
-					}
-					if key, err := orderRecordKey(payload); err != nil || key != submitted[i] {
-						t.Fatalf("test precondition: record %d is %q (%v), want %q", i, key, err, submitted[i])
-					}
-					payloads[i] = payload
-				}
-				c := newOrderGateCollector(submitted)
-				client := &http.Client{Transport: &http.Transport{DialContext: c.dial, DisableKeepAlives: true, DisableCompression: true}}
-				post := func(payload []byte) {
-					req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://127.0.0.1:1/v1/logs", bytes.NewReader(payload))
-					if err != nil {
-						t.Errorf("post: %v", err)
-						return
-					}
-					req.Header.Set("Content-Type", "application/json")
-					resp, err := client.Do(req)
-					if err != nil {
-						t.Errorf("post: %v", err)
-						return
-					}
-					_, _ = io.Copy(io.Discard, resp.Body)
-					_ = resp.Body.Close()
-				}
-				var senders sync.WaitGroup
-				if tt.together {
-					for _, payload := range payloads {
-						senders.Go(func() { post(payload) })
-					}
-				} else {
-					senders.Go(func() {
-						for _, payload := range payloads {
-							post(payload)
-						}
-					})
-				}
+				findings := g.HandOff()
 				waited := make(chan struct{})
 				go func() {
 					defer close(waited)
-					senders.Wait()
+					e.Wait()
 				}()
-				c.serve(t, waited)
-				want, wantBodies := slices.Clone(submitted), slices.Clone(payloads)
-				if tt.reverse {
-					slices.Reverse(want)
-					slices.Reverse(wantBodies)
+				g.Serve(t, waited)
+				if d := gocmp.Diff([]string(nil), findings); d != "" {
+					t.Errorf("how the emitter hands one post over to the next (-want +got):\n%s", d)
 				}
-				c.check(t, want)
-				if d := gocmp.Diff(wantBodies, c.bodies); d != "" {
-					t.Errorf("bodies the collector recorded (-sent +recorded):\n%s", d)
-				}
+				g.Check(t, want)
 			})
 		})
 	}

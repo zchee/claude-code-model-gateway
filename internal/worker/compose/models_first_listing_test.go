@@ -17,14 +17,17 @@ package compose_test
 import (
 	"context"
 	json "encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -43,6 +46,11 @@ const (
 	firstListingProxyHost = "127.0.0.1:19991"
 	// firstListingRows lists one model that the built-in list does not hold.
 	firstListingRows = `{"data":[{"id":"kimi-k3","display_name":"kimi-k3 (kimi)"}]}`
+	// firstListingCatalogHost is the Anthropic API the model cache fetches its catalog from;
+	// firstListingGate answers it itself.
+	firstListingCatalogHost = "anthropic.test"
+	// firstListingCatalogRows is one Anthropic catalog page with one model.
+	firstListingCatalogRows = `{"data":[{"id":"claude-overlap-1","display_name":"Overlap One"}],"has_more":false}`
 )
 
 // listingMode is what firstListingGate does with one proxy listing request.
@@ -59,23 +67,40 @@ const (
 	listingHoldFail
 	// listingHoldTimeout holds the listing until its own context ends.
 	listingHoldTimeout
+	// listingHoldUntilCleanup holds the listing until release and ignores its context, so it stays
+	// held past its own timeout until the test cleans up.
+	listingHoldUntilCleanup
 )
 
 // firstListingGate is the model cache's whole network: it answers the proxy listing requests in
 // turn by modes (later requests are answered at once) and every other request, the local engine
-// probes and the Anthropic catalog, with 404. A held listing also ends with its request's context.
+// probes and the Anthropic catalog, with 404. A held listing also ends with its request's context,
+// except one held until cleanup.
 type firstListingGate struct {
-	mu      sync.Mutex // guards modes and calls
-	modes   []listingMode
-	calls   int
-	entered chan struct{}
-	release chan struct{}
-	unhold  func()
+	mu    sync.Mutex // guards modes and calls
+	modes []listingMode
+	calls int
+	// holding counts the listing requests held at the gate now.
+	holding atomic.Int32
+	// rows holds the listing body of a request by its index; others answer firstListingRows.
+	rows map[int]string
+
+	// holdCatalog makes the Anthropic catalog page answer one row once releaseCatalog closes, or
+	// end with its request's context; otherwise the catalog answers 404.
+	holdCatalog    bool
+	catalogCalls   atomic.Int32
+	catalogEntered chan struct{}
+	releaseCatalog chan struct{}
+	unholdCatalog  func()
+	entered        chan struct{}
+	release        chan struct{}
+	unhold         func()
 }
 
 func newFirstListingGate(modes ...listingMode) *firstListingGate {
-	g := &firstListingGate{modes: modes, entered: make(chan struct{}, 8), release: make(chan struct{})}
+	g := &firstListingGate{modes: modes, entered: make(chan struct{}, 8), release: make(chan struct{}), catalogEntered: make(chan struct{}, 8), releaseCatalog: make(chan struct{})}
 	g.unhold = sync.OnceFunc(func() { close(g.release) })
+	g.unholdCatalog = sync.OnceFunc(func() { close(g.releaseCatalog) })
 	return g
 }
 
@@ -89,7 +114,27 @@ func (g *firstListingGate) arm(call int, mode listingMode) {
 	g.modes[call] = mode
 }
 
+// setRows sets the listing body of the listing request with index call, counting from the first.
+func (g *firstListingGate) setRows(call int, body string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.rows == nil {
+		g.rows = map[int]string{}
+	}
+	g.rows[call] = body
+}
+
 func (g *firstListingGate) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.URL.Host == firstListingCatalogHost && r.URL.Path == "/v1/models" && g.holdCatalog {
+		g.catalogCalls.Add(1)
+		g.catalogEntered <- struct{}{}
+		select {
+		case <-g.releaseCatalog:
+		case <-r.Context().Done():
+			return nil, r.Context().Err()
+		}
+		return gateResponse(r, http.StatusOK, firstListingCatalogRows), nil
+	}
 	if r.URL.Host != firstListingProxyHost || r.URL.Path != "/v1/models" {
 		return gateResponse(r, http.StatusNotFound, ""), nil
 	}
@@ -98,25 +143,34 @@ func (g *firstListingGate) RoundTrip(r *http.Request) (*http.Response, error) {
 	if g.calls < len(g.modes) {
 		mode = g.modes[g.calls]
 	}
+	body := firstListingRows
+	if rows, ok := g.rows[g.calls]; ok {
+		body = rows
+	}
 	g.calls++
 	g.mu.Unlock()
 	switch mode {
-	case listingHold, listingHoldFail, listingHoldTimeout:
+	case listingHold, listingHoldFail, listingHoldTimeout, listingHoldUntilCleanup:
+		g.holding.Add(1)
+		defer g.holding.Add(-1)
 		g.entered <- struct{}{}
-		release := g.release
-		if mode == listingHoldTimeout {
+		release, done := g.release, r.Context().Done()
+		switch mode {
+		case listingHoldTimeout:
 			release = nil
+		case listingHoldUntilCleanup:
+			done = nil
 		}
 		select {
 		case <-release:
-		case <-r.Context().Done():
+		case <-done:
 			return nil, r.Context().Err()
 		}
 	}
 	if mode == listingFail || mode == listingHoldFail {
 		return gateResponse(r, http.StatusServiceUnavailable, `{"error":"unavailable"}`), nil
 	}
-	return gateResponse(r, http.StatusOK, firstListingRows), nil
+	return gateResponse(r, http.StatusOK, body), nil
 }
 
 func gateResponse(r *http.Request, status int, body string) *http.Response {
@@ -129,10 +183,13 @@ func gateResponse(r *http.Request, status int, body string) *http.Response {
 // modelsAnswer is one GET /v1/models answer of the composed worker, with the virtual instant it
 // completed.
 type modelsAnswer struct {
-	status int
-	ids    []string
-	err    error
-	at     time.Time
+	// aborted reports a handler that ended the request with http.ErrAbortHandler, as the worker
+	// does for a request whose client went away.
+	aborted bool
+	status  int
+	ids     []string
+	err     error
+	at      time.Time
 }
 
 // source names which list an answer advertises: "proxy" when it holds the proxy's model and none of
@@ -153,16 +210,36 @@ func (a modelsAnswer) source() string {
 }
 
 func (a modelsAnswer) String() string {
-	return fmt.Sprintf("status %d, %s list %q, err %v", a.status, a.source(), a.ids, a.err)
+	return fmt.Sprintf("aborted %t, status %d, %s list %q, err %v", a.aborted, a.status, a.source(), a.ids, a.err)
 }
 
 // getModels sends GET /v1/models to wh from its own goroutine and delivers the answer.
 func getModels(ctx context.Context, wh http.Handler) <-chan modelsAnswer {
+	return getModelsWith(ctx, wh, nil)
+}
+
+// getModelsWith is getModels with the request headers header.
+func getModelsWith(ctx context.Context, wh http.Handler, header http.Header) <-chan modelsAnswer {
 	answers := make(chan modelsAnswer, 1)
 	go func() {
 		rec := httptest.NewRecorder()
-		wh.ServeHTTP(rec, httptest.NewRequestWithContext(ctx, http.MethodGet, "/v1/models", nil))
-		answer := modelsAnswer{status: rec.Code}
+		req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/v1/models", nil)
+		maps.Copy(req.Header, header)
+		var aborted bool
+		func() {
+			// The HTTP server recovers this panic, which ends a request without an answer; the
+			// test calls the handler itself and recovers it in the server's stead.
+			defer func() {
+				if r := recover(); r != nil {
+					if err, _ := r.(error); !errors.Is(err, http.ErrAbortHandler) {
+						panic(r)
+					}
+					aborted = true
+				}
+			}()
+			wh.ServeHTTP(rec, req)
+		}()
+		answer := modelsAnswer{aborted: aborted, status: rec.Code}
 		var doc struct {
 			Data []struct {
 				ID string `json:"id"`
@@ -230,9 +307,20 @@ func TestModelsFirstAnswerWaitsForFirstListing(t *testing.T) {
 		// later makes the request under test a later one: the first listing ends before any
 		// request, and the request is sent while a later listing is held.
 		later bool
+		// pastBound sends the first request partway through a first listing that stays held past
+		// its timeout, until cleanup.
+		pastBound bool
+		// cancelRequest ends the first request's own context while the first listing is held.
+		cancelRequest bool
 		// want is the list the request under test advertises.
 		want string
 	}{
+		"success: a first request sent partway through a listing held past its bound answers from the built-in list at the startup deadline": {
+			first: listingHoldUntilCleanup, pastBound: true, want: "fallback",
+		},
+		"success: a first request whose context ends returns at once while the first listing is held, and the listing still lands": {
+			first: listingHold, cancelRequest: true, want: "proxy",
+		},
 		"success: the first request waits for a held first listing and lists the proxy rows": {
 			first: listingHold, want: "proxy",
 		},
@@ -303,8 +391,15 @@ func TestModelsFirstAnswerWaitsForFirstListing(t *testing.T) {
 				}
 
 				mc.Start(ctx)
-				if tt.later {
+				switch {
+				case tt.later:
 					runLaterRequest(t, ctx, gate, mc, wh, tt.want)
+					return
+				case tt.pastBound:
+					runPastBound(t, ctx, gate, wh, tt.want)
+					return
+				case tt.cancelRequest:
+					runCanceledRequest(t, ctx, gate, wh, tt.want)
 					return
 				}
 				if !awaitEntered(t, gate, "the first listing") {
@@ -376,5 +471,74 @@ func runLaterRequest(t *testing.T, ctx context.Context, gate *firstListingGate, 
 	case <-refreshed:
 	case <-time.After(time.Minute):
 		t.Error("the later refresh never ended")
+	}
+}
+
+// runPastBound sends the first request halfway through a first listing that stays held past its
+// timeout, and requires the request to wait and then answer with want at the startup deadline, the
+// listing's timeout after the cache started, while the listing is still held.
+func runPastBound(t *testing.T, ctx context.Context, gate *firstListingGate, wh http.Handler, want string) {
+	t.Helper()
+	if !awaitEntered(t, gate, "the first listing") {
+		return
+	}
+	// The cache starts its first listing at once, so this is also the instant it started.
+	started := time.Now()
+	time.Sleep(modelcache.ProxyListingTimeout / 2)
+	answers := getModels(ctx, wh)
+	synctest.Wait()
+	if a, ok := answered(answers); ok {
+		t.Errorf("the first GET /v1/models answered (%v) %s after the cache started, while the first listing was pending and before the startup deadline", a, time.Since(started))
+		return
+	}
+	a, ok := awaitAnswer(t, answers, "the first GET /v1/models")
+	if !ok {
+		return
+	}
+	deadline := started.Add(modelcache.ProxyListingTimeout)
+	if a.status != http.StatusOK || a.err != nil || a.source() != want {
+		t.Errorf("the first GET /v1/models at the startup deadline: %v, want status 200 and the %s list", a, want)
+	}
+	if !a.at.Equal(deadline) {
+		t.Errorf("the first GET /v1/models answered %s after the cache started, want at the startup deadline %s", a.at.Sub(started), modelcache.ProxyListingTimeout)
+	}
+	if n := gate.holding.Load(); n != 1 {
+		t.Errorf("test precondition: %d listing(s) held when the answer arrived, want the first one still held", n)
+	}
+}
+
+// runCanceledRequest sends the first request while the first listing is held, ends the request's
+// own context, and requires the request to return at that instant while the listing is still held;
+// the listing, released afterwards, still lands, and a new request lists want.
+func runCanceledRequest(t *testing.T, ctx context.Context, gate *firstListingGate, wh http.Handler, want string) {
+	t.Helper()
+	if !awaitEntered(t, gate, "the first listing") {
+		return
+	}
+	requestCtx, cancelRequest := context.WithCancel(ctx)
+	defer cancelRequest()
+	answers := getModels(requestCtx, wh)
+	time.Sleep(modelcache.ProxyListingTimeout / 2)
+	synctest.Wait()
+	if a, ok := answered(answers); ok {
+		t.Errorf("the first GET /v1/models answered (%v) while the first listing was pending, before its context ended", a)
+		return
+	}
+	canceled := time.Now()
+	cancelRequest()
+	a, ok := awaitAnswer(t, answers, "the canceled GET /v1/models")
+	if !ok {
+		return
+	}
+	if !a.at.Equal(canceled) {
+		t.Errorf("the canceled GET /v1/models returned %s after its context ended, want at once", a.at.Sub(canceled))
+	}
+	if n := gate.holding.Load(); n != 1 {
+		t.Errorf("test precondition: %d listing(s) held when the canceled request returned, want the first one still held", n)
+	}
+	gate.unhold()
+	synctest.Wait()
+	if b, ok := awaitAnswer(t, getModels(ctx, wh), "a GET /v1/models after the first listing landed"); ok && (b.status != http.StatusOK || b.err != nil || b.source() != want) {
+		t.Errorf("a GET /v1/models after the released first listing: %v, want status 200 and the %s list", b, want)
 	}
 }
