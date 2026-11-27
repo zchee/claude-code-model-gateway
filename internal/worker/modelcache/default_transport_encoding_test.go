@@ -17,6 +17,7 @@ package modelcache_test
 import (
 	"bytes"
 	"compress/gzip"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -38,6 +39,9 @@ const (
 	encodingTestListing = `{"data":[{"id":"gpt-6-astra","display_name":"gpt-6-astra (codex)"}]}`
 	// encodingTestPage is a valid last Anthropic catalog page with one row.
 	encodingTestPage = `{"data":[{"id":"claude-encoded-1","display_name":"Encoded One"}],"has_more":false}`
+	// catalogPageUnitBound restates modelcache.MaxAnthropicPageUTF16Units: the most UTF-16 code units
+	// one catalog page may decode to. An ASCII page has one unit per byte.
+	catalogPageUnitBound = 2 * 1024 * 1024
 )
 
 // encodedEndpoint answers every request with a fixed body and records the Accept-Encoding field of
@@ -84,6 +88,23 @@ func gzipBody(t *testing.T, plain string) []byte {
 	var buf bytes.Buffer
 	zw := gzip.NewWriter(&buf)
 	if _, err := zw.Write([]byte(plain)); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// gzipAtLevel compresses plain at level.
+func gzipAtLevel(t *testing.T, plain []byte, level int) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw, err := gzip.NewWriterLevel(&buf, level)
+	if err != nil {
+		t.Fatalf("gzip writer: %v", err)
+	}
+	if _, err := zw.Write(plain); err != nil {
 		t.Fatalf("gzip write: %v", err)
 	}
 	if err := zw.Close(); err != nil {
@@ -183,12 +204,27 @@ func TestDefaultTransportAsksForNoEncoding(t *testing.T) {
 // asked for. The cache reads the bytes as sent, as the source does, and a compressed body is not the
 // JSON it encodes: the listing is unread, so the built-in catalog stays, and the catalog page is
 // invalid JSON. The same answers sent without an encoding through the same fake endpoints are read.
+//
+// Valid JSON sent uncompressed under the same gzip label is read: the bytes reach the cache unchanged,
+// so the negative cases are not an early refusal of every labelled body. The catalog's page bound
+// tells its two failures apart, which the listing cannot: a stored gzip page whose decoded text is
+// exactly at the bound has more bytes on the wire and is too large, while a compressed page whose
+// decoded text is over the bound has few bytes on the wire and is invalid JSON, not too large. An
+// identity page exactly at the bound is saved.
 func TestDefaultTransportKeepsCompressedBytes(t *testing.T) {
 	tests := map[string]struct {
-		kind    string
-		body    string
+		kind string
+		body string
+		// padTo pads body with trailing spaces to that many bytes when positive.
+		padTo int
+		// gzipped marks the answer Content-Encoding: gzip.
 		gzipped bool
-		want    encodingOutcome
+		// encode turns the padded body into the bytes sent; nil sends body compressed at the default
+		// level when gzipped, as sent otherwise.
+		encode func(t *testing.T, plain []byte) []byte
+		// precondition checks the decoded and sent sizes; it returns a description of a mismatch.
+		precondition func(plain, wire []byte) string
+		want         encodingOutcome
 	}{
 		"success: an identity listing is read": {
 			kind: "listing",
@@ -212,12 +248,78 @@ func TestDefaultTransportKeepsCompressedBytes(t *testing.T) {
 			gzipped: true,
 			want:    encodingOutcome{Saved: savedCatalog{IDs: []string{}, Error: "invalid catalog JSON"}},
 		},
+		"success: a valid listing labelled gzip but sent uncompressed is read as sent": {
+			kind:    "listing",
+			body:    encodingTestListing,
+			gzipped: true,
+			encode:  sentAsIs,
+			want:    encodingOutcome{Source: "proxy"},
+		},
+		"success: a valid catalog page labelled gzip but sent uncompressed is saved as sent": {
+			kind:    "catalog",
+			body:    encodingTestPage,
+			gzipped: true,
+			encode:  sentAsIs,
+			want:    encodingOutcome{Saved: savedCatalog{IDs: []string{"claude-encoded-1"}}},
+		},
+		"success: an identity catalog page exactly at the bound is saved": {
+			kind:  "catalog",
+			body:  encodingTestPage,
+			padTo: catalogPageUnitBound,
+			precondition: func(plain, wire []byte) string {
+				if len(plain) != catalogPageUnitBound || len(wire) != catalogPageUnitBound {
+					return fmt.Sprintf("decoded %d and sent %d bytes, want both exactly %d", len(plain), len(wire), catalogPageUnitBound)
+				}
+				return ""
+			},
+			want: encodingOutcome{Saved: savedCatalog{IDs: []string{"claude-encoded-1"}}},
+		},
+		"error: a stored gzip catalog page at the decoded bound is too large on the wire": {
+			kind:    "catalog",
+			body:    encodingTestPage,
+			padTo:   catalogPageUnitBound,
+			gzipped: true,
+			encode:  func(t *testing.T, plain []byte) []byte { return gzipAtLevel(t, plain, gzip.NoCompression) },
+			precondition: func(plain, wire []byte) string {
+				if len(plain) != catalogPageUnitBound || len(wire) <= catalogPageUnitBound {
+					return fmt.Sprintf("decoded %d and sent %d bytes, want the decoded text exactly at and the sent bytes over %d", len(plain), len(wire), catalogPageUnitBound)
+				}
+				return ""
+			},
+			want: encodingOutcome{Saved: savedCatalog{IDs: []string{}, Error: "catalog too large"}},
+		},
+		"error: a compressed catalog page over the decoded bound is invalid JSON, not too large": {
+			kind:    "catalog",
+			body:    encodingTestPage,
+			padTo:   2 * catalogPageUnitBound,
+			gzipped: true,
+			encode:  func(t *testing.T, plain []byte) []byte { return gzipAtLevel(t, plain, gzip.BestCompression) },
+			precondition: func(plain, wire []byte) string {
+				if len(plain) <= catalogPageUnitBound || len(wire) > catalogPageUnitBound {
+					return fmt.Sprintf("decoded %d and sent %d bytes, want the decoded text over and the sent bytes within %d", len(plain), len(wire), catalogPageUnitBound)
+				}
+				return ""
+			},
+			want: encodingOutcome{Saved: savedCatalog{IDs: []string{}, Error: "invalid catalog JSON"}},
+		},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			wire := []byte(tt.body)
-			if tt.gzipped {
-				wire = gzipBody(t, tt.body)
+			plain := []byte(tt.body)
+			if tt.padTo > 0 {
+				plain = padJSON(t, tt.body, tt.padTo)
+			}
+			wire := plain
+			switch {
+			case tt.encode != nil:
+				wire = tt.encode(t, plain)
+			case tt.gzipped:
+				wire = gzipBody(t, string(plain))
+			}
+			if tt.precondition != nil {
+				if mismatch := tt.precondition(plain, wire); mismatch != "" {
+					t.Fatalf("test precondition: %s", mismatch)
+				}
 			}
 			endpoint := startEncodedEndpoint(t, wire, tt.gzipped)
 			got := runEncodingRequest(t, tt.kind, endpoint, &http.Client{})
@@ -230,3 +332,6 @@ func TestDefaultTransportKeepsCompressedBytes(t *testing.T) {
 		})
 	}
 }
+
+// sentAsIs sends the body unchanged, whatever its Content-Encoding label says.
+func sentAsIs(_ *testing.T, plain []byte) []byte { return plain }

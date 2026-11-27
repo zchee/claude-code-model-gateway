@@ -171,6 +171,12 @@ func TestWaitDoesNotCancelLiveWorker(t *testing.T) {
 // fetched rows are saved, while another writer replaces the saved catalog right after that write; the
 // replacement happens in the discovery sync the refresh runs after it saves. The caller is served the
 // catalog as read back from disk after the write, the replacement, and not the fetched rows.
+//
+// The test deliberately depends on the refresh running its discovery sync, and with it the
+// EffectiveBaseURL callback, between the write of the fetched rows and the read-back: that callback is
+// the only point where a test can change the saved file between the two. If the sync moves before
+// the write or after the read-back, the precondition on the rows saved when the sync ran, or the
+// listing assertions, fail, and the test must be rewritten for the new order rather than relaxed.
 func TestCatalogRefreshReturnsSavedCatalogReread(t *testing.T) {
 	tests := map[string]struct {
 		fetched     string

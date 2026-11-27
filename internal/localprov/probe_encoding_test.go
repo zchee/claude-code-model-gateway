@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	gocmp "github.com/google/go-cmp/cmp"
 
@@ -33,6 +34,11 @@ import (
 
 // probeBodyBound restates localprov's maxProbeBody: the most bytes one probe response may carry.
 const probeBodyBound = 16 << 20
+
+// largeTransferTimeout is the probe timeout of a case that moves more than probeBodyBound bytes over
+// loopback. It is far above any transfer time, so a slow runner cannot turn the size outcome into a
+// timeout; the probe's own transport is still selected, since only the timeout is set.
+const largeTransferTimeout = 2 * time.Minute
 
 // encodedAnswer is a local engine that answers every request with a fixed body and records the
 // Accept-Encoding field of each request it receives.
@@ -166,9 +172,11 @@ func TestProbeDefaultTransportKeepsCompressedBytes(t *testing.T) {
 		plain   func(t *testing.T) []byte
 		gzipped bool
 		level   int
-		// probe runs the probe against answer and returns its state for comparison.
-		probe func(t *testing.T, answer *encodedAnswer) any
-		want  func(answer *encodedAnswer) any
+		// probe runs the probe against answer with opts and returns its state for comparison.
+		probe func(t *testing.T, answer *encodedAnswer, opts localprov.ProbeOptions) any
+		// timeout is the probe timeout; zero leaves localprov's default.
+		timeout time.Duration
+		want    func(answer *encodedAnswer) any
 		// wireOverBound requires the sent bytes to exceed probeBodyBound while plain does not.
 		wireOverBound bool
 	}{
@@ -193,6 +201,7 @@ func TestProbeDefaultTransportKeepsCompressedBytes(t *testing.T) {
 			gzipped:       true,
 			level:         gzip.NoCompression,
 			wireOverBound: true,
+			timeout:       largeTransferTimeout,
 			probe:         probeLlamaState,
 			want: func(a *encodedAnswer) any {
 				return localprov.LlamaState{Port: a.port, Configured: true, Reachable: false, Error: "response too large"}
@@ -229,7 +238,7 @@ func TestProbeDefaultTransportKeepsCompressedBytes(t *testing.T) {
 				t.Fatalf("test precondition: decoded %d and sent %d bytes, want the decoded text within and the sent bytes over the %d-byte bound", len(plain), len(wire), probeBodyBound)
 			}
 			answer := startEncodedAnswer(t, wire, tt.gzipped)
-			got := tt.probe(t, answer)
+			got := tt.probe(t, answer, localprov.ProbeOptions{Timeout: tt.timeout})
 			if present, _ := answer.requests(); len(present) != 1 {
 				t.Fatalf("test precondition: the engine received %d request(s), want 1", len(present))
 			}
@@ -240,10 +249,10 @@ func TestProbeDefaultTransportKeepsCompressedBytes(t *testing.T) {
 	}
 }
 
-func probeLlamaState(t *testing.T, answer *encodedAnswer) any {
-	return localprov.ProbeLlama(t.Context(), mapLookup(map[string]string{"CCP_LLAMA_PORT": strconv.Itoa(int(answer.port))}), localprov.ProbeOptions{})
+func probeLlamaState(t *testing.T, answer *encodedAnswer, opts localprov.ProbeOptions) any {
+	return localprov.ProbeLlama(t.Context(), mapLookup(map[string]string{"CCP_LLAMA_PORT": strconv.Itoa(int(answer.port))}), opts)
 }
 
-func probeStudioState(t *testing.T, answer *encodedAnswer) any {
-	return localprov.ProbeStudio(t.Context(), mapLookup(map[string]string{"CCP_LMSTUDIO_BASE_URL": answer.url}), t.TempDir(), localprov.ProbeOptions{})
+func probeStudioState(t *testing.T, answer *encodedAnswer, opts localprov.ProbeOptions) any {
+	return localprov.ProbeStudio(t.Context(), mapLookup(map[string]string{"CCP_LMSTUDIO_BASE_URL": answer.url}), t.TempDir(), opts)
 }

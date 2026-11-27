@@ -31,6 +31,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -66,8 +67,12 @@ const (
 	// catalogRowCount makes the fetched catalog page several times larger than catalogSaveLimit.
 	catalogRowCount = 2000
 
-	// staleCatalogNow is a clock reading more than an hour after the seeded catalog's update time.
+	// staleCatalogNow is a clock reading more than an hour after the seeded catalog's update time,
+	// and the child's first clock reading.
 	staleCatalogNow = 1_800_000_000_000
+	// clockStepMillis is how far each further clock reading of the child is after the one before, so
+	// each reading is a distinct literal.
+	clockStepMillis = 1000
 	// seededCatalog is a valid saved Anthropic catalog that is stale at staleCatalogNow.
 	seededCatalog = `{"data":[{"id":"claude-cached-1","display_name":"Cached One"}],"updatedAt":1}`
 	// authBearerPayload is a synthetic credential; output that could carry it is redacted.
@@ -183,7 +188,9 @@ func setCatalogFileLimit(t testing.TB, arg string, savedSize int) unix.Rlimit {
 // runCatalogWriteChild seeds a stale saved catalog in its working directory, applies the file size
 // limit its single argument selects, refreshes the catalog from an in-memory upstream that serves
 // catalogRows, and prints catalogWriteDone when the refresh succeeded and logged nothing. The parent
-// reads the saved catalog the refresh left behind.
+// reads the saved catalog the refresh left behind. The cache's clock gives successive readings
+// staleCatalogNow, staleCatalogNow+clockStepMillis, and so on, so the parent can tell which reading
+// each saved time is.
 func runCatalogWriteChild(t testing.TB, args []string) {
 	if len(args) != 1 {
 		t.Fatalf("child arguments = %q, want one file size limit selector", args)
@@ -250,6 +257,11 @@ func runCatalogWriteChild(t testing.TB, args []string) {
 		_, _ = w.Write(page)
 	})
 	var logs logCapture
+	// The clock is read on the caller's goroutine and on the refresh goroutine.
+	var clockReads atomic.Int64
+	clock := func() time.Time {
+		return time.UnixMilli(staleCatalogNow + (clockReads.Add(1)-1)*clockStepMillis)
+	}
 	cache, err := modelcache.New(modelcache.Options{
 		Lookup:           lookup,
 		Paths:            resolver,
@@ -257,7 +269,7 @@ func runCatalogWriteChild(t testing.TB, args []string) {
 		AnthropicBaseURL: "http://anthropic-catalog.test",
 		DefaultBaseURL:   "http://127.0.0.1:19999",
 		Client:           &http.Client{Transport: handlerTransport{handler: upstream}},
-		Clock:            func() time.Time { return time.UnixMilli(staleCatalogNow) },
+		Clock:            clock,
 		Routes:           &route.Store{},
 		Sentry:           &sentry.State{},
 		Logf:             logs.logf,
@@ -281,10 +293,13 @@ func runCatalogWriteChild(t testing.TB, args []string) {
 	fmt.Println(catalogWriteDone)
 }
 
-// savedCatalog is the part of anthropic-models.json this test compares.
+// savedCatalog is the part of anthropic-models.json this test compares. UpdatedAt and AttemptedAt are
+// zero when the field is absent.
 type savedCatalog struct {
-	IDs   []string
-	Error string
+	IDs         []string
+	Error       string
+	UpdatedAt   float64
+	AttemptedAt float64
 }
 
 func readSavedCatalog(t *testing.T, path string) savedCatalog {
@@ -294,8 +309,10 @@ func readSavedCatalog(t *testing.T, path string) savedCatalog {
 		t.Fatalf("read anthropic-models.json: %v", err)
 	}
 	var doc struct {
-		Data  []idDisplay `json:"data"`
-		Error *string     `json:"error"`
+		Data        []idDisplay `json:"data"`
+		Error       *string     `json:"error"`
+		UpdatedAt   *float64    `json:"updatedAt"`
+		AttemptedAt *float64    `json:"attemptedAt"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		t.Fatalf("unmarshal anthropic-models.json: %v", err)
@@ -307,16 +324,34 @@ func readSavedCatalog(t *testing.T, path string) savedCatalog {
 	if doc.Error != nil {
 		saved.Error = *doc.Error
 	}
+	if doc.UpdatedAt != nil {
+		saved.UpdatedAt = *doc.UpdatedAt
+	}
+	if doc.AttemptedAt != nil {
+		saved.AttemptedAt = *doc.AttemptedAt
+	}
 	return saved
 }
 
 // TestCatalogSuccessWriteFailureIsRecorded fetches a valid catalog far larger than catalogSaveLimit
 // in a child process whose soft file size limit is lowered to it, so saving the fetched rows fails
-// and only the small failure record fits. The saved catalog keeps the cached rows with the failure
-// message for a failed save. The control runs the same child without lowering the limit, after the
-// child checked the limit leaves room for the catalog, and saves the fetched rows, so the size limit
-// is the only difference. Only the child's limit changes; the test binary keeps its own.
+// and only the small failure record fits. The saved catalog keeps the cached rows and their update
+// time with the failure message for a failed save. The control runs the same child without lowering
+// the limit, after the child checked the limit leaves room for the catalog, and saves the fetched
+// rows, so the size limit is the only difference. Only the child's limit changes; the test binary
+// keeps its own.
+//
+// The child's clock gives a new literal on every reading. The first reading finds the saved catalog
+// stale; the second is the time of the refresh. The control saves that second reading as its update
+// time, and the failure record carries the same second reading as its attempt time: the clock is not
+// read again after the failed save, which would record the third reading.
 func TestCatalogSuccessWriteFailureIsRecorded(t *testing.T) {
+	const (
+		// refreshReading is the child's second clock reading, staleCatalogNow + clockStepMillis.
+		refreshReading = 1_800_000_001_000
+		// seededUpdatedAt is the update time of seededCatalog.
+		seededUpdatedAt = 1
+	)
 	_, fetchedIDs := catalogRows()
 	tests := map[string]struct {
 		arg  string
@@ -324,11 +359,11 @@ func TestCatalogSuccessWriteFailureIsRecorded(t *testing.T) {
 	}{
 		"success: a fetched catalog that can be saved replaces the cached rows": {
 			arg:  unlimitedArg,
-			want: savedCatalog{IDs: fetchedIDs},
+			want: savedCatalog{IDs: fetchedIDs, UpdatedAt: refreshReading},
 		},
 		"error: a fetched catalog that cannot be saved records catalog write failed": {
 			arg:  limitedArg,
-			want: savedCatalog{IDs: []string{"claude-cached-1"}, Error: "catalog write failed"},
+			want: savedCatalog{IDs: []string{"claude-cached-1"}, Error: "catalog write failed", UpdatedAt: seededUpdatedAt, AttemptedAt: refreshReading},
 		},
 	}
 	for name, tt := range tests {

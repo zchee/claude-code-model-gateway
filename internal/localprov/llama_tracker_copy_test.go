@@ -15,8 +15,12 @@
 package localprov_test
 
 import (
+	json "encoding/json/v2"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
+	"sync/atomic"
 	"testing"
 
 	gocmp "github.com/google/go-cmp/cmp"
@@ -25,10 +29,45 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/proxymodels"
 )
 
+// switchableLlama is a llama-server on its own listener that answers /props with the window it was
+// started with while status is 200, and with status and no props otherwise. The listener stays open
+// for the whole test, so an outage keeps the configured port and no other process can take it.
+type switchableLlama struct {
+	port   uint16
+	status atomic.Int32
+}
+
+func startSwitchableLlama(t *testing.T, window int64) *switchableLlama {
+	t.Helper()
+	llama := &switchableLlama{}
+	llama.status.Store(http.StatusOK)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/props" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		status := int(llama.status.Load())
+		if status != http.StatusOK {
+			w.WriteHeader(status)
+			return
+		}
+		data, err := json.Marshal(map[string]any{"default_generation_settings": map[string]any{"n_ctx": window}})
+		if err != nil {
+			t.Errorf("marshal llama props: %v", err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(data)
+	}))
+	t.Cleanup(srv.Close)
+	llama.port = uint16(srv.Listener.Addr().(*net.TCPAddr).Port)
+	return llama
+}
+
 // TestLlamaTrackerHandsOutCopies changes every field of the states the llama-server tracker hands
 // out, from Refresh and from State. The tracked state keeps the measured values, and a later probe
-// that finds the server gone still preserves the window that was measured, not a value written into
-// a returned copy.
+// that finds the server failing on the same port still preserves the window that was measured, not
+// a value written into a returned copy.
 func TestLlamaTrackerHandsOutCopies(t *testing.T) {
 	const measuredWindow = 65536
 	tests := map[string]struct {
@@ -47,7 +86,8 @@ func TestLlamaTrackerHandsOutCopies(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			port, closeServer := startFakeLlama(t, func() int64 { return measuredWindow }, http.StatusOK)
+			llama := startSwitchableLlama(t, measuredWindow)
+			port := llama.port
 			routes := []proxymodels.Route{{ID: "local/gguf", Provider: "local"}}
 			env := mapLookup(map[string]string{"CCP_LLAMA_PORT": strconv.Itoa(int(port))})
 			want := localprov.LlamaState{Port: port, Configured: true, Reachable: true, ContextWindow: measuredWindow}
@@ -80,13 +120,15 @@ func TestLlamaTrackerHandsOutCopies(t *testing.T) {
 				t.Error("two State calls returned the same pointer, want a fresh copy each time")
 			}
 
-			closeServer()
+			// The outage is a failing answer on the same listener, so the configured port is unchanged.
+			llama.status.Store(http.StatusServiceUnavailable)
 			down := tracker.Refresh(t.Context(), routes, env, localprov.ProbeOptions{})
 			if down == nil {
-				t.Fatal("Refresh after the server stopped returned nil")
+				t.Fatal("Refresh after the server started failing returned nil")
 			}
-			if down.Reachable || down.ContextWindow != measuredWindow {
-				t.Errorf("Refresh after the server stopped = %+v, want unreachable with the measured window %d preserved", *down, measuredWindow)
+			wantDown := localprov.LlamaState{Port: port, Configured: true, Reachable: false, ContextWindow: measuredWindow, Error: "GET /props answered HTTP 503"}
+			if diff := gocmp.Diff(wantDown, *down); diff != "" {
+				t.Errorf("Refresh after the server started failing mismatch, want unreachable with the measured window %d preserved (-want +got):\n%s", measuredWindow, diff)
 			}
 		})
 	}

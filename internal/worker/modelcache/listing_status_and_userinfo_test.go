@@ -70,6 +70,9 @@ func (b *stalledListingBody) Close() error { return nil }
 // no virtual time, rather than waiting for the body until the listing deadline. A 200 whose body
 // stalls the same way is read until that deadline, which shows the body really stalls.
 func TestListingReturnsOnNon200BeforeBodyEnds(t *testing.T) {
+	// listingDeadline restates modelcache.ProxyListingTimeout: how long a listing is read before it
+	// counts as unread.
+	const listingDeadline = 2500 * time.Millisecond
 	tests := map[string]struct {
 		status      int
 		wantElapsed time.Duration
@@ -82,7 +85,7 @@ func TestListingReturnsOnNon200BeforeBodyEnds(t *testing.T) {
 		},
 		"error: a 200 listing whose body stalls is read until the listing deadline": {
 			status:      http.StatusOK,
-			wantElapsed: modelcache.ProxyListingTimeout,
+			wantElapsed: listingDeadline,
 		},
 	}
 	for name, tt := range tests {
