@@ -271,7 +271,7 @@ func (r *Reservation) AcknowledgeDrain(ctx context.Context) error {
 		}
 		r.ack = ackWriting
 		r.ackDone = make(chan struct{})
-		r.ackCause, r.ackCauseAt, r.ackInterruptErr = nil, time.Time{}, nil
+		r.ackWrite = ackWrite{}
 		reg.mu.Unlock()
 		return r.writeAck(ctx)
 	}
@@ -285,17 +285,29 @@ func (r *Reservation) endedAckError() error {
 	return fmt.Errorf("workerlink: no acknowledgment for generation %q, which has ended: %w", r.generation, ErrUnavailable)
 }
 
-// interruptAckLocked records cause as the interruption of the claimed acknowledgment write, unless an earlier one
-// was recorded: the first interruption decides the write's error.
-func (r *Reservation) interruptAckLocked(cause error) {
-	if r.ack == ackWriting && r.ackCause == nil {
-		r.ackCause, r.ackCauseAt = cause, time.Now()
-	}
+// ackWrite records, under Registry.mu, what happened to one claimed acknowledgment write. The times let the writer
+// tell which of these events can have caused the error its Write returned.
+type ackWrite struct {
+	// admitted is true from the admission point until the Write returns. Only while it is true may the cancellation
+	// callback touch the parent end: before admission the connection is left as it is, so that a released claim
+	// leaves a live channel to try again on.
+	admitted bool
+	// cancel is the caller's interruption, recorded the first time the callback runs.
+	cancel error
+	// pastDeadlineAt is when the callback began to set, successfully, a passed write deadline on the parent end of
+	// an admitted Write.
+	pastDeadlineAt time.Time
+	// fallbackAt is when the callback began to close the parent end because that deadline could not be set;
+	// fallbackEffective records whether that Close was the one that closed it, and setterErr is why the deadline
+	// could not be set.
+	fallbackAt        time.Time
+	fallbackEffective bool
+	setterErr         error
 }
 
 // writeAck writes the one acknowledgment line as the claimed writer. It arms the write deadline, admits the Write
-// only if nothing has interrupted it yet, classifies the outcome by the first interruption, releases the listener
-// when the line went out completely, and then records the outcome and wakes the joiners.
+// only if nothing has interrupted it yet, decides the error by what can have caused the one the Write returned,
+// releases the listener when the line went out completely, and then records the outcome and wakes the joiners.
 func (r *Reservation) writeAck(ctx context.Context) error {
 	reg := r.reg
 	parent := r.parent
@@ -308,23 +320,50 @@ func (r *Reservation) writeAck(ctx context.Context) error {
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 		deadline, callerDeadline = d, true
 	}
-	// Only the write deadline: the manager may be reading this connection at the same time.
+	// Only the write deadline, and outside the registry's lock: the manager may be reading this connection at the
+	// same time, and a slow setter must not stall the registry.
 	if err := parent.SetWriteDeadline(deadline); err != nil {
-		return r.releaseAckClaim(fmt.Errorf("workerlink: acknowledgment of generation %q: its write deadline cannot be armed: %w", r.generation, err))
+		armErr := fmt.Errorf("workerlink: acknowledgment of generation %q: its write deadline cannot be armed: %w", r.generation, err)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			// The caller has gone meanwhile: its error is the one to report, with the arming failure beside it.
+			armErr = errors.Join(r.cancelledAckError(ctxErr), armErr)
+		}
+		return r.releaseAckClaim(armErr)
 	}
 	interrupted := make(chan struct{})
 	stop := context.AfterFunc(ctx, func() {
 		defer close(interrupted)
 		reg.mu.Lock()
-		r.interruptAckLocked(fmt.Errorf("workerlink: acknowledgment of generation %q interrupted: %w", r.generation, ctx.Err()))
-		reg.mu.Unlock()
-		if err := parent.SetWriteDeadline(aLongTimeAgo); err != nil {
-			// The Write cannot be ended through its deadline, so it is ended by closing the channel.
-			closeErr := parent.Close()
-			reg.mu.Lock()
-			r.ackInterruptErr = errors.Join(fmt.Errorf("workerlink: end the acknowledgment write through its deadline: %w", err), closeErr)
-			reg.mu.Unlock()
+		w := &r.ackWrite
+		if w.cancel == nil {
+			w.cancel = r.cancelledAckError(ctx.Err())
 		}
+		admitted := w.admitted
+		reg.mu.Unlock()
+		if !admitted {
+			// Before admission the cancellation is only recorded; the admission point refuses on it.
+			return
+		}
+		began := time.Now()
+		err := parent.SetWriteDeadline(aLongTimeAgo)
+		reg.mu.Lock()
+		if err == nil {
+			// Recorded only once it is in force, so that a failed setter is never taken for the cause of a timeout.
+			w.pastDeadlineAt = began
+			reg.mu.Unlock()
+			return
+		}
+		// The Write cannot be ended through its deadline, so it is ended by closing the channel.
+		w.fallbackAt = time.Now()
+		w.setterErr = fmt.Errorf("workerlink: end the acknowledgment write through its deadline: %w", err)
+		reg.mu.Unlock()
+		closeErr := parent.Close()
+		reg.mu.Lock()
+		w.fallbackEffective = !errors.Is(closeErr, net.ErrClosed)
+		if closeErr != nil && w.fallbackEffective {
+			w.setterErr = errors.Join(w.setterErr, closeErr)
+		}
+		reg.mu.Unlock()
 	})
 	joinCallback := func() {
 		if !stop() {
@@ -333,17 +372,21 @@ func (r *Reservation) writeAck(ctx context.Context) error {
 	}
 
 	// The admission point: the last check before the Write, made under the lock that the cancellation callback and
-	// End take to record an interruption, so that one recorded before here makes no Write call.
+	// End take, so that a cancellation or an End recorded before here makes no Write call, and one recorded after
+	// here finds the Write admitted.
 	reg.mu.Lock()
-	refusal := r.ackCause
+	var refusal error
 	switch {
-	case refusal != nil:
+	case r.ackWrite.cancel != nil:
+		refusal = r.ackWrite.cancel
 	case r.ended:
 		refusal = r.endedAckError()
 	case ctx.Err() != nil:
-		refusal = fmt.Errorf("workerlink: acknowledgment of generation %q interrupted: %w", r.generation, ctx.Err())
+		refusal = r.cancelledAckError(ctx.Err())
 	case callerDeadline && !time.Now().Before(deadline):
-		refusal = fmt.Errorf("workerlink: acknowledgment of generation %q interrupted: %w", r.generation, context.DeadlineExceeded)
+		refusal = r.cancelledAckError(context.DeadlineExceeded)
+	default:
+		r.ackWrite.admitted = true
 	}
 	reg.mu.Unlock()
 	if refusal != nil {
@@ -353,38 +396,28 @@ func (r *Reservation) writeAck(ctx context.Context) error {
 
 	n, werr := parent.Write(line)
 	returned := time.Now()
-	// The callback is joined before the interruption is read: when it ends the Write by closing the channel, it
-	// records why only after that close.
+	reg.mu.Lock()
+	r.ackWrite.admitted = false
+	reg.mu.Unlock()
+	// The callback is joined before the record is read: when it ends the Write by closing the channel, it records
+	// the setter's error only after starting that close.
 	joinCallback()
 	reg.mu.Lock()
-	cause, causeAt, interruptErr := r.ackCause, r.ackCauseAt, r.ackInterruptErr
+	w, ended, endCloseDone := r.ackWrite, r.ended, r.endCloseDone
 	reg.mu.Unlock()
-
-	switch {
-	case werr == nil && n == len(line):
-		err = nil
-	case werr == nil:
-		err = fmt.Errorf("workerlink: acknowledgment of generation %q: %d of %d bytes written: %w", r.generation, n, len(line), io.ErrShortWrite)
-	default:
-		// An interruption recorded after the Write returned did not end it.
-		recorded := cause != nil && !causeAt.After(returned)
-		timedOut := errors.Is(werr, os.ErrDeadlineExceeded)
-		switch {
-		case timedOut && (!recorded || !causeAt.Before(deadline)):
-			// The armed deadline passed before any other interruption: it decides.
-			if callerDeadline {
-				err = fmt.Errorf("workerlink: acknowledgment of generation %q interrupted: %w", r.generation, context.DeadlineExceeded)
-			} else {
-				err = fmt.Errorf("workerlink: acknowledgment of generation %q not written: %w: %w", r.generation, errAckBudget, werr)
-			}
-		case recorded && interruptErr != nil:
-			err = errors.Join(cause, interruptErr)
-		case recorded:
-			err = cause
-		default:
-			err = fmt.Errorf("workerlink: acknowledgment of generation %q not written: %w", r.generation, werr)
+	o := ackOutcome{returned: returned, deadline: deadline, callerDeadline: callerDeadline, write: w}
+	if ended && errors.Is(werr, net.ErrClosed) {
+		// Whether End's Close produced this error is known only once that Close has returned. End closes the parent
+		// end before it waits for this writer, so the wait cannot deadlock.
+		<-endCloseDone
+		reg.mu.Lock()
+		if r.endCloseEffective {
+			o.endClosedAt = r.endClosedAt
 		}
+		reg.mu.Unlock()
 	}
+
+	err = r.ackWriteError(n, len(line), werr, o)
 	if err == nil {
 		reg.mu.Lock()
 		release := !r.listenerReleased
@@ -407,12 +440,63 @@ func (r *Reservation) writeAck(ctx context.Context) error {
 	return err
 }
 
+// cancelledAckError is the error of an acknowledgment that its caller's context ended.
+func (r *Reservation) cancelledAckError(ctxErr error) error {
+	return fmt.Errorf("workerlink: acknowledgment of generation %q interrupted: %w", r.generation, ctxErr)
+}
+
+// ackOutcome is what the writer knows when its Write has returned: when it returned, the deadline it armed and
+// whose it was, the record of the write's interruptions, and when End began the Close that closed the parent end
+// (zero when End did not close it).
+type ackOutcome struct {
+	returned       time.Time
+	deadline       time.Time
+	callerDeadline bool
+	write          ackWrite
+	endClosedAt    time.Time
+}
+
+// ackWriteError decides the acknowledgment's error from the Write's result. The error the Write chose stands unless
+// this call's own interruption produced it. A timeout from the deadline this call armed becomes the caller's
+// deadline or the budget's cause, and a timeout from the passed deadline the cancellation set becomes the
+// cancellation; a timeout carries no mark of which deadline fired, so it is attributed by time: to the deadline that
+// was in force first. A closed connection becomes End's or the cancellation's only when End's or the fallback's own
+// Close was the one that closed it, which that Close tells by not finding the end already closed; a connection
+// someone else closed keeps the Write's error. Events recorded after the Write returned did not cause its error.
+func (r *Reservation) ackWriteError(n, size int, werr error, o ackOutcome) error {
+	happened := func(at time.Time) bool { return !at.IsZero() && !at.After(o.returned) }
+	switch {
+	case werr == nil && n == size:
+		return nil
+	case werr == nil:
+		return fmt.Errorf("workerlink: acknowledgment of generation %q: %d of %d bytes written: %w", r.generation, n, size, io.ErrShortWrite)
+	case errors.Is(werr, os.ErrDeadlineExceeded):
+		switch {
+		case happened(o.write.pastDeadlineAt) && o.write.pastDeadlineAt.Before(o.deadline):
+			return o.write.cancel
+		case !o.returned.Before(o.deadline) && o.callerDeadline:
+			return r.cancelledAckError(context.DeadlineExceeded)
+		case !o.returned.Before(o.deadline):
+			return fmt.Errorf("workerlink: acknowledgment of generation %q not written: %w: %w", r.generation, errAckBudget, werr)
+		}
+	case errors.Is(werr, net.ErrClosed):
+		fallback, ended := o.write.fallbackEffective && happened(o.write.fallbackAt), happened(o.endClosedAt)
+		switch {
+		case fallback && (!ended || !o.endClosedAt.Before(o.write.fallbackAt)):
+			return errors.Join(o.write.cancel, o.write.setterErr)
+		case ended:
+			return r.endedAckError()
+		}
+	}
+	return fmt.Errorf("workerlink: acknowledgment of generation %q not written: %w", r.generation, werr)
+}
+
 // releaseAckClaim gives up a claim whose Write was never entered: the acknowledgment is left as never tried, the
 // joiners wake to try again, and err is returned.
 func (r *Reservation) releaseAckClaim(err error) error {
 	r.reg.mu.Lock()
 	r.ack = ackNone
-	r.ackCause, r.ackCauseAt, r.ackInterruptErr = nil, time.Time{}, nil
+	r.ackWrite = ackWrite{}
 	close(r.ackDone)
 	r.reg.mu.Unlock()
 	return err

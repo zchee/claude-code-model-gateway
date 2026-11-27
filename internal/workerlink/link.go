@@ -139,11 +139,14 @@ type Reservation struct {
 	// released before any Write.
 	ackDone chan struct{}
 	ackErr  error
-	// ackCause is the first interruption of the claimed write, recorded by the cancellation callback or by End at
-	// ackCauseAt; ackInterruptErr is a failure to end that write through its deadline.
-	ackCause        error
-	ackCauseAt      time.Time
-	ackInterruptErr error
+	// ackWrite records what happened to the claimed acknowledgment write; it is reset at every claim.
+	ackWrite ackWrite
+	// endClosedAt is when End began closing the parent end; zero before End. endCloseEffective records whether
+	// that Close was the one that closed it (it did not find the end already closed), and endCloseDone is closed
+	// once that result is recorded.
+	endClosedAt       time.Time
+	endCloseEffective bool
+	endCloseDone      chan struct{}
 	// endDone is closed when the first End has finished; endErr is its result.
 	endDone chan struct{}
 	endErr  error
@@ -423,7 +426,7 @@ func (r *Reservation) Retire() {
 
 // End finally stops the generation: it cancels unfinished dials, wakes Exited waiters and releases its files.
 //
-// It denies admission first and records itself as the interruption of a claimed acknowledgment write, then closes
+// It denies admission first, so that no acknowledgment Write is admitted after it, then closes
 // every lease's Exited channel, cancels the pinned dials and closes the drain channel's parent end, which also ends an
 // acknowledgment write in progress. It keeps the listener until every pinned dial has settled and the acknowledgment's
 // writer has finished; only then does it take the listener, unless that writer already released it. A repeated End
@@ -439,7 +442,10 @@ func (r *Reservation) End() error {
 	}
 	r.endDone = make(chan struct{})
 	r.ended = true
-	r.interruptAckLocked(r.endedAckError())
+	// End closes the parent end right after this; an acknowledgment Write that then fails on a closed connection
+	// reports End.
+	r.endClosedAt = time.Now()
+	r.endCloseDone = make(chan struct{})
 	if reg.eligible == r {
 		reg.eligible = nil
 	}
@@ -450,9 +456,15 @@ func (r *Reservation) End() error {
 
 	r.endCancel()
 	var errs []error
-	// The parent end is lent to the manager; a manager that already closed it leaves nothing to report.
-	if err := r.parent.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-		errs = append(errs, err)
+	// The parent end is lent to the manager; a manager that already closed it leaves nothing to report, and then this
+	// Close did not cause an acknowledgment Write to fail.
+	closeErr := r.parent.Close()
+	reg.mu.Lock()
+	r.endCloseEffective = !errors.Is(closeErr, net.ErrClosed)
+	close(r.endCloseDone)
+	reg.mu.Unlock()
+	if closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+		errs = append(errs, closeErr)
 	}
 	// The context never ends here: only the pins themselves release this wait.
 	_ = r.awaitPins(context.Background(), nil)
