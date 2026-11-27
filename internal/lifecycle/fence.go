@@ -19,6 +19,12 @@ import "context"
 // StartFence serializes worker process starts with intentional stop and resume in one state root.
 type StartFence struct{}
 
+// unlockFence is the unlock call of a fence release, given the descriptor that holds the lock. It is a variable so
+// that a test can make the unlock fail and observe that the release still closes the descriptor exactly once.
+var unlockFence = func(fd int) error {
+	panic("not implemented")
+}
+
 // NewStartFence validates a clean absolute state root without acquiring a lock.
 func NewStartFence(stateDir string) (*StartFence, error) {
 	panic("not implemented")

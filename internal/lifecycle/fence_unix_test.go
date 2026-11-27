@@ -278,6 +278,9 @@ func TestNewStartFence(t *testing.T) {
 	}
 }
 
+// TestStartFenceExcludesHolders shows that two holders of one state root exclude each other, as a nonblocking flock
+// on a fresh open file description observes it. It does not show how a waiting Acquire is built (whether it waits
+// on its own open file description, or opens one per attempt); reading the implementation decides that.
 func TestStartFenceExcludesHolders(t *testing.T) {
 	tests := map[string]struct{ separate bool }{
 		"success: one fence value acquired twice": {},
@@ -445,6 +448,134 @@ func TestStartFenceRelease(t *testing.T) {
 	}
 }
 
+// TestStartFencePerStateRoot shows that the fence belongs to one state root: holding one root's fence never delays
+// an acquisition for another root, and each root's file is locked by its own holder only.
+func TestStartFencePerStateRoot(t *testing.T) {
+	tests := map[string]struct {
+		// other returns the second state root, given the first.
+		other func(t *testing.T, first string) string
+	}{
+		"success: sibling state roots": {other: func(t *testing.T, _ string) string { return t.TempDir() }},
+		"success: state root nested inside another": {other: func(t *testing.T, first string) string {
+			nested := filepath.Join(first, "nested")
+			noError(t, os.Mkdir(nested, 0o700))
+			return nested
+		}},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			firstRoot := t.TempDir()
+			secondRoot := tt.other(t, firstRoot)
+			firstPath, secondPath := filepath.Join(firstRoot, fenceName), filepath.Join(secondRoot, fenceName)
+			first, second := newFence(t, firstRoot), newFence(t, secondRoot)
+			// Real time, not a synctest bubble: an acquisition blocked on a process-wide mutex would hang a bubble
+			// instead of failing. The watchdog only bounds such a wait; the result is the prompt lease. The context
+			// lives as long as the subtest, so no lease is held under a context that has already ended.
+			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+			defer cancel()
+			promptly := func(f *lifecycle.StartFence, which string) func() error {
+				t.Helper()
+				var got fenceResult
+				select {
+				case got = <-acquireAsync(t, ctx, f):
+				case <-time.After(30 * time.Second):
+					t.Fatalf("Acquire for the %s root waited on the other root's fence", which)
+				}
+				if t.Failed() {
+					t.FailNow()
+				}
+				checkLease(t, got)
+				if got.err != nil {
+					t.Fatalf("Acquire for the %s root while the other root's fence was held: %v", which, got.err)
+				}
+				return got.release
+			}
+			descriptors := func(held bool) int {
+				if held {
+					return 1
+				}
+				return 0
+			}
+			// held checks both roots' files: whether each is locked, and that only its own holder's one
+			// close-on-exec descriptor refers to it.
+			held := func(wantFirst, wantSecond bool) {
+				t.Helper()
+				equal(t, [2]bool{wantFirst, wantSecond}, [2]bool{fenceHeld(t, firstPath), fenceHeld(t, secondPath)})
+				onlyCloseOnExec(t, firstPath, descriptors(wantFirst))
+				onlyCloseOnExec(t, secondPath, descriptors(wantSecond))
+			}
+
+			releaseFirst := holdFence(t, first)
+			held(true, false)
+			releaseSecond := promptly(second, "second")
+			held(true, true)
+			// Releasing one root's fence leaves the other's held, and the released one is free again at once.
+			noError(t, unfence(t, releaseFirst))
+			held(false, true)
+			releaseFirst = promptly(first, "first")
+			held(true, true)
+			noError(t, unfence(t, releaseSecond))
+			held(true, false)
+			noError(t, unfence(t, releaseFirst))
+			held(false, false)
+		})
+	}
+}
+
+// TestStartFenceReleaseReportsUnlockFailure makes the unlock call of one release fail. That release reports the
+// failure and still closes its descriptor, which gives the lock up. Calling the same closure again does nothing:
+// it neither unlocks nor closes again, so a later holder whose descriptor may reuse the closed number keeps its lock.
+func TestStartFenceReleaseReportsUnlockFailure(t *testing.T) {
+	state := t.TempDir()
+	path := filepath.Join(state, fenceName)
+	errUnlock := errors.New("unlock refused by the test")
+	var calls []int
+	var unlock func(fd int) error
+	unlock = lifecycle.ReplaceFenceUnlock(t, func(fd int) error {
+		calls = append(calls, fd)
+		// The release unlocks the descriptor that holds the fence, before it closes that descriptor.
+		if _, ok := fenceDescriptors(t, path)[fd]; !ok {
+			t.Errorf("unlock was called with descriptor %d, which does not refer to the fence file", fd)
+		}
+		if !fenceHeld(t, path) {
+			t.Error("unlock was called after the fence had already been given up")
+		}
+		if len(calls) == 1 {
+			return errUnlock
+		}
+		return unlock(fd)
+	})
+
+	failing := holdFence(t, newFence(t, state))
+	onlyCloseOnExec(t, path, 1)
+	if err := unfence(t, failing); !errors.Is(err, errUnlock) {
+		t.Fatalf("release whose unlock failed = %v, want an error that wraps the unlock failure", err)
+	}
+	equal(t, 1, len(calls))
+	// The descriptor was closed although the unlock failed, and closing the only description gave the lock up.
+	onlyCloseOnExec(t, path, 0)
+	if fenceHeld(t, path) {
+		t.Fatal("the fence stayed locked after a release whose unlock failed")
+	}
+
+	successor := holdFence(t, newFence(t, state))
+	descriptors := fenceDescriptors(t, path)
+	equal(t, 1, len(descriptors))
+	// What a repeated call returns after a failed release is not fixed here; what it does is.
+	_ = unfence(t, failing)
+	equal(t, 1, len(calls))
+	equal(t, descriptors, fenceDescriptors(t, path))
+	if !fenceHeld(t, path) {
+		t.Fatal("a repeated call of a failed release closure released a later holder's fence")
+	}
+	noError(t, unfence(t, successor))
+	equal(t, 2, len(calls))
+	onlyCloseOnExec(t, path, 0)
+	if fenceHeld(t, path) {
+		t.Fatal("the later holder's release left the fence locked")
+	}
+}
+
 func TestStartFenceFileRetained(t *testing.T) {
 	tests := map[string]struct {
 		existing *string
@@ -464,7 +595,15 @@ func TestStartFenceFileRetained(t *testing.T) {
 			fence := newFence(t, state)
 			var original fs.FileInfo
 			for attempt := range 3 {
-				held := holdFence(t, fence)
+				held := func() func() error {
+					if attempt == 0 && tt.existing == nil {
+						// With an empty creation mask the new file shows exactly the mode Acquire asked for.
+						// This test is sequential because the creation mask belongs to the test process.
+						previous := unix.Umask(0)
+						defer unix.Umask(previous)
+					}
+					return holdFence(t, fence)
+				}()
 				info, err := os.Lstat(path)
 				noError(t, err)
 				if !info.Mode().IsRegular() {
@@ -473,7 +612,6 @@ func TestStartFenceFileRetained(t *testing.T) {
 				if attempt == 0 {
 					original = info
 					if tt.existing == nil {
-						// The requested creation mode under the venue's umask of 022.
 						equal(t, fs.FileMode(0o600), info.Mode().Perm())
 					}
 				} else if !os.SameFile(original, info) {

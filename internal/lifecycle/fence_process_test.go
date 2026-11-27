@@ -155,6 +155,17 @@ func TestStartFenceAcrossProcesses(t *testing.T) {
 			if !fenceHeld(t, path) {
 				t.Fatal("the helper reported the fence held, but worker-start.lock is not locked")
 			}
+			// The file the other process holds; after it gives the lock up, this same file is the fence.
+			heldFile, err := os.Lstat(path)
+			noError(t, err)
+			sameFile := func(when string) {
+				t.Helper()
+				info, err := os.Lstat(path)
+				noError(t, err)
+				if !os.SameFile(heldFile, info) {
+					t.Fatalf("%s, worker-start.lock is not the file the other process held; it was replaced", when)
+				}
+			}
 			fence := newFence(t, state)
 			synctest.Test(t, func(t *testing.T) {
 				ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
@@ -185,6 +196,11 @@ func TestStartFenceAcrossProcesses(t *testing.T) {
 				noError(t, err)
 				equal(t, "released", holder.next(t))
 			}
+			// Before this process tries again, the same file is already free: nothing but the holder's end gave it up.
+			sameFile("after the holder gave the fence up")
+			if fenceHeld(t, path) {
+				t.Fatal("worker-start.lock is still locked after its holder gave it up")
+			}
 
 			// The watchdog only bounds a fence that stays locked; success is the result.
 			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
@@ -196,7 +212,9 @@ func TestStartFenceAcrossProcesses(t *testing.T) {
 			if !fenceHeld(t, path) {
 				t.Fatal("Acquire returned without the advisory lock")
 			}
+			sameFile("after this process acquired the fence")
 			noError(t, unfence(t, r.release))
+			sameFile("after this process released the fence")
 
 			if !tt.kill {
 				_, err := io.WriteString(holder.input, "X")

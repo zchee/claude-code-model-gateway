@@ -20,7 +20,9 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -37,6 +39,10 @@ const (
 	sequentialKey   = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
 	sequentialNonce = "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"
 )
+
+// canaryGeneration is a startup generation that no ordinary error text contains, so that an error which repeats
+// it can be told apart from one that merely mentions a generation.
+const canaryGeneration = "startup-canary-q7x41z"
 
 // mac returns the lowercase hex HMAC-SHA-256 of the concatenated parts.
 func mac(key []byte, parts ...[]byte) string {
@@ -82,16 +88,69 @@ func verify(t testing.TB, token, nonce, generation, proof string) (ok bool) {
 	return controlauth.VerifySupervisorIdentity(token, nonce, generation, proof)
 }
 
-// leaks reports which of the secret or caller-supplied inputs an error message repeats.
-// Inputs shorter than four bytes are skipped: they can occur in any English message.
-func leaks(err error, inputs ...string) []string {
+// minLeakInput is the shortest input whose repetition in an error message can be told from ordinary text.
+const minLeakInput = 8
+
+// leakForms returns the spellings in which an error message could repeat input: as it is, escaped as Go
+// quoting escapes it (%q, %+q, strconv), and as the hex encoding of its bytes (%x).
+func leakForms(input string) []string {
+	unquote := func(quoted string) string { return quoted[1 : len(quoted)-1] }
+	return []string{
+		input,
+		unquote(strconv.Quote(input)),
+		unquote(strconv.QuoteToASCII(input)),
+		hex.EncodeToString([]byte(input)),
+	}
+}
+
+// leaks reports which of the secret or caller-supplied inputs an error message repeats, in any form of leakForms
+// and in any letter case (an uppercase token repeated in lowercase is still the token). An empty input cannot be
+// repeated; a nonempty input shorter than minLeakInput fails the test, because no row may go unchecked.
+func leaks(t testing.TB, err error, inputs ...string) []string {
+	t.Helper()
+	message := strings.ToLower(err.Error())
 	var found []string
 	for _, input := range inputs {
-		if len(input) >= 4 && strings.Contains(err.Error(), input) {
-			found = append(found, input)
+		if input == "" {
+			continue
+		}
+		if len(input) < minLeakInput {
+			t.Fatalf("fixture input %q is too short to tell its repetition from ordinary text", input)
+		}
+		for _, form := range leakForms(input) {
+			if strings.Contains(message, strings.ToLower(form)) {
+				found = append(found, input)
+				break
+			}
 		}
 	}
 	return found
+}
+
+// TestLeakCheck checks the repetition check the error tests rely on, against messages this test builds itself.
+func TestLeakCheck(t *testing.T) {
+	const invalid = canaryGeneration + "\xff"
+	tests := map[string]struct {
+		err   error
+		input string
+		want  []string
+	}{
+		"success: message without the input":   {err: errors.New("invalid supervisor identity nonce"), input: sequentialNonce},
+		"success: empty input is not repeated": {err: errors.New("invalid supervisor identity nonce"), input: ""},
+		"error: input as it is":                {err: fmt.Errorf("bad nonce %s", sequentialNonce), input: sequentialNonce, want: []string{sequentialNonce}},
+		"error: input in another case":         {err: fmt.Errorf("bad token %s", strings.ToLower(sequentialKey)), input: strings.ToUpper(sequentialKey), want: []string{strings.ToUpper(sequentialKey)}},
+		"error: input quoted":                  {err: fmt.Errorf("bad generation %q", invalid), input: invalid, want: []string{invalid}},
+		"error: input quoted as ascii":         {err: fmt.Errorf("bad generation %+q", "世代-"+canaryGeneration), input: "世代-" + canaryGeneration, want: []string{"世代-" + canaryGeneration}},
+		"error: input escaped with a newline":  {err: fmt.Errorf("bad token %q", sequentialKey[:63]+"\n"), input: sequentialKey[:63] + "\n", want: []string{sequentialKey[:63] + "\n"}},
+		"error: input as hex of its bytes":     {err: fmt.Errorf("bad generation %x", canaryGeneration), input: canaryGeneration, want: []string{canaryGeneration}},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			if diff := gocmp.Diff(tt.want, leaks(t, tt.err, tt.input)); diff != "" {
+				t.Fatalf("repeated inputs (-want +got):\n%s", diff)
+			}
+		})
+	}
 }
 
 func TestIdentityDeclarations(t *testing.T) {
@@ -133,6 +192,16 @@ func TestSupervisorIdentityKnownAnswers(t *testing.T) {
 		},
 		"success: generation with separators and spaces": {
 			token: sequentialKey, nonce: sequentialNonce, generation: " a/b:c d ",
+		},
+		// The nonce has a fixed length and the generation is the rest of the message, so a NUL or a line feed
+		// inside the generation leaves the layout unambiguous; such a generation is signed like any other.
+		"success: generation containing a NUL": {
+			token: sequentialKey, nonce: sequentialNonce, generation: "g\x00-1",
+			pinned: "d9ff780459e4fbab87919ac64821ead0e2f89c9f881a36f0a93a471f073ddfde",
+		},
+		"success: generation containing a line feed": {
+			token: sequentialKey, nonce: sequentialNonce, generation: "g\n-1",
+			pinned: "5deb023c24c52610bb0efee8eed1b3d21cffad4663f744e37ce393fedabdae15",
 		},
 	}
 	for name, tt := range tests {
@@ -191,11 +260,8 @@ func TestSupervisorIdentityBinding(t *testing.T) {
 			if verify(t, tt.token, tt.nonce, tt.generation, proof) {
 				t.Fatal("a proof for one token, challenge and generation verified for another")
 			}
-			// A control character in the generation is valid UTF-8, but whether the signer accepts it is left open.
-			if strings.ContainsAny(tt.generation, "\x00\n") {
-				return
-			}
-			// The changed inputs are still valid, so they must sign to a different proof.
+			// The changed inputs are still valid, a NUL or a line feed in the generation included, so they must
+			// sign to a different proof.
 			other, err := sign(t, tt.token, tt.nonce, tt.generation)
 			if err != nil {
 				t.Fatalf("SignSupervisorIdentity(changed inputs): %v", err)
@@ -207,6 +273,9 @@ func TestSupervisorIdentityBinding(t *testing.T) {
 	}
 }
 
+// TestSupervisorIdentityDomainSeparation tries named samples of other domains and other layouts of the signed
+// fields. It does not prove that no other message yields the same MAC: what verification enforces is equality with
+// the one canonical MAC of this endpoint's message.
 func TestSupervisorIdentityDomainSeparation(t *testing.T) {
 	const generation = "g-1"
 	key, nonce := decodedOrRaw(sequentialKey), decodedOrRaw(sequentialNonce)
@@ -255,7 +324,7 @@ func sha256Sum(parts ...[]byte) []byte {
 }
 
 func TestIdentityNonceForms(t *testing.T) {
-	const generation = "g"
+	const generation = canaryGeneration
 	tests := map[string]struct{ nonce string }{
 		"error: absent":                   {""},
 		"error: one byte short":           {sequentialNonce[:62]},
@@ -285,7 +354,7 @@ func TestIdentityNonceForms(t *testing.T) {
 			if proof != "" {
 				t.Fatalf("SignSupervisorIdentity returned %q with an invalid challenge, want no proof", proof)
 			}
-			if found := leaks(err, sequentialKey, tt.nonce); len(found) != 0 {
+			if found := leaks(t, err, sequentialKey, tt.nonce, generation); len(found) != 0 {
 				t.Fatalf("error %q repeats inputs %q", err, found)
 			}
 			// A noncanonical spelling of valid bytes must not verify, even with the proof of those bytes.
@@ -300,17 +369,17 @@ func TestIdentitySignerInputs(t *testing.T) {
 	tests := map[string]struct {
 		token, generation string
 	}{
-		"error: absent token":                {"", "g"},
-		"error: short token":                 {sequentialKey[:62], "g"},
-		"error: long token":                  {sequentialKey + "20", "g"},
-		"error: uppercase token":             {strings.ToUpper(sequentialKey), "g"},
-		"error: non-hex token":               {strings.Repeat("g", 64), "g"},
-		"error: token with trailing newline": {sequentialKey[:63] + "\n", "g"},
+		"error: absent token":                {"", canaryGeneration},
+		"error: short token":                 {sequentialKey[:62], canaryGeneration},
+		"error: long token":                  {sequentialKey + "20", canaryGeneration},
+		"error: uppercase token":             {strings.ToUpper(sequentialKey), canaryGeneration},
+		"error: non-hex token":               {strings.Repeat("g", 64), canaryGeneration},
+		"error: token with trailing newline": {sequentialKey[:63] + "\n", canaryGeneration},
 		"error: empty generation":            {sequentialKey, ""},
-		"error: invalid utf-8 generation":    {sequentialKey, "gen-1\xff"},
-		"error: truncated utf-8 generation":  {sequentialKey, "gen-1\xc3"},
-		"error: encoded surrogate":           {sequentialKey, "gen-1\xed\xa0\x80"},
-		"error: overlong encoding":           {sequentialKey, "gen-1\xc0\xaf"},
+		"error: invalid utf-8 generation":    {sequentialKey, canaryGeneration + "\xff"},
+		"error: truncated utf-8 generation":  {sequentialKey, canaryGeneration + "\xc3"},
+		"error: encoded surrogate":           {sequentialKey, canaryGeneration + "\xed\xa0\x80"},
+		"error: overlong encoding":           {sequentialKey, canaryGeneration + "\xc0\xaf"},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -321,7 +390,8 @@ func TestIdentitySignerInputs(t *testing.T) {
 			if proof != "" {
 				t.Fatalf("SignSupervisorIdentity returned %q with an error, want no proof", proof)
 			}
-			if found := leaks(err, tt.token, sequentialNonce, tt.generation); len(found) != 0 {
+			// The canary on its own catches an error that repeats only the valid part of an invalid generation.
+			if found := leaks(t, err, tt.token, sequentialNonce, tt.generation, canaryGeneration); len(found) != 0 {
 				t.Fatalf("error %q repeats inputs %q", err, found)
 			}
 			if verify(t, tt.token, sequentialNonce, tt.generation, referenceProof(tt.token, sequentialNonce, tt.generation)) {

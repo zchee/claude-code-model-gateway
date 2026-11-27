@@ -98,11 +98,26 @@ func lockOut(t *testing.T, dir string, mode *fs.FileMode) func() {
 	return func() { noError(t, os.Chmod(dir, 0o700)) }
 }
 
+// modeDenies fails the test unless the file mode a case set really denies the access the case relies on. A process
+// that file modes do not bind (the superuser, or one with an override capability) would make such a case pass or
+// fail for a reason other than the behaviour under test. try attempts the access and returns its error.
+func modeDenies(t *testing.T, access string, try func() error) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Fatalf("the venue must not run as root: this case needs a file mode that denies %s", access)
+	}
+	if err := try(); !errors.Is(err, fs.ErrPermission) {
+		t.Fatalf("the file mode did not deny %s (error %v): this process is not bound by file modes", access, err)
+	}
+}
+
 func TestStopMarkerPresent(t *testing.T) {
 	tests := map[string]struct {
 		setup func(t *testing.T, f rootFixture) (stateDir string)
 		// lock, when set, is the state root's mode during the call.
-		lock    *fs.FileMode
+		lock *fs.FileMode
+		// denied, when set, confirms that the case's file modes deny the access it relies on.
+		denied  func(t *testing.T, f rootFixture)
 		present bool
 		wantErr bool
 		// stopped is the unchanged answer of the existing boolean helper for the same tree.
@@ -137,6 +152,15 @@ func TestStopMarkerPresent(t *testing.T) {
 				noError(t, filesFor(f.state).Stop())
 				noError(t, os.Chmod(filepath.Join(f.state, markerName), 0))
 				return f.state
+			},
+			denied: func(t *testing.T, f rootFixture) {
+				modeDenies(t, "reading the marker", func() error {
+					file, err := os.Open(filepath.Join(f.state, markerName))
+					if err == nil {
+						_ = file.Close()
+					}
+					return err
+				})
 			},
 			present: true, stopped: true,
 		},
@@ -174,7 +198,13 @@ func TestStopMarkerPresent(t *testing.T) {
 				noError(t, filesFor(f.state).Stop())
 				return f.state
 			},
-			lock:    new(fs.FileMode(0)),
+			lock: new(fs.FileMode(0)),
+			denied: func(t *testing.T, f rootFixture) {
+				modeDenies(t, "looking up the marker in the state root", func() error {
+					_, err := os.Lstat(filepath.Join(f.state, markerName))
+					return err
+				})
+			},
 			wantErr: true,
 		},
 		"error: state root is a regular file": {
@@ -206,6 +236,9 @@ func TestStopMarkerPresent(t *testing.T) {
 			files := filesFor(tt.setup(t, fixture))
 			before := treeSnapshot(t, fixture)
 			restore := lockOut(t, fixture.state, tt.lock)
+			if tt.denied != nil {
+				tt.denied(t, fixture)
+			}
 			equal(t, tt.stopped, files.Stopped())
 			got := markerPresent(t, files)
 			restore()
@@ -260,7 +293,9 @@ func TestClearStartupFailure(t *testing.T) {
 	tests := map[string]struct {
 		setup func(t *testing.T, f rootFixture) (stateDir string)
 		// lock, when set, is the state root's mode during the call.
-		lock    *fs.FileMode
+		lock *fs.FileMode
+		// denied, when set, confirms that the case's file modes deny the access it relies on.
+		denied  func(t *testing.T, f rootFixture)
 		wantErr bool
 		check   func(t *testing.T, f rootFixture)
 	}{
@@ -345,12 +380,42 @@ func TestClearStartupFailure(t *testing.T) {
 				writeRecord(t, f.state)
 				return f.state
 			},
-			lock:    new(fs.FileMode(0o500)),
+			lock: new(fs.FileMode(0o500)),
+			denied: func(t *testing.T, f rootFixture) {
+				modeDenies(t, "changing the entries of the state root", func() error {
+					probe := filepath.Join(f.state, "mode-probe")
+					file, err := os.OpenFile(probe, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+					if err == nil {
+						_ = file.Close()
+						_ = os.Remove(probe)
+					}
+					return err
+				})
+			},
 			wantErr: true,
 			check: func(t *testing.T, f rootFixture) {
 				msg, ok := filesFor(f.state).StartupFailure(41, "startup")
 				equal(t, true, ok)
 				equal(t, "bind failed", msg)
+			},
+		},
+		// A file where the state root should be is not a confirmed absence of the record.
+		"error: state root is a regular file": {
+			setup: func(t *testing.T, f rootFixture) string {
+				root := filepath.Join(f.outside, "file")
+				noError(t, os.WriteFile(root, []byte("not a directory"), 0o600))
+				return root
+			},
+			wantErr: true,
+			check: func(t *testing.T, f rootFixture) {
+				root := filepath.Join(f.outside, "file")
+				info, err := os.Lstat(root)
+				noError(t, err)
+				if !info.Mode().IsRegular() {
+					t.Fatalf("state root has mode %v after a failed clear, want the regular file kept", info.Mode())
+				}
+				equal(t, "not a directory", bytesAt(t, root))
+				equal(t, []string{"file"}, entryNames(t, f.outside))
 			},
 		},
 		"error: relative state root": {
@@ -381,6 +446,9 @@ func TestClearStartupFailure(t *testing.T) {
 			marker := bytesAt(t, filepath.Join(neighbour.StateDir, markerName))
 			journal := bytesAt(t, filepath.Join(neighbour.StateDir, "logs", "lifecycle.jsonl"))
 			restore := lockOut(t, fixture.state, tt.lock)
+			if tt.denied != nil {
+				tt.denied(t, fixture)
+			}
 			err := clearFailure(t, files)
 			restore()
 			if tt.wantErr {
