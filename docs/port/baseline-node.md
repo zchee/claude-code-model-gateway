@@ -240,9 +240,12 @@ the complete 257,982-byte fixture stream:
   before zero); at +100 ms the provider sends the rest of the body and its end.
 
 Each case ran five times with each client, on one supervisor, inside a
-1,500 ms observation window. The JS harness decodes the chunked body strictly,
-keeping only whole chunks, and compares it with the fixture; no record has a
-framing error or bytes after the end of the body. The table gives each
+1,500 ms observation window. The JS harness checks the chunk size line, the
+CRLF after each chunk's data, and that each trailer field line starts with a
+field name followed by a colon; it keeps only whole chunks and compares the
+decoded body with the fixture. It does not validate chunk extension content
+or trailer field values; the fixture sends neither. No record has a framing
+error or bytes after the end of the body. The table gives each
 column's range over the five runs. Both time columns are offsets from time
 zero to a callback in the client process: "end of input" is when the client's
 `end` event ran, "close" when its `close` event ran. They are not packet
