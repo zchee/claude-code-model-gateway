@@ -1,0 +1,333 @@
+#!/usr/bin/env bash
+# Copyright 2026 The claude-code-model-gateway Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The diagnostic controls of the macOS Node baseline, run only by the
+# node-baseline-darwin-interrupt job on a hosted runner. None of them publishes
+# a baseline. Every subcommand takes the attempt directory first.
+#
+#   control-start <dir>             start the unrelated process that must survive
+#   term <dir>                      run the bench and send it TERM once it is ready
+#   fixture <dir> <kind>            run the half-close bench with a diagnostic fixture
+#   deadline <dir>                  run the bench until the step deadline ends it
+#   outcomes <dir> <step outcome>   judge the deadline run and list what remained
+#   assert <dir> <TERM step outcome> <fixture kind>=<step outcome>...
+#
+# The three environment conditions below only keep this script off other
+# machines; they are not an attestation. Every control first runs the
+# repository's venue check, as the make targets do, before it starts any
+# process. No raw process environment or full command line is written to a
+# file or to the log: observations keep identities, states and booleans.
+
+set -euo pipefail
+[[ $(uname -s) == Darwin && ${GITHUB_ACTIONS:-} == true && ${RUNNER_ENVIRONMENT:-} == github-hosted ]] ||
+    { printf 'baseline-darwin-controls: only on a GitHub-hosted macOS runner\n' >&2; exit 97; }
+(( $# >= 2 )) || { printf 'baseline-darwin-controls: usage: <subcommand> <dir> [argument...]\n' >&2; exit 2; }
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
+"$root/hack/venue-check"
+command=$1 base=$2
+shift 2
+limit='the remnants recorded are an observation, not proof of cleanup'
+marker_pattern='/ MODEL_GATEWAY_BENCH_RUN=\/private\/tmp\/gateway-bench\./'
+fixtures='marked-orphan unmarked-orphan signal-failure listing-zero listing-without-self'
+
+# One snapshot of a process: state, start time and short command name.
+snapshot() {
+    LC_ALL=C /bin/ps -o stat=,lstart=,comm= -p "$1" 2>/dev/null
+}
+
+# The state field of a snapshot, and its identity (start time and command,
+# with the column padding normalised).
+state_of() { awk '{ print $1 }' <<< "$1"; }
+identity_of() { awk '{ $1 = ""; sub(/^ +/, ""); print }' <<< "$1"; }
+
+# Observes one recorded identity, a PID with its start time in microseconds,
+# through ps. Prints "present <state> <tagged|untagged> <marked|unmarked>",
+# "absent" (a successful listing without that identity, or the PID now
+# belongs to a process with another start second) or "error" (no listing,
+# or times that cannot be compared). Both sides read times in UTC: ps prints
+# wall time without an offset. No tool's diagnostic reaches the log, since it
+# could quote a process line; a failure is the one word "error".
+observe() {
+    local pid=$1 start_us=$2 tag=$3 row state lstart epoch flags state_pattern='^[A-Za-z+<>]+$'
+    # Malformed recorded metadata is an inspection error before any listing.
+    [[ $pid =~ ^[0-9]+$ && $start_us =~ ^[0-9]+$ ]] || { printf 'error\n'; return; }
+    row=$(TZ=UTC0 LC_ALL=C /bin/ps -A -o pid=,stat=,lstart= 2>/dev/null |
+        awk -v pid="$pid" '$1 == pid { $1 = ""; sub(/^ +/, ""); print }' 2>/dev/null) || { printf 'error\n'; return; }
+    if [[ -z $row ]]; then printf 'absent\n'; return; fi
+    state=${row%% *}
+    lstart=${row#* }
+    epoch=$(TZ=UTC0 LC_ALL=C /bin/date -j -f '%a %b %d %T %Y' "$lstart" +%s 2>/dev/null) || { printf 'error\n'; return; }
+    [[ $state =~ $state_pattern && $epoch =~ ^[0-9]+$ ]] || { printf 'error\n'; return; }
+    if (( epoch != start_us / 1000000 )); then printf 'absent\n'; return; fi
+    # Only two booleans leave this pipeline; the environment itself is never kept.
+    flags=$(TZ=UTC0 LC_ALL=C /bin/ps -E -ww -o command= -p "$pid" 2>/dev/null | awk -v tag="$tag" '
+        { printf "%s %s\n", (index($0, tag) ? "tagged" : "untagged"), (index($0, " MODEL_GATEWAY_BENCH_RUN=") ? "marked" : "unmarked") }' 2>/dev/null) ||
+        { printf 'error\n'; return; }
+    [[ $flags =~ ^(tagged|untagged)\ (marked|unmarked)$ ]] || { printf 'error\n'; return; }
+    printf 'present %s %s\n' "$state" "$flags"
+}
+
+control_start() {
+    env -i PATH=/usr/bin:/bin perl -MPOSIX=setsid -e 'setsid; exec "sleep", "3600"' < /dev/null > /dev/null 2>&1 &
+    local pid=$! snap
+    sleep 1
+    snap=$(snapshot "$pid") && [[ -n $snap && $(state_of "$snap") != Z* ]] ||
+        { printf 'the control process is not running\n' >&2; return 1; }
+    printf '%s\n' "$pid" > "$base/control.pid"
+    identity_of "$snap" > "$base/control.identity"
+    cat -- "$base/control.pid" "$base/control.identity"
+}
+
+# Starts make in a session of its own under a Perl parent that does not reap
+# it before the TERM, so the group number cannot be reused; a TERM is sent
+# only after readiness was seen, and the witness records both.
+term() {
+    local dir=$base/term rc=0
+    BENCH_ARTIFACT_DIR=$dir perl -MPOSIX=setsid,WNOHANG -e '
+        my ($partial, $witness, @command) = @ARGV;
+        defined(my $pid = fork) or die "fork: $!\n";
+        if (!$pid) { setsid or die "setsid: $!\n"; exec @command or exit 127 }
+        open my $log, ">", $witness or die "$witness: $!\n";
+        $log->autoflush(1);
+        my $ready = 0;
+        for (1 .. 1200) {
+            if (waitpid($pid, WNOHANG) == $pid) { print $log "ended before readiness: wait status $?\n"; exit 3 }
+            if (open my $in, "<", $partial) { if (grep { /"type":"environment"/ } <$in>) { $ready = 1; last } }
+            select undef, undef, undef, 0.5;
+        }
+        if (!$ready) {
+            print $log "readiness never seen within 600 s; stopping the run\n";
+            kill "TERM", -$pid;
+            waitpid($pid, 0);
+            exit 5;
+        }
+        printf $log "ready at %s UTC\n", scalar gmtime;
+        if (kill("TERM", -$pid) != 1) { print $log "TERM to process group $pid failed: $!\n"; exit 4 }
+        printf $log "TERM delivered to process group %d at %s UTC\n", $pid, scalar gmtime;
+        waitpid($pid, 0);
+        printf $log "make ended with wait status %d\n", $?;
+        exit 0;
+    ' "$dir/records.partial.jsonl" "$dir.signal" make -- bench > "$dir.out" 2> "$dir.err" || rc=$?
+    # The bench wrapper outlives make; its last act is the status file.
+    local _
+    for _ in $(seq 1 120); do
+        if [[ -f $dir/status ]]; then break; fi
+        sleep 0.5
+    done
+    cat -- "$dir.signal" "$dir.err" >&2 || :
+    return "$rc"
+}
+
+# The runner's step deadline ends this run. A Perl parent records the start,
+# a heartbeat each second while make runs, and make's own end if it comes
+# first; the last line is the witness at the boundary.
+deadline() {
+    local dir=$base/deadline
+    BENCH_ARTIFACT_DIR=$dir exec perl -MPOSIX=WNOHANG -e '
+        my ($witness, @command) = @ARGV;
+        open my $log, ">", $witness or die "$witness: $!\n";
+        $log->autoflush(1);
+        print $log "started ", time, "\n";
+        defined(my $pid = fork) or die "fork: $!\n";
+        if (!$pid) { exec @command or exit 127 }
+        while (1) {
+            if (waitpid($pid, WNOHANG) == $pid) { print $log "exited ", time, " ", $?, "\n"; exit($? & 127 ? 128 + ($? & 127) : $? >> 8) }
+            print $log "alive ", time, "\n";
+            sleep 1;
+        }
+    ' "$dir.witness" make -- bench > "$dir.out" 2> "$dir.err"
+}
+
+fixture() {
+    local kind=$1 out rc=0 pid='' start='' seen fpid fstart fsig _
+    dir=$base/fixture-$kind
+    out=$base/fixture-$kind.verdict
+    case " $fixtures " in *" $kind "*) ;; *) printf 'unknown fixture: %s\n' "$kind" >&2; return 2 ;; esac
+    : > "$out"
+    verdict() { if [[ $1 == 0 ]]; then printf 'pass: %s\n' "$2" >> "$out"; else printf 'FAIL: %s\n' "$2" >> "$out"; fi; }
+    has() { grep -q -- "$1" "$dir/supervisor.log" 2>/dev/null; }
+    # The owner releases its orphan on every way out, never by a signal.
+    release() { if [[ -d $dir ]]; then : > "$dir/fixture-release"; fi; }
+    trap release EXIT
+    trap 'release; exit 143' TERM
+    mkdir -- "$dir"
+    BENCH_FIXTURE=$kind BENCH_ARTIFACT_DIR=$dir make -- bench BENCH_PROBE=half-close > "$dir.out" 2> "$dir.err" || rc=$?
+    verdict "$(( rc == 0 ))" "the bench failed (exit $rc)"
+    verdict "$(grep -q '^NODE-BENCH-V1 ' "$dir.out" && printf 1 || printf 0)" 'no evidence frame was printed'
+    verdict "$([[ "$(cat -- "$dir/status" 2>/dev/null)" == 'incomplete (exit 1)' ]] && printf 0 || printf 1)" 'the wrapper ended incomplete with exit 1'
+    verdict "$(has "diagnostic fixture $kind" && printf 0 || printf 1)" 'the supervisor ran the fixture'
+    verdict "$(has "fixture $kind: the harness frame validated; arming the fixture" && printf 0 || printf 1)" \
+        'the harness frame validated before the fixture was armed'
+    if [[ -f $dir/fixture.pid ]]; then read -r pid start < "$dir/fixture.pid" || :; fi
+    seen=none
+    if [[ -n $pid && -n $start ]]; then seen=$(observe "$pid" "$start" "bench-fixture-$kind"); fi
+    printf 'observer after the run: PID %s start %s: %s\n' "${pid:-none}" "${start:-none}" "$seen" >> "$out"
+    case $kind in
+        marked-orphan)
+            verdict "$([[ -n $pid ]] && has "SIGTERM marked PID $pid " && printf 0 || printf 1)" 'the sweep stopped the marked orphan by identity'
+            verdict "$(has 'refusing evidence after forced termination' && printf 0 || printf 1)" 'the forced cleanup refused the evidence'
+            verdict "$([[ $seen == absent ]] && printf 0 || printf 1)" 'the observer confirmed the marked orphan gone'
+            ;;
+        unmarked-orphan)
+            verdict "$(has 'consecutive scans observed no process of the run' && printf 0 || printf 1)" 'the sweep observed nothing of the run'
+            verdict "$(has 'fixture run: evidence withheld' && printf 0 || printf 1)" 'the fixture run withheld its evidence'
+            verdict "$([[ $seen == present\ * && $seen != present\ Z* && $seen == *' tagged unmarked' ]] && printf 0 || printf 1)" \
+                'documented limit demonstrated: an unmarked detached orphan outlived the sweep'
+            ;;
+        signal-failure)
+            fpid='' fstart='' fsig=''
+            if [[ -f $dir/fault-injected ]]; then read -r fpid fstart fsig < "$dir/fault-injected" || :; fi
+            verdict "$([[ -n $pid && $fpid == "$pid" && $fstart == "$start" ]] && printf 0 || printf 1)" \
+                "the fault was injected once, for the recorded target (${fsig:-no signal})"
+            verdict "$(has "injected a failed .* for PID $pid\$" && printf 0 || printf 1)" 'the supervisor logged the injected failure'
+            verdict "$(has 'refusing evidence after [0-9][0-9]* failed signal' && printf 0 || printf 1)" 'the latched failure refused the evidence'
+            verdict "$([[ $seen == absent ]] && printf 0 || printf 1)" 'the observer confirmed that the released target exited'
+            ;;
+        listing-zero|listing-without-self)
+            if [[ $kind == listing-zero ]]; then text='proc_listpids type 4'; else text='does not include the supervisor'; fi
+            verdict "$(has "sweep inspection failed: .*$text" && printf 0 || printf 1)" "the sweep logged the listing fault ($text)"
+            verdict "$(has 'cleanup deadline' && printf 0 || printf 1)" 'the sweep reached its deadline instead of certifying cleanup'
+            ;;
+    esac
+    release
+    if [[ -n $pid && -n $start ]]; then
+        for _ in $(seq 1 50); do
+            seen=$(observe "$pid" "$start" "bench-fixture-$kind")
+            [[ $seen == present\ * ]] || break
+            sleep 0.2
+        done
+        printf 'observer after the release: %s\n' "$seen" >> "$out"
+        verdict "$([[ $seen == absent ]] && printf 0 || printf 1)" 'the final observation after the release succeeded and found no fixture process'
+    fi
+    cat -- "$out"
+    if grep -q '^FAIL' "$out"; then return 1; fi
+    # Written only after every check and the owner's release.
+    printf 'complete\n' > "$base/fixture-$kind.complete"
+}
+
+outcomes() {
+    local step_outcome=$1 judged started='' kind='' time='' wait_status='' verdict listing='' canary listing_status
+    judged=$(date -u '+%s')
+    if [[ -f $base/deadline.witness ]]; then
+        started=$(awk '$1 == "started" { print $2 }' "$base/deadline.witness")
+        read -r kind time wait_status < <(tail -n 1 "$base/deadline.witness") || :
+    fi
+    if [[ -z $started || -z $time ]]; then
+        verdict='inconclusive: no witness of the run'
+    elif [[ $kind == exited ]]; then
+        # A witnessed ordinary end is never the deadline, however long it took.
+        verdict="the run never reached the deadline: make ended on its own after $(( time - started )) s (wait status $wait_status)"
+    elif [[ $kind != alive || $step_outcome != failure ]] || (( time - started < 118 )); then
+        verdict="inconclusive: no exit record, but the step outcome ($step_outcome) and the witness ($(( time - started )) s) do not both show the step timeout"
+    elif ! grep -q '"type":"run"' "$base/deadline/records.partial.jsonl" 2>/dev/null; then
+        verdict='the deadline was reached during set-up, before the bench started'
+    else
+        # A bench that outlived its step gets time to finish its own cleanup.
+        sleep 20
+        if [[ -f $base/deadline/status ]] && grep -q 'consecutive scans observed no process of the run' "$base/deadline/supervisor.log" 2>/dev/null; then
+            verdict='cleanup observed: the bench finished its own sweep after the runner ended the step'
+        else
+            verdict='cleanup not observed: the runner ended the step and the bench did not finish its own sweep'
+        fi
+    fi
+    verdict="$verdict; $limit"
+    # A short-lived canary that carries a marker proves the listing sees
+    # environments; it exits by itself and is waited for, never signalled.
+    # The listing goes straight into a filter that keeps PIDs only.
+    env -i PATH=/usr/bin:/bin MODEL_GATEWAY_BENCH_RUN=/private/tmp/gateway-bench.listing-canary sleep 3 &
+    canary=$!
+    sleep 0.5
+    # Neither tool's diagnostic reaches the log. One awk pass keeps only
+    # marked rows of three decimal fields and fails on any other marked row
+    # or a missing canary, which makes the listing inconclusive.
+    if listing=$(TZ=UTC0 LC_ALL=C /bin/ps -A -E -ww -o pid=,ppid=,pgid=,command= 2>/dev/null |
+                 awk -v pid="$canary" "$marker_pattern {
+                     if (\$1 !~ /^[0-9]+\$/ || \$2 !~ /^[0-9]+\$/ || \$3 !~ /^[0-9]+\$/) { bad = 1; next }
+                     print \$1, \$2, \$3
+                     if (\$1 == pid) found = 1
+                 } END { exit (bad || !found) ? 1 : 0 }" 2>/dev/null); then
+        listing_status='conclusive: the listing showed the marked canary'
+    else
+        listing_status='inconclusive: the process listing failed or did not show the marked canary'
+        listing=''
+    fi
+    wait "$canary" || :
+    {
+        printf 'judged at %s (UTC epoch %s); witness: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$judged" "$(tail -n 1 "$base/deadline.witness" 2>/dev/null || printf none)"
+        printf '== deadline verdict: %s\n' "$verdict"
+        printf '== remnant listing: %s\n' "$listing_status"
+        for variant in term deadline; do
+            printf '== %s\nbench status: %s\n' "$variant" "$(cat -- "$base/$variant/status" 2>/dev/null || printf 'absent (the bench did not finish its cleanup)')"
+            grep -h 'consecutive scans\|cleanup deadline\|SIGTERM\|SIGKILL\|interrupted\|inspection failed\|cannot\|failed\|refusing' -- "$base/$variant/supervisor.log" 2>/dev/null ||
+                printf 'no sweep outcome in supervisor.log\n'
+        done
+        printf '== processes still carrying a run marker (PID PPID PGID only)\n'
+        if [[ -n $listing ]]; then awk -v pid="$canary" '$1 != pid' <<< "$listing"; else printf 'no listing\n'; fi
+    } > "$base/cleanup-outcomes.txt"
+    printf '%s\n' "$verdict" > "$base/deadline-verdict.txt"
+    printf '%s\n' "$listing_status" > "$base/listing-status.txt"
+    cat -- "$base/cleanup-outcomes.txt"
+}
+
+assert_outcomes() {
+    local term_outcome=$1 out=$base/assertions.txt log=$base/term/supervisor.log pid snap identity kind pair outcome
+    shift
+    : > "$out"
+    verdict() { if [[ $1 == 0 ]]; then printf 'pass: %s\n' "$2" >> "$out"; else printf 'FAIL: %s\n' "$2" >> "$out"; fi; }
+    ok() { if "$@"; then printf 0; else printf 1; fi; }
+    pid=$(cat -- "$base/control.pid" 2>/dev/null || :)
+    identity=$(cat -- "$base/control.identity" 2>/dev/null || :)
+    snap=''
+    if [[ -n $pid ]]; then snap=$(snapshot "$pid" || :); fi
+    verdict "$(ok test -n "$snap" -a -n "$identity")" "one snapshot of the unrelated control: ${snap:-none}"
+    verdict "$([[ -n $snap && $(state_of "$snap") != Z* && "$(identity_of "$snap")" == "$identity" ]] && printf 0 || printf 1)" \
+        'the unrelated control is alive, not a zombie, with its start time and command'
+    verdict "$([[ $term_outcome == success ]] && grep -q '^ready at ' "$base/term.signal" 2>/dev/null &&
+        grep -q '^TERM delivered to process group' "$base/term.signal" && printf 0 || printf 1)" \
+        'the TERM was sent only after readiness and its delivery was acknowledged'
+    verdict "$(ok grep -q '"type":"environment"' "$base/term/records.partial.jsonl")" 'the TERM variant kept its partial samples'
+    verdict "$(ok grep -q 'bench: interrupted' "$log")" 'the bench acknowledged the interruption'
+    verdict "$([[ "$(cat -- "$base/term/status" 2>/dev/null)" == 'incomplete (exit 1)' ]] && printf 0 || printf 1)" 'the bench wrapper ended incomplete with exit 1'
+    verdict "$(grep -q 'SIGTERM grouped PID' "$log" 2>/dev/null && grep -q 'consecutive scans observed no process of the run' "$log" && printf 0 || printf 1)" \
+        'the sweep stopped the job by identity and then observed no process of the run'
+    verdict "$(grep -q 'cleanup deadline\|inspection failed\|cannot\|signal failed\|refusing evidence after' "$log" 2>/dev/null && printf 1 || printf 0)" \
+        'no cleanup deadline, transient or final inspection failure, or signal failure in the TERM variant'
+    for kind in $fixtures; do
+        outcome=missing
+        for pair in "$@"; do
+            if [[ ${pair%%=*} == "$kind" ]]; then outcome=${pair#*=}; fi
+        done
+        verdict "$([[ $outcome == success && -f $base/fixture-$kind.complete ]] && printf 0 || printf 1)" \
+            "fixture $kind: step $outcome, completion sentinel $([[ -f $base/fixture-$kind.complete ]] && printf present || printf missing)"
+    done
+    verdict "$(grep -q '^cleanup \(not \)\?observed: ' "$base/deadline-verdict.txt" 2>/dev/null && printf 0 || printf 1)" \
+        "the deadline variant ran into its deadline: $(cat -- "$base/deadline-verdict.txt" 2>/dev/null || printf 'no verdict')"
+    verdict "$(ok grep -q '^conclusive' "$base/listing-status.txt")" "the remnant listing is conclusive: $(cat -- "$base/listing-status.txt" 2>/dev/null || printf 'no listing')"
+    verdict "$(grep -q '^complete' "$base/deadline/status" 2>/dev/null && printf 1 || printf 0)" 'the deadline variant is not complete'
+    verdict "$(grep -q '^NODE-BENCH-V1 ' "$base"/*.out 2>/dev/null && printf 1 || printf 0)" 'no run printed an evidence frame'
+    verdict "$(ok test ! -e "$base/darwin")" 'no canonical baseline file exists'
+    cat -- "$out"
+    ! grep -q '^FAIL' "$out"
+}
+
+case $command in
+    control-start) control_start ;;
+    term) term ;;
+    fixture) (( $# == 1 )) || exit 2; fixture "$1" ;;
+    deadline) deadline ;;
+    outcomes) (( $# == 1 )) || exit 2; outcomes "$1" ;;
+    assert) (( $# >= 1 )) || exit 2; assert_outcomes "$@" ;;
+    *) printf 'baseline-darwin-controls: unknown subcommand %s\n' "$command" >&2; exit 2 ;;
+esac

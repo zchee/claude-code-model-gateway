@@ -8,7 +8,7 @@ applying the Go performance gate, using this same fixture for both runtimes.
 Do not use historical numbers as its threshold.
 
 The [raw JSON Lines file](baseline-node-samples/measurements.jsonl) contains every
-warmup, timed sample, RSS reading, load average, launch environment, and probe event.
+warmup, timed sample, RSS reading, load average, supplied launch environment, and probe event.
 It was decoded from the single checksum-verified run frame. UTC timestamps were
 read with `date` in the venue; durations and offsets use a monotonic clock.
 
@@ -61,8 +61,12 @@ plugin in its verified source export):
 | listeners | `ss -H -ltn "sport = :$PORT"` |
 
 The launch environment was cleared with `env -i`; the `run`, `environment`, and
-`probe-environment` records list the exact environment allowlists (private scratch
-prefix replaced by `$WORK`, also the process marker value). The source export
+`probe-environment` records list the application environment the harness supplies
+to each launch (the environment option it passes), with exact key sets (private
+scratch prefix replaced by `$WORK`, also the process marker value). They show
+nothing of the environment at exec or inside a child: Node adds its IPC channel
+variables to the gateway launch, and the pinned supervisor builds its worker's
+environment itself. The source export
 additionally prepends its private `env` shim to `PATH` so Git inherits the marker.
 The isolated install sets `npm_config_cache`
 to the private `$WORK/npm-cache`. Supervisor and direct worker get a throwaway home,
@@ -292,7 +296,7 @@ its client goes away. Not measured: the direct worker path (`serve-worker`) and
 the Codex route.
 
 The [raw JSON Lines file](baseline-node-samples/half-close.jsonl) holds the run
-record, the launch environment and one record per probe with its full event
+record, the supplied launch environment and one record per probe with its full event
 timeline (offsets in milliseconds from time zero). Run started
 2026-11-27T00:21:40.608743937Z and ended 2026-11-27T00:22:28.033990216Z (UTC,
 `date` in the venue), source commit a8501f25175572071a0d085d34346dcf67e49b23,

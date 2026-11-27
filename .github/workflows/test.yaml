@@ -13,11 +13,24 @@ on:
         required: false
         default: auto
         type: string
+      node_baseline:
+        description: Also run the pinned Node gateway baseline on the hosted macOS runner
+        required: false
+        default: false
+        type: boolean
+      node_baseline_interrupt:
+        description: Also interrupt the macOS Node baseline on purpose to check its cleanup (publishes no baseline)
+        required: false
+        default: false
+        type: boolean
 
 permissions: {}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # A baseline dispatch has a group of its own, named before the ref so that no
+  # other ref's group can coincide with it and no push can cancel the
+  # measurement; every other run keeps the shared group.
+  group: ${{ github.workflow }}-${{ inputs.node_baseline_interrupt && 'node-baseline-interrupt-' || inputs.node_baseline && 'node-baseline-' || '' }}${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -339,4 +352,267 @@ jobs:
         with:
           name: conformance-export-${{ needs.checks.outputs.conformance_phase }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/publish-check/candidate
+          if-no-files-found: error
+
+  node-baseline-darwin:
+    # The pinned Node gateway's baseline on hosted macOS, only when a dispatch
+    # asks for it. Containment is this runner's teardown after the job plus the
+    # benchmark's own marker sweep.
+    # Never in the same dispatch as the interruption control.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.node_baseline && !inputs.node_baseline_interrupt }}
+    permissions:
+      contents: read
+    runs-on: xcode-27
+    timeout-minutes: 45
+    env:
+      # Recorded in the run record, so that a sample names the job it came from.
+      BENCH_JOB: node-baseline-darwin
+    steps:
+      - name: Prepare the attempt directory
+        # Before checkout, so that even a failed checkout uploads a marked attempt.
+        run: |
+          base="$RUNNER_TEMP/node-baseline-darwin"
+          mkdir -p -- "$base/full" "$base/half-close"
+          printf 'incomplete: the attempt has not finished\n' > "$base/status"
+          {
+            printf 'repository: %s\ncommit: %s\nref: %s\nrun: %s attempt %s\n' \
+              "$GITHUB_REPOSITORY" "$GITHUB_SHA" "$GITHUB_REF" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'runner: %s %s %s\nimage: %s %s\n' "$RUNNER_NAME" "$RUNNER_OS" "$RUNNER_ARCH" "${ImageOS-}" "${ImageVersion-}"
+            printf 'started: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            sw_vers || :
+            uname -a || :
+            sysctl machdep.cpu.brand_string hw.model hw.physicalcpu hw.logicalcpu hw.memsize || :
+            for tool in bash python3 perl lsof ps git make; do printf '%s: %s\n' "$tool" "$(command -v "$tool")"; done
+            bash --version || :
+            python3 --version || :
+            perl -e 'print "perl: $^V\n"' || :
+          } > "$base/runner.txt" 2>&1
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24.11.1'
+      - name: Check the Node version
+        run: |
+          node_ver=$(node --version)
+          printf 'node: %s (%s)\nnpm: %s\n' "$node_ver" "$(command -v node)" "$(npm --version)" >> "$RUNNER_TEMP/node-baseline-darwin/runner.txt"
+          if [[ $node_ver != v24.11.1 ]]; then
+            printf 'unexpected Node version: %s (expected v24.11.1)\n' "$node_ver" >&2
+            exit 70
+          fi
+      - name: Attest hosted runner
+        id: attest
+        run: ./hack/venue-attest-ci
+      - name: Run the baseline
+        id: full
+        timeout-minutes: 20
+        env:
+          BENCH_ARTIFACT_DIR: ${{ runner.temp }}/node-baseline-darwin/full
+        run: |
+          rc=0
+          make -- bench > "$BENCH_ARTIFACT_DIR.out" 2> "$BENCH_ARTIFACT_DIR.err" || rc=$?
+          cat -- "$BENCH_ARTIFACT_DIR.err" >&2
+          exit "$rc"
+      - name: Run the half-close probe
+        id: half_close
+        # Runs after a failed full run as well, so that its diagnostics are kept.
+        if: ${{ !cancelled() && steps.attest.outcome == 'success' }}
+        timeout-minutes: 10
+        env:
+          BENCH_ARTIFACT_DIR: ${{ runner.temp }}/node-baseline-darwin/half-close
+        run: |
+          rc=0
+          make -- bench BENCH_PROBE=half-close > "$BENCH_ARTIFACT_DIR.out" 2> "$BENCH_ARTIFACT_DIR.err" || rc=$?
+          cat -- "$BENCH_ARTIFACT_DIR.err" >&2
+          exit "$rc"
+      - name: Verify and decode the samples
+        id: verify
+        # Each frame is printed only after its run's cleanup succeeded. The
+        # decoded files are staged outside the upload tree and move into
+        # darwin/ only after every check and the summary succeeded.
+        if: ${{ !cancelled() && steps.full.outcome == 'success' && steps.half_close.outcome == 'success' }}
+        run: |
+          base="$RUNNER_TEMP/node-baseline-darwin"
+          staging="$RUNNER_TEMP/node-baseline-darwin-staging"
+          mkdir -- "$staging" "$staging/darwin"
+          label="$BENCH_JOB job of .github/workflows/test.yaml on the hosted xcode-27 runner"
+          ./hack/baseline-bench verify --platform darwin --job "$label" full "$base/full.out" "$staging/darwin/measurements.jsonl" > "$staging/verify.txt"
+          ./hack/baseline-bench verify --platform darwin --job "$label" half-close "$base/half-close.out" "$staging/darwin/half-close.jsonl" >> "$staging/verify.txt"
+          ./hack/baseline-bench summary --platform darwin "$staging/darwin/measurements.jsonl" > "$staging/summary.md"
+          cat -- "$staging/verify.txt" "$staging/summary.md"
+          mv -- "$staging/verify.txt" "$staging/summary.md" "$base/"
+          # The last fallible command: darwin/ appears only when everything else succeeded.
+          mv -- "$staging/darwin" "$base/darwin"
+      - name: Record the attempt outcome
+        if: ${{ always() }}
+        env:
+          JOB_STATUS: ${{ job.status }}
+          ATTEST: ${{ steps.attest.outcome }}
+          FULL: ${{ steps.full.outcome }}
+          HALF_CLOSE: ${{ steps.half_close.outcome }}
+          VERIFY: ${{ steps.verify.outcome }}
+        run: |
+          base="$RUNNER_TEMP/node-baseline-darwin"
+          mkdir -p -- "$base"
+          result=incomplete
+          if [[ $VERIFY == success && $JOB_STATUS == success && -d $base/darwin ]]; then result=complete; fi
+          # An incomplete attempt uploads no canonical sample files.
+          if [[ $result == incomplete ]]; then rm -rf -- "${base:?}/darwin"; fi
+          printf '%s\njob: %s\nattestation: %s\nfull run: %s\nhalf-close probe: %s\nverification: %s\nfinished: %s\n' \
+            "$result" "$JOB_STATUS" "$ATTEST" "$FULL" "$HALF_CLOSE" "$VERIFY" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$base/status"
+          cat -- "$base/status"
+      - name: Upload the attempt
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: node-baseline-darwin-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/node-baseline-darwin
+          if-no-files-found: error
+
+  node-baseline-inputs:
+    # The baseline and its interruption control are separate dispatches.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.node_baseline && inputs.node_baseline_interrupt }}
+    permissions: {}
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Refuse both baseline inputs
+        run: |
+          printf 'node_baseline and node_baseline_interrupt are mutually exclusive; dispatch them separately\n' >&2
+          exit 1
+
+  node-baseline-darwin-interrupt:
+    # Interrupts the macOS bench on purpose, once with TERM after it has started
+    # its gateway children and once by letting its step run into the step
+    # deadline, beside an unrelated process that must survive. It checks what
+    # cleanup did and never publishes a baseline.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.node_baseline_interrupt && !inputs.node_baseline }}
+    permissions:
+      contents: read
+    runs-on: xcode-27
+    timeout-minutes: 75
+    env:
+      BENCH_JOB: node-baseline-darwin-interrupt
+    steps:
+      - name: Prepare the attempt directory
+        run: |
+          base="$RUNNER_TEMP/node-baseline-darwin-interrupt"
+          mkdir -p -- "$base/term" "$base/deadline"
+          printf 'incomplete: interruption control, never a baseline\n' > "$base/status"
+          {
+            printf 'repository: %s\ncommit: %s\nref: %s\nrun: %s attempt %s\n' \
+              "$GITHUB_REPOSITORY" "$GITHUB_SHA" "$GITHUB_REF" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            printf 'image: %s %s\nstarted: %s\n' "${ImageOS-}" "${ImageVersion-}" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            sw_vers || :
+            python3 --version || :
+          } > "$base/runner.txt" 2>&1
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24.11.1'
+      - name: Check the Node version
+        run: |
+          node_ver=$(node --version)
+          printf 'node: %s\n' "$node_ver" >> "$RUNNER_TEMP/node-baseline-darwin-interrupt/runner.txt"
+          if [[ $node_ver != v24.11.1 ]]; then
+            printf 'unexpected Node version: %s (expected v24.11.1)\n' "$node_ver" >&2
+            exit 70
+          fi
+      - name: Attest hosted runner
+        id: attest
+        run: ./hack/venue-attest-ci
+      - name: Start the unrelated control process
+        id: control
+        # Started before every bench in a session of its own, with a minimal
+        # environment: the sweeps must leave it alone. One snapshot records its
+        # start time and command. Every control runs the venue check first.
+        run: ./hack/baseline-darwin-controls control-start "$RUNNER_TEMP/node-baseline-darwin-interrupt"
+      - name: Interrupt the bench with TERM
+        id: term
+        continue-on-error: true
+        timeout-minutes: 15
+        run: ./hack/baseline-darwin-controls term "$RUNNER_TEMP/node-baseline-darwin-interrupt"
+      - name: Fixture, a marked detached orphan
+        id: fixture_marked
+        if: ${{ !cancelled() && steps.attest.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 10
+        run: ./hack/baseline-darwin-controls fixture "$RUNNER_TEMP/node-baseline-darwin-interrupt" marked-orphan
+      - name: Fixture, an unmarked detached orphan
+        id: fixture_unmarked
+        if: ${{ !cancelled() && steps.attest.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 10
+        run: ./hack/baseline-darwin-controls fixture "$RUNNER_TEMP/node-baseline-darwin-interrupt" unmarked-orphan
+      - name: Fixture, a failed signal before the target exits
+        id: fixture_signal
+        if: ${{ !cancelled() && steps.attest.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 10
+        run: ./hack/baseline-darwin-controls fixture "$RUNNER_TEMP/node-baseline-darwin-interrupt" signal-failure
+      - name: Fixture, an empty process listing
+        id: fixture_zero
+        if: ${{ !cancelled() && steps.attest.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 10
+        run: ./hack/baseline-darwin-controls fixture "$RUNNER_TEMP/node-baseline-darwin-interrupt" listing-zero
+      - name: Fixture, a process listing without the supervisor
+        id: fixture_without_self
+        if: ${{ !cancelled() && steps.attest.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 10
+        run: ./hack/baseline-darwin-controls fixture "$RUNNER_TEMP/node-baseline-darwin-interrupt" listing-without-self
+      - name: Let the bench run into its step deadline
+        id: deadline
+        # Last, so that whatever the runner leaves of this run cannot affect
+        # another control. A full run idles three times 60 s; it cannot end in
+        # 2 min unless it fails.
+        if: ${{ !cancelled() && steps.attest.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 2
+        run: ./hack/baseline-darwin-controls deadline "$RUNNER_TEMP/node-baseline-darwin-interrupt"
+      - name: Record the cleanup outcomes
+        id: outcomes
+        if: ${{ always() && steps.attest.outcome == 'success' }}
+        env:
+          DEADLINE_OUTCOME: ${{ steps.deadline.outcome }}
+        run: ./hack/baseline-darwin-controls outcomes "$RUNNER_TEMP/node-baseline-darwin-interrupt" "$DEADLINE_OUTCOME"
+      - name: Check the interruption outcomes
+        id: assertions
+        if: ${{ always() && steps.attest.outcome == 'success' }}
+        # Each fixture counts only with its step's success and its completion
+        # sentinel, written after every check and the owner's release.
+        env:
+          TERM_OUTCOME: ${{ steps.term.outcome }}
+          MARKED: ${{ steps.fixture_marked.outcome }}
+          UNMARKED: ${{ steps.fixture_unmarked.outcome }}
+          SIGNAL: ${{ steps.fixture_signal.outcome }}
+          ZERO: ${{ steps.fixture_zero.outcome }}
+          WITHOUT_SELF: ${{ steps.fixture_without_self.outcome }}
+        run: |
+          ./hack/baseline-darwin-controls assert "$RUNNER_TEMP/node-baseline-darwin-interrupt" "$TERM_OUTCOME" \
+            "marked-orphan=$MARKED" "unmarked-orphan=$UNMARKED" "signal-failure=$SIGNAL" \
+            "listing-zero=$ZERO" "listing-without-self=$WITHOUT_SELF"
+      - name: Record the attempt outcome
+        if: ${{ always() }}
+        env:
+          JOB_STATUS: ${{ job.status }}
+          TERM_OUTCOME: ${{ steps.term.outcome }}
+          DEADLINE_OUTCOME: ${{ steps.deadline.outcome }}
+          ASSERTIONS: ${{ steps.assertions.outcome }}
+        run: |
+          base="$RUNNER_TEMP/node-baseline-darwin-interrupt"
+          mkdir -p -- "$base"
+          printf 'incomplete: interruption control, never a baseline\njob: %s\nTERM variant: %s\ndeadline variant: %s (%s)\nassertions: %s\nfinished: %s\n' \
+            "$JOB_STATUS" "$TERM_OUTCOME" "$DEADLINE_OUTCOME" "$(cat -- "$base/deadline-verdict.txt" 2>/dev/null || printf 'no verdict')" \
+            "$ASSERTIONS" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$base/status"
+          cat -- "$base/status"
+      - name: Upload the attempt
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: node-baseline-darwin-interrupt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/node-baseline-darwin-interrupt
           if-no-files-found: error

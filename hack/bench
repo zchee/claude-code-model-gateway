@@ -5,11 +5,33 @@
 set -euo pipefail
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
 "$root/hack/venue-check"
-# This run reads Linux RSS and relies on the kernel's ephemeral port range.
-[[ $(uname -s) == Linux ]] || { printf 'not a test venue: bench requires Linux\n' >&2; exit 97; }
-read -r low high < /proc/sys/net/ipv4/ip_local_port_range
-for port in 80 18764 18765; do
-    (( port < low || port > high )) || { printf 'bench: ephemeral range includes forbidden port %s\n' "$port" >&2; exit 1; }
+# Every fixture listens on a port the kernel picks from its ephemeral range.
+system=$(uname -s)
+case $system in
+    Linux)
+        read -r low high < /proc/sys/net/ipv4/ip_local_port_range
+        ranges=("$low $high")
+        ;;
+    Darwin)
+        # A bind to port zero draws from the default range; the high range
+        # serves sockets that ask for it. Neither may reach a gateway port.
+        # The kernel allocates downward when first exceeds last, so a pair
+        # names the same ports in either order.
+        ranges=()
+        for range in portrange.first,portrange.last portrange.hifirst,portrange.hilast; do
+            low=$(/usr/sbin/sysctl -n "net.inet.ip.${range%,*}") && high=$(/usr/sbin/sysctl -n "net.inet.ip.${range#*,}") &&
+                [[ $low =~ ^[0-9]+$ && $high =~ ^[0-9]+$ ]] ||
+                { printf 'bench: cannot read net.inet.ip.%s\n' "${range%,*}" >&2; exit 1; }
+            if (( low > high )); then ranges+=("$high $low"); else ranges+=("$low $high"); fi
+        done
+        ;;
+    *) printf 'not a test venue: bench requires Linux or macOS\n' >&2; exit 97 ;;
+esac
+for range in "${ranges[@]}"; do
+    read -r low high <<< "$range"
+    for port in 80 18764 18765; do
+        (( port < low || port > high )) || { printf 'bench: ephemeral range includes forbidden port %s\n' "$port" >&2; exit 1; }
+    done
 done
 if command -v claude >/dev/null; then printf 'bench: claude resolves on venue PATH\n' >&2; exit 1; fi
 # An empty selection runs the whole baseline; half-close runs only that probe.
@@ -17,7 +39,36 @@ case ${BENCH_PROBE-} in
     ''|half-close) ;;
     *) printf 'bench: unknown BENCH_PROBE: %s\n' "$BENCH_PROBE" >&2; exit 2 ;;
 esac
+# The hosted macOS runner keeps each attempt's diagnostics and partial samples
+# here as they are written; the directory must be new and empty so that it
+# holds one attempt only. Other systems ignore it.
+artifact=''
+if [[ $system == Darwin ]]; then artifact=${BENCH_ARTIFACT_DIR-}; fi
+if [[ -n $artifact ]]; then
+    [[ $artifact == /* && -d $artifact && ! -L $artifact && -z $(ls -A -- "$artifact") ]] ||
+        { printf 'bench: BENCH_ARTIFACT_DIR must name an empty directory by absolute path\n' >&2; exit 2; }
+fi
+# A diagnostic fixture of the hosted macOS controls: it plants a detached
+# orphan or a cleanup fault, needs an artifact directory and never publishes.
+fixture=''
+if [[ $system == Darwin ]]; then
+    fixture=${BENCH_FIXTURE-}
+    case $fixture in
+        ''|marked-orphan|unmarked-orphan|signal-failure|listing-zero|listing-without-self) ;;
+        *) printf 'bench: unknown BENCH_FIXTURE: %s\n' "$fixture" >&2; exit 2 ;;
+    esac
+    if [[ -n $fixture && -z $artifact ]]; then printf 'bench: BENCH_FIXTURE needs BENCH_ARTIFACT_DIR\n' >&2; exit 2; fi
+    # Which workflow job ran this bench, for the run record.
+    case ${BENCH_JOB-} in
+        node-baseline-darwin|node-baseline-darwin-interrupt) job_name="$BENCH_JOB job of .github/workflows/test.yaml on the hosted xcode-27 runner" ;;
+        '') job_name='no workflow job named (BENCH_JOB unset)' ;;
+        *) printf 'bench: unknown BENCH_JOB: %s\n' "$BENCH_JOB" >&2; exit 2 ;;
+    esac
+    if [[ -n $fixture ]]; then job_name+=", diagnostic fixture $fixture"; fi
+fi
 
+# Started through $supervisor.
+# shellcheck disable=SC2329
 supervise_job() {
     exec python3 -I - "$1" "$2" "$3" <<'PY'
 import ctypes
@@ -165,6 +216,654 @@ except OSError as error:
 PY
 }
 
+# macOS has no caller-selected subreaper: an orphan is reparented to launchd,
+# so waiting for a child proves only that this supervisor's own child is gone.
+# Containment there is the hosted runner's teardown plus a sweep for the
+# processes this run marked, grouped or still parents. One program serves the
+# supervisor and the bounded runner that stands in for GNU timeout.
+if [[ $system == Darwin ]]; then
+    IFS= read -r -d '' darwin_program <<'PY' || :
+import base64
+import ctypes
+import datetime
+import errno
+import gzip
+import hashlib
+import json
+import os
+import signal
+import struct
+import sys
+import time
+
+libc = ctypes.CDLL(None, use_errno=True)
+libc.proc_listpids.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_int]
+libc.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+libc.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
+                        ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t]
+PROC_PGRP_ONLY = 2
+PROC_UID_ONLY = 4
+PROC_PIDT_BSDINFOWITHUNIQID = 18
+BSDINFO_SIZE = 192  # struct proc_bsdinfowithuniqid in <sys/proc_info.h>
+KINFO_SIZE = 648  # struct kinfo_proc on 64-bit macOS
+SZOMB = 5
+CTL_KERN = 1
+KERN_PROC = 14
+KERN_PROC_PID = 1
+KERN_PROCARGS2 = 49
+WATCHED = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
+started = time.monotonic()
+me = os.getpid()
+
+
+class Unresolved(OSError):
+    """A listed process that is neither readable, a zombie nor gone."""
+
+
+def report(message):
+    try:
+        print(f'+{time.monotonic() - started:.3f}s {message}', file=sys.stderr, flush=True)
+    except OSError:
+        pass  # The log is evidence, not a condition for containment.
+
+
+def failure(what):
+    err = ctypes.get_errno()
+    return OSError(err, os.strerror(err), what)
+
+
+def listed(kind, value):
+    # proc_listpids returns 0, not -1, when the call fails. Every listing made
+    # here includes a known process, so an empty answer is a failure too.
+    def call(buffer, size):
+        ctypes.set_errno(0)
+        result = libc.proc_listpids(kind, value, buffer, size)
+        if result <= 0:
+            err = ctypes.get_errno() or errno.EIO
+            raise OSError(err, os.strerror(err), f'proc_listpids type {kind}')
+        return result
+
+    capacity = call(None, 0) // 4 + 64
+    while True:
+        buffer = (ctypes.c_int * capacity)()
+        size = call(buffer, ctypes.sizeof(buffer))
+        if size < ctypes.sizeof(buffer):
+            return [pid for pid in buffer[:size // 4] if pid > 0]
+        capacity *= 2
+
+
+def kernel_record(pid):
+    # kern.proc.pid also describes a zombie, which proc_pidinfo does not.
+    mib = (ctypes.c_int * 4)(CTL_KERN, KERN_PROC, KERN_PROC_PID, pid)
+    buffer = ctypes.create_string_buffer(KINFO_SIZE)
+    size = ctypes.c_size_t(KINFO_SIZE)
+    if libc.sysctl(mib, 4, buffer, ctypes.byref(size), None, 0) != 0:
+        raise failure(f'kern.proc.pid PID {pid}')
+    if size.value == 0:
+        return None
+    seconds, microseconds = struct.unpack_from('<qi', buffer.raw, 0)
+    if size.value != KINFO_SIZE or struct.unpack_from('<i', buffer.raw, 40)[0] != pid:
+        raise OSError(errno.EIO, f'kern.proc.pid PID {pid}: unexpected record')
+    return {'zombie': struct.unpack_from('<b', buffer.raw, 36)[0] == SZOMB, 'start': seconds * 1000000 + microseconds}
+
+
+def process(pid):
+    # None: no process. Otherwise the start time in microseconds identifies
+    # the process; a zombie has exited and holds nothing but its status.
+    info = ctypes.create_string_buffer(BSDINFO_SIZE)
+    ctypes.set_errno(0)
+    if libc.proc_pidinfo(pid, PROC_PIDT_BSDINFOWITHUNIQID, 0, info, BSDINFO_SIZE) == BSDINFO_SIZE:
+        fields = struct.unpack_from('<12I', info.raw)
+        if fields[3] != pid:
+            raise Unresolved(errno.EIO, f'proc_pidinfo PID {pid} described PID {fields[3]}')
+        seconds, microseconds = struct.unpack_from('<2Q', info.raw, 120)
+        return {
+            'zombie': False, 'ppid': fields[4], 'uid': fields[5],
+            'pgid': struct.unpack_from('<I', info.raw, 100)[0],
+            'start': seconds * 1000000 + microseconds,
+            'comm': info.raw[48:64].split(b'\0', 1)[0].decode('ascii', 'replace'),
+            'version': struct.unpack_from('<i', info.raw, 168)[0],
+        }
+    error = failure(f'proc_pidinfo PID {pid}')
+    record = kernel_record(pid)
+    if record is None or record['zombie']:
+        return record
+    # A permission error is not proof of another owner: a policy can refuse
+    # inspection of a process of this user.
+    raise Unresolved(error.errno, f'{error.strerror} ({error.filename})')
+
+
+def environment(pid):
+    # The 64-bit kern.procargs2 layout: argc, the executable path, NUL padding
+    # to eight bytes counted from the stripped executable_path= prefix, argv,
+    # then the initial environment.
+    mib = (ctypes.c_int * 3)(CTL_KERN, KERN_PROCARGS2, pid)
+    size = ctypes.c_size_t(0)
+    if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0:
+        raise failure(f'kern.procargs2 size PID {pid}')
+    buffer = ctypes.create_string_buffer(size.value)
+    if libc.sysctl(mib, 3, buffer, ctypes.byref(size), None, 0) != 0:
+        raise failure(f'kern.procargs2 PID {pid}')
+    raw = buffer.raw[:size.value]
+    if len(raw) < 5:
+        raise OSError(errno.EIO, f'kern.procargs2 PID {pid}: missing argc')
+    argc = struct.unpack_from('<I', raw)[0]
+    path, separator, rest = raw[4:].partition(b'\0')
+    pad = -(len('executable_path=') + len(path) + 1) & 7
+    if not separator or not path or argc < 1 or len(rest) <= pad or rest[:pad].strip(b'\0') or rest[pad] == 0:
+        raise OSError(errno.EIO, f'kern.procargs2 PID {pid}: invalid layout')
+    strings = rest[pad:].split(b'\0')
+    if len(strings) <= argc:
+        raise OSError(errno.EIO, f'kern.procargs2 PID {pid}: truncated argv')
+    env = []
+    for entry in strings[argc:]:
+        if not entry:
+            break
+        env.append(entry)
+    return env
+
+
+libc.proc_signal_with_audittoken.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+
+def signal_identity(pid, version, sig):
+    # The kernel delivers only to the process whose PID and version both
+    # match, so an exited PID that was reused cannot receive the signal.
+    token = (ctypes.c_uint32 * 8)()
+    token[5] = pid
+    token[7] = version & 0xffffffff
+    ctypes.set_errno(0)
+    # libproc returns the error number itself; -1 would leave it in errno.
+    result = libc.proc_signal_with_audittoken(ctypes.byref(token), sig)
+    if result == -1:
+        result = ctypes.get_errno() or errno.EIO
+    if result == 0:
+        return True
+    if result == errno.ESRCH:
+        return False
+    raise OSError(result, os.strerror(result), f'{sig.name} PID {pid}')
+
+
+def check_identity_signals():
+    # The call must refuse a wrong version and deliver exactly one signal for
+    # the right one; otherwise it does not bind a signal to one process and
+    # the sweep must not signal at all.
+    received = []
+    previous = signal.signal(signal.SIGWINCH, lambda _signum, _frame: received.append(True))
+    try:
+        mine = process(me)
+        if signal_identity(me, mine['version'] + 1, signal.SIGWINCH):
+            raise OSError(errno.EIO, 'proc_signal_with_audittoken delivered to a mismatched version')
+        if not signal_identity(me, mine['version'], signal.SIGWINCH):
+            raise OSError(errno.EIO, 'proc_signal_with_audittoken refused this process with its own version')
+        deadline = time.monotonic() + 2
+        while not received and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.05)
+        if len(received) != 1:
+            raise OSError(errno.EIO, f'the identity probe received {len(received)} signals, expected exactly one')
+    finally:
+        signal.signal(signal.SIGWINCH, previous)
+
+
+def bounded(seconds, argv):
+    # Like GNU timeout --kill-after=1s, for a whole process group: TERM at the
+    # deadline, KILL a second later, then wait until no live member remains.
+    # The unreaped leader keeps the group number from being reused.
+    child = os.fork()
+    if child == 0:
+        try:
+            os.setpgid(0, 0)
+            for sig in WATCHED:
+                signal.signal(sig, signal.SIG_DFL)
+            os.execvp(argv[0], argv)
+        except OSError as error:
+            report(f'bounded: cannot exec {argv[0]}: {error}')
+        finally:
+            os._exit(127)
+    try:
+        os.setpgid(child, child)
+    except OSError:
+        pass  # The child already did it, or has exec'd after doing it.
+
+    failures = []
+
+    def signal_group(sig):
+        # No live member left is not an error; anything else is reported and
+        # fails the run.
+        try:
+            os.killpg(child, sig)
+        except ProcessLookupError:
+            pass
+        except OSError as error:
+            failures.append(f'{signal.Signals(sig).name} to process group {child}: {error}')
+            report(f'bounded: {failures[-1]}')
+
+    def forward(signum, _frame):
+        signal_group(signum)
+
+    for sig in WATCHED:
+        signal.signal(sig, forward)
+    phase, deadline = 'run', time.monotonic() + seconds
+    while True:
+        try:
+            leader = kernel_record(child)
+            members = []
+            group = listed(PROC_PGRP_ONLY, child)
+            if child not in group:
+                raise OSError(errno.EIO, 'the group listing does not include its unreaped leader')
+            for pid in group:
+                try:
+                    record = process(pid)
+                except OSError:
+                    record = {'zombie': False}  # Unknown counts as live.
+                if record is not None and not record['zombie']:
+                    members.append(pid)
+            if leader is not None and leader['zombie'] and not members:
+                break
+        except OSError as error:
+            report(f'bounded: cannot inspect process group {child}: {error}')
+        now = time.monotonic()
+        if now >= deadline:
+            if phase == 'kill':
+                report(f'bounded: process group {child} still has members 5 s after KILL')
+                try:
+                    os.waitpid(child, os.WNOHANG)  # Never wait past the hard deadline.
+                except ChildProcessError:
+                    pass
+                return 125
+            phase, deadline = ('term', now + 1) if phase == 'run' else ('kill', now + 5)
+            signal_group(signal.SIGTERM if phase == 'term' else signal.SIGKILL)
+        time.sleep(0.02)
+    _, status = os.waitpid(child, 0)
+    if failures:
+        return 125
+    if phase != 'run':
+        return 124
+    code = os.waitstatus_to_exitcode(status)
+    return code if code >= 0 else 128 - code
+
+
+# A detached process for a diagnostic run. It ends when the release file
+# appears (created by its owner, or by the supervisor at an injected fault),
+# so no one has to signal it by number; it gives up after 900 s.
+FIXTURE_SCRIPT = r'''
+my ($tag, $dir) = @ARGV;
+my $deadline = time + 900;
+select undef, undef, undef, 0.1 while time < $deadline && !-e "$dir/fixture-release";
+'''
+ORPHAN_FIXTURES = ('marked-orphan', 'unmarked-orphan', 'signal-failure')
+FAULT_FIXTURES = ('listing-zero', 'listing-without-self')
+
+
+def start_fixture(kind, directory):
+    # The intermediate exits at once, so launchd adopts the orphan. Its PID
+    # and start time go to fixture.pid for an independent observer.
+    middle = os.fork()
+    if middle == 0:
+        try:
+            orphan = os.fork()
+            if orphan == 0:
+                try:
+                    os.setsid()
+                    null = os.open('/dev/null', os.O_RDONLY)
+                    os.dup2(null, 0)
+                    os.close(null)
+                    # A minimal environment: nothing inherited but the marker.
+                    env = {'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'}
+                    if kind != 'unmarked-orphan':
+                        env['MODEL_GATEWAY_BENCH_RUN'] = os.environ['MODEL_GATEWAY_BENCH_RUN']
+                    os.execve('/usr/bin/perl', ['perl', '-e', FIXTURE_SCRIPT, f'bench-fixture-{kind}', directory], env)
+                finally:
+                    os._exit(127)
+            record = process(orphan)
+            with open(directory + '/fixture.pid', 'x') as file:
+                file.write(f'{orphan} {record["start"] if record else 0}\n')
+        finally:
+            os._exit(0)
+    os.waitpid(middle, 0)
+
+
+def inject_listing_fault(kind):
+    # Replaces the libc call itself, so the real checks of listed() and
+    # table() meet the fault: a listing of this user's processes that returns
+    # nothing, or one that leaves the supervisor out.
+    real = libc.proc_listpids
+
+    def faulty(list_kind, value, buffer, size):
+        if list_kind != PROC_UID_ONLY:
+            return real(list_kind, value, buffer, size)
+        if kind == 'listing-zero':
+            ctypes.set_errno(0)
+            return 0
+        result = real(list_kind, value, buffer, size)
+        if buffer is None or result <= 0:
+            return result
+        kept = [pid for pid in buffer[:result // 4] if pid != me]
+        for index, pid in enumerate(kept):
+            buffer[index] = pid
+        return len(kept) * 4
+
+    libc.proc_listpids = faulty
+
+
+def supervise(job, root, work, fixture=''):
+    interrupt_file = work + '/interrupted'
+    marker = b'MODEL_GATEWAY_BENCH_RUN=' + os.fsencode(work)
+    containment = ('containment by runner teardown and marker sweep; '
+                   'absence of unmarked detached descendants not proven')
+    uid = os.getuid()
+    interrupted = False
+    empty_scans, scan_interval_ms = 3, 100
+
+    def note_interrupt(_signum, _frame):
+        nonlocal interrupted
+        interrupted = True
+
+    def stopping():
+        return interrupted or os.path.exists(interrupt_file)
+
+    def table():
+        # Every process of this user, read directly; a listed process that
+        # cannot be resolved is reported, never skipped.
+        processes, unknown = {}, []
+        pids = listed(PROC_UID_ONLY, uid)
+        if me not in pids:
+            raise OSError(errno.EIO, 'the listing of this user\'s processes does not include the supervisor')
+        for pid in pids:
+            if pid == me:
+                continue
+            try:
+                record = process(pid)
+            except Unresolved as error:
+                unknown.append(f'PID {pid}: {error}')
+                continue
+            if record is not None:
+                processes[pid] = record
+        return processes, unknown
+
+    def scan(previous, observed, job_pid):
+        # The processes of the run that are alive now: new and marked, in the
+        # job's group, below this supervisor, or observed earlier and alive.
+        processes, unknown = table()
+        found = {}
+        for pid, record in processes.items():
+            identity = (pid, record['start'])
+            if record['zombie'] or identity in previous:
+                continue
+            reason = observed.get(identity)
+            if reason is None and record['pgid'] == job_pid:
+                reason = 'grouped'
+            ancestor, seen = record['ppid'], set()
+            while reason is None and ancestor not in seen:
+                if ancestor == me:
+                    reason = 'descendant'
+                    break
+                if ancestor not in processes or processes[ancestor]['zombie']:
+                    break  # An exited parent has no parent of its own on record.
+                seen.add(ancestor)
+                ancestor = processes[ancestor]['ppid']
+            if reason is None:
+                try:
+                    if marker not in environment(pid):
+                        continue
+                    reason = 'marked'
+                except OSError as error:
+                    try:
+                        again = process(pid)
+                    except OSError:
+                        again = record
+                    if again is None or again['zombie'] or again['start'] != record['start']:
+                        continue
+                    unknown.append(f'PID {pid} ({record["comm"]}): {error}')
+                    continue
+            found[identity] = (reason, record['comm'], record['version'])
+        return found, unknown
+
+    def harness_frame():
+        # The frame the harness writes only after a complete, successful run.
+        with open(work + '/result', 'rb') as file:
+            parts = file.read().rstrip(b'\n').split(b' ')
+        if len(parts) != 3 or parts[0] != b'NODE-BENCH-V1':
+            raise ValueError('no evidence frame from the harness')
+        payload = base64.b64decode(parts[2], validate=True)
+        if hashlib.sha256(payload).hexdigest().encode() != parts[1]:
+            raise ValueError('damaged evidence frame from the harness')
+        return payload
+
+    def publish_cleanup(observations):
+        # The harness wrote its frame before this sweep; the published frame
+        # carries what the sweep observed as its last record.
+        path = work + '/result'
+        payload = harness_frame()
+        record = {
+            'type': 'cleanup',
+            'checked': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ'),
+            'containment': containment,
+            'observations': observations,
+        }
+        raw = gzip.decompress(payload) + (json.dumps(record, ensure_ascii=False, separators=(',', ':')) + '\n').encode()
+        payload = gzip.compress(raw, mtime=0)
+        with open(path + '.new', 'xb') as file:
+            file.write(b'NODE-BENCH-V1 ' + hashlib.sha256(payload).hexdigest().encode() + b' ' +
+                       base64.b64encode(payload) + b'\n')
+        os.replace(path + '.new', path)
+
+    for sig in WATCHED:
+        signal.signal(sig, note_interrupt)
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    # Refuse before launch if any part of the sweep cannot work here.
+    environment(me)
+    check_identity_signals()
+    # A process caught while it starts or exits can be unreadable once; only
+    # one that stays unreadable on a second look refuses the run.
+    processes, unknown = table()
+    if unknown:
+        time.sleep(0.2)
+        processes, unknown = table()
+        if not unknown:
+            report('bench: a second listing had no unresolved entries')
+    if unknown:
+        raise OSError(errno.EPERM, 'processes of this user that cannot be inspected: ' + '; '.join(unknown))
+    # Processes older than the run cannot carry its marker. The start time
+    # keeps a reused PID from exempting a process of the run.
+    previous = {(pid, record['start']) for pid, record in processes.items()}
+
+    # The hosted runner is slower than the Linux venue; the budget is larger.
+    job_deadline = time.monotonic() + 600
+    job_pid = None if stopping() else os.fork()
+    if job_pid == 0:
+        try:
+            for sig in WATCHED:
+                signal.signal(sig, signal.SIG_DFL)
+            # A process group of its own lets the sweep find children that
+            # neither detached nor kept the marker. The job stays unreaped
+            # until the sweep ends, so its PID and group number stay reserved.
+            os.setsid()
+            log = os.open(work + '/attempt/job.log', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.dup2(log, 1)
+            os.dup2(log, 2)
+            os.close(log)
+            os.environ['MODEL_GATEWAY_BENCH_RUN'] = work
+            if fixture in ORPHAN_FIXTURES:
+                start_fixture(fixture, os.path.realpath(work + '/attempt'))
+            os.execvp('bash', ['bash', '-euo', 'pipefail', '-c', job + '\nrun_job "$@"', 'bench', root, work])
+        except OSError as error:
+            report(f'bench: cannot exec job: {error}')
+        finally:
+            os._exit(127)
+
+    def job_exited():
+        record = kernel_record(job_pid)
+        return record is None or record['zombie']
+
+    timed_out = False
+    try:
+        while job_pid is not None and not stopping() and not job_exited():
+            if time.monotonic() >= job_deadline:
+                timed_out = True
+                break
+            time.sleep(0.025)
+    except OSError as error:
+        report(f'bench: waiting for job failed: {error}')
+    if stopping():
+        report('bench: interrupted')
+    elif timed_out:
+        report('bench: job exceeded outer deadline')
+
+    send = signal_identity
+    if fixture:
+        report(f'bench: diagnostic fixture {fixture}: this run publishes no evidence')
+        # A fault is armed only after the harness frame validated, which the
+        # harness writes only after a complete run. That is all this claims.
+        try:
+            harness_frame()
+            report(f'bench: fixture {fixture}: the harness frame validated; arming the fixture')
+            armed = True
+        except (OSError, ValueError) as err:
+            report(f'bench: fixture {fixture}: not armed, the harness frame did not validate: {err}')
+            armed = False
+        attempt_dir = os.path.realpath(work + '/attempt')
+        if armed and fixture in FAULT_FIXTURES:
+            inject_listing_fault(fixture)
+        if armed and fixture == 'signal-failure':
+            with open(attempt_dir + '/fixture.pid') as file:
+                target = tuple(int(field) for field in file.read().split())
+            injected = []
+
+            def send(pid, version, sig):
+                # Exactly one failure, for the recorded target; its witness
+                # then releases the target, which exits by itself.
+                record = kernel_record(pid)
+                if not injected and record is not None and (pid, record['start']) == target:
+                    injected.append(True)
+                    with open(attempt_dir + '/fault-injected', 'x') as file:
+                        file.write(f'{pid} {target[1]} {sig.name}\n')
+                    with open(attempt_dir + '/fixture-release', 'x'):
+                        pass
+                    report(f'bench: fixture signal-failure: injected a failed {sig.name} for PID {pid}')
+                    raise OSError(errno.EPERM, 'injected signal failure', f'{sig.name} PID {pid}')
+                return signal_identity(pid, version, sig)
+
+    cleanup_started = time.monotonic()
+    deadline = cleanup_started + 10
+    observed, signaled = {}, {}
+    pending, error, empty = {}, None, 0
+    reported_error = None
+
+    def report_error(message):
+        # Every distinct inspection failure is logged when it happens, not
+        # only the last one before a deadline.
+        nonlocal reported_error
+        if message != reported_error:
+            reported_error = message
+            report(f'bench: sweep inspection failed: {message}')
+    # A signal that failed for any reason but an exited target stays recorded,
+    # even if the process exits later: such a run publishes no evidence. Its
+    # target is not signalled again; the sweep waits for it or its deadline.
+    signal_failures, failed = [], set()
+    while True:
+        try:
+            pending, unknown = scan(previous, observed, job_pid)
+            for identity, (reason, _, _) in pending.items():
+                observed.setdefault(identity, reason)
+            if unknown:
+                error = '; '.join(unknown)
+                report_error(error)
+            if not pending and not unknown and (job_pid is None or job_exited()):
+                empty += 1
+                if empty >= empty_scans:
+                    break
+                time.sleep(scan_interval_ms / 1000)
+                continue
+            empty = 0
+            sig = signal.SIGTERM if time.monotonic() < cleanup_started + 3 else signal.SIGKILL
+            for identity, (reason, comm, version) in pending.items():
+                if signaled.get(identity) == sig or identity in failed:
+                    continue
+                try:
+                    delivered = send(identity[0], version, sig)
+                except OSError as err:
+                    error = str(err)
+                    signal_failures.append(error)
+                    failed.add(identity)
+                    report(f'bench: signal failed: {error}')
+                    continue
+                if delivered:
+                    signaled[identity] = sig
+                    report(f'bench: {sig.name} {reason} PID {identity[0]} ({comm})')
+        except OSError as err:
+            error = str(err)
+            report_error(error)
+            empty = 0
+        if time.monotonic() >= deadline:
+            leftover = sorted(pid for pid, _ in pending) or sorted(pid for pid, _ in observed)
+            report(f'bench: cleanup deadline with processes of the run (last observed): {leftover}; last error: {error}')
+            return 1
+        time.sleep(0.025)
+
+    rc = 1
+    if job_pid is not None:
+        _, status = os.waitpid(job_pid, 0)
+        code = os.waitstatus_to_exitcode(status)
+        rc = 124 if timed_out else (code if code >= 0 else 128 - code)
+    try:
+        os.waitpid(-1, os.WNOHANG)
+        report('bench: the supervisor still has a child after the sweep')
+        return 1
+    except ChildProcessError:
+        pass  # ECHILD: the job was this supervisor's only child.
+    report(f'bench: {empty_scans} consecutive scans observed no process of the run '
+           f'(marked, grouped or descendant); {len(observed)} observed during cleanup, '
+           f'{len(signaled)} signaled; {containment}')
+    if signal_failures:
+        report(f'bench: refusing evidence after {len(signal_failures)} failed signal(s)')
+        return 1
+    if signaled and rc == 0:
+        report('bench: refusing evidence after forced termination')
+        return 1
+    if stopping():
+        return 1
+    if fixture:
+        report('bench: fixture run: evidence withheld')
+        return 1
+    if rc == 0:
+        try:
+            publish_cleanup({
+                'sweep': 'marked, grouped and descendant processes of the job: none observed',
+                'note': ('after the job ended, consecutive scans of the processes of this user observed no '
+                         'process that started during the run and carried the run marker, kept the job process '
+                         'group or descended from the supervisor; every process of the run observed during '
+                         'cleanup was seen to exit'),
+                'consecutiveEmptyScans': empty_scans,
+                'scanIntervalMs': scan_interval_ms,
+                'observedDuringCleanup': len(observed),
+                'signaled': len(signaled),
+                'preRunProcesses': len(previous),
+            })
+        except (OSError, ValueError) as err:
+            report(f'bench: cannot record the sweep in the evidence frame: {err}')
+            return 1
+    return rc
+
+
+try:
+    if sys.argv[1:2] == ['supervise'] and len(sys.argv) == 6 and sys.argv[5] in ('',) + ORPHAN_FIXTURES + FAULT_FIXTURES:
+        sys.exit(supervise(*sys.argv[2:]))
+    if sys.argv[1:2] == ['bounded'] and len(sys.argv) >= 4:
+        sys.exit(bounded(float(sys.argv[2]), sys.argv[3:]))
+    sys.exit('bench: usage: supervise <job> <root> <work> <fixture> | bounded <seconds> <command...>')
+except OSError as error:
+    sys.exit(f'bench: cannot establish containment: {error}')
+PY
+fi
+
+# Started through $supervisor.
+# shellcheck disable=SC2329
+supervise_job_darwin() {
+    exec python3 -I -c "$darwin_program" supervise "$1" "$2" "$3" "$fixture"
+}
+
 # Called by the timed child shell, not by this wrapper.
 # shellcheck disable=SC2329
 run_job() {
@@ -187,7 +886,7 @@ run_job() {
     exec "${clean[@]}" node --input-type=commonjs - "$plugin" "$work" ${BENCH_PROBE:+"$BENCH_PROBE"} > "$work/result" <<'JS'
 'use strict';
 const assert = require('node:assert/strict');
-const { execFileSync, spawn } = require('node:child_process');
+const { execFileSync, spawn, spawnSync } = require('node:child_process');
 const { createHash } = require('node:crypto');
 const { once } = require('node:events');
 const fs = require('node:fs');
@@ -205,8 +904,26 @@ const cli = path.join(plugin, 'bin/model-gateway.js');
 const { writeCommandLauncher } = require(path.join(plugin, 'hooks/registry-writer.js'));
 const pluginVersion = require(path.join(plugin, '.claude-plugin/plugin.json')).version;
 const [commit, rootTree, pluginTree] = fs.readFileSync(path.join(work, 'pin'), 'utf8').trim().split('\t');
+// The variables run_job passes in (its env -i list). Each launch gets an
+// options.env built from these (plus its own declared keys), and each recorded
+// map is that options.env: the application environment the harness supplies,
+// with exact key sets. A variable the platform adds inside this process (macOS
+// CoreFoundation sets one at start-up) is therefore neither supplied nor
+// recorded. The maps claim nothing about the environment at exec or inside a
+// child: Node adds its IPC channel variables to the gateway launch, which has
+// an IPC channel, and the pinned supervisor hands its worker an environment of
+// its own making.
+const launchKeys = ['PATH', 'HOME', 'TMPDIR', 'LC_ALL', 'MODEL_GATEWAY_BENCH_RUN'];
+const launchEnv = Object.fromEntries(launchKeys.map((key) => {
+  assert.equal(typeof process.env[key], 'string', `missing launch variable ${key}`);
+  return [key, process.env[key]];
+}));
 const node = process.execPath;
 const loopback = '127.0.0.1';
+// macOS has no /proc, ss, lscpu or nanosecond date; the hosted runner uses these probes instead.
+const darwin = process.platform === 'darwin';
+const utcMicroseconds = ['-MPOSIX=strftime', '-MTime::HiRes=gettimeofday', '-e',
+  '($s, $us) = gettimeofday; printf "%s.%06dZ", strftime("%Y-%m-%dT%H:%M:%S", gmtime $s), $us'];
 const commands = {
   run: 'VENUE_HOST=debian-13-trixie.gaudiy-platform ./hack/remote run bench',
   status: 'VENUE_HOST=debian-13-trixie.gaudiy-platform ./hack/remote status',
@@ -222,6 +939,18 @@ const commands = {
   CPU: 'lscpu -p=SOCKET,CORE',
   listeners: 'ss -H -ltn "sport = :$PORT"',
 };
+if (darwin) Object.assign(commands, {
+  run: 'make -- bench',
+  status: './hack/venue-attest-ci, then ./hack/venue-check before and after the run',
+  date: `perl ${utcMicroseconds.slice(0, 3).join(' ')} '${utcMicroseconds[3]}'`,
+  CPU: 'sysctl -n hw.physicalcpu',
+  listeners: '/usr/sbin/lsof -nP -iTCP:$CANARY,$PORT -sTCP:LISTEN -Fpfn (exit 0, no stderr, the harness canary listener present)',
+  job: fs.readFileSync(path.join(work, 'job-name'), 'utf8').trim(),
+  parent: 'ps -o ppid= -p $PID',
+  rss: 'ps -o rss= -p $PID (resident set size in KiB as macOS ps reports it; not Linux VmRSS)',
+  liveness: 'kill -0 $PID; a process that answers and ps -o stat= -p $PID shows as a zombie has exited',
+  system: 'sw_vers -productVersion; sw_vers -buildVersion; sysctl -n hw.model',
+});
 const settings = {
   series: 3, warmups: 1, readinessRuns: 50, ttfbRuns: 200,
   requestBytes: 1024 * 1024, events: 2000, idleMs: 60000,
@@ -237,13 +966,23 @@ if (halfClose) Object.assign(commands, {
 });
 const run = { commit, rootTree, pluginTree, pluginVersion, commands, settings,
   ...(halfClose ? { probe: 'half-close', halfCloseSettings } : {}) };
-const command = (name, ...args) => execFileSync(name, args, { encoding: 'utf8' }).trim();
-const date = () => command('date', '-u', '+%Y-%m-%dT%H:%M:%S.%NZ');
+const command = (name, ...args) => execFileSync(name, args, { encoding: 'utf8', env: launchEnv }).trim();
+const date = () => darwin ? command('perl', ...utcMicroseconds) : command('date', '-u', '+%Y-%m-%dT%H:%M:%S.%NZ');
 const load = () => ({ at: date(), averages: os.loadavg() });
 const elapsed = (since) => Number((performance.now() - since).toFixed(6));
 const envForReport = (env) => Object.fromEntries(Object.entries(env).map(([key, value]) => [key, value.replaceAll(work, '$WORK')]));
 const record = (type, data) => ({ type, ...data });
 const records = [];
+// On macOS each record also reaches the attempt directory when it is made, so
+// a failed or killed attempt still leaves the samples it collected.
+const partial = path.join(work, 'attempt', 'records.partial.jsonl');
+if (darwin) {
+  const keep = records.push.bind(records);
+  records.push = (...items) => {
+    for (const item of items) fs.appendFileSync(partial, `${JSON.stringify(item)}\n`);
+    return keep(...items);
+  };
+}
 const portURL = (port) => `http://${loopback}:${port}`;
 
 const models = { anthropic: 'claude-sonnet-4-6', codex: 'claude-gpt-5.6-sol' };
@@ -359,8 +1098,10 @@ function request(port, url, body) {
 
 function gateway(commandName, home, upstreams) {
   fs.mkdirSync(home);
+  // The application environment this launch is given; the IPC channel the
+  // fixture shutdown needs makes Node add its own transport variables at spawn.
   const env = {
-    ...process.env, HOME: home,
+    ...launchEnv, HOME: home,
     CODEX_GATEWAY_PORT: '0', CODEX_GATEWAY_WORKER_PORT: '0', CODEX_GATEWAY_COMPAT_PORT: '0',
     CODEX_GATEWAY_PROXY_PORT: String(upstreams.codex.port),
     CODEX_GATEWAY_ANTHROPIC_UPSTREAM: portURL(upstreams.anthropic.port),
@@ -369,6 +1110,8 @@ function gateway(commandName, home, upstreams) {
     CODEX_GATEWAY_SOCKET_PATH: path.join(home, 'gateway.sock'),
     CODEX_GATEWAY_CLAUDE_BIN: path.join(home, 'missing-claude'),
   };
+  // sun_path on macOS holds 104 bytes, including the terminating NUL.
+  if (darwin) assert(Buffer.byteLength(env.CODEX_GATEWAY_SOCKET_PATH) < 104, `socket path too long: ${env.CODEX_GATEWAY_SOCKET_PATH}`);
   fs.writeFileSync(env.CODEX_GATEWAY_HOSTS_FILE, '');
   const child = spawn(node, [cli, commandName], { cwd: home, env, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
   let stdout = '', stderr = '';
@@ -427,7 +1170,7 @@ function gateway(commandName, home, upstreams) {
     }
     const [code, signal] = outcome;
     assert.equal(code, 0, `${diagnostic()} (signal ${signal})`);
-    for (const pid of [child.pid, topology.workerPid].filter(Boolean)) assert(!fs.existsSync(`/proc/${pid}`), `PID ${pid} remains`);
+    for (const pid of [child.pid, topology.workerPid].filter(Boolean)) assert(!running(pid), `PID ${pid} remains`);
     for (const port of new Set([topology.port, topology.workerPort].filter(Boolean))) checkClosed(port);
   };
   return topology;
@@ -454,13 +1197,72 @@ function bounded(promise, what, milliseconds = settings.timeoutMs) {
   return Promise.race([promise, deadline]).finally(() => timeout.abort());
 }
 
-const checkClosed = (port) => assert.equal(command('ss', '-H', '-ltn', `sport = :${port}`), '', `port ${port} still listening`);
-const parentPID = (pid) => Number(fs.readFileSync(`/proc/${pid}/status`, 'utf8').match(/^PPid:\s+(\d+)$/m)?.[1]);
-const rss = (pid) => {
+const linuxClosed = (port) => assert.equal(command('ss', '-H', '-ltn', `sport = :${port}`), '', `port ${port} still listening`);
+const linuxParent = (pid) => Number(fs.readFileSync(`/proc/${pid}/status`, 'utf8').match(/^PPid:\s+(\d+)$/m)?.[1]);
+const linuxRSS = (pid) => {
   const kib = Number(fs.readFileSync(`/proc/${pid}/status`, 'utf8').match(/^VmRSS:\s+(\d+)\s+kB$/m)?.[1]);
   assert(kib > 0, `missing RSS for ${pid}`);
   return kib;
 };
+// One decimal field of one process, from macOS ps; ps exits 1 for a PID it cannot find.
+const psNumber = (field, pid) => {
+  const value = command('/bin/ps', '-o', `${field}=`, '-p', String(pid));
+  assert.match(value, /^\d+$/, `ps ${field} for PID ${pid}: ${JSON.stringify(value)}`);
+  return Number(value);
+};
+// A listener the harness holds for the whole run. lsof must list it before an
+// empty answer for another port can mean that port has no listener: unprivileged
+// lsof sees only this user's sockets, and a listing can fail silently.
+let canaryPort;
+function darwinListeners(port) {
+  assert(canaryPort !== undefined && port !== canaryPort, `no canary listener for port ${port}`);
+  const result = spawnSync('/usr/sbin/lsof', ['-nP', `-iTCP:${canaryPort},${port}`, '-sTCP:LISTEN', '-Fpfn'],
+    { encoding: 'utf8', timeout: 10000, env: launchEnv });
+  assert.equal(result.error, undefined, `lsof for port ${port}: ${result.error}`);
+  assert.equal(result.stderr, '', `lsof for port ${port} wrote to stderr`);
+  assert.equal(result.status, 0, `lsof for port ${port}: exit ${result.status}, signal ${result.signal}`);
+  const lines = result.stdout.split('\n');
+  assert.equal(lines.pop(), '', 'lsof output does not end with a newline');
+  const holders = [];
+  let owner, field = 'p', canarySeen = false;
+  for (const line of lines) {
+    let match;
+    if ((field === 'p' || field === 'pf') && (match = /^p([0-9]+)$/.exec(line))) { owner = Number(match[1]); field = 'f'; continue; }
+    if ((field === 'f' || field === 'pf') && /^f[0-9]+$/.test(line)) { field = 'n'; continue; }
+    match = field === 'n' && /^n(.*):([0-9]+)$/.exec(line);
+    assert(match, `unexpected lsof line: ${JSON.stringify(line)}`);
+    const [, address, listened] = match;
+    assert(address === '*' || net.isIP(address.replace(/^\[(.*)\]$/, '$1').replace(/%[\w.-]+$/, '')) !== 0, `unexpected lsof address: ${JSON.stringify(line)}`);
+    if (owner === process.pid && address === loopback && Number(listened) === canaryPort) canarySeen = true;
+    else if (Number(listened) === port) holders.push({ pid: owner, address });
+    field = 'pf';
+  }
+  assert(field === 'pf' && canarySeen, `lsof did not list the canary listener on port ${canaryPort}`);
+  return holders;
+}
+const darwinClosed = (port) => assert.deepEqual(darwinListeners(port), [], `port ${port} still listening`);
+// A zombie has exited and holds no socket; only its exit status is left to reap.
+function running(pid) {
+  if (!darwin) return fs.existsSync(`/proc/${pid}`);
+  try { process.kill(pid, 0); } catch (error) { if (error.code === 'ESRCH') return false; throw error; }
+  const state = spawnSync('/bin/ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8', timeout: 10000, env: launchEnv });
+  assert.equal(state.error, undefined, `ps stat for PID ${pid}: ${state.error}`);
+  assert.equal(state.stderr, '', `ps stat for PID ${pid} wrote to stderr`);
+  if (state.status === 1 && state.stdout === '') {
+    // ps found no such process; the kernel must agree before that means gone.
+    try { process.kill(pid, 0); } catch (error) { if (error.code === 'ESRCH') return false; throw error; }
+    throw new Error(`PID ${pid}: ps lists no process but the kernel still has one`);
+  }
+  assert.equal(state.status, 0, `ps stat for PID ${pid}: exit ${state.status}, signal ${state.signal}`);
+  return !state.stdout.trim().startsWith('Z');
+}
+const checkClosed = darwin ? darwinClosed : linuxClosed;
+const parentPID = darwin ? (pid) => psNumber('ppid', pid) : linuxParent;
+const rss = darwin ? (pid) => {
+  const kib = psNumber('rss', pid);
+  assert(kib > 0, `missing RSS for ${pid}`);
+  return kib;
+} : linuxRSS;
 
 function readinessFixture(shim) {
   const { home, state, port, child, env } = shim;
@@ -516,7 +1318,9 @@ async function measure(shim, index) {
   const { pid } = shim.child;
   assert.equal(parentPID(shim.workerPid), pid);
   const supervisorKiB = rss(pid), workerKiB = rss(shim.workerPid);
-  records.push(record('rss', { series: index, idleMs, supervisorKiB, workerKiB, sumKiB: supervisorKiB + workerKiB }));
+  // The macOS value is ps resident set size, not Linux VmRSS: the record names it.
+  records.push(record('rss', { series: index, idleMs, supervisorKiB, workerKiB, sumKiB: supervisorKiB + workerKiB,
+    ...(darwin ? { metric: 'darwin-ps-rss-kib' } : {}) }));
   sample('rss', 'end', load());
 }
 
@@ -829,20 +1633,29 @@ async function upgrade(topology) {
 
 async function main() {
   const cleanup = [], errors = [];
-  let usage;
+  let usage, canary;
   try {
+    if (darwin) {
+      canary = net.createServer();
+      await bounded(new Promise((resolve, reject) => canary.once('error', reject).listen(0, loopback, resolve)), 'listen canary');
+      canaryPort = canary.address().port;
+      checkPort(canaryPort);
+    }
     const anthropic = await fakeUpstream('anthropic', cleanup);
     const codex = await fakeUpstream('codex', cleanup);
     usage = await fakeUpstream('usage', cleanup);
     const providers = { anthropic, codex };
     const upstreams = { ...providers, usage };
-    const cores = new Set(command('lscpu', '-p=SOCKET,CORE').split('\n').filter((line) => /^\d+,\d+$/.test(line))).size;
-    assert(cores > 0, 'no processor topology from lscpu');
+    const cores = darwin ? Number(command('/usr/sbin/sysctl', '-n', 'hw.physicalcpu')) :
+      new Set(command('lscpu', '-p=SOCKET,CORE').split('\n').filter((line) => /^\d+,\d+$/.test(line))).size;
+    assert(cores > 0, darwin ? 'no core count from sysctl hw.physicalcpu' : 'no processor topology from lscpu');
     records.push(record('run', { ...run, started: date(), machine: { cpu: os.cpus()[0].model, logicalCPUs: os.cpus().length, cores,
       availableCPUs: os.availableParallelism(), memoryBytes: os.totalmem(), kernel: command('uname', '-srvm'),
       node: process.version, npm: command('npm', '--version'),
-      ajv: require(path.join(plugin, 'node_modules/ajv/package.json')).version },
-      env: envForReport(process.env), npmCache: '$WORK/npm-cache',
+      ajv: require(path.join(plugin, 'node_modules/ajv/package.json')).version,
+      ...(darwin ? { system: { version: command('/usr/bin/sw_vers', '-productVersion'), build: command('/usr/bin/sw_vers', '-buildVersion'),
+        model: command('/usr/sbin/sysctl', '-n', 'hw.model') } } : {}) },
+      env: envForReport(launchEnv), npmCache: '$WORK/npm-cache',
       providers: Object.fromEntries(Object.entries(upstreams).map(([name, fake]) => [name, fake.port])),
       responseBytes }));
     if (halfClose) {
@@ -889,6 +1702,11 @@ async function main() {
     for (const result of await Promise.allSettled(cleanup.map((close) => close()))) {
       if (result.status === 'rejected') errors.push(result.reason);
     }
+    // Every listener check that needs the canary has run.
+    if (canary?.listening) {
+      await bounded(new Promise((resolve, reject) => canary.close((err) => err ? reject(err) : resolve())), 'close canary')
+        .catch((error) => errors.push(error));
+    }
   }
   if (errors.length) throw new AggregateError(errors, 'benchmark job failed');
   // The half-close run has no fixed count of completed streams, so it records the count without asserting one.
@@ -897,26 +1715,47 @@ async function main() {
   const payload = gzipSync(records.map((r) => JSON.stringify(r)).join('\n') + '\n');
   process.stdout.write(`NODE-BENCH-V1 ${createHash('sha256').update(payload).digest('hex')} ${payload.toString('base64')}\n`);
 }
-main().catch((error) => { console.error(error); process.exitCode = 1; });
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+  if (!darwin) return;
+  // Marks the samples on disk as an incomplete attempt and says why.
+  const reasons = [error, ...(error?.errors ?? [])].map((e) => String(e?.stack ?? e));
+  try { fs.appendFileSync(partial, `${JSON.stringify(record('incomplete', { reasons }))}\n`); }
+  catch (failure) { console.error(failure); }
+});
 JS
+}
+
+# GNU timeout on Linux. macOS has none; the bounded runner there applies the
+# same limits to the command's whole process group and forwards signals.
+# shellcheck disable=SC2329
+bounded() {
+    local seconds=$1
+    shift
+    if [[ $system == Linux ]]; then
+        timeout --kill-after=1s "${seconds}s" "$@"
+    else
+        python3 -I -c "$darwin_program" bounded "$seconds" "$@"
+    fi
 }
 
 # Invoked by the EXIT trap.
 # shellcheck disable=SC2329
 cleanup() {
-    local rc=$? result='' stamp log
+    local rc=$? result='' stamp log status
     local -a logs=()
     trap '' HUP INT TERM
     if (( interrupted )) || [[ -n $work && -e $work/interrupted ]]; then rc=1; fi
     if [[ -z $work ]]; then exit "$rc"; fi
-    for log in "$work/supervisor.log" "$work/job.log"; do
+    for log in "${logs_dir:-$work}/supervisor.log" "${logs_dir:-$work}/job.log"; do
         if [[ -f $log ]]; then logs+=("$log"); fi
     done
     # The supervisor has completed containment. Deliver buffered diagnostics
     # like other venue targets, even if the remote reader delays delivery.
     if (( ${#logs[@]} )) && ! cat -- "${logs[@]}" 9<&- >&2; then rc=1; fi
     if (( rc == 0 )); then
-        if ! timeout --kill-after=1s 10s "$root/hack/venue-check" 9<&- ||
+        if ! bounded 10 "$root/hack/venue-check" 9<&- ||
            ! IFS= read -r result < "$work/result" || [[ $result != NODE-BENCH-V1\ * ]]; then
             printf 'bench: missing valid evidence or venue check failed\n' >&2
             rc=1
@@ -924,16 +1763,20 @@ cleanup() {
     fi
     # Only the benchmark's private scratch belongs to this script. The
     # remote runner retains its separate staging tree on failure for diagnosis.
-    if timeout --kill-after=1s 10s rm -rf -- "$work" 9<&- && [[ ! -e $work && ! -L $work ]]; then
+    if bounded 10 rm -rf -- "$work" 9<&- && [[ ! -e $work && ! -L $work ]]; then
         printf 'bench: removed private scratch %s\n' "$work" >&2
     else
         printf 'bench: private scratch remains: %s\n' "$work" >&2
         rc=1
     fi
-    if stamp=$(timeout --kill-after=1s 2s date -u '+%Y-%m-%dT%H:%M:%S.%NZ' 9<&-); then
+    if stamp=$(bounded 2 "${utc_stamp[@]}" 9<&-); then
         printf 'bench: run %s ended at %s (exit %s)\n' "${work##*/}" "$stamp" "$rc" >&2
     else
         rc=1
+    fi
+    if [[ -n $artifact ]]; then
+        if (( rc == 0 )); then status=complete; else status="incomplete (exit $rc)"; fi
+        printf '%s\n' "$status" > "$artifact/status" || rc=1
     fi
     if (( rc == 0 )); then printf '%s\n' "$result"; fi
     exit "$rc"
@@ -948,18 +1791,41 @@ interrupt() {
 }
 
 umask 077
+utc_stamp=(date -u '+%Y-%m-%dT%H:%M:%S.%NZ')
+scratch=${TMPDIR:-/tmp}
+supervisor=supervise_job
+if [[ $system == Darwin ]]; then
+    # BSD date has no fractional seconds.
+    # shellcheck disable=SC2016
+    utc_stamp=(perl -MPOSIX=strftime -MTime::HiRes=gettimeofday -e
+        '($s, $us) = gettimeofday; printf "%s.%06dZ\n", strftime("%Y-%m-%dT%H:%M:%S", gmtime $s), $us')
+    # The run's Unix socket lives in this directory. A macOS socket path holds
+    # at most 103 bytes, the runner's TMPDIR is long, and /tmp is a symlink.
+    scratch=/private/tmp
+    supervisor=supervise_job_darwin
+fi
 work=''
+logs_dir=''
 interrupted=0
 trap cleanup EXIT
 trap interrupt HUP INT TERM
 # Let mktemp return the path it owns even if a signal reaches the whole group.
-work=$(trap '' HUP INT TERM; exec mktemp -d "${TMPDIR:-/tmp}/gateway-bench.XXXXXXXX" 9<&-)
+work=$(trap '' HUP INT TERM; exec mktemp -d "$scratch/gateway-bench.XXXXXXXX" 9<&-)
 (( interrupted == 0 )) || exit 1
+logs_dir=$work
+if [[ $system == Darwin ]]; then
+    # The attempt's logs and partial samples go straight to the artifact
+    # directory when there is one; the evidence frame stays in the scratch.
+    logs_dir=$work/attempt
+    if [[ -n $artifact ]]; then ln -s -- "$artifact" "$logs_dir"; else mkdir -- "$logs_dir"; fi
+    printf '%s\n' "$job_name" > "$work/job-name"
+fi
 job=$(declare -f run_job)
-# The run starts only after subreaping is established. Neither the supervisor
-# nor its children inherit the remote runner's flock descriptor. Keep both
-# streams private so containment cannot wait for the output reader.
-supervise_job "$job" "$root" "$work" 9<&- > "$work/supervisor.log" 2>&1 &
+# The run starts only after subreaping (on macOS, the pre-run process
+# snapshot) is established. Neither the supervisor nor its children inherit
+# the remote runner's flock descriptor. Keep both streams private so
+# containment cannot wait for the output reader.
+"$supervisor" "$job" "$root" "$work" 9<&- > "$logs_dir/supervisor.log" 2>&1 &
 pid=$!
 rc=0
 wait "$pid" || rc=$?

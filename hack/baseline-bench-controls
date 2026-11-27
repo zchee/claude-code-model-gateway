@@ -1,0 +1,1226 @@
+#!/usr/bin/env bash
+# Copyright 2026 The claude-code-model-gateway Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Negative and positive controls for hack/baseline-bench. Every case is built by
+# mutation from the committed Linux samples in a private temporary directory;
+# the checker runs on it and must give the stated verdict. Nothing here starts
+# Node, a gateway or the bench.
+#
+#   baseline-bench-controls [--without-platform] [<checker>]
+#       <checker> defaults to hack/baseline-bench next to this script.
+#       --without-platform calls verify, check and summary without the
+#       --platform option, for a checker that predates it; the controls that exist only
+#       through that option are then listed as not expressible.
+#
+# The option is passed as `verify --platform <p> <mode> ...`,
+# `check --platform <p> <mode> ...` and `summary --platform <p> <file>`. Each control prints one line; the exit
+# status is 1 when any observed verdict differs from the expected one.
+#
+# The oversized inputs are sparse files and a gzip stream fed in chunks, so
+# building them costs neither disk nor memory here. A checker run gets a
+# deadline and is killed with its process group when it passes it; its peak
+# resident memory, including its own children, comes from wait4.
+
+set -euo pipefail
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
+python3 -I - "$root" "$@" <<'PY'
+import base64
+import copy
+import gzip
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import struct
+import sys
+import tempfile
+import time
+import zlib
+from pathlib import Path
+
+ROOT = Path(sys.argv[1])
+SAMPLES = ROOT / 'docs/port/baseline-node-samples'
+SAMPLE_SHA256 = {
+    'measurements.jsonl': '0302b95c4e24deb34837666db3ec1e92535f3aeaddc4447567800b790def2873',
+    'half-close.jsonl': 'a057e7df72405860774cd6e6f3de3e5ef5e2b2e17dfb599b4a2ea49c75cf9b8f',
+}
+# A run's decoded records are about 80 KiB, its frame line less. An input of
+# this size is far above any cap a checker can reasonably set, and a checker
+# that keeps it in memory shows a peak far above the bound below.
+OVERSIZE = 768 << 20
+RSS_BOUND = 256 << 20
+DEADLINE = 60
+OVERSIZE_DEADLINE = 120
+# A FIFO without a writer blocks a plain open for reading; a checker that refuses it does so at once.
+FIFO_DEADLINE = 10
+# Caps of the corrected checker as its lane reports them: the run output and a records file 16 MiB, the base64
+# text of one frame 12 MiB. A frame between the two tests the frame cap on its own.
+RUN_OUTPUT_CAP = 16 << 20
+FRAME_CAP = 12 << 20
+DECODED_CAP = 64 << 20
+# A growing input is extended this much per poll of the checker, up to the limit; the file stays sparse.
+GROWTH_STEP = 8 << 20
+GROWTH_LIMIT = 2 << 30
+EMPTY_SHA256 = hashlib.sha256(b'').hexdigest()
+# Platform fields of a macOS run, as hack/bench writes them on Darwin.
+DARWIN_KERNEL = ('Darwin 27.3.0 Darwin Kernel Version 27.3.0: Fri Oct 30 02:00:17 PDT 2026; '
+                 'root:xnu-13432.60.57~99/RELEASE_ARM64_VMAPPLE arm64')
+DARWIN_COMMANDS = {
+    'run': 'make -- bench',
+    'status': './hack/venue-attest-ci, then ./hack/venue-check before and after the run',
+    'date': 'perl -MPOSIX=strftime -MTime::HiRes=gettimeofday -e '
+            '\'($s, $us) = gettimeofday; printf "%s.%06dZ", strftime("%Y-%m-%dT%H:%M:%S", gmtime $s), $us\'',
+    'CPU': 'sysctl -n hw.physicalcpu',
+    'listeners': '/usr/sbin/lsof -nP -iTCP:$CANARY,$PORT -sTCP:LISTEN -Fpfn '
+                 '(exit 0, no stderr, the harness canary listener present)',
+    'job': 'node-baseline-darwin job of .github/workflows/test.yaml on the hosted xcode-27 runner',
+    'parent': 'ps -o ppid= -p $PID',
+    'rss': 'ps -o rss= -p $PID (resident set size in KiB as macOS ps reports it; not Linux VmRSS)',
+    'liveness': 'kill -0 $PID; a process that answers and ps -o stat= -p $PID shows as a zombie has exited',
+    'system': 'sw_vers -productVersion; sw_vers -buildVersion; sysctl -n hw.model',
+}
+DARWIN_MACHINE = {
+    'cpu': 'Apple M1 (Virtual)', 'logicalCPUs': 3, 'cores': 3, 'availableCPUs': 3,
+    'memoryBytes': 7516192768, 'kernel': DARWIN_KERNEL,
+    'system': {'version': '26.1', 'build': '25B78', 'model': 'VirtualMac2,1'},
+}
+DARWIN_RSS = 'darwin-ps-rss-kib'
+# What the macOS supervisor observed while it swept for the run's processes.
+OBSERVATIONS = {
+    'sweep': 'marked, grouped and descendant processes of the job: none observed',
+    'consecutiveEmptyScans': 3,
+    'scanIntervalMs': 100,
+    'observedDuringCleanup': 0,
+    'signaled': 0,
+    'preRunProcesses': 412,
+}
+OBSERVATION_COUNTS = ('consecutiveEmptyScans', 'scanIntervalMs', 'observedDuringCleanup', 'signaled', 'preRunProcesses')
+HALF_CLOSE_NULLABLE = ('head', 'statusLine', 'framing', 'terminated', 'framingError')
+HALF_CLOSE_FIN = ('client-end-call', 'client-write-side-finished', 'client-input-end', 'client-close')
+# Launch-environment maps: the variables the harness handed to a child it launched, recorded as exactly these
+# names per kind of record. Each entry: record type, member, declared names, the modes that carry it, the record
+# that a control changes (not the first of its kind) and the declared name a control removes.
+RUN_ENV = frozenset(('HOME', 'LC_ALL', 'MODEL_GATEWAY_BENCH_RUN', 'PATH', 'TMPDIR'))
+GATEWAY_ENV = RUN_ENV | {'CODEX_GATEWAY_' + k for k in ('ANTHROPIC_UPSTREAM', 'CLAUDE_BIN', 'COMPAT_PORT', 'HOSTS_FILE',
+                                                       'PORT', 'PROXY_PORT', 'SOCKET_PATH', 'USAGE_ENDPOINT',
+                                                       'WORKER_PORT')}
+READINESS_ENV = GATEWAY_ENV | {'ANTHROPIC_BASE_URL'}
+ENV_MAPS = (
+    ('run', 'env', RUN_ENV, ('full', 'half-close'), {}, 'MODEL_GATEWAY_BENCH_RUN'),
+    ('environment', 'supervisor', GATEWAY_ENV, ('full',), {'series': 3}, 'CODEX_GATEWAY_CLAUDE_BIN'),
+    # Without ANTHROPIC_BASE_URL the readiness map is exactly the supervisor's: a check against the wrong set passes it.
+    ('environment', 'readiness', READINESS_ENV, ('full',), {'series': 3}, 'ANTHROPIC_BASE_URL'),
+    ('probe-environment', 'gateway', GATEWAY_ENV, ('full', 'half-close'), {'topology': 'relayed'},
+     'CODEX_GATEWAY_CLAUDE_BIN'),
+)
+ENV_NAME = re.compile(r'[A-Z_][A-Z0-9_]*\Z')
+# macOS adds this variable to the environment of every process it starts.
+CF_ENCODING = '__CF_USER_TEXT_ENCODING'
+CF_VALUE = 'cfValue8d1a'
+EXTRA_NAME, EXTRA_VALUE = 'BENCH_CONTROL_EXTRA', 'extraValue4c2b'
+# A refusal names the extra key and never prints its value; no control or file name holds either.
+LEAK_VALUE = 'LeakProbe9f3e2a7c'
+# A value of the wrong type for one declared name per map; the number and the list item are distinctive, so their
+# absence from the checker's output can be checked.
+WRONG_TYPE_NAME = {('run', 'env'): 'TMPDIR', ('environment', 'supervisor'): 'CODEX_GATEWAY_PORT',
+                   ('environment', 'readiness'): 'ANTHROPIC_BASE_URL',
+                   ('probe-environment', 'gateway'): 'CODEX_GATEWAY_HOSTS_FILE'}
+WRONG_TYPES = (('number', 48151623, '48151623'), ('null', None, None), ('list', ['ListProbe2b7d'], 'ListProbe2b7d'))
+# Job labels for --job: the committed Linux samples carry none, the macOS frame carries the bench's own text.
+JOB = 'node-baseline-linux'
+OTHER_JOB = 'node-baseline-other'
+
+
+def fail(reason):
+    sys.exit('baseline-bench-controls: ' + reason)
+
+
+def containment_sentence():
+    # The plan states the contract once, in curly quotes, wrapped across lines.
+    text = (ROOT / 'docs/port/model-gateway-go-port.md').read_text(encoding='utf-8')
+    found = re.findall(r'records the result as “([^”]+)”', text)
+    if len(found) != 1:
+        fail(f'the plan states the macOS containment contract {len(found)} times, expected once')
+    return ' '.join(found[0].split())
+
+
+def load(name):
+    raw = (SAMPLES / name).read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != SAMPLE_SHA256[name]:
+        fail(f'{name} has SHA-256 {digest}, not the one docs/port/baseline-node.md records')
+    return raw, [json.loads(line) for line in raw.split(b'\n')[:-1]]
+
+
+def encode(records):
+    # The committed samples are exactly this serialization of their records.
+    return b''.join((json.dumps(r, ensure_ascii=False, separators=(',', ':')) + '\n').encode() for r in records)
+
+
+def frame_line(payload):
+    return b'NODE-BENCH-V1 ' + hashlib.sha256(payload).hexdigest().encode() + b' ' + base64.b64encode(payload) + b'\n'
+
+
+def run_output(raw):
+    return payload_output(gzip.compress(raw, mtime=0))
+
+
+def payload_output(payload):
+    return b'bench: launching the pinned harness\n' + frame_line(payload) + b'bench: subreaper has no remaining children\n'
+
+
+def two_members(raw):
+    # Both halves end at a record boundary; a reader that joins members sees the whole run.
+    middle = raw.index(b'\n', len(raw) // 2) + 1
+    return gzip.compress(raw[:middle], mtime=0) + gzip.compress(raw[middle:], mtime=0)
+
+
+def padded_member(raw, encoded):
+    # One gzip member whose header comment (FCOMMENT) pads its base64 text to encoded bytes; it still decodes to raw.
+    packer = zlib.compressobj(9, zlib.DEFLATED, -15)
+    body = packer.compress(raw) + packer.flush()
+    trailer = struct.pack('<II', zlib.crc32(raw), len(raw) & 0xffffffff)
+    fixed = 10 + 1 + len(body) + len(trailer)
+    header = b'\x1f\x8b\x08\x10' + bytes(4) + b'\x00\xff'
+    return header + b'x' * (encoded * 3 // 4 - fixed) + b'\x00' + body + trailer
+
+
+def with_literal(records, path, literal):
+    # json.dumps cannot write an overflowing literal such as 1e999, so a marker string stands in for it.
+    records = copy.deepcopy(records)
+    target = records[0]
+    for k in path[:-1]:
+        target = target[k]
+    target[path[-1]] = '\u0000literal'
+    return encode(records).replace(b'"\\u0000literal"', literal, 1)
+
+
+def of_type(records, kind):
+    return [r for r in records if r['type'] == kind]
+
+
+def first(records, kind, **match):
+    for r in records:
+        if r['type'] == kind and all(r.get(k) == v for k, v in match.items()):
+            return r
+    fail(f'no {kind} record matches {match}')
+
+
+def end_record(records):
+    return first(records, 'end')
+
+
+def darwinize(records, sentence):
+    records = copy.deepcopy(records)
+    run = records[0]
+    # A macOS run takes its UTC stamps from perl, to the microsecond.
+    for r in records:
+        for k in ('started', 'ended', 'at'):
+            if isinstance(r.get(k), str):
+                r[k] = re.sub(r'(\.[0-9]{6})[0-9]{3}Z$', r'\1Z', r[k])
+    run['commands'].update(DARWIN_COMMANDS)
+    run['machine'].update(copy.deepcopy(DARWIN_MACHINE))
+    for r in of_type(records, 'rss'):
+        r['metric'] = DARWIN_RSS
+    records.append({'type': 'cleanup', 'checked': '2026-11-27T12:00:00.000000Z', 'containment': sentence,
+                    'observations': copy.deepcopy(OBSERVATIONS)})
+    return records
+
+
+# Mutations of the full run. Each returns new records and changes only what
+# its name says; dependent totals (usage posts) follow the change truthfully.
+
+def fewer_series(records):
+    records = [r for r in copy.deepcopy(records) if r.get('series') != 3]
+    s = records[0]['settings']
+    s['series'] = 2
+    end_record(records)['usagePosts'] = s['series'] * (s['warmups'] + s['ttfbRuns'])
+    return records
+
+
+def fewer_samples(kind, field):
+    def mutate(records):
+        records = copy.deepcopy(records)
+        s = records[0]['settings']
+        last = s['warmups'] + s[field] - 1
+        records = [r for r in records if not (r['type'] == kind and r['sample'] == last)]
+        records[0]['settings'][field] -= 1
+        s = records[0]['settings']
+        end_record(records)['usagePosts'] = s['series'] * (s['warmups'] + s['ttfbRuns'])
+        return records
+    return mutate
+
+
+def no_warmup(records):
+    records = [r for r in copy.deepcopy(records) if not (r['type'] in ('readiness', 'ttfb') and r['warmup'])]
+    for r in records:
+        if r['type'] in ('readiness', 'ttfb'):
+            r['sample'] -= 1
+    s = records[0]['settings']
+    s['warmups'] = 0
+    end_record(records)['usagePosts'] = s['series'] * s['ttfbRuns']
+    return records
+
+
+def shorter_idle(records):
+    records = copy.deepcopy(records)
+    records[0]['settings']['idleMs'] = 30000
+    for r in of_type(records, 'rss'):
+        r['idleMs'] -= 30000
+    return records
+
+
+def rss_missing(records):
+    return [r for r in copy.deepcopy(records) if not (r['type'] == 'rss' and r['series'] == 3)]
+
+
+def disconnect_missing(records):
+    victim = first(records, 'disconnect', topology='relayed', model='claude-gpt-5.6-sol', stage='mid-stream')
+    return [r for r in copy.deepcopy(records) if r != victim]
+
+
+def drop_field(kind, field, **match):
+    def mutate(records):
+        records = copy.deepcopy(records)
+        del first(records, kind, **match)[field]
+        return records
+    return mutate
+
+
+def empty_values(kind, keys, **match):
+    def mutate(records):
+        records = copy.deepcopy(records)
+        r = first(records, kind, **match)
+        for k in r:
+            if k not in keys:
+                r[k] = type(r[k])()
+        return records
+    return mutate
+
+
+def upgrade_head(make):
+    def mutate(records):
+        records = copy.deepcopy(records)
+        r = first(records, 'upgrade', topology='relayed')
+        r['head'] = make(r['head'])
+        return records
+    return mutate
+
+
+def set_run(path, value):
+    def mutate(records):
+        records = copy.deepcopy(records)
+        target = records[0]
+        for k in path[:-1]:
+            target = target[k]
+        target[path[-1]] = value
+        return records
+    return mutate
+
+
+def flip_hex(value):
+    return value[:-1] + ('0' if value[-1] != '0' else '1')
+
+
+def duplicate_record(records):
+    records = copy.deepcopy(records)
+    i = records.index(first(records, 'ttfb', series=2, sample=7))
+    return records[:i + 1] + [copy.deepcopy(records[i])] + records[i + 1:]
+
+
+def set_field(kind, field, value, **match):
+    def mutate(records):
+        records = copy.deepcopy(records)
+        first(records, kind, **match)[field] = value
+        return records
+    return mutate
+
+
+def boolean_rss(records):
+    records = copy.deepcopy(records)
+    r = first(records, 'rss', series=2)
+    r['supervisorKiB'] = True
+    r['sumKiB'] = r['workerKiB'] + 1
+    return records
+
+
+def nan_load(records):
+    records = copy.deepcopy(records)
+    first(records, 'load', series=2, action='ttfb', boundary='end')['averages'][0] = float('nan')
+    return records
+
+
+# Mutations of the half-close run.
+
+def fewer_repetitions(records):
+    records = copy.deepcopy(records)
+    h = records[0]['halfCloseSettings']
+    records = [r for r in records if not (r['type'] == 'half-close' and r['run'] == h['runs'])]
+    h['runs'] -= 1
+    end_record(records)['usagePosts'] = len(of_type(records, 'half-close'))
+    return records
+
+
+HALF = {'scenario': 'answer-pending', 'clientKind': 'half-close', 'run': 1}
+
+
+def half_close_no_outcome(records):
+    records = copy.deepcopy(records)
+    r = first(records, 'half-close', **HALF)
+    for k in ('outcome', 'outcomeEvent', 'outcomeMs'):
+        del r['provider'][k]
+    del r['client']['end']
+    return records
+
+
+def half_close_no_fin(records):
+    records = copy.deepcopy(records)
+    r = first(records, 'half-close', **HALF)
+    r['events'] = [e for e in r['events'] if e['event'] not in HALF_CLOSE_FIN]
+    for k in ('inputEndMs', 'closeMs'):
+        del r['client'][k]
+    return records
+
+
+def rule_breaks(record):
+    """Name the half-close client rules the record breaks."""
+    c, broken = record['client'], set()
+    errors = [e for e in record['events'] if e['event'] == 'client-error']
+    if c['errorCode'] != (errors[-1].get('code') if errors else None):
+        broken.add('error-code')
+    if any(not isinstance(e.get('code'), str) for e in errors):
+        broken.add('error-code-type')
+    if c['errorCode'] == 'ECONNRESET':
+        end = 'reset'
+    elif c['errorCode'] is not None:
+        end = 'error'
+    else:
+        end = 'orderly' if c['inputEndMs'] is not None else 'open'
+    if c['end'] != end:
+        broken.add('end')
+    complete = bool(c['bodyMatches'] and c['framingError'] is None and c['terminated'] is not False and
+                    (c['terminated'] is True or c['end'] == 'orderly'))
+    if c['bodyComplete'] is not complete:
+        broken.add('body-complete')
+    if c['head'] is None:
+        if (c['framing'], c['bodyBytes'], c['terminated'], c['framingError'], c['excessBytes'], c['bodyMatches']) != \
+                (None, 0, False, None, 0, False) or c['terminated'] is not False or c['bodyMatches'] is not False:
+            broken.add('head')
+    elif c['framing'] is None or c['statusLine'] != c['head'].split('\r\n', 1)[0]:
+        broken.add('head')
+    if c['head'] is None and c['wireBytes'] > 0 and not isinstance(c['statusLine'], str):
+        broken.add('head')
+    if (c['framing'] == 'close') != (c['terminated'] is None):
+        broken.add('close-framing')
+    if c['wireBytes'] == 0 and (c['statusLine'] is not None or c['head'] is not None or c['wireSHA256'] != EMPTY_SHA256):
+        broken.add('empty-wire')
+    return broken
+
+
+def contradiction(rule, match, *changes):
+    # Changes to one committed record that break exactly the named rules (none for a consistent variant).
+    def mutate(records):
+        records = copy.deepcopy(records)
+        r = first(records, 'half-close', **match)
+        for change in changes:
+            change(r)
+        if rule_breaks(r) != ({rule} if rule else set()):
+            fail(f'the {rule or "consistent"} variant breaks {sorted(rule_breaks(r))}')
+        return records
+    return mutate
+
+
+def error_event(**fields):
+    def change(record):
+        record['events'].append(dict({'event': 'client-error', 'offsetMs': record['events'][-1]['offsetMs'] + 1},
+                                     **fields))
+    return change
+
+
+PARTIAL_WIRE = b'\r\n'
+
+
+def partial_wire(record):
+    # The client received two bytes and no complete head: the wire, its digest, its data event and first byte agree.
+    c = record['client']
+    at = next(i for i, e in enumerate(record['events']) if e['event'] == 'client-input-end')
+    offset = (record['events'][at - 1]['offsetMs'] + record['events'][at]['offsetMs']) / 2
+    record['events'].insert(at, {'event': 'client-data', 'bytes': len(PARTIAL_WIRE), 'offsetMs': offset})
+    c.update(wireBytes=len(PARTIAL_WIRE), wireSHA256=hashlib.sha256(PARTIAL_WIRE).hexdigest(),
+             statusLine=PARTIAL_WIRE.decode('latin1').split('\r\n')[0], firstByteMs=offset)
+
+
+def client_error(record):
+    record['events'].append({'event': 'client-error', 'code': 'ECONNRESET',
+                             'offsetMs': record['events'][-1]['offsetMs'] + 1})
+
+
+def pad_record(raw, size):
+    # JSON allows whitespace between tokens: spaces after the first brace make the records exactly size bytes.
+    if size < len(raw):
+        fail(f'cannot pad {len(raw)} bytes down to {size}')
+    return raw[:1] + b' ' * (size - len(raw)) + raw[1:]
+
+
+def pad_output(output, size):
+    # Log lines in front of the frame make a run output exactly size bytes.
+    missing = size - len(output)
+    lines = []
+    while missing:
+        n = min(missing, 1 << 20)
+        if missing - n == 1:
+            n -= 1
+        if n < 2:
+            fail(f'cannot pad a run output to {size} bytes')
+        lines.append(b'bench: ' [:n - 1].ljust(n - 1, b'.') + b'\n')
+        missing -= n
+    return b''.join(lines) + output
+
+
+def grower(path):
+    # Extends the file, as a writer appending zeros would, until the limit.
+    def tick():
+        size = path.stat().st_size
+        if size < GROWTH_LIMIT:
+            os.truncate(path, min(size + GROWTH_STEP, GROWTH_LIMIT))
+    return tick
+
+
+def unchanged(path, data, link=None):
+    def post():
+        if link is not None and not os.path.islink(link):
+            return 'replaced-the-symlink'
+        if data is None:
+            return 'created-the-target' if os.path.lexists(path) else None
+        return None if path.read_bytes() == data else 'changed-the-file'
+    return post
+
+
+def drop_client(field):
+    # The record whose client fields are explicit nulls (and terminated false) in the committed run.
+    def mutate(records):
+        records = copy.deepcopy(records)
+        del first(records, 'half-close', **HALF)['client'][field]
+        return records
+    return mutate
+
+
+def retype(field, cast):
+    def mutate(records):
+        r = records[-1]['observations']
+        r[field] = cast(r[field])
+    return mutate
+
+
+def without_cleanup(records):
+    return [r for r in records if r['type'] != 'cleanup']
+
+
+def reworded(records):
+    records = copy.deepcopy(records)
+    r = records[-1]
+    r['containment'] = r['containment'].replace('not proven', 'is not proven')
+    return records
+
+
+def duplicate_member(raw):
+    # The second member wins in a parser that keeps the last one.
+    lines = raw.split(b'\n')
+    for i, line in enumerate(lines):
+        if line.startswith(b'{"type":"ttfb","series":2,"sample":9,'):
+            lines[i] = line.replace(b'"ttfbMs":', b'"ttfbMs":-1,"ttfbMs":', 1)
+            return b'\n'.join(lines)
+    fail('no ttfb record for the duplicated member')
+
+
+def check_env_maps(name, records, mode):
+    """Stop unless every declared map holds exactly its names and no other record member looks like one."""
+    declared = {(kind, member): names for kind, member, names, modes, _, _ in ENV_MAPS if mode in modes}
+    seen = dict.fromkeys(declared, 0)
+
+    def walk(kind, path, value):
+        if isinstance(value, dict):
+            if value and all(ENV_NAME.match(k) for k in value) and (kind, path) not in declared:
+                fail(f'{name}: {kind} member {path} looks like an environment map of {len(value)} names, not declared')
+            for k, v in value.items():
+                walk(kind, f'{path}.{k}' if path else k, v)
+        elif isinstance(value, list):
+            for v in value:
+                walk(kind, path + '[]', v)
+
+    for r in records:
+        walk(r['type'], '', r)
+        for (kind, member), names in declared.items():
+            if r['type'] != kind:
+                continue
+            env = r.get(member)
+            keys = set(env) if isinstance(env, dict) else set()
+            if keys != names:
+                fail(f'{name}: one {kind} record has {len(keys)} names in {member}, not the {len(names)} declared '
+                     f'(extra {sorted(keys - names)}, missing {sorted(names - keys)})')
+            seen[kind, member] += 1
+    for (kind, member), count in seen.items():
+        if not count:
+            fail(f'{name}: no {kind} record carries {member}')
+
+
+def env_change(kind, member, match, add=None, remove=None):
+    # One map of one record gains the names in add or loses the name remove.
+    def mutate(records):
+        records = copy.deepcopy(records)
+        env = first(records, kind, **match)[member]
+        env.update(add or {})
+        if remove is not None:
+            del env[remove]
+        return records
+    return mutate
+
+
+def names_key_not_value(key, value):
+    # Checks the checker's stdout (bytes) and stderr (text); a value of None is only required to be refused.
+    def says(stdout, stderr, observed):
+        text = stdout.decode('utf-8', 'replace') + stderr
+        if value is not None and value in text:
+            return 'printed-the-value'
+        if observed == 'refuse' and key not in text:
+            return 'did-not-name-the-key'
+        return None
+    return says
+
+
+def names_labels(*labels):
+    # A job-label refusal names the expected label and, when the record has one, the recorded label.
+    def says(stdout, stderr, observed):
+        text = stdout.decode('utf-8', 'replace') + stderr
+        if observed == 'refuse' and not all(label in text for label in labels):
+            return 'did-not-name-the-labels'
+        return None
+    return says
+
+
+def no_file(path):
+    # The file must not exist after the run; one the checker created is removed.
+    def post():
+        if os.path.lexists(path):
+            os.unlink(path)
+            return 'created-the-file'
+        return None
+    return post
+
+
+def wrote(path, data):
+    # The file must exist as a plain file holding data; it is removed afterwards.
+    def post():
+        if not os.path.lexists(path):
+            return 'did-not-create-the-file'
+        right = not os.path.islink(path) and path.read_bytes() == data
+        os.unlink(path)
+        return None if right else 'wrote-wrong-output'
+    return post
+
+
+def with_job(records, *job):
+    # The run record's commands.job set to job[0], or removed when no job is given.
+    records = copy.deepcopy(records)
+    commands = records[0]['commands']
+    commands.pop('job', None)
+    if job:
+        commands['job'] = job[0]
+    return records
+
+
+class Runner:
+    def __init__(self, checker, with_platform, work):
+        self.checker = checker
+        self.with_platform = with_platform
+        self.work = work
+        self.results = {}
+        self.differ = 0
+        self.inexpressible = []
+        self.count = 0
+
+    def argv(self, sub, mode, platform, files, platform_last=False, job=None, job_at='after-platform'):
+        # --job <name> goes directly after --platform <p>; job_at places it elsewhere for the usage-error controls.
+        option = ['--platform', platform] if platform is not None else []
+        label = ['--job', job] if job is not None else []
+        head = {'after-platform': option + label, 'before-platform': label + option, 'after-mode': option}[job_at]
+        tail = label if job_at == 'after-mode' else []
+        args = [self.checker, sub] + ([] if platform_last else head) + ([mode] if mode is not None else []) + tail
+        return args + [str(f) for f in files] + (option if platform_last else [])
+
+    def spawn(self, args, deadline, tick=None, cwd=None):
+        out, err = self.work / 'stdout', self.work / 'stderr'
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        actions = [(os.POSIX_SPAWN_OPEN, 0, os.devnull, os.O_RDONLY, 0),
+                   (os.POSIX_SPAWN_OPEN, 1, str(out), flags, 0o600),
+                   (os.POSIX_SPAWN_OPEN, 2, str(err), flags, 0o600)]
+        # posix_spawn has no working-directory argument; the child inherits this process's, set only for the call.
+        here = os.getcwd()
+        os.chdir(cwd or here)
+        try:
+            pid = os.posix_spawn(args[0], args, dict(os.environ), file_actions=actions, setsid=True)
+        finally:
+            os.chdir(here)
+        limit = time.monotonic() + deadline
+        timed_out = False
+        while True:
+            done, status, usage = os.wait4(pid, os.WNOHANG)
+            if done:
+                break
+            if tick is not None:
+                tick()
+            if time.monotonic() > limit and not timed_out:
+                timed_out = True
+                os.killpg(pid, signal.SIGKILL)
+            time.sleep(0.02)
+        # ru_maxrss is in bytes on macOS and in KiB on Linux.
+        peak = usage.ru_maxrss if sys.platform == 'darwin' else usage.ru_maxrss * 1024
+        return (os.waitstatus_to_exitcode(status), out.read_bytes(), err.read_bytes().decode('utf-8', 'replace'), peak,
+                timed_out)
+
+    def control(self, name, expect, sub, mode, platform, files, witness=(), raw=None, rss_bound=None, deadline=DEADLINE,
+                post=None, tick=None, platform_last=False, says=None, job=None, job_at='after-platform', cwd=None):
+        """Run one control; platform None means the option is deliberately left out.
+
+        post, when given, runs after the checker and names what the checker changed that it must not have; tick runs
+        on every poll while the checker is alive; platform_last puts the option after the files. summary takes the
+        option but no mode. says, when given, reads the checker's stdout and stderr and names what they must or must
+        not have held. job passes --job, which exists only beside --platform; job_at moves it (see argv). cwd is
+        the checker's working directory (this script's own by default).
+        """
+        self.count += 1
+        if not self.with_platform:
+            if (platform is None or platform == 'unknown' or name.startswith('platform-') or platform_last or
+                    job is not None):
+                self.inexpressible.append(name)
+                print(f'control {name}: expected {expect}, not expressible without --platform')
+                return
+            platform = None
+        elif platform == 'unknown':
+            platform = 'windows'
+        out_file = None
+        if raw is not None:
+            out_file = self.work / f'{name}.decoded.jsonl'
+            files = list(files) + [out_file]
+        args = self.argv(sub, mode, platform, files, platform_last, job, job_at)
+        rc, stdout, stderr, peak, timed_out = self.spawn(args, deadline, tick, cwd)
+        reason = next((line for line in stderr.splitlines() if line.strip()), '')
+        if timed_out:
+            observed = 'timeout'
+        elif 'Traceback (most recent call last)' in stderr:
+            observed = 'crash'
+            reason = stderr.strip().splitlines()[-1]
+        elif rc == 0:
+            observed = 'pass'
+            if out_file is not None and (not out_file.exists() or out_file.read_bytes() != raw):
+                observed = 'pass-with-wrong-output'
+            if sub == 'summary' and not stdout.strip():
+                observed = 'pass-without-output'
+        elif rss_bound is not None and peak >= rss_bound:
+            observed = 'refuse-after-reading'
+        else:
+            observed = 'refuse'
+        damage = post() if post is not None else None
+        missing = [w for w in witness if self.results.get(w) != 'pass']
+        if not damage and says is not None:
+            # A refusal without its passing positive is unproven, so its wording is not judged; a leak always is.
+            damage = says(stdout, stderr, 'unproven' if missing and observed == 'refuse' else observed)
+            if damage == 'printed-the-value':
+                reason = 'the injected value appears in the checker output'
+        if damage:
+            observed += '-but-' + damage
+        if expect == 'refuse' and observed == 'refuse':
+            if missing:
+                observed = 'unproven'
+                reason = f'no passing positive with the same argument shape: {", ".join(missing)}'
+        self.results[name] = observed
+        detail = f'; peak {peak / 2**20:.0f} MiB' if rss_bound is not None else ''
+        mark = '' if observed == expect else ' DIFFERS'
+        print(f'control {name}: expected {expect}, observed {observed}{mark} (rc {rc}{detail}; {reason[:160]})')
+        if observed != expect:
+            self.differ += 1
+
+
+def sparse(path, head, size):
+    with open(path, 'wb') as file:
+        file.write(head)
+        file.truncate(size)
+
+
+def bomb(path, head, size):
+    # A valid frame whose payload decompresses to size bytes.
+    packer = zlib.compressobj(9, zlib.DEFLATED, 31)
+    chunks = [packer.compress(head)]
+    block = bytes(1 << 20)
+    for _ in range((size - len(head)) // len(block)):
+        chunks.append(packer.compress(block))
+    chunks.append(packer.flush())
+    path.write_bytes(frame_line(b''.join(chunks)))
+
+
+def main():
+    args = sys.argv[2:]
+    with_platform = True
+    if args[:1] == ['--without-platform']:
+        with_platform = False
+        args = args[1:]
+    if len(args) > 1 or (args and args[0].startswith('-')):
+        fail('usage: baseline-bench-controls [--without-platform] [<checker>]')
+    checker = str(Path(args[0]).resolve()) if args else str(ROOT / 'hack/baseline-bench')
+    if not os.access(checker, os.X_OK):
+        fail(f'{checker} is not executable')
+    sentence = containment_sentence()
+    full_raw, full = load('measurements.jsonl')
+    half_raw, half = load('half-close.jsonl')
+    for r in of_type(half, 'half-close'):
+        if rule_breaks(r):
+            fail(f'committed half-close record {r["scenario"]}/{r["clientKind"]}/{r["run"]} breaks {sorted(rule_breaks(r))}')
+    # The committed half-close run is itself the positive with explicit nulls; it holds none for terminated.
+    nulls = {k for r in of_type(half, 'half-close') for k in HALF_CLOSE_NULLABLE if r['client'][k] is None}
+    if nulls != set(HALF_CLOSE_NULLABLE) - {'terminated'}:
+        fail(f'the committed half-close run has explicit nulls for {sorted(nulls)}')
+    darwin_full, darwin_half = darwinize(full, sentence), darwinize(half, sentence)
+    # The positives carry exactly the declared launch-environment names, on both platforms.
+    for name, recs, mode in (('measurements.jsonl', full, 'full'), ('half-close.jsonl', half, 'half-close'),
+                             ('the macOS full run', darwin_full, 'full'),
+                             ('the macOS half-close run', darwin_half, 'half-close')):
+        check_env_maps(name, recs, mode)
+    work = Path(tempfile.mkdtemp(prefix='baseline-bench-controls.'))
+    try:
+        run = Runner(checker, with_platform, work)
+
+        def put(name, data):
+            path = work / name
+            path.write_bytes(data)
+            return path
+
+        def records(name, recs):
+            return put(name + '.jsonl', encode(recs))
+
+        def frame(name, recs):
+            return put(name + '.out', run_output(encode(recs)))
+
+        linux_full = put('measurements.jsonl', full_raw)
+        linux_half = put('half-close.jsonl', half_raw)
+        linux_full_out = put('measurements.out', run_output(full_raw))
+        linux_half_out = put('half-close.out', run_output(half_raw))
+        mac_full = frame('darwin-measurements', darwin_full)
+        mac_half = frame('darwin-half-close', darwin_half)
+        c = run.control
+
+        # Positives: the committed Linux samples and a macOS frame derived from them.
+        c('linux-check-full', 'pass', 'check', 'full', 'linux', [linux_full])
+        c('linux-check-half-close', 'pass', 'check', 'half-close', 'linux', [linux_half])
+        c('linux-verify-full', 'pass', 'verify', 'full', 'linux', [linux_full_out], raw=full_raw)
+        c('linux-verify-half-close', 'pass', 'verify', 'half-close', 'linux', [linux_half_out], raw=half_raw)
+        c('darwin-verify-full', 'pass', 'verify', 'full', 'darwin', [mac_full], raw=encode(darwin_full))
+        c('darwin-verify-half-close', 'pass', 'verify', 'half-close', 'darwin', [mac_half], raw=encode(darwin_half))
+        c('darwin-check-full', 'pass', 'check', 'full', 'darwin', [records('darwin-measurements', darwin_full)])
+
+        # The platform option.
+        c('platform-linux-frame-as-darwin-full', 'refuse', 'verify', 'full', 'darwin', [linux_full_out],
+          witness=('darwin-verify-full', 'linux-verify-full'))
+        c('platform-linux-frame-as-darwin-half-close', 'refuse', 'verify', 'half-close', 'darwin', [linux_half_out],
+          witness=('darwin-verify-half-close', 'linux-verify-half-close'))
+        c('platform-linux-records-as-darwin', 'refuse', 'check', 'full', 'darwin', [linux_full],
+          witness=('darwin-check-full', 'linux-check-full'))
+        c('platform-darwin-frame-as-linux', 'refuse', 'verify', 'full', 'linux', [mac_full],
+          witness=('darwin-verify-full', 'linux-verify-full'))
+        c('platform-missing-verify', 'refuse', 'verify', 'full', None, [linux_full_out], witness=('linux-verify-full',))
+        c('platform-missing-check', 'refuse', 'check', 'full', None, [linux_full], witness=('linux-check-full',))
+        c('platform-unknown', 'refuse', 'check', 'full', 'unknown', [linux_full], witness=('linux-check-full',))
+
+        # Content of the full run, through check with the Linux platform.
+        full_cases = (
+            ('reduced-series', fewer_series),
+            ('reduced-readiness-samples', fewer_samples('readiness', 'readinessRuns')),
+            ('reduced-ttfb-samples', fewer_samples('ttfb', 'ttfbRuns')),
+            ('reduced-warmups', no_warmup),
+            ('reduced-idle', shorter_idle),
+            ('rss-observation-missing', rss_missing),
+            ('disconnect-case-missing', disconnect_missing),
+            ('disconnect-without-client', drop_field('disconnect', 'client', topology='direct', stage='mid-stream',
+                                                     model='claude-sonnet-4-6')),
+            ('disconnect-without-provider', drop_field('disconnect', 'provider', topology='relayed', stage='headers-only',
+                                                       model='claude-gpt-5.6-sol')),
+            ('load-empty-values', empty_values('load', ('type', 'series', 'action', 'boundary'),
+                                               series=1, action='rss', boundary='end')),
+            ('environment-empty-values', empty_values('environment', ('type', 'series'), series=2)),
+            ('upgrade-status-line-only', upgrade_head(lambda head: head.split('\r\n', 1)[0])),
+            ('upgrade-headers-differ', upgrade_head(lambda head: head.rsplit('\r\n', 1)[0])),
+            ('node-version-wrong', set_run(('machine', 'node'), 'v24.11.0')),
+            ('pinned-tree-wrong', set_run(('rootTree',), flip_hex(full[0]['rootTree']))),
+            ('record-duplicated', duplicate_record),
+            ('boolean-series', set_field('readiness', 'series', True, series=1, sample=3)),
+            ('boolean-rss-kib', boolean_rss),
+            ('nan-load-average', nan_load),
+            ('infinity-idle', set_field('rss', 'idleMs', float('inf'), series=1)),
+        )
+        for name, mutate in full_cases:
+            c(name, 'refuse', 'check', 'full', 'linux', [records(name, mutate(full))], witness=('linux-check-full',))
+        c('member-duplicated', 'refuse', 'check', 'full', 'linux', [put('member-duplicated.jsonl', duplicate_member(full_raw))],
+          witness=('linux-check-full',))
+
+        # Content of the half-close run.
+        half_cases = tuple((f'half-close-without-client-{k}', drop_client(k)) for k in HALF_CLOSE_NULLABLE) + (
+            ('reduced-half-close-repetitions', fewer_repetitions),
+            ('half-close-without-duration', drop_field('half-close', 'observationMs', **HALF)),
+            ('half-close-without-outcome', half_close_no_outcome),
+            ('half-close-without-fin-timeline', half_close_no_fin),
+        )
+        for name, mutate in half_cases:
+            c(name, 'refuse', 'check', 'half-close', 'linux', [records(name, mutate(half))],
+              witness=('linux-check-half-close',))
+
+        # The macOS cleanup record and its containment sentence.
+        for mode, recs, positive in (('full', darwin_full, 'darwin-verify-full'),
+                                     ('half-close', darwin_half, 'darwin-verify-half-close')):
+            c(f'darwin-without-cleanup-{mode}', 'refuse', 'verify', mode, 'darwin',
+              [frame(f'darwin-without-cleanup-{mode}', without_cleanup(recs))], witness=(positive,))
+            c(f'darwin-reworded-containment-{mode}', 'refuse', 'verify', mode, 'darwin',
+              [frame(f'darwin-reworded-{mode}', reworded(recs))], witness=(positive,))
+
+        def observations(recs):
+            return recs[-1]['observations']
+
+        def unlabel(recs):
+            for r in of_type(recs, 'rss'):
+                del r['metric']
+
+        darwin_cases = (
+            ('darwin-rss-unlabelled', unlabel),
+            ('darwin-one-empty-scan', lambda recs: observations(recs).update(consecutiveEmptyScans=1)),
+            ('darwin-signaled', lambda recs: observations(recs).update(signaled=1)),
+            ('darwin-without-observations', lambda recs: recs[-1].pop('observations')),
+            ('darwin-signaled-boolean', lambda recs: observations(recs).update(signaled=False)),
+            ('darwin-without-machine-system', lambda recs: recs[0]['machine'].pop('system')),
+            ('darwin-two-empty-scans', lambda recs: observations(recs).update(consecutiveEmptyScans=2)),
+            ('darwin-scan-interval-99', lambda recs: observations(recs).update(scanIntervalMs=99)),
+            ('darwin-sweep-other-text', lambda recs: observations(recs).update(
+                sweep='marked, grouped and descendant processes of the job: none seen')),
+            ('darwin-sweep-empty', lambda recs: observations(recs).update(sweep='')),
+            ('darwin-no-pre-run-processes', lambda recs: observations(recs).update(preRunProcesses=0)),
+        ) + tuple((f'darwin-{k}-{form}', retype(k, cast)) for k in OBSERVATION_COUNTS
+                  for form, cast in (('float', float), ('string', str)))
+        for name, mutate in darwin_cases:
+            recs = copy.deepcopy(darwin_full)
+            mutate(recs)
+            c(name, 'refuse', 'verify', 'full', 'darwin', [frame(name, recs)], witness=('darwin-verify-full',))
+
+        # Launch-environment maps hold exactly their declared names: Linux records through check, the macOS frame
+        # through verify. An extra-key refusal names the key and never prints its value.
+        sources = {('linux', 'full'): full, ('linux', 'half-close'): half,
+                   ('darwin', 'full'): darwin_full, ('darwin', 'half-close'): darwin_half}
+        for kind, member, _, modes, match, removed in ENV_MAPS:
+            for mode in modes:
+                for platform, sub in (('linux', 'check'), ('darwin', 'verify')):
+                    base = f'launch-env-{kind}-{member}-{mode}-{platform}'
+                    for suffix, mutate, says in (
+                            ('cf-encoding', env_change(kind, member, match, add={CF_ENCODING: CF_VALUE}),
+                             names_key_not_value(CF_ENCODING, CF_VALUE)),
+                            ('extra-key', env_change(kind, member, match, add={EXTRA_NAME: EXTRA_VALUE}),
+                             names_key_not_value(EXTRA_NAME, EXTRA_VALUE)),
+                            ('missing-key', env_change(kind, member, match, remove=removed), None)):
+                        name, recs = f'{base}-{suffix}', mutate(sources[platform, mode])
+                        path = records(name, recs) if sub == 'check' else frame(name, recs)
+                        c(name, 'refuse', sub, mode, platform, [path], witness=(f'{platform}-{sub}-{mode}',), says=says)
+        # The same rule through the other path of each platform, on the gateway's own map.
+        cf_gateway = env_change('probe-environment', 'gateway', {'topology': 'relayed'}, add={CF_ENCODING: CF_VALUE})
+        c('launch-env-cf-encoding-linux-verify', 'refuse', 'verify', 'full', 'linux',
+          [frame('launch-env-cf-encoding-linux-verify', cf_gateway(full))], witness=('linux-verify-full',),
+          says=names_key_not_value(CF_ENCODING, CF_VALUE))
+        c('launch-env-cf-encoding-darwin-check', 'refuse', 'check', 'full', 'darwin',
+          [records('launch-env-cf-encoding-darwin-check', cf_gateway(darwin_full))], witness=('darwin-check-full',),
+          says=names_key_not_value(CF_ENCODING, CF_VALUE))
+        # A distinctive value that must not reach the checker's output, while the key name must.
+        leak = env_change('probe-environment', 'gateway', {'topology': 'relayed'}, add={CF_ENCODING: LEAK_VALUE})
+        c('launch-env-refusal-names-key-not-value', 'refuse', 'verify', 'full', 'darwin',
+          [frame('launch-env-refusal-names-key-not-value', leak(darwin_full))], witness=('darwin-verify-full',),
+          says=names_key_not_value(CF_ENCODING, LEAK_VALUE))
+
+        # A launch-environment value of the wrong type, one declared name per map, through check on Linux.
+        for kind, member, _, _, match, _ in ENV_MAPS:
+            key = WRONG_TYPE_NAME[kind, member]
+            for form, value, shown in WRONG_TYPES:
+                name = f'launch-env-{kind}-{member}-full-linux-{form}-value'
+                recs = env_change(kind, member, match, add={key: value})(full)
+                c(name, 'refuse', 'check', 'full', 'linux', [records(name, recs)], witness=('linux-check-full',),
+                  says=names_key_not_value(key, shown))
+
+        # The job label: checked against commands.job only when --job is given, directly after --platform.
+        job_files = {}
+        for path_name, sub, platform, source, label in (('linux-check', 'check', 'linux', full, JOB),
+                                                        ('linux-verify', 'verify', 'linux', full, JOB),
+                                                        ('darwin-verify', 'verify', 'darwin', darwin_full,
+                                                         DARWIN_COMMANDS['job'])):
+            def write(name, recs, sub=sub):
+                return records(name, recs) if sub == 'check' else frame(name, recs)
+
+            def raw_of(recs, sub=sub):
+                return encode(recs) if sub == 'verify' else None
+
+            base, labelled = f'job-{path_name}', with_job(source, label)
+            job_files[path_name] = write(base + '-match', labelled)
+            c(base + '-match', 'pass', sub, 'full', platform, [job_files[path_name]], raw=raw_of(labelled), job=label)
+            witness = (base + '-match',)
+            c(base + '-other', 'refuse', sub, 'full', platform, [write(base + '-other', labelled)], witness=witness,
+              job=OTHER_JOB, says=names_labels(label, OTHER_JOB))
+            # Without commands.job the macOS run may be refused first for its commands set, so only Linux must name
+            # the expected label here.
+            c(base + '-absent', 'refuse', sub, 'full', platform, [write(base + '-absent', with_job(source))],
+              witness=witness, job=label, says=names_labels(label) if platform == 'linux' else None)
+            # A list holding the label defeats a membership test; a number defeats a comparison through str().
+            c(base + '-list', 'refuse', sub, 'full', platform, [write(base + '-list', with_job(source, [label]))],
+              witness=witness, job=label)
+            c(base + '-number', 'refuse', sub, 'full', platform, [write(base + '-number', with_job(source, 7))],
+              witness=witness, job='7')
+            # The macOS frame already carries commands.job, so darwin-verify-full is its positive without --job.
+            if platform == 'linux':
+                c(base + '-without-option', 'pass', sub, 'full', platform, [write(base + '-without-option', labelled)],
+                  raw=raw_of(labelled))
+        for sub in ('check', 'verify'):
+            for at in ('before-platform', 'after-mode'):
+                c(f'job-{at}-{sub}', 'refuse', sub, 'full', 'linux', [job_files['linux-' + sub]],
+                  witness=(f'job-linux-{sub}-match',), job=JOB, job_at=at)
+        # A --job value that starts with "--" is a usage error whatever the records hold. The decisive cases carry
+        # that very word as commands.job, so a checker that took it as a label would find it matching and pass.
+        # The checker runs in the temporary directory, where a file it wrongly creates would be found and removed.
+        for sub, source, source_out in (('check', full, linux_full), ('verify', full, linux_full_out)):
+            def write(name, recs, sub=sub):
+                return records(name, recs) if sub == 'check' else frame(name, recs)
+
+            witness = (f'job-linux-{sub}-match',)
+            for word, form in (('--job', 'option'), ('--', 'double-dash')):
+                c(f'job-value-{form}-labelled-{sub}', 'refuse', sub, 'full', 'linux',
+                  [write(f'job-value-{form}-labelled-{sub}', with_job(source, word))], witness=witness, job=word,
+                  post=no_file(work / word), cwd=work)
+                c(f'job-value-{form}-committed-{sub}', 'refuse', sub, 'full', 'linux', [source_out], witness=witness,
+                  job=word, post=no_file(work / word), cwd=work)
+            # "--" inside the label is not a leading "--": an ordinary label, so it passes.
+            inner = 'node-baseline--linux'
+            labelled = with_job(source, inner)
+            c(f'job-value-inner-double-dash-{sub}', 'pass', sub, 'full', 'linux',
+              [write(f'job-value-inner-double-dash-{sub}', labelled)],
+              raw=encode(labelled) if sub == 'verify' else None, job=inner)
+
+        # The RSS sum as an integral float, through both paths.
+        float_sum = copy.deepcopy(full)
+        r = first(float_sum, 'rss', series=3)
+        r['sumKiB'] = float(r['sumKiB'])
+        c('rss-sum-float-check', 'refuse', 'check', 'full', 'linux', [records('rss-sum-float', float_sum)],
+          witness=('linux-check-full',))
+        c('rss-sum-float-verify', 'refuse', 'verify', 'full', 'linux', [frame('rss-sum-float', float_sum)],
+          witness=('linux-verify-full',))
+
+        # A non-finite number in members that nothing else interprets; 1e999 overflows to infinity.
+        c('nonfinite-extra-member', 'refuse', 'check', 'full', 'linux',
+          [put('nonfinite-extra-member.jsonl', with_literal(full, ('note',), b'1e999'))], witness=('linux-check-full',))
+        c('nonfinite-uninterpreted-member', 'refuse', 'check', 'full', 'linux',
+          [put('nonfinite-uninterpreted-member.jsonl', with_literal(full, ('responseBytes',), b'-1e999'))],
+          witness=('linux-check-full',))
+
+        # Inputs that are not plain files, and frames that are not one plain gzip member.
+        for name, target in (('input-symlink-records', linux_full), ('input-symlink-run-output', linux_full_out)):
+            link = work / name
+            os.symlink(target, link)
+        c('input-symlink-records', 'refuse', 'check', 'full', 'linux', [work / 'input-symlink-records'],
+          witness=('linux-check-full',))
+        c('input-symlink-run-output', 'refuse', 'verify', 'full', 'linux', [work / 'input-symlink-run-output'],
+          witness=('linux-verify-full',))
+        fifo = work / 'input.fifo'
+        os.mkfifo(fifo)
+        c('input-fifo-records', 'refuse', 'check', 'full', 'linux', [fifo], witness=('linux-check-full',),
+          deadline=FIFO_DEADLINE)
+        c('input-fifo-run-output', 'refuse', 'verify', 'full', 'linux', [fifo], witness=('linux-verify-full',),
+          deadline=FIFO_DEADLINE)
+        fifo.unlink()
+        c('frame-two-gzip-members', 'refuse', 'verify', 'full', 'linux',
+          [put('two-members.out', payload_output(two_members(full_raw)))], witness=('linux-verify-full',))
+        padded = payload_output(padded_member(full_raw, (FRAME_CAP + RUN_OUTPUT_CAP) // 2))
+        if not len(padded) < RUN_OUTPUT_CAP:
+            fail('the padded frame does not fit under the run output cap')
+        c('frame-over-frame-cap', 'refuse', 'verify', 'full', 'linux', [put('frame-over-cap.out', padded)],
+          witness=('linux-verify-full',))
+
+        # Cross-field rules of the half-close client record, one contradiction at a time.
+        control = {'scenario': 'answer-pending', 'clientKind': 'control', 'run': 1}
+        streaming = {'scenario': 'mid-stream', 'clientKind': 'half-close', 'run': 1}
+
+        def set_client(**fields):
+            return lambda r: r['client'].update(fields)
+
+        rule_cases = (
+            ('half-close-rule-error-code-unreported', contradiction('error-code', control, client_error)),
+            ('half-close-rule-end-open-after-input-end', contradiction('end', control, set_client(end='open'))),
+            ('half-close-rule-end-reset-without-error', contradiction('end', HALF, set_client(end='reset'))),
+            ('half-close-rule-body-complete-false', contradiction('body-complete', control, set_client(bodyComplete=False))),
+            ('half-close-rule-body-complete-without-match', contradiction('body-complete', streaming,
+                                                                          set_client(bodyComplete=True))),
+            ('half-close-rule-headless-body-bytes', contradiction('head', HALF, set_client(bodyBytes=1))),
+            ('half-close-rule-status-line-not-head', contradiction('head', control,
+                                                                   set_client(statusLine='HTTP/1.1 201 Created'))),
+            ('half-close-rule-head-without-framing', contradiction('head', control, set_client(framing=None))),
+            ('half-close-rule-close-framing-terminated', contradiction('close-framing', control, set_client(framing='close'))),
+            ('half-close-rule-null-terminated-chunked', contradiction('close-framing', streaming, set_client(terminated=None))),
+            ('half-close-rule-empty-wire-digest', contradiction('empty-wire', HALF,
+                                                                set_client(wireSHA256=hashlib.sha256(b'x').hexdigest()))),
+            ('half-close-rule-empty-wire-status-line', contradiction('empty-wire', HALF,
+                                                                     set_client(statusLine='HTTP/1.1 200 OK'))),
+        )
+        for name, mutate in rule_cases:
+            c(name, 'refuse', 'check', 'half-close', 'linux', [records(name, mutate(half))],
+              witness=('linux-check-half-close',))
+        # Every client-error event carries a string code; a numeric one is reported as such, with the end it implies.
+        for name, mutate in (
+                ('half-close-rule-error-code-null', contradiction('error-code-type', control, error_event(code=None))),
+                ('half-close-rule-error-code-missing', contradiction('error-code-type', control, error_event())),
+                ('half-close-rule-error-code-number', contradiction('error-code-type', control, error_event(code=104),
+                                                                    set_client(errorCode=104, end='error')))):
+            c(name, 'refuse', 'check', 'half-close', 'linux', [records(name, mutate(half))],
+              witness=('linux-check-half-close',))
+        # No committed record has a non-empty wire without a head; this one is built from the headless record.
+        c('half-close-partial-wire-empty-status-line', 'pass', 'check', 'half-close', 'linux',
+          [records('partial-wire', contradiction(None, HALF, partial_wire)(half))])
+        c('half-close-rule-partial-wire-null-status-line', 'refuse', 'check', 'half-close', 'linux',
+          [records('partial-wire-null', contradiction('head', HALF, partial_wire, set_client(statusLine=None))(half))],
+          witness=('half-close-partial-wire-empty-status-line',))
+
+        # observations.note: a string or nothing.
+        for name, note, expect in (('darwin-note-string', 'runner image macos-26-arm64', 'pass'),
+                                   ('darwin-note-number', 1, 'refuse'), ('darwin-note-array', [], 'refuse'),
+                                   ('darwin-note-object', {}, 'refuse')):
+            recs = copy.deepcopy(darwin_full)
+            recs[-1]['observations']['note'] = note
+            c(name, expect, 'verify', 'full', 'darwin', [frame(name, recs)], witness=('darwin-verify-full',))
+
+        # verify never writes through an existing path.
+        kept = b'an earlier decoded run\n'
+        existing = put('output-existing.jsonl', kept)
+        c('verify-output-existing-file', 'refuse', 'verify', 'full', 'linux', [linux_full_out, existing],
+          witness=('linux-verify-full',), post=unchanged(existing, kept))
+        target = put('output-target.jsonl', kept)
+        link = work / 'output-link.jsonl'
+        os.symlink(target, link)
+        c('verify-output-symlink', 'refuse', 'verify', 'full', 'linux', [linux_full_out, link],
+          witness=('linux-verify-full',), post=unchanged(target, kept, link))
+        absent, dangling = work / 'output-absent.jsonl', work / 'output-dangling.jsonl'
+        os.symlink(absent, dangling)
+        c('verify-output-dangling-symlink', 'refuse', 'verify', 'full', 'linux', [linux_full_out, dangling],
+          witness=('linux-verify-full',), post=unchanged(absent, None, dangling))
+
+        # Damaged frames.
+        line = frame_line(gzip.compress(full_raw, mtime=0))
+        prefix = len(b'NODE-BENCH-V1 ') + 64 + 1
+        middle = prefix + (len(line) - prefix) // 2
+        digest = hashlib.sha256(gzip.compress(full_raw, mtime=0)).hexdigest().encode()
+        log = b'bench: launching the pinned harness\n'
+        damaged = (
+            ('frame-base64-corrupt', log + line[:middle] + b'!' + line[middle + 1:]),
+            ('frame-truncated', log + line[:middle] + b'\n'),
+            ('frame-digest-mismatch', log + line.replace(digest, flip_hex(digest.decode()).encode(), 1)),
+            ('frame-two-parts', log + b'NODE-BENCH-V1 ' + line.split(b' ')[2]),
+            ('frame-four-parts', log + line[:-1] + b' trailing\n'),
+            ('run-output-two-frames', log + line + line),
+            ('run-output-no-frame', log + b'bench: subreaper has no remaining children\n'),
+        )
+        # The digest decides completeness: a frame line without its final newline is complete.
+        c('frame-last-line-without-newline', 'pass', 'verify', 'full', 'linux', [put('no-newline.out', log + line[:-1])])
+        for name, data in damaged:
+            c(name, 'refuse', 'verify', 'full', 'linux', [put(name + '.out', data)], witness=('linux-verify-full',))
+
+        # Size boundaries: exactly at each cap passes, the smallest valid input above it is refused.
+        at = pad_output(run_output(full_raw), RUN_OUTPUT_CAP)
+        c('size-run-output-at-cap', 'pass', 'verify', 'full', 'linux', [put('run-output-at-cap.out', at)])
+        c('size-run-output-over-cap', 'refuse', 'verify', 'full', 'linux',
+          [put('run-output-over-cap.out', b'.' + at)], witness=('size-run-output-at-cap',))
+        at = pad_record(full_raw, RUN_OUTPUT_CAP)
+        c('size-records-at-cap', 'pass', 'check', 'full', 'linux', [put('records-at-cap.jsonl', at)])
+        c('size-records-over-cap', 'refuse', 'check', 'full', 'linux',
+          [put('records-over-cap.jsonl', pad_record(full_raw, RUN_OUTPUT_CAP + 1))], witness=('size-records-at-cap',))
+        # base64 comes in groups of four characters, so the smallest valid frame above the cap is four longer.
+        for name, size, expect in (('size-frame-at-cap', FRAME_CAP, 'pass'), ('size-frame-over-cap', FRAME_CAP + 4, 'refuse')):
+            payload = padded_member(full_raw, size)
+            if len(base64.b64encode(payload)) != size:
+                fail(f'{name}: the frame is not {size} characters')
+            c(name, expect, 'verify', 'full', 'linux', [put(name + '.out', payload_output(payload))],
+              witness=('size-frame-at-cap',))
+        for name, size, expect in (('size-decoded-at-cap', DECODED_CAP, 'pass'),
+                                   ('size-decoded-over-cap', DECODED_CAP + 1, 'refuse')):
+            c(name, expect, 'verify', 'full', 'linux', [put(name + '.out', run_output(pad_record(full_raw, size)))],
+              witness=('size-decoded-at-cap',))
+
+        # Inputs that grow while the checker reads them.
+        for name, sub, data in (('grow-records', 'check', full_raw), ('grow-run-output', 'verify', run_output(full_raw))):
+            path = put(name, data)
+            grow = grower(path)
+            grow()
+            c(name, 'refuse', sub, 'full', 'linux', [path], witness=(f'linux-{sub}-full',), rss_bound=RSS_BOUND,
+              deadline=FIFO_DEADLINE, tick=grow)
+            path.unlink()
+
+        # summary: full runs only, with the option directly after the subcommand.
+        c('summary-full', 'pass', 'summary', None, 'linux', [linux_full])
+        for name, files, platform, last in (
+                ('summary-half-close', [linux_half], 'linux', False),
+                ('summary-rss-sum-float', [work / 'rss-sum-float.jsonl'], 'linux', False),
+                ('summary-platform-missing', [linux_full], None, False),
+                ('summary-platform-after-file', [linux_full], 'linux', True)):
+            c(name, 'refuse', 'summary', None, platform, files, witness=('summary-full',), platform_last=last)
+        c('summary-job', 'refuse', 'summary', None, 'linux', [linux_full], witness=('summary-full',), job=JOB)
+
+        # An option-like word in a positional place is a usage error, while ./--job is an intentional file name. The
+        # checker runs in the temporary directory, where a file it wrongly creates under that word would appear.
+        for name, sub, source, word, witness in (
+                ('positional-job-after-verify-input', 'verify', linux_full_out, '--job', 'linux-verify-full'),
+                ('positional-platform-after-verify-input', 'verify', linux_full_out, '--platform', 'linux-verify-full'),
+                ('positional-job-after-check-input', 'check', linux_full, '--job', 'linux-check-full'),
+                ('positional-job-after-summary-input', 'summary', linux_full, '--job', 'summary-full')):
+            stray = work / word
+            if os.path.lexists(stray):
+                fail(f'{stray} exists before {name}')
+            c(name, 'refuse', sub, None if sub == 'summary' else 'full', 'linux', [source, word], witness=(witness,),
+              post=no_file(stray), cwd=work)
+        if os.path.lexists(work / '--job'):
+            fail('--job exists before positional-dot-slash-output')
+        c('positional-dot-slash-output', 'pass', 'verify', 'full', 'linux', [linux_full_out, './--job'],
+          post=wrote(work / '--job', full_raw), cwd=work)
+
+        # Oversized inputs: refused, and without holding them in memory.
+        big = work / 'oversize.jsonl'
+        sparse(big, full_raw, OVERSIZE)
+        c('oversize-records', 'refuse', 'check', 'full', 'linux', [big], witness=('linux-check-full',),
+          rss_bound=RSS_BOUND, deadline=OVERSIZE_DEADLINE)
+        big.unlink()
+        big = work / 'oversize.out'
+        sparse(big, run_output(full_raw), OVERSIZE)
+        c('oversize-run-output', 'refuse', 'verify', 'full', 'linux', [big], witness=('linux-verify-full',),
+          rss_bound=RSS_BOUND, deadline=OVERSIZE_DEADLINE)
+        big.unlink()
+        big = work / 'oversize-decoded.out'
+        bomb(big, full_raw, OVERSIZE)
+        c('oversize-decoded-frame', 'refuse', 'verify', 'full', 'linux', [big], witness=('linux-verify-full',),
+          rss_bound=RSS_BOUND, deadline=OVERSIZE_DEADLINE)
+        big.unlink()
+    finally:
+        shutil.rmtree(work)
+    note = f', {len(run.inexpressible)} not expressible without --platform' if run.inexpressible else ''
+    print(f'{run.count} controls, {run.differ} differ{note}')
+    sys.exit(1 if run.differ else 0)
+
+
+main()
+PY
