@@ -45,6 +45,7 @@ import (
 
 	"github.com/zchee/claude-code-model-gateway/internal/cli/serveshim"
 	"github.com/zchee/claude-code-model-gateway/internal/gatewaytest"
+	"github.com/zchee/claude-code-model-gateway/internal/lifecycle"
 	"github.com/zchee/claude-code-model-gateway/internal/supervisor"
 )
 
@@ -217,6 +218,7 @@ func (b *lockedBuffer) String() string {
 
 // shimUnderTest is a foreground supervisor running in this process with the fixture child as its worker.
 type shimUnderTest struct {
+	state    string
 	public   string
 	token    string
 	ready    chan int
@@ -268,7 +270,7 @@ func startShim(t *testing.T, env map[string]string, prepare ...func(state string
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &shimUnderTest{token: token, ready: make(chan int, 1), done: make(chan struct{}), stderr: new(lockedBuffer), children: make(chan *fixtureChild, 8)}
+	s := &shimUnderTest{state: state, token: token, ready: make(chan int, 1), done: make(chan struct{}), stderr: new(lockedBuffer), children: make(chan *fixtureChild, 8)}
 	var accepted sync.WaitGroup
 	var connsMu sync.Mutex
 	var conns []net.Conn
@@ -382,6 +384,37 @@ func (s *shimUnderTest) awaitStop(deadline time.Time) bool {
 		return true
 	case <-timer.C:
 		return false
+	}
+}
+
+// awaitExitRecord returns once the supervisor's lifecycle journal holds the worker-exit record of the worker with pid,
+// which the supervisor writes only after it observed that worker's exit and retired its endpoint. The end of the
+// child's control connection is no such signal: the kernel closes a dead process's descriptors before its parent's wait
+// returns, so a request sent then can still find the worker's port eligible.
+func (s *shimUnderTest) awaitExitRecord(t *testing.T, pid int) {
+	t.Helper()
+	const bound = 10 * time.Second
+	deadline := time.Now().Add(bound)
+	for {
+		for _, raw := range (lifecycle.Files{StateDir: s.state}).Records() {
+			var rec struct {
+				Event string `json:"event"`
+				Child struct {
+					PID int `json:"pid"`
+				} `json:"child"`
+			}
+			if json.Unmarshal(raw, &rec) == nil && rec.Event == "worker-exit" && rec.Child.PID == pid {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the supervisor never recorded the exit of worker %d within %v; stderr: %s", pid, bound, s.stderr)
+		}
+		select {
+		case <-s.done:
+			t.Fatalf("supervisor stopped before it recorded the exit of worker %d: %v; stderr: %s", pid, s.result, s.stderr)
+		case <-time.After(2 * time.Millisecond):
+		}
 	}
 }
 
@@ -691,9 +724,9 @@ func otherFreePort(t *testing.T, port int) int {
 
 // TestEndpointEligibility checks that the supervisor relays to a worker endpoint only after the current worker
 // process itself reported that it is listening there, for its own generation, also when a port is configured. A port
-// that is only configured, or that belonged to a worker that has exited, receives no request: another program may
-// hold it, and the request carries the client's headers, body and control token. Until an endpoint is eligible,
-// requests wait and then receive the retryable 503.
+// that is only configured, or that belonged to a worker whose exit the supervisor has observed, receives no request:
+// another program may hold it, and the request carries the client's headers, body and control token. Until an endpoint
+// is eligible, requests wait and then receive the retryable 503.
 func TestEndpointEligibility(t *testing.T) {
 	if control := os.Getenv(eligibilityControlKey); control != "" {
 		// This process is a worker the supervisor under test started, not the test itself.
@@ -911,10 +944,17 @@ func TestEndpointEligibility(t *testing.T) {
 			if diff := gocmp.Diff(probeResult{Status: http.StatusOK, ChildPID: first.pid}, s.probe(t, rand.Text())); diff != "" {
 				t.Fatalf("request to the reporting child (-want +got):\n%s", diff)
 			}
-			// The child closes its listener and exits; another program takes the port before a replacement reports.
+			// The child closes its listener and exits; another program takes the port before a replacement reports. The
+			// request goes out once the supervisor has observed the exit, which is what the supervisor guarantees: from
+			// then on no new relay selects the exited child's port. Two windows remain, because the supervisor reaches its
+			// worker by port number alone. Between the worker's exit and the supervisor observing it, a request is still
+			// relayed to the port. During a drain the worker closes its listeners at once and stays alive until its live
+			// responses end, and its port stays the endpoint all that time. Another program that binds the port in either
+			// window receives the request. Both close only when the supervisor owns the worker's listener.
 			first.command(t, "exit", "closed")
 			foreign := startForeign(t, port)
 			first.exited(t)
+			s.awaitExitRecord(t, first.pid)
 			marker := rand.Text()
 			type answer struct {
 				result probeResult
