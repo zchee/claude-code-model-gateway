@@ -21,6 +21,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"regexp"
 	"sync"
@@ -49,6 +50,17 @@ type Emitter struct {
 	sequence uint64
 	tools    recent[identity, snapshot]
 	pending  sync.WaitGroup
+
+	queueMu sync.Mutex // guards queue and sending
+	queue   []queuedPost
+	sending bool // a sender is draining queue
+}
+
+// queuedPost is one record waiting for the sender. Its export bound started when it was submitted.
+type queuedPost struct {
+	ctx     context.Context
+	cancel  context.CancelFunc
+	payload []byte
 }
 
 // NewEmitter resolves log settings and shares one builder across captures.
@@ -170,8 +182,12 @@ func (b *Builder) emitterRecords(primary Record, added []toolAttribution) []Reco
 	return append(records, b.toolResultRecords(primary, added)...)
 }
 
-// schedule posts one record in the background. Delivery failures, including timeouts and
-// refused connections, are silent and never affect the request.
+// schedule submits one record for export in the background and returns at once. Records reach the
+// collector in submission order, as the source starts its posts in order: one sender starts each
+// post and waits only until its request is written, or the post ended, before starting the next.
+// Replies are read concurrently, so a slow collector delays no later post. Each post's bound starts
+// at submission, and a record still queued when its bound expires is dropped. Delivery failures,
+// including timeouts and refused connections, are silent and never affect the request.
 func (e *Emitter) schedule(record Record) {
 	if e.client == nil {
 		return
@@ -180,12 +196,49 @@ func (e *Emitter) schedule(record Record) {
 	if err != nil {
 		return
 	}
-	e.pending.Go(func() { e.post(payload) })
+	ctx, cancel := context.WithTimeout(context.Background(), exportTimeout)
+	e.queueMu.Lock()
+	e.queue = append(e.queue, queuedPost{ctx: ctx, cancel: cancel, payload: payload})
+	start := !e.sending
+	e.sending = true
+	e.queueMu.Unlock()
+	if start {
+		e.pending.Go(e.send)
+	}
 }
 
-func (e *Emitter) post(payload []byte) {
-	ctx, cancel := context.WithTimeout(context.Background(), exportTimeout)
-	defer cancel()
+// send starts the queued posts one at a time, in queue order, until the queue is empty. It is
+// counted in pending, so every post it starts is added to pending before Wait can return.
+func (e *Emitter) send() {
+	for {
+		e.queueMu.Lock()
+		if len(e.queue) == 0 {
+			e.queue, e.sending = nil, false
+			e.queueMu.Unlock()
+			return
+		}
+		next := e.queue[0]
+		e.queue[0] = queuedPost{}
+		e.queue = e.queue[1:]
+		e.queueMu.Unlock()
+		if next.ctx.Err() != nil {
+			next.cancel()
+			continue
+		}
+		written := make(chan struct{})
+		e.pending.Go(func() {
+			defer next.cancel()
+			e.post(next.ctx, next.payload, sync.OnceFunc(func() { close(written) }))
+		})
+		<-written
+	}
+}
+
+// post sends one record under ctx and calls written once: when the request has been written, or
+// when the post ends without that.
+func (e *Emitter) post(ctx context.Context, payload []byte, written func()) {
+	defer written()
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{WroteRequest: func(httptrace.WroteRequestInfo) { written() }})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.endpoint.String(), bytes.NewReader(payload))
 	if err != nil {
 		return
