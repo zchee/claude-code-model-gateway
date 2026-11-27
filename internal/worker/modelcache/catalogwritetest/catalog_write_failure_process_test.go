@@ -190,7 +190,7 @@ func setCatalogFileLimit(t testing.TB, arg string, savedSize int) unix.Rlimit {
 // catalogRows, and prints catalogWriteDone when the refresh succeeded and logged nothing. The parent
 // reads the saved catalog the refresh left behind. The cache's clock gives successive readings
 // staleCatalogNow, staleCatalogNow+clockStepMillis, and so on, so the parent can tell which reading
-// each saved time is.
+// each saved time is. The child fails unless the cache read its clock exactly twice.
 func runCatalogWriteChild(t testing.TB, args []string) {
 	if len(args) != 1 {
 		t.Fatalf("child arguments = %q, want one file size limit selector", args)
@@ -287,6 +287,11 @@ func runCatalogWriteChild(t testing.TB, args []string) {
 	if refreshErr != nil {
 		t.Fatalf("ModelsResponse: %s", redact(refreshErr.Error()))
 	}
+	// One reading finds the saved catalog stale and one is the refresh's time. A further reading, even
+	// one whose value is not saved, fails here: the saved times alone cannot show it.
+	if n := clockReads.Load(); n != 2 {
+		t.Fatalf("the cache read its clock %d times, want 2 (the stale check and the refresh)", n)
+	}
 	if logged := logs.String(); logged != "" {
 		t.Fatalf("the refresh logged %q, want no log line", redact(logged))
 	}
@@ -344,7 +349,8 @@ func readSavedCatalog(t *testing.T, path string) savedCatalog {
 // The child's clock gives a new literal on every reading. The first reading finds the saved catalog
 // stale; the second is the time of the refresh. The control saves that second reading as its update
 // time, and the failure record carries the same second reading as its attempt time: the clock is not
-// read again after the failed save, which would record the third reading.
+// read again after the failed save, which would record the third reading. The child also fails on a
+// third clock reading anywhere, even one whose value is not saved.
 func TestCatalogSuccessWriteFailureIsRecorded(t *testing.T) {
 	const (
 		// refreshReading is the child's second clock reading, staleCatalogNow + clockStepMillis.

@@ -86,7 +86,8 @@ func exchangeOnce(t *testing.T, authority, method, target string) rawAnswer {
 // validator among them, without the supervisor's health fields and without Transfer-Encoding, and nothing follows the
 // head. A 204 carries no Content-Length even when the worker sent
 // one (RFC 9110, section 8.6); a 304 and an answer to HEAD keep the length the worker declared for the representation.
-// The worker here writes its answer byte for byte, so the fields it sends reach the relay unchanged.
+// The worker here writes its answer byte for byte, so the fields above are exactly what it emits before the supervisor
+// parses them.
 func TestHealthBodylessOnTheWire(t *testing.T) {
 	tests := map[string]struct {
 		method, target string

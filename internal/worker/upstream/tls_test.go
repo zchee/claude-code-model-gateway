@@ -487,7 +487,8 @@ func TestDoHidesBrokenTLSRecords(t *testing.T) {
 			},
 		},
 		// The client's TLS layer reports the failed decryption as a local alert of a type the TLS
-		// package does not export, so Do reports the generic response failure, not the TLS one.
+		// package does not export, so Do reports the generic response failure, not the TLS one. The
+		// error type is that of the Go 1.27.4 TLS package, not a documented guarantee.
 		"error: a corrupted record inside the response head after a completed handshake": {
 			handle: func(t *testing.T, cert tls.Certificate) func(net.Conn) {
 				return afterHandshake(t, cert, func(raw net.Conn, tc *tls.Conn) error {

@@ -27,7 +27,6 @@ import (
 
 	gocmp "github.com/google/go-cmp/cmp"
 
-	"github.com/zchee/claude-code-model-gateway/internal/lifecycle"
 	"github.com/zchee/claude-code-model-gateway/internal/procinfo"
 )
 
@@ -71,10 +70,7 @@ func TestReportTimeoutDecisionIsFinal(t *testing.T) {
 					t.Fatal(err)
 				}
 				var stderr bytes.Buffer
-				s := &shim{
-					lifetime: t.Context(), state: state, executable: exe, version: "1.2.3", stderr: &stderr, pid: os.Getpid(),
-					startedAt: "2026-01-01T00:00:00.000Z", files: lifecycle.Files{StateDir: state}, fatal: make(chan error, 1),
-				}
+				s := &shim{lifetime: t.Context(), state: state, executable: exe, version: "1.2.3", stderr: &stderr, fatal: make(chan error, 1)}
 				// takeFatal returns the failure handed to Run, or "" when none is pending.
 				takeFatal := func() string {
 					select {

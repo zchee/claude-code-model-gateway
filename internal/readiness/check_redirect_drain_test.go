@@ -16,6 +16,7 @@ package readiness_test
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -30,14 +31,16 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/readiness"
 )
 
-// redirectSlurpBound restates net/http's maxBodySlurpSize (net/http/client.go): the most bytes the
-// client reads from a redirect response's body, when its length is unknown or at most this bound,
-// before it closes the body and requests the next hop.
+// redirectSlurpBound restates maxBodySlurpSize of the Go 1.27.4 net/http client (net/http/client.go):
+// the most bytes the client reads from a redirect response's body, when its length is unknown or at
+// most this bound, before it closes the body and requests the next hop. This is observed
+// implementation behaviour of that release, not a documented guarantee.
 const redirectSlurpBound = 2 << 10
 
 // drainedRedirect answers the first request in memory with a 302 to /next whose body is
 // instrumented, and the request for /next with the final answer. It records, in order, each request's
-// path and the closing of the redirect body with the bytes read from it until then.
+// path, the closing of the redirect body with the bytes read from it until then, and any read of the
+// redirect body after its closing. A negative contentLength sends no Content-Length field.
 type drainedRedirect struct {
 	body          []byte
 	contentLength int64
@@ -70,16 +73,21 @@ func (d *drainedRedirect) RoundTrip(req *http.Request) (*http.Response, error) {
 			Request:       req,
 		}, nil
 	}
+	header := http.Header{"Location": {"/next"}}
+	if d.contentLength >= 0 {
+		header.Set("Content-Length", strconv.FormatInt(d.contentLength, 10))
+	}
 	return &http.Response{
 		StatusCode:    http.StatusFound,
-		Header:        http.Header{"Location": {"/next"}, "Content-Length": {strconv.FormatInt(d.contentLength, 10)}},
+		Header:        header,
 		ContentLength: d.contentLength,
 		Body:          &redirectBody{owner: d, rest: d.body},
 		Request:       req,
 	}, nil
 }
 
-// redirectBody hands out as much of rest as each read asks for and records its closing.
+// redirectBody hands out as much of rest as each read asks for and records its closing. A read after
+// the closing is recorded and fails.
 type redirectBody struct {
 	owner  *drainedRedirect
 	rest   []byte
@@ -88,6 +96,10 @@ type redirectBody struct {
 }
 
 func (b *redirectBody) Read(p []byte) (int, error) {
+	if b.closed {
+		b.owner.record("read the redirect body after its closing")
+		return 0, errors.New("read of a closed redirect body")
+	}
 	if len(b.rest) == 0 {
 		return 0, io.EOF
 	}

@@ -101,9 +101,9 @@ func TestEmitterExportNeverCompletes(t *testing.T) {
 						}
 					} else {
 						// A TLS record header (content type 22 = handshake, protocol major version
-						// 3, two bytes of minor version and length) followed by the handshake type
-						// 1 = ClientHello. Only an exporter that dialed and began the handshake
-						// sends these bytes.
+						// 3, one byte of minor version, two bytes of length) followed by the
+						// handshake type 1 = ClientHello. Only an exporter that dialed and began the
+						// handshake sends these bytes.
 						var hello [6]byte
 						if _, err = io.ReadFull(peer, hello[:]); err == nil && (hello[0] != 22 || hello[1] != 3 || hello[5] != 1) {
 							err = fmt.Errorf("first bytes %x are not the start of a TLS ClientHello", hello)

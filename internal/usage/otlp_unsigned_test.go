@@ -70,6 +70,9 @@ func TestOTLPIntegerAttributesExact(t *testing.T) {
 			value: namedUint64(9007199254740993),
 			want:  "9007199254740993",
 		},
+		// Every value up to 2^53 is exact in a binary64, so these two cases, like the 8- and 32-bit
+		// maxima and zero, also pass where the value goes through a float: they check that these
+		// unsigned kinds are exported as an intValue at all; precision is not what they test.
 		"success: named type of kind uint16 at its largest value": {
 			value: namedUint16(math.MaxUint16),
 			want:  "65535",

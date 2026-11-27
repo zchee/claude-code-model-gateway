@@ -65,9 +65,10 @@ func (r *catalogRecorder) requests() []string {
 }
 
 // TestInvalidCatalogBaseURLDisablesRefreshSilently configures an Anthropic base URL that does not
-// parse, is relative, names no scheme, or is empty, with a stale saved catalog and request credentials
-// that would otherwise start a refresh. The cache sends no catalog request, keeps serving the saved
-// row, leaves the saved catalog byte for byte as it was, with no failure recorded, and logs nothing.
+// parse, is relative, names no scheme, names a scheme but no host, or is empty, with a stale saved
+// catalog and request credentials that would otherwise start a refresh. The cache sends no catalog
+// request, keeps serving the saved row, leaves the saved catalog byte for byte as it was, with no
+// failure recorded, and logs nothing.
 // A working base URL with the same inputs refreshes the catalog, without a log line either.
 func TestInvalidCatalogBaseURLDisablesRefreshSilently(t *testing.T) {
 	const freshPage = `{"data":[{"id":"claude-fresh-1","display_name":"Fresh One"}],"has_more":false}`
@@ -88,6 +89,10 @@ func TestInvalidCatalogBaseURLDisablesRefreshSilently(t *testing.T) {
 		},
 		"error: a base URL without a scheme disables the refresh": {
 			base:         "//anthropic.test",
+			wantRequests: []string{},
+		},
+		"error: a base URL with a scheme but without a host disables the refresh": {
+			base:         "http:///anthropic",
 			wantRequests: []string{},
 		},
 		"error: an empty base URL disables the refresh": {

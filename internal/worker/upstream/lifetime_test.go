@@ -47,7 +47,8 @@ const (
 	clientClosedText = "upstream client closed"
 )
 
-// messagesRequest is a request with a body, which net/http never replays on another connection.
+// messagesRequest is a request with a body, which the Go 1.27.4 net/http transport never replays on
+// another connection (observed implementation behaviour, not a documented guarantee).
 func messagesRequest() upstream.Request {
 	return upstream.Request{
 		Target:        upstream.TargetAnthropic,
@@ -355,6 +356,8 @@ func TestClientCloseRacingDialClosesConnection(t *testing.T) {
 					reqWG.Wait()
 					synctest.Wait()
 
+					// The public result of Do is checked, not which layer produced the closed-client
+					// error.
 					if doErr == nil {
 						t.Errorf("iteration %d: Do returned no error for a request Client.Close ended", i)
 					} else if diff := gocmp.Diff([]string{clientClosedText}, errorTexts(doErr)); diff != "" {
@@ -618,7 +621,8 @@ func TestIdlePooledConnectionEviction(t *testing.T) {
 	// wantIdleTimeout restates idlePoolTimeout, the idle-pool timeout NewTransport sets.
 	const wantIdleTimeout = 55 * time.Minute
 	// keepAliveHintReply is okReply with a Keep-Alive hint far shorter than the idle-pool timeout;
-	// the source's agent would act on the hint, the transport ignores it.
+	// the source's agent would act on the hint, the Go 1.27.4 transport ignores it (observed
+	// implementation behaviour, not a documented guarantee).
 	const keepAliveHintReply = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\nContent-Length: 11\r\n\r\n{\"ok\":true}"
 
 	// NewClient uses the transport policy of NewTransport, whose idle timeout is visible.
@@ -627,6 +631,9 @@ func TestIdlePooledConnectionEviction(t *testing.T) {
 	tests := map[string]struct {
 		// warmReply answers the warm-up request; empty means okReply.
 		warmReply string
+		// replyDelay is how long the upstream waits after reading the warm-up request before it
+		// writes the whole reply, which moves the connection's last I/O away from its dial.
+		replyDelay time.Duration
 		// hold is how long the warm-up response body stays unread after all of its bytes arrived,
 		// which delays the moment the connection is parked but not its last I/O.
 		hold time.Duration
@@ -635,7 +642,7 @@ func TestIdlePooledConnectionEviction(t *testing.T) {
 		idle      func(idleTimeout time.Duration) time.Duration
 		wantDials int32
 		// wantFirstClose, when set, is when the first connection must be closed for the first time,
-		// measured from the warm-up request, which is its last I/O.
+		// measured from the warm-up request, which dials it.
 		wantFirstClose time.Duration
 	}{
 		"success: a connection whose upstream hinted a five-second Keep-Alive timeout is reused after just under the idle timeout": {
@@ -651,6 +658,17 @@ func TestIdlePooledConnectionEviction(t *testing.T) {
 			idle:           func(time.Duration) time.Duration { return 51 * time.Minute },
 			wantDials:      2,
 			wantFirstClose: time.Hour,
+		},
+		// Dialed at 0, last I/O at 5 minutes when the reply arrives, parked at 15 minutes after a
+		// ten-minute hold: an hour counted from the dial would close the connection at 60 minutes,
+		// the pool would evict it at 70, and the inactivity deadline counted from the last I/O
+		// closes it at 65. The second request at 66 minutes needs a fresh connection.
+		"success: a connection whose reply arrived five minutes after its dial closes one hour after that reply, not after the dial": {
+			replyDelay:     5 * time.Minute,
+			hold:           10 * time.Minute,
+			idle:           func(time.Duration) time.Duration { return 51 * time.Minute },
+			wantDials:      2,
+			wantFirstClose: 5*time.Minute + time.Hour,
 		},
 		"success: a connection idle for just under the idle timeout is reused": {
 			idle:      func(d time.Duration) time.Duration { return d - time.Nanosecond },
@@ -684,7 +702,11 @@ func TestIdlePooledConnectionEviction(t *testing.T) {
 				up.serve = func(peer net.Conn, _ *faultConn) {
 					serveHTTP(peer, func(*http.Request) string {
 						// The first request served is the warm-up.
-						if served.Add(1) == 1 && tt.warmReply != "" {
+						if served.Add(1) != 1 {
+							return okReply
+						}
+						time.Sleep(tt.replyDelay)
+						if tt.warmReply != "" {
 							return tt.warmReply
 						}
 						return okReply
@@ -738,10 +760,10 @@ func TestIdlePooledConnectionEviction(t *testing.T) {
 				if tt.wantFirstClose > 0 {
 					closes := up.dialed()[0].closeTimes()
 					if len(closes) == 0 {
-						t.Fatalf("first connection was never closed, want a close %v after its last I/O", tt.wantFirstClose)
+						t.Fatalf("first connection was never closed, want a close %v after its dial", tt.wantFirstClose)
 					}
 					if diff := gocmp.Diff(tt.wantFirstClose, closes[0].Sub(start)); diff != "" {
-						t.Errorf("first close of the first connection, measured from its last I/O (-want +got):\n%s", diff)
+						t.Errorf("first close of the first connection, measured from its dial (-want +got):\n%s", diff)
 					}
 				}
 			})

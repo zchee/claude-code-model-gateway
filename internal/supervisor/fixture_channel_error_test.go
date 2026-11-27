@@ -99,9 +99,12 @@ func (c *scriptedChannel) Close() error { c.closes++; return nil }
 // TestFixtureChannelErrorAfterUnrelatedMessage checks a guarded test control channel whose
 // first message is not the shutdown message: a channel error that is not its end, arriving
 // with that message or after it, is returned with a false stop, and the channel is not read
-// again after it. A clean end after the same message stops nothing and reports no error.
+// again after it. A later shutdown message buffered before the error is dropped, and the error
+// behind it is still returned. A clean end after the same message stops nothing and reports no
+// error.
 func TestFixtureChannelErrorAfterUnrelatedMessage(t *testing.T) {
 	const unrelated = "{\"type\":\"noop\"}\n"
+	const laterShutdown = "{\"type\":\"fixture-shutdown\"}\n"
 	tests := map[string]struct {
 		chunks  []scriptedChunk
 		wantErr error
@@ -112,6 +115,20 @@ func TestFixtureChannelErrorAfterUnrelatedMessage(t *testing.T) {
 		},
 		"error: channel error in the read after the first message": {
 			chunks:  []scriptedChunk{{data: unrelated}, {err: errScriptedChannel}},
+			wantErr: errScriptedChannel,
+		},
+		// The later message is already buffered when the first one is decided, so the drain finds
+		// data before it reaches the error.
+		"error: channel error behind a later shutdown message in the same read as the first message": {
+			chunks:  []scriptedChunk{{data: unrelated + laterShutdown, err: errScriptedChannel}},
+			wantErr: errScriptedChannel,
+		},
+		"error: channel error in the read after a later shutdown message that came with the first message": {
+			chunks:  []scriptedChunk{{data: unrelated + laterShutdown}, {err: errScriptedChannel}},
+			wantErr: errScriptedChannel,
+		},
+		"error: channel error in the read after a later shutdown message in its own read": {
+			chunks:  []scriptedChunk{{data: unrelated}, {data: laterShutdown}, {err: errScriptedChannel}},
 			wantErr: errScriptedChannel,
 		},
 		"error: channel error wrapping the buffer-full sentinel in the same read as the first message": {

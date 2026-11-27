@@ -77,9 +77,11 @@ const (
 
 // directTransport carries the cache's requests when the injected client has no transport of its own
 // or names the process-wide default. It never consults the environment's proxy settings and keeps no
-// idle connections, so it outlives no request. It neither asks for nor decodes a compressed body, as
-// the source sends no Accept-Encoding and reads the bytes as sent, so the size bounds count the
-// bytes on the wire.
+// idle connection once a response is done; that alone does not end a dial net/http carries on after
+// the request that started it ended. It neither asks for nor decodes a compressed body, as the source
+// sends no Accept-Encoding and reads the bytes as sent, so no body is inflated before its bound
+// applies: the proxy listing bound counts the body bytes as received, and the catalog page bound
+// counts the UTF-16 code units of the decoded text.
 var directTransport = &http.Transport{
 	Proxy:              nil,
 	DialContext:        (&net.Dialer{}).DialContext,

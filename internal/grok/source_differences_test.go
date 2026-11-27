@@ -28,6 +28,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -871,9 +872,10 @@ func TestRefreshStoreReplacementFailure(t *testing.T) {
 // TestBranchOutdatedVersionDrainsBody verifies that the body of an upstream 426 is read to its end
 // and discarded rather than kept: the source collects every chunk of that body and never uses
 // them, while the port's memory stays bounded whatever its size. The fixture upstream sends a
-// 32 MiB body from one small reused buffer, so the bytes allocated during the call that exceed a
-// quarter of the body can only come from a reader that keeps it. The client still gets the fixed
-// outdated-version answer once the whole body was received.
+// 32 MiB body from one small reused buffer. The allocation count is process-wide, so the fixture
+// runs several times and the smallest count is compared: more than a quarter of the body in every
+// run can only come from a reader that keeps it. In each run the whole body is read and the client
+// gets the fixed outdated-version answer; the test does not observe which of the two comes first.
 func TestBranchOutdatedVersionDrainsBody(t *testing.T) {
 	const (
 		bodySize  = 32 << 20
@@ -881,6 +883,9 @@ func TestBranchOutdatedVersionDrainsBody(t *testing.T) {
 		// allocLimit is a quarter of the body: far above what draining the body allocates, far
 		// below what keeping it would.
 		allocLimit = bodySize / 4
+		// fixtureRuns is how many times the fixture runs; the smallest allocation count of the runs
+		// is compared with allocLimit.
+		fixtureRuns = 3
 		// outdatedMessage restates the production text outdatedVersionMessage.
 		outdatedMessage = "model-gateway: Grok CLI version header is outdated. Update the grok CLI, then retry."
 	)
@@ -900,44 +905,48 @@ func TestBranchOutdatedVersionDrainsBody(t *testing.T) {
 			t.Cleanup(func() { goleak.VerifyNone(t) })
 			synctest.Test(t, func(t *testing.T) {
 				now := time.UnixMilli(1_700_000_000_000)
-				store := mustNewAuthStore(t, grok.AuthOptions{File: validAuthFixture(t, now), Transport: denyNetworkTransport(t), Now: func() time.Time { return now }})
 				body := `{"model":"claude-grok-4.7[1m]","max_tokens":10,"messages":[{"role":"user","content":"hello"}]}`
 
-				var written atomic.Int64
-				serve := func(conn net.Conn) {
-					if !readPipedRequest(conn) {
-						return
-					}
-					if _, err := io.WriteString(conn, head); err != nil {
-						return
-					}
-					for written.Load() < bodySize {
-						n, err := conn.Write(chunk)
-						written.Add(int64(n))
-						if err != nil {
+				var allocations []uint64
+				for run := range fixtureRuns {
+					store := mustNewAuthStore(t, grok.AuthOptions{File: validAuthFixture(t, now), Transport: denyNetworkTransport(t), Now: func() time.Time { return now }})
+					var written atomic.Int64
+					serve := func(conn net.Conn) {
+						if !readPipedRequest(conn) {
 							return
 						}
+						if _, err := io.WriteString(conn, head); err != nil {
+							return
+						}
+						for written.Load() < bodySize {
+							n, err := conn.Write(chunk)
+							written.Add(int64(n))
+							if err != nil {
+								return
+							}
+						}
 					}
-				}
 
-				var before, after runtime.MemStats
-				runtime.ReadMemStats(&before)
-				got := handleOverPipe(t, store, body, serve)
-				runtime.ReadMemStats(&after)
+					var before, after runtime.MemStats
+					runtime.ReadMemStats(&before)
+					got := handleOverPipe(t, store, body, serve)
+					runtime.ReadMemStats(&after)
+					allocations = append(allocations, after.TotalAlloc-before.TotalAlloc)
 
-				if got.dials != 1 {
-					t.Errorf("upstream dials = %d, want 1", got.dials)
+					if got.dials != 1 {
+						t.Errorf("run %d: upstream dials = %d, want 1", run, got.dials)
+					}
+					if n := written.Load(); n != bodySize {
+						t.Errorf("run %d: the client read %d bytes of the %d byte outdated-version body, want all of it", run, n, bodySize)
+					}
+					if got.elapsed >= time.Hour {
+						t.Errorf("run %d: the drain took %v of virtual time, want less than the inactivity timeout", run, got.elapsed)
+					}
+					checkPipedAnswer(t, got, http.StatusUpgradeRequired, errorEnvelope("api_error", outdatedMessage), tt.wantResult)
 				}
-				if n := written.Load(); n != bodySize {
-					t.Errorf("the client read %d bytes of the %d byte outdated-version body, want all of it", n, bodySize)
+				if allocated := slices.Min(allocations); allocated >= allocLimit {
+					t.Errorf("answering a %d byte outdated-version body allocated at least %d bytes in each of %d runs (%v), want less than %d in one (the body is kept, not drained)", bodySize, allocated, fixtureRuns, allocations, allocLimit)
 				}
-				if allocated := after.TotalAlloc - before.TotalAlloc; allocated >= allocLimit {
-					t.Errorf("answering a %d byte outdated-version body allocated %d bytes, want less than %d (the body is kept, not drained)", bodySize, allocated, allocLimit)
-				}
-				if got.elapsed >= time.Hour {
-					t.Errorf("the drain took %v of virtual time, want less than the inactivity timeout", got.elapsed)
-				}
-				checkPipedAnswer(t, got, http.StatusUpgradeRequired, errorEnvelope("api_error", outdatedMessage), tt.wantResult)
 			})
 		})
 	}

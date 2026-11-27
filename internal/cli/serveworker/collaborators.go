@@ -204,7 +204,8 @@ func (l *lifetime) awaitLive(now <-chan struct{}) {
 //  8. join the readiness check, the model cache, the usage exporter and the trace exporter, then end
 //     and join the connection establishment of the exporters' transports.
 //
-// A nil stopper stops at once. Nothing of the worker runs after stop returns.
+// A nil stopper stops at once. When stop returns, every step above has finished; what net/http still
+// does with a dial's result after the dial function returned is not part of any wait (see dials).
 func (l *lifetime) stop(stop *stopper) {
 	l.stopOnce.Do(func() {
 		if stop != nil && stop.mode() == stopDrain {

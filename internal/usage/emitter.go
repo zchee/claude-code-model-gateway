@@ -30,7 +30,8 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/worker/upstream"
 )
 
-// exportTimeout bounds one collector post, including draining its reply.
+// exportTimeout bounds one collector post, including draining its reply. Refusing a reply that
+// switched protocols closes its connection outside this bound (see upstream.RefuseSwitch).
 const exportTimeout = 500 * time.Millisecond
 
 // Emitter sends counts-only records to the configured loopback collector.

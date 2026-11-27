@@ -468,7 +468,8 @@ func TestRelayTrailerAndPragmaNormalization(t *testing.T) {
 // TestCaptureHeaderLosesFramingFields checks the framing fields the Go response parser removes before the capture
 // header is built, which the source's capture still sees: Transfer-Encoding, and on an HTTP/1.1 response a Connection
 // field naming the close token. Connection without close, Keep-Alive, and Connection: close on an HTTP/1.0 response
-// stay in the capture header. The relay header carries none of the three fields in any case.
+// stay in the capture header. The relay header carries none of the three fields in any case. Which fields the parser
+// removes is the Go 1.27.4 net/http implementation, observed behaviour rather than a documented guarantee.
 func TestCaptureHeaderLosesFramingFields(t *testing.T) {
 	const (
 		chunkedHello = "5\r\nhello\r\n0\r\n\r\n"
@@ -540,7 +541,7 @@ func TestCaptureHeaderLosesFramingFields(t *testing.T) {
 					want["capture "+field] = v
 				}
 			}
-			// A field the parser keeps reaches both maps unchanged.
+			// Content-Type, a field the parser keeps, reaches both maps unchanged.
 			for _, header := range []struct {
 				view string
 				h    http.Header

@@ -1618,8 +1618,9 @@ func TestRefreshBodyBound(t *testing.T) {
 }
 
 // TestShadowRefreshRefusesBeforeReading verifies that in shadow mode Refresh answers
-// ErrAuthCannotRefresh before it reads the auth file or contacts anything, so a missing or
-// unusable file does not change the answer.
+// ErrAuthCannotRefresh whatever the state of the auth file, contacts nothing and changes no file: a
+// missing, malformed, unusable or expired file gives the same answer. It does not observe whether
+// the file is read.
 func TestShadowRefreshRefusesBeforeReading(t *testing.T) {
 	tests := map[string]struct {
 		content *string

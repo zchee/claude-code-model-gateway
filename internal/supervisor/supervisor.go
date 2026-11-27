@@ -452,9 +452,10 @@ func FixtureShutdown(channel io.ReadCloser, guarded bool) (bool, error) {
 				return true, nil
 			}
 			// The rest is drained through the reader itself, so an error it already holds is returned
-			// and the channel is not read again after it. Peek(1) waits for input and returns only the
-			// channel's own errors, so no error value of the channel is mistaken for the reader's
-			// buffer state.
+			// and the channel is not read again after it. Peek(1) waits for input and never makes up
+			// bufio.ErrBufferFull, so no error value of the channel is mistaken for the reader's
+			// buffer state; it returns the channel's own errors, or io.ErrNoProgress when the channel
+			// keeps returning neither data nor an error.
 			for err == nil {
 				if _, err = reader.Peek(1); err == nil {
 					_, _ = reader.Discard(reader.Buffered())

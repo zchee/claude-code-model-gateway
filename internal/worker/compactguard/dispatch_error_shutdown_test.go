@@ -119,7 +119,8 @@ func (d dispatchErrorServe) wantDispatchHeads() []bool {
 
 // checkDispatchErrorClient checks that the client received nothing from the attempt that
 // returned an error: no status, header field, body or flush when no head was committed, and
-// only the first attempt's committed 200 head with an empty body otherwise.
+// only the first attempt's committed 200 head with an empty body otherwise. That head was
+// written but never flushed, so a flush in either case comes from the attempt that failed.
 func checkDispatchErrorClient(t *testing.T, committed bool, w *headRecorder) {
 	t.Helper()
 	if committed {
@@ -133,9 +134,9 @@ func checkDispatchErrorClient(t *testing.T, committed bool, w *headRecorder) {
 		if h := w.Header(); len(h) != 0 {
 			t.Errorf("client received header fields %v, want none", h)
 		}
-		if w.rec.Flushed {
-			t.Error("client response was flushed, want no flush")
-		}
+	}
+	if w.rec.Flushed {
+		t.Error("client response was flushed, want no flush")
 	}
 	if body := w.bodyString(); body != "" {
 		t.Errorf("client received body %q, want none", body)
@@ -305,8 +306,9 @@ func TestGuardSettledVerdictAfterServiceEnded(t *testing.T) {
 				if diff := gocmp.Diff(verdict, got); diff != "" {
 					t.Errorf("Serve result (-want +got):\n%s", diff)
 				}
-				if !errors.Is(err, tt.err) || (tt.err == nil && err != nil) {
-					t.Errorf("Serve error = %v, want the attempt's own error %v", err, tt.err)
+				// The verdict's own error value comes back as it is: neither wrapped nor replaced.
+				if err != tt.err { //nolint:errorlint // Identity is the property checked; a wrapper must fail.
+					t.Errorf("Serve error = %v, want the attempt's own error value %v, unwrapped", err, tt.err)
 				}
 				if errors.Is(err, errDispatchShutdown) {
 					t.Errorf("Serve error = %v carries the service's cause, want the settled verdict's error", err)
