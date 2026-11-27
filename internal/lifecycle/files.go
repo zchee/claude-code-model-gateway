@@ -79,6 +79,11 @@ func (f Files) Stopped() bool {
 	return err == nil
 }
 
+// StopMarkerPresent distinguishes a missing stop marker from a failure to inspect the state root.
+func (f Files) StopMarkerPresent() (bool, error) {
+	panic("not implemented")
+}
+
 // Stop records an intentional stop.
 func (f Files) Stop() error {
 	if !validStateDir(f.StateDir) {
