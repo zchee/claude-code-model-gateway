@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	json "encoding/json/v2"
 	"io"
 	"net/http"
 	"os"
@@ -153,6 +154,7 @@ func installInertProxyBinary(t *testing.T, state string) {
 // Anthropic catalog page, the readiness check's proxy request, a usage export and a trace export.
 // The clients of these tests send Accept-Encoding to the worker, so none of it is passed on either.
 func TestWorkerOwnedRequestsAskForNoEncoding(t *testing.T) {
+	const startupID = "gpt-fixture-startup"
 	tests := map[string]struct{ request string }{
 		"success: the proxy listing request asks for no encoding":           {request: "listing"},
 		"success: an Anthropic catalog page request asks for no encoding":   {request: "catalog"},
@@ -165,14 +167,18 @@ func TestWorkerOwnedRequestsAskForNoEncoding(t *testing.T) {
 			home, env, state := sandbox(t)
 			first := &firstEncoding{seen: newSignal()}
 			var armed atomic.Bool
-			listed := newSignal()
+			listing := codexListing
+			if tt.request == "readiness" {
+				// A model only the startup listing names: once the worker lists it, the startup refresh
+				// has read and accepted its listing, so no retry of that listing is still to come.
+				listing = `{"data":[{"id":"` + startupID + `","display_name":"` + startupID + ` (codex)"}]}`
+			}
 			env["CODEX_GATEWAY_PROXY_PORT"] = portOf(t, env.StartUpstream(t, messagesProxy(func(w http.ResponseWriter, r *http.Request) {
 				if tt.request == "listing" || tt.request == "readiness" && armed.Load() {
 					first.record(r)
 				}
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = io.WriteString(w, codexListing)
-				listed.fire()
+				_, _ = io.WriteString(w, listing)
 			}, nil)))
 			collector := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				_, _ = io.Copy(io.Discard, r.Body)
@@ -188,9 +194,9 @@ func TestWorkerOwnedRequestsAskForNoEncoding(t *testing.T) {
 				}))
 			case "readiness":
 				installInertProxyBinary(t, state)
-				// The periodic refresh is held off, so the only listing request after the startup refresh
-				// is the readiness check's.
-				env["CODEX_GATEWAY_MODELS_REFRESH_MS"] = "Infinity"
+				// The periodic refresh is held off for an hour, so the only listing request after the
+				// startup refresh is the readiness check's.
+				env["CODEX_GATEWAY_MODELS_REFRESH_MS"] = "3600000"
 			case "usage":
 				env["CODEX_GATEWAY_USAGE_ENDPOINT"] = env.StartUpstream(t, collector) + "/v1/logs"
 			case "trace":
@@ -204,7 +210,7 @@ func TestWorkerOwnedRequestsAskForNoEncoding(t *testing.T) {
 			case "catalog":
 				listWithCredential(t, w.public)
 			case "readiness":
-				listed.wait(t, "the startup refresh to read the proxy listing")
+				waitListed(t, w.public, startupID)
 				armed.Store(true)
 				// The first /healthz starts the shared readiness check.
 				_ = getJSON(t, "http://"+w.public+"/healthz")
@@ -263,6 +269,40 @@ func listedIDs(t *testing.T, public string, ids ...string) map[string]bool {
 	return found
 }
 
+// waitListed reads the worker's /v1/models until it lists id, failing at the bound.
+func waitListed(t *testing.T, public, id string) {
+	t.Helper()
+	deadline := time.Now().Add(failureBound)
+	for !listedIDs(t, public, id)[id] {
+		if time.Now().After(deadline) {
+			t.Fatalf("the worker never listed %s", id)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// catalogIDs reads the model ids of the Anthropic catalog the worker persisted.
+func catalogIDs(t *testing.T, state string) []string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(state, "anthropic-models.json"))
+	if err != nil {
+		t.Fatalf("no Anthropic catalog state was recorded: %v", err)
+	}
+	var doc struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("Anthropic catalog state: %v", err)
+	}
+	var ids []string
+	for _, row := range doc.Data {
+		ids = append(ids, row.ID)
+	}
+	return ids
+}
+
 // TestWorkerOwnedRequestsReadCompressedBytesAsSent decides that the worker reads an answer it did not
 // ask to be compressed as the bytes that were sent, as the source does: a gzip-compressed catalog
 // page is not JSON, and a gzip-compressed proxy listing lists nothing, so the listing that follows it
@@ -275,9 +315,12 @@ func TestWorkerOwnedRequestsReadCompressedBytesAsSent(t *testing.T) {
 	tests := map[string]struct {
 		listing, compressed bool
 		wantCatalogError    any
+		wantCatalogIDs      []string
 		wantListed          map[string]bool
 	}{
-		"success: an Anthropic catalog page sent uncompressed is read": {},
+		"success: an Anthropic catalog page sent uncompressed is read": {
+			wantCatalogIDs: []string{"claude-opus-5-5"},
+		},
 		"error: an Anthropic catalog page sent gzip-compressed without being asked is read as sent, which is not JSON": {
 			compressed: true, wantCatalogError: "invalid catalog JSON",
 		},
@@ -333,6 +376,9 @@ func TestWorkerOwnedRequestsReadCompressedBytesAsSent(t *testing.T) {
 			if diff := gocmp.Diff(tt.wantCatalogError, catalogError(t, state)); diff != "" {
 				t.Errorf("recorded catalog failure (-want +got):\n%s", diff)
 			}
+			if diff := gocmp.Diff(tt.wantCatalogIDs, catalogIDs(t, state)); diff != "" {
+				t.Errorf("model ids of the persisted catalog (-want +got):\n%s", diff)
+			}
 		})
 	}
 }
@@ -387,6 +433,41 @@ func TestStopEndsPendingExportHandshakes(t *testing.T) {
 	}
 }
 
+// usageTokens reads the input and output token counts of the one usage record of an OTLP log export,
+// as the export writes them: decimal strings of OTLP integer values. A count the record lacks is empty.
+func usageTokens(t *testing.T, body string) (input, output string) {
+	t.Helper()
+	var doc struct {
+		ResourceLogs []struct {
+			ScopeLogs []struct {
+				LogRecords []struct {
+					Attributes []struct {
+						Key   string `json:"key"`
+						Value struct {
+							IntValue string `json:"intValue"`
+						} `json:"value"`
+					} `json:"attributes"`
+				} `json:"logRecords"`
+			} `json:"scopeLogs"`
+		} `json:"resourceLogs"`
+	}
+	if err := json.Unmarshal([]byte(body), &doc); err != nil {
+		t.Fatalf("usage export payload: %v", err)
+	}
+	if len(doc.ResourceLogs) != 1 || len(doc.ResourceLogs[0].ScopeLogs) != 1 || len(doc.ResourceLogs[0].ScopeLogs[0].LogRecords) != 1 {
+		t.Fatalf("usage export payload holds other than one log record: %s", body)
+	}
+	for _, a := range doc.ResourceLogs[0].ScopeLogs[0].LogRecords[0].Attributes {
+		switch a.Key {
+		case "input_tokens":
+			input = a.Value.IntValue
+		case "output_tokens":
+			output = a.Value.IntValue
+		}
+	}
+	return input, output
+}
+
 // TestDrainDeliversUsageOfAFinishingRequest follows a request that is still waiting for its provider
 // when a drain begins and finishes during the drain: its client gets the answer, Run returns, and the
 // collector has received the request's usage record by then, since Run joins the exporters. The record
@@ -406,15 +487,8 @@ func TestDrainDeliversUsageOfAFinishingRequest(t *testing.T) {
 				entered.fire()
 				<-release.ch
 			})))
-			var mu sync.Mutex
-			var paths []string
-			env["CODEX_GATEWAY_USAGE_ENDPOINT"] = env.StartUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				_, _ = io.Copy(io.Discard, r.Body)
-				mu.Lock()
-				paths = append(paths, r.URL.Path)
-				mu.Unlock()
-				w.WriteHeader(http.StatusNoContent)
-			})) + "/v1/logs"
+			collector := env.StartUsageCollector(t)
+			env["CODEX_GATEWAY_USAGE_ENDPOINT"] = collector.URL
 			var stdout, stderr lockedSink
 			w := startWorker(t, home, env, &stdout, &stderr)
 			pollHealth(t, w.public, "the proxy catalog", func(doc map[string]any) bool { return doc["catalog"] == "proxy" })
@@ -423,10 +497,19 @@ func TestDrainDeliversUsageOfAFinishingRequest(t *testing.T) {
 				status int
 				err    error
 			}
-			answered := make(chan answer, 1)
+			answered, clientDone := make(chan answer, 1), make(chan struct{})
+			clientCtx, cancelClient := context.WithCancel(t.Context())
 			go func() {
-				status, err := sendMessage(t.Context(), w.public)
+				defer close(clientDone)
+				status, err := sendMessage(clientCtx, w.public)
 				answered <- answer{status, err}
+			}()
+			// Runs before the worker's cleanup waits for Run, also after a failed assertion: the
+			// provider lets the request go, the client gives up, and its goroutine is joined.
+			defer func() {
+				release.fire()
+				cancelClient()
+				<-clientDone
 			}()
 			entered.wait(t, "the provider to hold the message request")
 			status, active, err := postDrain(t.Context(), w.public, lifecycleToken)
@@ -443,9 +526,18 @@ func TestDrainDeliversUsageOfAFinishingRequest(t *testing.T) {
 			if w.err != nil {
 				t.Errorf("Run: %v", w.err)
 			}
-			mu.Lock()
-			defer mu.Unlock()
-			if diff := gocmp.Diff([]string{"/v1/logs"}, paths); diff != "" {
+			type export struct {
+				Method, RequestURI, ContentType string
+				InputTokens, OutputTokens       string
+			}
+			var got []export
+			for _, r := range collector.Requests() {
+				input, output := usageTokens(t, r.Body)
+				got = append(got, export{r.Method, r.RequestURI, r.ContentType, input, output})
+			}
+			// The provider's answer reports 12 input and 4 output tokens.
+			want := []export{{http.MethodPost, "/v1/logs", "application/json", "12", "4"}}
+			if diff := gocmp.Diff(want, got); diff != "" {
 				t.Errorf("usage exports the collector received once Run returned (-want +got):\n%s", diff)
 			}
 		})

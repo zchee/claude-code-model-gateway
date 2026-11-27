@@ -17,6 +17,7 @@
 package serveworker
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -39,13 +40,8 @@ import (
 	"github.com/zchee/claude-code-model-gateway/internal/usage"
 )
 
-const (
-	// waitBound only ends a wait for an event that should already have happened; no assertion passes
-	// by waiting it out.
-	waitBound = 5 * time.Second
-	// switchAnswer is a protocol switch as net/http recognises one: status 101 with the upgrade headers.
-	switchAnswer = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
-)
+// switchAnswer is a protocol switch as net/http recognises one: status 101 with the upgrade headers.
+const switchAnswer = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
 
 // composedWorker builds the worker's collaborators as Run builds them, in a private sandbox with
 // env's settings, and stops them when the test ends. Nothing serves; the test drives the
@@ -95,7 +91,7 @@ func internalSandbox(t *testing.T) (string, gatewaytest.Environment) {
 	return home, gatewaytest.NewEnv(home, nil, nil, nil)
 }
 
-// takenConns records connections a fixture took over and closes them all when the test ends.
+// takenConns records the connections a fixture took over; the handler that took one closes it.
 type takenConns struct {
 	mu    sync.Mutex
 	conns []net.Conn
@@ -111,12 +107,6 @@ func (h *takenConns) snapshot() []net.Conn {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return append([]net.Conn(nil), h.conns...)
-}
-
-func (h *takenConns) close() {
-	for _, c := range h.snapshot() {
-		_ = c.Close()
-	}
 }
 
 // peerClosed reads c until the worker closes its end. The deadline only aborts a wait for a close
@@ -167,9 +157,13 @@ func TestLocalProviderProbeSwitchedResponse(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			home, env := internalSandbox(t)
 			var taken takenConns
-			defer taken.close()
-			probed := make(chan struct{})
-			var probedOnce sync.Once
+			// released lets every handler that took a connection over close it and return; until then
+			// the fixture holds its end of each one open.
+			released := make(chan struct{})
+			release := sync.OnceFunc(func() { close(released) })
+			// The fixture reports how its first probe ended: the error of closing the connection, or
+			// of writing the protocol switch.
+			probes := make(chan error, 1)
 			mux := http.NewServeMux()
 			mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
@@ -180,13 +174,18 @@ func TestLocalProviderProbeSwitchedResponse(t *testing.T) {
 				if err != nil {
 					return
 				}
-				defer probedOnce.Do(func() { close(probed) })
+				defer func() { _ = conn.Close() }()
 				if !tt.switched {
-					_ = conn.Close()
-					return
+					err = conn.Close()
+				} else {
+					taken.add(conn)
+					_, err = io.WriteString(conn, switchAnswer)
 				}
-				taken.add(conn)
-				_, _ = io.WriteString(conn, switchAnswer)
+				select {
+				case probes <- err:
+				default:
+				}
+				<-released
 			})
 			fixture := env.StartUpstream(t, mux)
 			port := fixturePort(t, fixture)
@@ -194,8 +193,23 @@ func TestLocalProviderProbeSwitchedResponse(t *testing.T) {
 			env["CCP_LLAMA_PORT"] = port
 			life := composedWorker(t, home, env)
 
-			refreshed := make(chan error, 1)
-			go func() { refreshed <- life.cache.Refresh(t.Context()) }()
+			refreshCtx, cancelRefresh := context.WithCancel(t.Context())
+			refreshed, refreshDone := make(chan error, 1), make(chan struct{})
+			go func() {
+				defer close(refreshDone)
+				refreshed <- life.cache.Refresh(refreshCtx)
+			}()
+			// Runs before the worker's stop and the fixture's shutdown, also after a failed assertion:
+			// the fixture lets its connections go, then the refresh is ended and joined.
+			defer func() {
+				release()
+				cancelRefresh()
+				select {
+				case <-refreshDone:
+				case <-time.After(waitBound):
+					t.Error("the refresh did not return once its context ended and the fixture closed its connections")
+				}
+			}()
 			select {
 			case err := <-refreshed:
 				if err != nil {
@@ -205,9 +219,15 @@ func TestLocalProviderProbeSwitchedResponse(t *testing.T) {
 				t.Fatal("the refresh did not return while the llama-server held a switched probe connection open")
 			}
 			select {
-			case <-probed:
-			default:
-				t.Fatal("the refresh returned without probing the llama-server")
+			case err := <-probes:
+				if err != nil && tt.switched {
+					t.Fatalf("the fixture's write of the protocol switch to the probe failed: %v", err)
+				}
+				if err != nil {
+					t.Fatalf("the fixture's close of the probe connection failed: %v", err)
+				}
+			case <-time.After(waitBound):
+				t.Fatal("the refresh returned, but the llama-server never saw a probe")
 			}
 			n, err := strconv.ParseUint(port, 10, 16)
 			if err != nil {

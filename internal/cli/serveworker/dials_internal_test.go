@@ -16,10 +16,15 @@ package serveworker
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
+	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/http/httptrace"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -95,14 +100,16 @@ func TestDialGroupCloseJoinsPendingEstablishment(t *testing.T) {
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				serviceCtx, cancel := context.WithCancel(context.Background())
+				// The exporters' group hangs off the test's context, not the service's, as in the worker,
+				// so ending the service cannot end it.
+				serviceCtx, cancel := context.WithCancel(t.Context())
 				defer cancel()
 				life := &lifetime{
 					ctx:     serviceCtx,
 					cancel:  cancel,
 					auth:    upstream.NewTransport(upstream.Options{}),
 					dials:   newDials(serviceCtx),
-					exports: newDials(context.Background()),
+					exports: newDials(t.Context()),
 					changed: make(chan struct{}, 1),
 				}
 				group, closeGroup := life.dials, life.dials.close
@@ -200,7 +207,7 @@ func TestDialGroupTransportsTrackTheirDials(t *testing.T) {
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			group := newDials(context.Background())
+			group := newDials(t.Context())
 			rt, ok := group.transport().(refusingSwitch)
 			if !ok {
 				t.Fatalf("test precondition: the group's transport is %T, want refusingSwitch", group.transport())
@@ -216,6 +223,140 @@ func TestDialGroupTransportsTrackTheirDials(t *testing.T) {
 			}
 			if !errors.Is(err, net.ErrClosed) {
 				t.Errorf("a dial of the closed group's transport returned %v, want net.ErrClosed from the group's tracking", err)
+			}
+		})
+	}
+}
+
+// waitBound only ends a wait for an event that should already have happened; no assertion passes by
+// waiting it out.
+const waitBound = 5 * time.Second
+
+// TestDialGroupTransportEndsWithTheGroupContext decides that the transport a group builds is bound to
+// the group's context, on its own, with admission still open: once the context has ended, a dial of
+// the transport is refused, and a dial that was already connecting when it ended is ended by it. The
+// connect is held in httptrace's ConnectStart hook, inside the real network dial of the transport the
+// group built, until the context has ended. The error decides what ended the dial: the transport's
+// refusal of a closed lifetime, or the cancellation of the dial's context, and not the establishment
+// bound, which would report a deadline. The live row shows that the same fixture and transport reach
+// the server when nothing ends the context, so the refusal of the other rows is the context's doing.
+func TestDialGroupTransportEndsWithTheGroupContext(t *testing.T) {
+	tests := map[string]struct {
+		tls bool
+		// end is "none" for a live group, "before" to end the group's context before the request,
+		// "connecting" to end it while the dial is held in its connect.
+		end string
+	}{
+		"success: a live group's transport reaches the server":                             {end: "none"},
+		"success: a live group's transport reaches the server over TLS":                    {tls: true, end: "none"},
+		"error: a dial of the transport after the group's context ended is refused":        {end: "before"},
+		"error: a TLS dial of the transport after the group's context ended is refused":    {tls: true, end: "before"},
+		"error: a dial of the transport connecting when the group's context ends is ended": {end: "connecting"},
+		"error: a TLS dial of the transport connecting when the group's context ends is ended": {
+			tls: true, end: "connecting",
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			var served atomic.Int64
+			handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				served.Add(1)
+				w.WriteHeader(http.StatusNoContent)
+			})
+			var srv *httptest.Server
+			if tt.tls {
+				srv = httptest.NewTLSServer(handler)
+			} else {
+				srv = httptest.NewServer(handler)
+			}
+			defer srv.Close()
+
+			// The refusal of a transport whose lifetime has ended, taken from a transport of the same
+			// constructor; it dials nothing.
+			ended, end := context.WithCancel(t.Context())
+			end()
+			_, refused := upstream.NewLifetimeTransport(upstream.Options{}, ended).DialContext(t.Context(), "tcp", srv.Listener.Addr().String())
+			if refused == nil {
+				t.Fatal("test precondition: a transport whose lifetime ended dialled")
+			}
+
+			group := newDials(t.Context())
+			defer group.close()
+			rt, ok := group.transport().(refusingSwitch)
+			if !ok {
+				t.Fatalf("test precondition: the group's transport is %T, want refusingSwitch", group.transport())
+			}
+			if tt.tls {
+				// The transport's TLS dial clones this configuration for every dial.
+				pool := x509.NewCertPool()
+				pool.AddCert(srv.Certificate())
+				rt.TLSClientConfig.RootCAs = pool
+			}
+
+			connecting, proceed := make(chan struct{}), make(chan struct{})
+			// Registered after the group's close, so it runs first: a dial held in its connect must
+			// be let go before the close waits for it.
+			proceedOnce := sync.OnceFunc(func() { close(proceed) })
+			defer proceedOnce()
+			ctx := t.Context()
+			if tt.end == "connecting" {
+				var connectOnce sync.Once
+				ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{ConnectStart: func(string, string) {
+					connectOnce.Do(func() { close(connecting) })
+					<-proceed
+				}})
+			}
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/", http.NoBody)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tt.end == "before" {
+				group.cancel()
+			}
+			roundTrip := make(chan error, 1)
+			go func() {
+				resp, err := rt.RoundTrip(req)
+				if err == nil {
+					_, _ = io.Copy(io.Discard, resp.Body)
+					_ = resp.Body.Close()
+				}
+				roundTrip <- err
+			}()
+			if tt.end == "connecting" {
+				select {
+				case <-connecting:
+				case <-time.After(waitBound):
+					t.Fatal("the transport's dial never reached its connect")
+				}
+				group.cancel()
+				proceedOnce()
+			}
+			select {
+			case err = <-roundTrip:
+			case <-time.After(waitBound):
+				t.Fatal("the request through the group's transport did not return")
+			}
+
+			switch tt.end {
+			case "none":
+				if err != nil {
+					t.Fatalf("a request through a live group's transport: %v", err)
+				}
+			case "before":
+				if !errors.Is(err, refused) {
+					t.Errorf("a request through the transport after the group's context ended: %v; want the refusal of an ended lifetime, %v", err, refused)
+				}
+			case "connecting":
+				if !errors.Is(err, refused) && !errors.Is(err, context.Canceled) {
+					t.Errorf("a request through the transport whose context ended while it connected: %v; want the refusal of an ended lifetime or the dial's cancellation, not a deadline", err)
+				}
+			}
+			want := int64(0)
+			if tt.end == "none" {
+				want = 1
+			}
+			if got := served.Load(); got != want {
+				t.Errorf("requests that reached the server = %d, want %d", got, want)
 			}
 		})
 	}
