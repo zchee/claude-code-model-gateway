@@ -117,9 +117,10 @@ func newWriter(opts ...WriteOption) writer {
 type WriteOption func(*writer)
 
 // SkipSync publishes the staged file without syncing it to storage first. By default the staged
-// file is synced before the rename, so the replacement survives a crash or power loss. It is meant
-// only for a cache that is fetched again when lost, such as the model catalog caches, which need
-// no such durability; the source's writer never syncs them either.
+// file is synced before rename; the containing directory is not synced, so persistence of the
+// rename across power loss is not guaranteed. It is meant only for a cache that is fetched again
+// when lost, such as the model catalog caches, which need no such durability; the source's writer
+// never syncs them either.
 func SkipSync() WriteOption {
 	return func(w *writer) { w.skipSync = true }
 }
