@@ -612,13 +612,18 @@ async function sendTail(probe) {
   } catch (error) { probe.note('provider-write-error', { code: error.code ?? error.message }); }
 }
 
-// Splits a raw HTTP/1.1 response and decodes its body framing, keeping only
-// whole chunks, so a cut stream is reported as incomplete rather than guessed.
+// Splits a raw HTTP/1.1 response and decodes its body framing strictly
+// (RFC 9112 sections 6 and 7.1). A chunk extension is skipped without
+// checking its content; trailer field lines must have a field name and a
+// colon. Only whole chunks are kept. Input that stops inside a size line,
+// a chunk or the trailer section is incomplete (terminated false, no framing
+// error); bytes that break the grammar set framingError instead of being
+// skipped. excessBytes counts what follows the end of the framed body.
 function parseWire(wire) {
   const split = wire.indexOf('\r\n\r\n');
   if (split === -1) {
     return { statusLine: wire.length ? wire.toString('latin1').split('\r\n')[0] : null, head: null, framing: null,
-      bodyBytes: 0, terminated: false, bodyMatches: false };
+      body: Buffer.alloc(0), bodyBytes: 0, terminated: false, framingError: null, excessBytes: 0, bodyMatches: false };
   }
   const head = wire.subarray(0, split).toString('latin1');
   const lines = head.split('\r\n');
@@ -626,38 +631,59 @@ function parseWire(wire) {
     const colon = line.indexOf(':');
     return [line.slice(0, colon).trim().toLowerCase(), line.slice(colon + 1).trim()];
   }));
-  let rest = wire.subarray(split + 4), body, framing, terminated;
+  let rest = wire.subarray(split + 4), body, framing, terminated = false, framingError = null, excessBytes = 0;
   if (/\bchunked\b/i.test(headers.get('transfer-encoding') ?? '')) {
     framing = 'chunked';
-    terminated = false;
     const parts = [];
     for (;;) {
       const eol = rest.indexOf('\r\n');
       if (eol === -1) break;
-      const size = Number.parseInt(rest.subarray(0, eol).toString('latin1'), 16);
-      if (!Number.isInteger(size)) break;
-      if (size === 0) { terminated = rest.subarray(eol, eol + 4).toString('latin1') === '\r\n\r\n'; break; }
-      if (rest.length < eol + 2 + size + 2) break;
-      parts.push(rest.subarray(eol + 2, eol + 2 + size));
-      rest = rest.subarray(eol + 2 + size + 2);
+      const sizeLine = rest.subarray(0, eol).toString('latin1');
+      const size = /^([0-9A-Fa-f]+)(?:[ \t]*;[^\r\n]*)?$/.exec(sizeLine)?.[1];
+      if (size === undefined) { framingError = `chunk size line ${JSON.stringify(sizeLine.slice(0, 40))}`; break; }
+      const bytes = Number.parseInt(size, 16);
+      if (bytes === 0) {
+        // The last chunk: zero or more trailer field lines, then an empty line.
+        let at = eol + 2;
+        for (;;) {
+          const next = rest.indexOf('\r\n', at);
+          if (next === -1) break;
+          if (next === at) { terminated = true; excessBytes = rest.length - next - 2; break; }
+          const field = rest.subarray(at, next).toString('latin1');
+          if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+:/.test(field)) { framingError = `trailer line ${JSON.stringify(field.slice(0, 40))}`; break; }
+          at = next + 2;
+        }
+        break;
+      }
+      if (rest.length < eol + 2 + bytes + 2) break;
+      if (rest[eol + 2 + bytes] !== 0x0d || rest[eol + 3 + bytes] !== 0x0a) { framingError = 'chunk data not followed by CRLF'; break; }
+      parts.push(rest.subarray(eol + 2, eol + 2 + bytes));
+      rest = rest.subarray(eol + 4 + bytes);
     }
     body = Buffer.concat(parts);
   } else if (headers.has('content-length')) {
     framing = 'length';
-    const length = Number(headers.get('content-length'));
+    const declared = headers.get('content-length');
+    if (!/^\d+$/.test(declared)) framingError = `content-length ${JSON.stringify(declared.slice(0, 40))}`;
+    const length = framingError === null ? Number(declared) : 0;
     body = rest.subarray(0, length);
-    terminated = rest.length >= length;
+    terminated = framingError === null && rest.length >= length;
+    excessBytes = Math.max(0, rest.length - length);
   } else {
     framing = 'close';
     body = rest;
     terminated = null;  // Only the peer's orderly close ends this body.
   }
-  return { statusLine: lines[0], head, framing, bodyBytes: body.length, terminated, bodyMatches: body.toString() === response };
+  return { statusLine: lines[0], head, framing, body, bodyBytes: body.length, terminated, framingError, excessBytes,
+    bodyMatches: body.toString() === response };
 }
 
-// One complete request through the given topology, then either a FIN from the
-// client (half-close) or nothing (control). Time zero is the FIN, or for the
-// control the instant the FIN would have been sent.
+// One complete request through the given topology, then either the call that
+// ends the client's write side, socket.end() (half-close), or nothing
+// (control). Time zero is taken just before that call, or for the control at
+// the same point of the schedule. Offsets are callback times in this process,
+// not packet timestamps: the client's end of input is when its 'end' event
+// ran, not when the peer's FIN reached the host.
 async function halfCloseProbe(topology, fake, scenario, clientKind, run) {
   const key = `half-close-${topology.name}-${scenario}-${clientKind}-${run}`;
   const timeline = [];
@@ -672,13 +698,22 @@ async function halfCloseProbe(topology, fake, scenario, clientKind, run) {
   const chunks = [];
   let errorCode = null;
   peer.on('error', (err) => { errorCode = err.code ?? err.message; probe.note('client-error', { code: errorCode }); });
-  peer.once('end', () => probe.note('client-end'));
-  peer.once('finish', () => probe.note('client-fin-sent'));
-  const closed = new Promise((resolve) => peer.once('close', (hadError) => { probe.note('client-close', { hadError }); resolve(); }));
+  peer.once('end', () => probe.note('client-input-end'));
+  peer.once('finish', () => probe.note('client-write-side-finished'));
+  peer.once('close', (hadError) => probe.note('client-close', { hadError }));
+  // The stream case waits until the decoded body holds the whole first event,
+  // through its terminating blank line, and then stops decoding.
+  let scanning = scenario === 'mid-stream';
+  const firstEvent = Buffer.from(start);
   const sawFirstEvent = new Promise((resolve) => peer.on('data', (chunk) => {
     chunks.push(chunk);
     probe.note('client-data', { bytes: chunk.length });
-    if (Buffer.concat(chunks).includes('event: message_start')) resolve();
+    if (!scanning) return;
+    const { body: decoded } = parseWire(Buffer.concat(chunks));
+    if (decoded.length < firstEvent.length || !decoded.subarray(0, firstEvent.length).equals(firstEvent)) return;
+    scanning = false;
+    probe.note('client-first-event', { bodyBytes: decoded.length });
+    resolve();
   }));
   const write = (chunk) => {
     const res = probe.upstream;
@@ -716,7 +751,7 @@ async function halfCloseProbe(topology, fake, scenario, clientKind, run) {
       await sleep(halfCloseSettings.settleMs);
     }
     const zero = performance.now();
-    timeline.push({ event: clientKind === 'half-close' ? 'client-fin' : 'client-fin-withheld', time: zero });
+    timeline.push({ event: clientKind === 'half-close' ? 'client-end-call' : 'client-end-call-withheld', time: zero });
     if (clientKind === 'half-close') peer.end();
     await sleep(halfCloseSettings.answerDelayMs);
     if (scenario === 'answer-pending') {
@@ -733,25 +768,34 @@ async function halfCloseProbe(topology, fake, scenario, clientKind, run) {
     const observationMs = elapsed(zero);
     const events = timeline.map(({ time, ...e }) => ({ ...e, offsetMs: Number((time - zero).toFixed(6)) }));
     const offset = (name) => events.find((e) => e.event === name)?.offsetMs ?? null;
-    const unfinishedClose = events.some((e) => e.event === 'provider-response-close' && e.finished === false);
-    const providerSocketClosed = events.some((e) => e.event === 'provider-socket-close');
-    const writeSkipped = events.some((e) => e.event === 'provider-write-skipped' || e.event === 'provider-headers-skipped');
+    // The provider's response ends one way, the first of these in the
+    // timeline: completed (its finish event, the whole response handed to the
+    // socket), aborted (it closed unfinished, or a write found it destroyed),
+    // or pending (neither before the observation ended). The provider socket's
+    // close is a separate observation: after completion it is a normal close.
+    const terminal = events.find((e) => e.event === 'provider-response-finish' ||
+      (e.event === 'provider-response-close' && e.finished === false) ||
+      e.event === 'provider-write-skipped' || e.event === 'provider-headers-skipped');
+    let outcome = 'pending';
+    if (terminal !== undefined) outcome = terminal.event === 'provider-response-finish' ? 'completed' : 'aborted';
     const wire = Buffer.concat(chunks);
     const parsed = parseWire(wire);
+    delete parsed.body;
     let end = 'open';
     if (errorCode !== null) end = errorCode === 'ECONNRESET' ? 'reset' : 'error';
-    else if (offset('client-end') !== null) end = 'orderly';
+    else if (offset('client-input-end') !== null) end = 'orderly';
     return record('half-close', { topology: topology.name, model: models.anthropic, scenario, clientKind, run, observationMs,
       provider: {
         requests: probe.requests, requestBytes: probe.providerRequestBytes, responseBytesWritten: probe.providerResponseBytes,
-        responseFinished: events.some((e) => e.event === 'provider-response-finish'),
-        responseClosedUnfinished: unfinishedClose, socketClosed: providerSocketClosed, writeSkipped,
-        aborted: unfinishedClose || providerSocketClosed || writeSkipped,
+        outcome, outcomeEvent: terminal?.event ?? null, outcomeMs: terminal?.offsetMs ?? null,
+        socketClosed: offset('provider-socket-close') !== null, socketCloseMs: offset('provider-socket-close'),
       },
       client: {
         wireBytes: wire.length, wireSHA256: createHash('sha256').update(wire).digest('hex'), ...parsed,
-        bodyComplete: parsed.bodyMatches && parsed.terminated !== false && (parsed.terminated === true || end === 'orderly'),
-        end, errorCode, firstByteMs: offset('client-data'), endMs: offset('client-end'), closeMs: offset('client-close'),
+        bodyComplete: parsed.bodyMatches && parsed.framingError === null && parsed.terminated !== false &&
+          (parsed.terminated === true || end === 'orderly'),
+        end, errorCode, firstByteMs: offset('client-data'), firstEventMs: offset('client-first-event'),
+        inputEndMs: offset('client-input-end'), closeMs: offset('client-close'),
       },
       events });
   } finally {

@@ -387,15 +387,17 @@ remote_parse_args() {
             ;;
         run)
             [[ $# -gt 0 ]] || usage_fail 'run requires at least one make target'
-            local arg has_bench=0
+            local arg has_bench=0 goals=0 selectors=0
             for arg do
                 if [[ $arg == conformance ]]; then has_conformance=1; fi
                 if [[ $arg == bench ]]; then has_bench=1; fi
+                if [[ $arg == *=* ]]; then selectors=$((selectors + 1)); else goals=$((goals + 1)); fi
             done
             for arg do
                 if [[ $arg == BENCH_PROBE=* ]]; then
-                    # Selects one probe of bench instead of the whole baseline.
-                    (( has_bench && ! has_conformance )) || usage_fail 'BENCH_PROBE requires bench without conformance'
+                    # Selects one probe of bench instead of the whole baseline:
+                    # the run names bench as its only goal and this as its only selector.
+                    (( has_bench && goals == 1 && selectors == 1 )) || usage_fail 'BENCH_PROBE requires exactly one goal, bench, and no other selector'
                     [[ $arg == BENCH_PROBE=half-close ]] || usage_fail 'invalid bench probe'
                 elif [[ $arg == *=* ]]; then
                     (( has_conformance )) || usage_fail 'invalid make target'

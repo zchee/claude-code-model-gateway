@@ -224,46 +224,55 @@ chunk-framed body, and extracts the headers at the first delimiter only.
 
 A raw client sends one complete `POST /v1/messages` (Anthropic model
 `claude-sonnet-4-6`) to the supervisor's public port and waits until the fake
-provider has the whole request body. It then closes only its write side
-(`socket.end()`, the client keeps reading); the control client sends nothing at
-that point. Time zero is that FIN, or for the control the same instant. The
-provider then answers on a fixed schedule with the complete 257,982-byte
-fixture stream:
+provider has the whole request body. It then closes only its write side by
+calling `socket.end()`, and keeps reading; the control client makes no call at
+that point. Time zero is taken just before that call, or for the control at the
+same point of the schedule. The provider then answers on a fixed schedule with
+the complete 257,982-byte fixture stream:
 
-- **Answer pending:** no response byte before the FIN; at +100 ms the
+- **Answer pending:** no response byte before time zero; at +100 ms the
   provider sends its headers, the whole body and its end.
 - **Headers after FIN:** at +100 ms the provider flushes its headers; at
   +300 ms it sends the whole body and its end.
-- **Stream in progress:** before the FIN the provider sends its headers and
-  the first event, and the client waits until it has received that event; at
-  +100 ms the provider sends the rest of the body and its end.
+- **Stream in progress:** before time zero the provider sends its headers and
+  the first event, and the client waits until its decoded body holds that whole
+  event, through its terminating blank line (in every run 0.039 to 0.051 ms
+  before zero); at +100 ms the provider sends the rest of the body and its end.
 
 Each case ran five times with each client, on one supervisor, inside a
-1,500 ms observation window. The JS harness decodes the chunked body, keeping
-only whole chunks, and compares it with the fixture. The table gives each
-column's range over the five runs.
+1,500 ms observation window. The JS harness decodes the chunked body strictly,
+keeping only whole chunks, and compares it with the fixture; no record has a
+framing error or bytes after the end of the body. The table gives each
+column's range over the five runs. Both time columns are offsets from time
+zero to a callback in the client process: "end of input" is when the client's
+`end` event ran, "close" when its `close` event ran. They are not packet
+timestamps.
 
-| Case | Client | Status line | Wire bytes | Body | Client end | Server FIN (ms) | Client close (ms) | Provider response |
+| Case | Client | Status line | Wire bytes | Body | Client end | Zero to end of input (ms) | Zero to close (ms) | Provider response |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Answer pending | half-close | — | 0 | none | orderly | +0.115 to +0.251 | +0.142 to +0.323 | finished at +99.746 to +100.814, not aborted |
-| Answer pending | control | `HTTP/1.1 200 OK` | 258173–258181 | complete | orderly | +103.041 to +104.368 | — (left open) | finished at +100.575 to +100.780, not aborted |
-| Headers after FIN | half-close | — | 0 | none | orderly | +0.103 to +0.152 | +0.131 to +0.200 | finished at +300.954 to +301.228, not aborted |
-| Headers after FIN | control | `HTTP/1.1 200 OK` | 258173 | complete | orderly | +303.349 to +303.747 | — (left open) | finished at +300.839 to +300.918, not aborted |
-| Stream in progress | half-close | `HTTP/1.1 200 OK` | 388 | first event only (246 bytes), no final chunk | orderly | +0.086 to +0.124 | +0.111 to +0.155 | finished at +99.679 to +100.880, not aborted |
-| Stream in progress | control | `HTTP/1.1 200 OK` | 258187 | complete | orderly | +103.003 to +103.271 | — (left open) | finished at +100.541 to +100.690, not aborted |
+| Answer pending | half-close | — | 0 | none | orderly | +0.104 to +0.271 | +0.130 to +0.335 | completed at +100.415 to +100.869 |
+| Answer pending | control | `HTTP/1.1 200 OK` | 258173–258181 | complete | orderly | +102.910 to +104.289 | — (left open) | completed at +100.558 to +100.786 |
+| Headers after FIN | half-close | — | 0 | none | orderly | +0.105 to +0.174 | +0.133 to +0.226 | completed at +300.030 to +301.240 |
+| Headers after FIN | control | `HTTP/1.1 200 OK` | 258173–258176 | complete | orderly | +303.322 to +303.747 | — (left open) | completed at +300.816 to +300.932 |
+| Stream in progress | half-close | `HTTP/1.1 200 OK` | 388 | first event only (246 bytes), no final chunk | orderly | +0.089 to +0.125 | +0.115 to +0.155 | completed at +100.665 to +100.904 |
+| Stream in progress | control | `HTTP/1.1 200 OK` | 258187 | complete | orderly | +102.622 to +103.286 | — (left open) | completed at +99.750 to +100.651 |
 
 "Orderly" means the client read end-of-stream with no socket error; no run
-produced a reset. "Not aborted" means the provider's response finished, its
-TCP connection was not closed during the window, and no provider write found the
-response destroyed. The fake usage collector received 30 POSTs, one for each
-probe, the half-closed ones included. Every response head carries
+produced a reset. The provider's response has one outcome, the first of these
+in its timeline: completed (its `finish` event), aborted (it closed unfinished,
+or a write found it destroyed) or pending (neither within the window). All 30
+completed. The provider's TCP connection is a separate observation: it did not
+close during the window in any run. The fake usage collector received 30 POSTs,
+one for each probe, the half-closed ones included. Every response head carries
 `connection: close`: the supervisor copies the worker's response headers. The
-control's FIN after the complete body comes from that header, not from
-anything the client did.
+control's end of input after the complete body comes from that header, not
+from anything the client did.
 
-**Measured rule:** after a complete request, the pinned supervisor answers
-the client's FIN with its own orderly FIN within about 0.3 ms and sends nothing
-further, while the worker's request to the provider is not aborted.
+**Measured rule:** after a complete request, the pinned supervisor ends the
+connection as soon as the client half-closes and sends nothing further, while
+the worker's request to the provider still completes; in these 15 half-close
+samples the client's end-of-input callback ran 0.089 to 0.271 ms after its
+`socket.end()` call, a figure for this host and load only.
 
 So a client that half-closes while the answer is pending gets no status line at
 all, whether the provider's headers come with the body or ahead of it. A client
@@ -282,20 +291,21 @@ the Codex route.
 The [raw JSON Lines file](baseline-node-samples/half-close.jsonl) holds the run
 record, the launch environment and one record per probe with its full event
 timeline (offsets in milliseconds from time zero). Run started
-2026-11-26T23:50:31.018718042Z and ended 2026-11-26T23:51:18.469487655Z (UTC,
+2026-11-27T00:21:40.608743937Z and ended 2026-11-27T00:22:28.033990216Z (UTC,
 `date` in the venue), source commit a8501f25175572071a0d085d34346dcf67e49b23,
 Node v24.11.1, on the same host and kernel as above. Compressed frame SHA-256
 (recorded at capture):
-df82bfb371e82586e268e530a6ca0cb923ec8b0a221f669538cd6aa3e85e9239. Raw JSON
+69242e16885e95630c264180384903fbc3267ce2fd2a642b89f6ee8c9c38fd7c. Raw JSON
 Lines SHA-256 (verifiable):
-1b91eb5708ca66607f73a9849a9abc622a0d0f2b2e27e610db2fdbb2ad371b8e.
+a057e7df72405860774cd6e6f3de3e5ef5e2b2e17dfb599b4a2ea49c75cf9b8f.
 
 ```bash
 VENUE_HOST=debian-13-trixie.gaudiy-platform ./hack/remote run bench BENCH_PROBE=half-close
 ```
 
-`BENCH_PROBE=half-close` runs only this probe through `make -- bench`. A plain
-`bench` still runs the whole baseline above, unchanged.
+`BENCH_PROBE=half-close` runs only this probe through `make -- bench`, and
+`./hack/remote` accepts it only with `bench` as the one goal and no other
+selector. A plain `bench` still runs the whole baseline above, unchanged.
 
 ## Cleanup
 
