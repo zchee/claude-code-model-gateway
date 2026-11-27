@@ -25,9 +25,15 @@ import (
 	"testing"
 	"time"
 
+	gocmp "github.com/google/go-cmp/cmp"
+
 	"github.com/zchee/claude-code-model-gateway/internal/cli/serveworker"
 	"github.com/zchee/claude-code-model-gateway/internal/gatewaytest"
 )
+
+// invalidUpstreamError restates the error compose.New returns for an unusable AnthropicBaseURL
+// (internal/worker/compose/compose.go, validate); the worker command returns it unwrapped before it listens.
+const invalidUpstreamError = "compose: AnthropicBaseURL must be an absolute http or https URL"
 
 type logSink func([]byte) (int, error)
 
@@ -38,6 +44,7 @@ func TestWorkerStartupBoundaries(t *testing.T) {
 		upstream   string
 		wantOrigin string
 		forbidden  []string
+		wantErr    string
 		stateKind  string
 	}{
 		"success: readiness prints only http origin": {
@@ -50,22 +57,28 @@ func TestWorkerStartupBoundaries(t *testing.T) {
 			wantOrigin: "https://upstream.invalid:8443",
 			forbidden:  []string{"alice", "secret-pass", "/v1/custom", "api_key", "tok", "frag"},
 		},
-		// Each condition of the fallback on its own: a value url.Parse refuses; one it parses with a scheme
-		// (fixture-user, the rest opaque) and no host; and a scheme-relative one it parses with a host and no scheme.
-		"success: readiness names an upstream that does not parse without its text": {
-			upstream:   "http://fixture-user:fixture-pass@[::1/fixture-path?fixture-query=yes",
-			wantOrigin: "anthropic (unparsable URL))",
-			forbidden:  []string{"fixture-user", "fixture-pass", "fixture-path", "fixture-query", "::1"},
+		// The worker refuses to start with an upstream that is not an absolute http or https URL: a value url.Parse
+		// refuses; one it parses with a scheme (fixture-user, the rest opaque) and no host; a scheme-relative one it
+		// parses with a host and no scheme; and one with a host and a scheme other than http or https.
+		"error: worker refuses an upstream that does not parse and never repeats it": {
+			upstream:  "http://fixture-user:fixture-pass@[::1/fixture-path?fixture-query=yes",
+			wantErr:   invalidUpstreamError,
+			forbidden: []string{"fixture-user", "fixture-pass", "fixture-path", "fixture-query", "::1"},
 		},
-		"success: readiness names an upstream with a scheme and no host without its text": {
-			upstream:   "fixture-user:fixture-pass@fixture-host/fixture-path?fixture-query=yes",
-			wantOrigin: "anthropic (unparsable URL))",
-			forbidden:  []string{"fixture-user", "fixture-pass", "fixture-host", "fixture-path", "fixture-query"},
+		"error: worker refuses an upstream with a scheme and no host and never repeats it": {
+			upstream:  "fixture-user:fixture-pass@fixture-host/fixture-path?fixture-query=yes",
+			wantErr:   invalidUpstreamError,
+			forbidden: []string{"fixture-user", "fixture-pass", "fixture-host", "fixture-path", "fixture-query"},
 		},
-		"success: readiness names an upstream with a host and no scheme without its text": {
-			upstream:   "//fixture-user:fixture-pass@fixture-host:9/fixture-path?fixture-query=yes",
-			wantOrigin: "anthropic (unparsable URL))",
-			forbidden:  []string{"fixture-user", "fixture-pass", "fixture-host", "fixture-path", "fixture-query"},
+		"error: worker refuses an upstream with a host and no scheme and never repeats it": {
+			upstream:  "//fixture-user:fixture-pass@fixture-host:9/fixture-path?fixture-query=yes",
+			wantErr:   invalidUpstreamError,
+			forbidden: []string{"fixture-user", "fixture-pass", "fixture-host", "fixture-path", "fixture-query"},
+		},
+		"error: worker refuses an upstream with a non-http scheme and never repeats it": {
+			upstream:  "ftp://fixture-user:fixture-pass@fixture-host:21/fixture-path?fixture-query=yes",
+			wantErr:   invalidUpstreamError,
+			forbidden: []string{"ftp:", "fixture-user", "fixture-pass", "fixture-host", "fixture-path", "fixture-query"},
 		},
 		"error: unclean dot state root":       {stateKind: "dot"},
 		"error: symlink traversal state root": {stateKind: "symlink"},
@@ -130,6 +143,28 @@ func TestWorkerStartupBoundaries(t *testing.T) {
 				for _, p := range forbiddenPaths {
 					if _, statErr := os.Lstat(p); !os.IsNotExist(statErr) {
 						t.Errorf("invalid state root produced filesystem state at %s: stat error=%v", p, statErr)
+					}
+				}
+				return
+			}
+			if tt.wantErr != "" {
+				gotErr := ""
+				if err != nil {
+					gotErr = err.Error()
+				}
+				if diff := gocmp.Diff(tt.wantErr, gotErr); diff != "" {
+					t.Errorf("Run error for an invalid upstream (-want +got):\n%s", diff)
+				}
+				if ready {
+					t.Error("worker announced readiness with an invalid upstream")
+				}
+				if stdout.Len() != 0 {
+					t.Errorf("worker wrote %d bytes to stdout before refusing an invalid upstream, want none", stdout.Len())
+				}
+				for _, marker := range tt.forbidden {
+					if strings.Contains(stdout.String(), marker) || strings.Contains(stderr.String(), marker) {
+						t.Error("worker output repeats a part of the refused upstream URL")
+						break
 					}
 				}
 				return
