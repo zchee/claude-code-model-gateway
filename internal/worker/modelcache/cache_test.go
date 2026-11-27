@@ -253,6 +253,27 @@ func newTestPaths(t *testing.T, extra map[string]string) (string, config.LookupE
 	return home, lookup, resolver
 }
 
+// seedDiscoveryInputs writes the two files a discovery sync reads to assemble its rows, the saved
+// Anthropic catalog and the Claude global configuration that holds the picker rows, as regular files
+// at the paths newTestPaths resolves, and returns those paths sorted.
+func seedDiscoveryInputs(t *testing.T, home string) []string {
+	t.Helper()
+	catalog := filepath.Join(home, ".claude", "model-gateway", "anthropic-models.json")
+	global := filepath.Join(home, ".claude", ".claude.json")
+	for path, data := range map[string]string{
+		catalog: `{"data":[],"updatedAt":0}`,
+		global:  `{"additionalModelOptionsCache":[]}`,
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+		}
+		if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+			t.Fatalf("seed %s: %v", path, err)
+		}
+	}
+	return slices.Sorted(slices.Values([]string{catalog, global}))
+}
+
 type handlerTransport struct {
 	handler http.Handler
 }
@@ -2672,6 +2693,11 @@ func TestDiscoveryCacheSync(t *testing.T) {
 	t.Cleanup(proxySrv.Close)
 
 	const defaultURL = "http://127.0.0.1:19999"
+	// Opens of the discovery inputs are observed through Linux inotify; elsewhere every other
+	// assertion still runs and this is said once.
+	noteUnobservable := sync.OnceFunc(func() {
+		t.Log("opens of the discovery inputs are not observed on this system: observing them needs Linux inotify")
+	})
 
 	t.Run("success: wired proxy writes discovery cache and only updates fetchedAt on force", func(t *testing.T) {
 		home, lookup, resolver := newTestPaths(t, nil)
@@ -2819,6 +2845,7 @@ func TestDiscoveryCacheSync(t *testing.T) {
 				t.Run(sub, func(t *testing.T) {
 					home, lookup, resolver := newTestPaths(t, nil)
 					cachePath := filepath.Join(home, ".claude", "cache", "gateway-models.json")
+					inputs := seedDiscoveryInputs(t, home)
 					if seeded {
 						if err := os.MkdirAll(filepath.Dir(cachePath), 0o700); err != nil {
 							t.Fatalf("mkdir discovery cache dir: %v", err)
@@ -2891,6 +2918,11 @@ func TestDiscoveryCacheSync(t *testing.T) {
 					}
 
 					checkFileUnchanged("after Refresh")
+					// From here on every open of the saved catalog or the picker configuration is recorded.
+					opens, observable := watchDiscoveryInputOpens(t, inputs...)
+					if !observable {
+						noteUnobservable()
+					}
 
 					// Block and record ALL outbound HTTP transport attempts (any destination) after setup.
 					gated.blocked.Store(true)
@@ -2919,6 +2951,11 @@ func TestDiscoveryCacheSync(t *testing.T) {
 						}
 						checkFileUnchanged(fmt.Sprintf("after SyncDiscoveryCache(%v)", force))
 					}
+					if observable {
+						if diff := gocmp.Diff([]string(nil), opens.opened(t)); diff != "" {
+							t.Errorf("input files the skipped or failed syncs opened (-want +got):\n%s", diff)
+						}
+					}
 					if n := pinCalls.Load(); n != 0 {
 						t.Errorf("skipped or failed syncs read the current pins %d time(s), want none before the gate passes", n)
 					}
@@ -2930,6 +2967,65 @@ func TestDiscoveryCacheSync(t *testing.T) {
 					}
 				})
 			}
+		}
+	})
+
+	t.Run("success: a sync that passes its gate opens the saved catalog and the picker configuration", func(t *testing.T) {
+		// The control of the skipped cases above: the same inputs, watched the same way, are opened by
+		// a sync of a wired, non-shadow worker, so the watch is known to see the reads.
+		tests := map[string]struct {
+			force bool
+		}{
+			"success: an unforced wired sync opens both inputs": {},
+			"success: a forced wired sync opens both inputs":    {force: true},
+		}
+		for name, tt := range tests {
+			t.Run(name, func(t *testing.T) {
+				home, lookup, resolver := newTestPaths(t, nil)
+				inputs := seedDiscoveryInputs(t, home)
+				var pinCalls atomic.Int32
+				cache, err := modelcache.New(modelcache.Options{
+					Lookup:           lookup,
+					Paths:            resolver,
+					ProxyBaseURL:     proxySrv.URL,
+					DefaultBaseURL:   defaultURL,
+					Client:           newTestClient(t),
+					Clock:            func() time.Time { return time.UnixMilli(1234567890) },
+					Routes:           &route.Store{},
+					Sentry:           &sentry.State{},
+					EffectiveBaseURL: baseURLFunc(defaultURL),
+					CurrentPins: func() map[string]string {
+						pinCalls.Add(1)
+						return nil
+					},
+				})
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				if err := cache.Refresh(t.Context()); err != nil {
+					t.Fatalf("Refresh: %v", err)
+				}
+				opens, observable := watchDiscoveryInputOpens(t, inputs...)
+				if !observable {
+					noteUnobservable()
+				}
+				pinCalls.Store(0)
+				res, err := cache.SyncDiscoveryCache(tt.force)
+				if err != nil {
+					t.Fatalf("SyncDiscoveryCache(%v): %v", tt.force, err)
+				}
+				if res.State == "skipped" {
+					t.Fatalf("test precondition: the wired sync was skipped (%q)", res.Reason)
+				}
+				if observable {
+					if diff := gocmp.Diff(inputs, opens.opened(t)); diff != "" {
+						t.Errorf("input files the wired sync opened (-want +got):\n%s", diff)
+					}
+				}
+				if diff := gocmp.Diff(int32(1), pinCalls.Load()); diff != "" {
+					t.Errorf("current pin reads of the wired sync (-want +got):\n%s", diff)
+				}
+			})
 		}
 	})
 
