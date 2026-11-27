@@ -37,7 +37,9 @@ func OpenDirectoryFile(path string, perm fs.FileMode) (*os.File, error) {
 func (d *Dir) ReadFile(name string) ([]byte, error) { return nil, fs.ErrClosed }
 
 // WriteFile returns fs.ErrClosed because no Dir can be opened on this platform.
-func (d *Dir) WriteFile(name string, data []byte, mode fs.FileMode) error { return fs.ErrClosed }
+func (d *Dir) WriteFile(name string, data []byte, mode fs.FileMode, opts ...WriteOption) error {
+	return fs.ErrClosed
+}
 
 // RewriteFile returns fs.ErrClosed because no Dir can be opened on this platform.
 func (d *Dir) RewriteFile(name string, data []byte) error { return fs.ErrClosed }

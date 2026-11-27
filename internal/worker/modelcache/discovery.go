@@ -109,7 +109,9 @@ func (c *Cache) SyncDiscoveryCache(force bool) (DiscoverySyncResult, error) {
 	if err := os.MkdirAll(filepath.Dir(c.discoveryPath), 0o777); err != nil {
 		return result, err
 	}
-	if err := atomicfile.WriteFile(c.discoveryPath, data, 0o600); err != nil {
+	// Like the Anthropic catalog, the discovery cache is rebuilt from the catalogs, and a reader
+	// may watch its directory, so it is published without the staging sync.
+	if err := atomicfile.WriteFile(c.discoveryPath, data, 0o600, atomicfile.SkipSync()); err != nil {
 		return result, err
 	}
 	result.State = "wrote"

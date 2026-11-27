@@ -179,7 +179,7 @@ func (w writer) replace(root *directory, base string, data []byte, mode fs.FileM
 		}
 		err = verifyMetadata(file, root.path(base), mode, want)
 	}
-	if err == nil {
+	if err == nil && !w.skipSync {
 		err = file.Sync()
 	}
 	if err = errors.Join(err, file.Close()); err != nil {

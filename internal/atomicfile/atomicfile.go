@@ -69,7 +69,7 @@ func (e *OwnershipError) Error() string {
 
 func (e *OwnershipError) Unwrap() error { return e.Err }
 
-// preparedFile names a synced, closed sibling ready for publication.
+// preparedFile names a closed sibling ready for publication, synced unless the write passed [SkipSync].
 type preparedFile interface {
 	Name() string
 	CloseAtomicallyReplace() error
@@ -81,15 +81,32 @@ type writer struct {
 	commit                func(preparedFile, string) error
 	remove                func(preparedFile) error
 	afterOpen, beforeLink func()
+	skipSync              bool
 }
 
-func newWriter() writer {
-	return writer{now: time.Now, commit: func(file preparedFile, _ string) error { return file.CloseAtomicallyReplace() }, remove: preparedFile.remove}
+func newWriter(opts ...WriteOption) writer {
+	w := writer{now: time.Now, commit: func(file preparedFile, _ string) error { return file.CloseAtomicallyReplace() }, remove: preparedFile.remove}
+	for _, opt := range opts {
+		opt(&w)
+	}
+	return w
+}
+
+// WriteOption changes how [WriteFile] and [Dir.WriteFile] stage a replacement.
+type WriteOption func(*writer)
+
+// SkipSync publishes the staged sibling without syncing it to storage first. By default the
+// sibling is synced before the rename. It is meant only for a cache that is fetched again when
+// lost, such as the model catalog caches: a reader that watches the directory can be woken by
+// the staging sibling and must find the new content at once, as with the source's writer, which
+// never syncs, and such a cache does not need the durability the sync buys.
+func SkipSync() WriteOption {
+	return func(w *writer) { w.skipSync = true }
 }
 
 // WriteFile replaces path with data using mode for the temporary sibling.
-func WriteFile(path string, data []byte, mode fs.FileMode) error {
-	return newWriter().writeFile(path, data, mode)
+func WriteFile(path string, data []byte, mode fs.FileMode, opts ...WriteOption) error {
+	return newWriter(opts...).writeFile(path, data, mode)
 }
 
 // ReplaceSettings follows a settings symlink and preserves the target's permissions.

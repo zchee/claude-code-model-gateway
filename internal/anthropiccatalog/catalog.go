@@ -210,7 +210,9 @@ func write(path string, obj jsonx.WireValue) error {
 		return err
 	}
 	defer func() { _ = dir.Close() }()
-	return dir.WriteFile(name, data, 0o600)
+	// The catalog is a cache the next refresh fetches again, and a reader watching the
+	// directory must find the new content as soon as the staging file wakes it.
+	return dir.WriteFile(name, data, 0o600, atomicfile.SkipSync())
 }
 
 // WithCached puts the advertised cached rows before models, which lose on an ID collision.

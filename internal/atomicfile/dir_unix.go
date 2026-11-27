@@ -160,14 +160,14 @@ func (d *Dir) readFile(name string, beforeOpen func()) ([]byte, error) {
 }
 
 // WriteFile replaces a single named entry using the same semantics as WriteFile.
-func (d *Dir) WriteFile(name string, data []byte, mode fs.FileMode) error {
+func (d *Dir) WriteFile(name string, data []byte, mode fs.FileMode, opts ...WriteOption) error {
 	if d.root.handle == nil {
 		return fs.ErrClosed
 	}
 	if !validWriteBase(name) {
 		return &DestinationError{name}
 	}
-	return newWriter().writeFileAt(&d.root, name, data, mode)
+	return newWriter(opts...).writeFileAt(&d.root, name, data, mode)
 }
 
 // CreateExclusive publishes a single named entry with the creation and cleanup
