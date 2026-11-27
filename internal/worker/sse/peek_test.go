@@ -279,8 +279,9 @@ func TestPeekFirstEvent(t *testing.T) {
 			}
 
 			if tt.wantEarlyEnd {
-				if res.EarlyEndOverride != "upstream_error" && res.EarlyEndOverride != "upstream_aborted" {
-					t.Errorf("EarlyEndOverride = %q, want upstream_error or upstream_aborted", res.EarlyEndOverride)
+				// The label of an abnormal read before a complete first event, restated as a literal.
+				if res.EarlyEndOverride != "upstream_aborted" {
+					t.Errorf("EarlyEndOverride = %q, want upstream_aborted", res.EarlyEndOverride)
 				}
 			} else if res.EarlyEndOverride != "" {
 				t.Errorf("EarlyEndOverride = %q, want empty", res.EarlyEndOverride)

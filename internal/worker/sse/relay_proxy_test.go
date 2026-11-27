@@ -636,6 +636,9 @@ func TestProxyRelayCompletionAndMessageStop(t *testing.T) {
 
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
+			// Installed before any server starts, so every line the relay or its servers write to
+			// standard error or the default logger during the turn is seen.
+			readStderr := captureStderr(t)
 			upSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Type", "text/event-stream")
 				w.WriteHeader(http.StatusOK)
@@ -691,6 +694,11 @@ func TestProxyRelayCompletionAndMessageStop(t *testing.T) {
 			}
 			if diff := gocmp.Diff(tt.wantOutcome, res); diff != "" {
 				t.Errorf("outcome.Result (-want +got):\n%s", diff)
+			}
+			// The source reports a synthesized stop on standard error; the relay reports nothing,
+			// whether or not it synthesized one.
+			if got := readStderr(); got != "" {
+				t.Errorf("standard error and default logger output during the turn = %q, want none", got)
 			}
 		})
 	}
@@ -1480,8 +1488,9 @@ func TestLMStudioFirstEventPeek(t *testing.T) {
 		if handlerErr != nil {
 			t.Fatalf("RelayProxy error = %v, want nil", handlerErr)
 		}
-		if res.Status != http.StatusOK || (res.StatusOverride != "upstream_error" && res.StatusOverride != "upstream_aborted") {
-			t.Errorf("outcome.Result = %+v, want status 200 with upstream_error or upstream_aborted", res)
+		// The label of an abnormal read before a complete first event, restated as a literal.
+		if res.Status != http.StatusOK || res.StatusOverride != "upstream_aborted" {
+			t.Errorf("outcome.Result = %+v, want status 200 with upstream_aborted", res)
 		}
 	})
 }

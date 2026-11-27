@@ -23,25 +23,39 @@ import (
 	gocmp "github.com/google/go-cmp/cmp"
 
 	"github.com/zchee/claude-code-model-gateway/internal/jsonx"
+	"github.com/zchee/claude-code-model-gateway/internal/policy"
 	"github.com/zchee/claude-code-model-gateway/internal/usage"
+	"github.com/zchee/claude-code-model-gateway/internal/worker/sentry"
 	"github.com/zchee/claude-code-model-gateway/internal/worker/sse"
 )
 
 // TestTransformerNullDataEvent checks that a transformed "data: null" frame is re-encoded on the
-// wire and that the JSON null is ignored by attempt and usage accounting, so the valid events
-// around it are rewritten, filtered and accounted for exactly as without it. The accounting of
-// the observed events is compared with the accounting of the valid events alone.
+// wire and that the JSON null is ignored by attempt, sentry and usage accounting, so the valid
+// events around it are rewritten, filtered and accounted for exactly as without it. The accounting
+// of the observed events is compared with the accounting of the valid events alone, and the
+// sentry's recorded usage is also compared with a literal crossing.
 func TestTransformerNullDataEvent(t *testing.T) {
 	const (
 		advertised = "claude-gpt-5.6-sol"
 		backend    = "gpt-5.6-sol"
+		// sentryTrigger is the environment trigger of the sentry target every case observes into.
+		sentryTrigger = 100
 	)
+	ordinaryReq := []byte(`{"model":"claude-gpt-5.6-sol","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	session := sentry.SessionKey(true, "session-null-frame", nil)
+	target, err := sentry.ResolveTarget(policy.NewResolver(policy.ResolverInputs{}), advertised, sentryTrigger, 0, 0)
+	if err != nil {
+		t.Fatalf("ResolveTarget: %v", err)
+	}
 	tests := map[string]struct {
 		cfg     sse.TransformerConfig
 		chunks  []string
 		wantOut string
 		// wantValid are the non-null events Observe must receive, in order.
 		wantValid []string
+		// wantCrossing is what the sentry's check of the next ordinary request reports after the
+		// observed events; nil means no crossing.
+		wantCrossing *sentry.Crossing
 	}{
 		"success: null frame is re-encoded and the following event is rewritten and observed": {
 			cfg: sse.TransformerConfig{AdvertisedModel: advertised, BackendModel: backend, Provider: "codex", FilterPlanTools: true},
@@ -94,16 +108,37 @@ func TestTransformerNullDataEvent(t *testing.T) {
 			wantValid: []string{
 				`{"type":"message_delta","usage":{"input_tokens":10,"output_tokens":2,"cache_read_input_tokens":29990}}`,
 			},
+			// 10 exclusive input tokens plus 29990 cache reads.
+			wantCrossing: &sentry.Crossing{Usage: 30000, Trigger: sentryTrigger},
+		},
+		"success: null frame after a crossing usage event leaves the sentry's recorded usage": {
+			cfg: sse.TransformerConfig{AdvertisedModel: advertised, BackendModel: backend, Provider: "codex"},
+			chunks: []string{
+				"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":150,\"output_tokens\":4}}\n\n" +
+					"data: null\n\n" +
+					"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+			},
+			wantOut: "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":150,\"output_tokens\":4}}\n\n" +
+				"data: null\n\n" +
+				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+			wantValid: []string{
+				`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":150,"output_tokens":4}}`,
+				`{"type":"message_stop"}`,
+			},
+			wantCrossing: &sentry.Crossing{Usage: 150, Trigger: sentryTrigger},
 		},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			var attempt sse.Attempt
 			capture := nullEventCapture(t)
+			var state sentry.State
 			var valid []string
 			cfg := tt.cfg
 			cfg.Observe = func(event jsonx.WireValue) {
 				attempt.NoteEvent(event)
+				// As the proxy relay observes a frame: never as an ordinary completed turn.
+				state.ObserveWire(session, target, event, false)
 				capture.ObserveEvent(event)
 				if event.Kind != 'n' {
 					valid = append(valid, mustEncodeWire(t, event))
@@ -132,13 +167,27 @@ func TestTransformerNullDataEvent(t *testing.T) {
 
 			var wantAttempt sse.Attempt
 			wantCapture := nullEventCapture(t)
+			var wantState sentry.State
 			for _, raw := range tt.wantValid {
 				event := mustDecodeWire(t, raw)
 				wantAttempt.NoteEvent(event)
+				wantState.ObserveWire(session, target, event, false)
 				wantCapture.ObserveEvent(event)
 			}
 			if diff := gocmp.Diff(wantAttempt, attempt); diff != "" {
 				t.Errorf("attempt accounting with the null event (-valid events only +observed):\n%s", diff)
+			}
+			crossing, fired := state.Check(session, target, ordinaryReq)
+			var gotCrossing *sentry.Crossing
+			if fired {
+				gotCrossing = &crossing
+			}
+			if diff := gocmp.Diff(tt.wantCrossing, gotCrossing); diff != "" {
+				t.Errorf("sentry check after the observed events (-want +got):\n%s", diff)
+			}
+			validCrossing, validFired := wantState.Check(session, target, ordinaryReq)
+			if fired != validFired || crossing != validCrossing {
+				t.Errorf("sentry check with the null event = (%+v, %t), valid events only = (%+v, %t)", crossing, fired, validCrossing, validFired)
 			}
 			if diff := gocmp.Diff(wantCapture.Snapshot(), capture.Snapshot()); diff != "" {
 				t.Errorf("usage accounting with the null event (-valid events only +observed):\n%s", diff)

@@ -17,7 +17,10 @@ package sse_test
 import (
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -81,6 +84,38 @@ func (b *eofChunkBody) remaining() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return len(b.chunks)
+}
+
+// captureStderr redirects the process's standard error and the default logger to a file until
+// the test ends and returns a function that reads what they received. The relays take no
+// diagnostics writer, so these are where a diagnostic line from them could go; a writer added to
+// their options later is not seen here. Standard output is left alone so the test framework's own
+// reporting is not captured. Tests that use it must not run in parallel.
+func captureStderr(t *testing.T) func() string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "stderr")
+	output, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create stderr capture: %v", err)
+	}
+	stderr, logOutput := os.Stderr, log.Writer()
+	os.Stderr = output
+	log.SetOutput(output)
+	t.Cleanup(func() {
+		os.Stderr = stderr
+		log.SetOutput(logOutput)
+		if err := output.Close(); err != nil {
+			t.Errorf("close stderr capture: %v", err)
+		}
+	})
+	return func() string {
+		t.Helper()
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read stderr capture: %v", err)
+		}
+		return string(raw)
+	}
 }
 
 // heldRead is one scripted result of a heldBody read.

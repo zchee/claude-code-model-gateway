@@ -712,8 +712,9 @@ func TestStreamAbortAndDisconnect(t *testing.T) {
 				if !errors.Is(handlerErr, http.ErrAbortHandler) {
 					t.Errorf("relay error = %v, want wrapped http.ErrAbortHandler", handlerErr)
 				}
-				if res.Status != http.StatusOK || (res.StatusOverride != "upstream_error" && res.StatusOverride != "upstream_aborted") {
-					t.Errorf("outcome.Result = %+v, want status 200 with upstream_error or upstream_aborted", res)
+				// The label of an abnormal body read during the relay, restated as a literal.
+				if res.Status != http.StatusOK || res.StatusOverride != "upstream_aborted" {
+					t.Errorf("outcome.Result = %+v, want status 200 with upstream_aborted", res)
 				}
 				if res.Cancelled {
 					t.Errorf("outcome.Cancelled = true on server-side upstream abort, want false")

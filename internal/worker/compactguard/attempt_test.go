@@ -56,6 +56,10 @@ func TestUsageSnapshotMergeAndDiagnostics(t *testing.T) {
 		"success: zero replaces prior count but absent values do not": {map[string]any{"input_tokens": 0.0, "cache_read_tokens": nil, "output_tokens": 12.5, "cache_creation_tokens": 4.0, "private": "omitted"}, outcome.Compaction{InputTokens: new(0.0), CacheReadTokens: new(3.0), OutputTokens: new(12.5), CacheCreationTokens: new(4.0)}},
 		"error: invalid counts add no diagnostic value":               {map[string]any{"input_tokens": math.NaN(), "output_tokens": math.Inf(-1), "cache_read_tokens": -1.0, "cache_creation_tokens": math.Inf(1)}, previous},
 		"error: strings and booleans are not numeric counts":          {map[string]any{"output_tokens": "6", "cache_creation_tokens": true}, previous},
+		// Only a float64 zero is a measured count; an integer zero is not.
+		"error: integer zero keeps the previous nonzero counts":                    {map[string]any{"input_tokens": 0, "cache_read_tokens": int64(0), "output_tokens": uint(0), "cache_creation_tokens": int32(0)}, previous},
+		"error: nonzero integers are not float64 counts either":                    {map[string]any{"input_tokens": 5, "cache_read_tokens": int64(9), "output_tokens": uint64(2)}, previous},
+		"success: float64 zero beside an integer zero replaces only its own count": {map[string]any{"input_tokens": 0, "cache_read_tokens": 0.0}, outcome.Compaction{InputTokens: new(17.0), CacheReadTokens: new(0.0)}},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
