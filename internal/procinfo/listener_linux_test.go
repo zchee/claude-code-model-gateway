@@ -71,7 +71,7 @@ func TestLinuxListenerWithoutLsof(t *testing.T) {
 	t.Cleanup(func() { _ = first.Close() })
 	t.Run("identifiable", func(t *testing.T) {
 		if got, want := p.Listener(t.Context(), port), (Listener{ListenerIdentified, os.Getpid()}); got != want {
-			t.Errorf("listener without lsof = %+v, want %+v", got, want)
+			t.Errorf("listener without lsof = %+v, want %+v%s", got, want, readPortEvidence(t.Context(), port))
 		}
 	})
 	t.Run("inaccessible", func(t *testing.T) {

@@ -402,15 +402,21 @@ func TestInstanceRecordAuthority(t *testing.T) {
 		}
 		for name, tt := range tests {
 			t.Run(name, func(t *testing.T) {
-				got, err := resolve(t, tt.auth, live, workerName, tt.port)
+				auth, lookups := recordLookups(t, tt.auth)
+				got, err := resolve(t, auth, live, workerName, tt.port)
+				var seen string
+				if err != nil || (owner{got.Class, got.PID}) != tt.want || tt.reason != "" && got.Reason != tt.reason {
+					seen = listenerEvidence(live, tt.port, lookups, got.Reason)
+				}
 				if err != nil {
-					t.Fatalf("Resolve: %v", err)
+					t.Fatalf("Resolve: %v%s", err, seen)
 				}
 				if diff := gocmp.Diff(tt.want, owner{got.Class, got.PID}); diff != "" {
-					t.Errorf("owner (-want +got):\n%s", diff)
+					t.Errorf("owner (-want +got):\n%s%s", diff, seen)
+					seen = ""
 				}
 				if tt.reason != "" && got.Reason != tt.reason {
-					t.Errorf("refusal text %q; want %q", got.Reason, tt.reason)
+					t.Errorf("refusal text %q; want %q%s", got.Reason, tt.reason, seen)
 				}
 			})
 		}
