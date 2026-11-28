@@ -78,6 +78,11 @@ func New(o Options) (http.Handler, error) {
 	return &handler{workers: o.Workers, lost: lost, wait: o.Wait, version: o.Version, pid: o.SupervisorPID}, nil
 }
 
+// OneGeneration marks ctx so that, once a lease was handed over for the request, the request is never offered to another lease.
+func OneGeneration(ctx context.Context) context.Context {
+	panic("not implemented")
+}
+
 // The source's fixed answers (lib/commands.js:2279-2282,2432-2440), byte for byte as JSON.stringify writes them.
 const (
 	undeliveredBody = `{"type":"error","error":{"type":"api_error","message":"model-gateway could not deliver this request to the shim worker; retry it shortly"}}`
