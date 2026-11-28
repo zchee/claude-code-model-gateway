@@ -71,31 +71,87 @@ func TestAppendFileLongName(t *testing.T) {
 	checkContents(t, path, oldState)
 }
 
+// TestAppendFileOpenRetry pins how the append path treats the answers of its creating open. A creating open without
+// the exclusive flag that is told the entry does not exist, while the held directory is still linked, is repeated a
+// bounded number of times: another opener may be creating the same entry at that moment, and on macOS the open system
+// call itself can then answer "does not exist". Any other answer ends the append at once, and a bound that is used up
+// returns the last "does not exist" unchanged: the very error value of the last open. The test asserts outcomes
+// only: how many answers in a row the bound survives is the implementation's, so the rows that succeed stop at five
+// failures and the row that never succeeds only requires more than one open and at most maxAppendOpens. One row stages
+// a real symbolic link at the name after the first injected "does not exist", so that the repeat meets it through the
+// directory's own open: the append must refuse it without following it into the file it names.
 func TestAppendFileOpenRetry(t *testing.T) {
 	const wantFlags = unix.O_WRONLY | unix.O_CREAT | unix.O_APPEND | unix.O_NONBLOCK | unix.O_NOCTTY
+	// maxAppendOpens is a generous cap that proves the repetition is bounded without pinning its bound.
+	const maxAppendOpens = 64
 	tests := map[string]struct {
-		failures      []error
+		// failures are the answers of the first opens, in order; the opens after them reach the directory.
+		failures []error
+		// missingForever answers every open with "does not exist", so that only the bound ends the append.
+		missingForever bool
+		// linkOnRepeat stages a symbolic link at the name, to a sentinel file, after the injected failures and before
+		// the open that reaches the directory.
+		linkOnRepeat bool
+		// opens is the exact number of opens, zero when only the range of the bound is required.
 		opens, writes int
 		wantErr       error
 	}{
-		"success: transient missing entry":  {[]error{unix.ENOENT}, 2, 1, nil},
-		"error: persistently missing entry": {[]error{unix.ENOENT, unix.ENOENT}, 2, 0, unix.ENOENT},
-		"error: permission denied":          {[]error{unix.EACCES}, 1, 0, unix.EACCES},
-		"error: different error on retry":   {[]error{unix.ENOENT, unix.EACCES}, 2, 0, unix.EACCES},
-		"error: symlink on retry":           {[]error{unix.ENOENT, unix.ELOOP}, 2, 0, &NonRegularError{}},
+		"success: one missing-entry answer, then the entry": {
+			failures: []error{unix.ENOENT}, opens: 2, writes: 1,
+		},
+		"success: two missing-entry answers in a row, then the entry": {
+			failures: []error{unix.ENOENT, unix.ENOENT}, opens: 3, writes: 1,
+		},
+		"success: five missing-entry answers in a row, then the entry": {
+			failures: []error{unix.ENOENT, unix.ENOENT, unix.ENOENT, unix.ENOENT, unix.ENOENT}, opens: 6, writes: 1,
+		},
+		"error: an entry that stays missing returns the missing-entry error once the bound is used up": {
+			missingForever: true, wantErr: unix.ENOENT,
+		},
+		"error: permission denied after a missing-entry answer is returned at once": {
+			failures: []error{unix.ENOENT, unix.EACCES}, opens: 2, wantErr: unix.EACCES,
+		},
+		"error: a symbolic link met on a repeat is still refused as not regular": {
+			failures: []error{unix.ENOENT, unix.ELOOP}, opens: 2, wantErr: &NonRegularError{},
+		},
+		"error: a real symbolic link that appears before the repeat is refused and its target is left untouched": {
+			failures: []error{unix.ENOENT}, linkOnRepeat: true, opens: 2, wantErr: &NonRegularError{},
+		},
+		"error: permission denied on the first open is not repeated": {
+			failures: []error{unix.EACCES}, opens: 1, wantErr: unix.EACCES,
+		},
 	}
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
 			d := openTestDir(t, dir)
+			path := filepath.Join(dir, "journal")
+			// sentinel is a writable regular file outside the directory: an append that followed the link would land
+			// in it.
+			sentinel := filepath.Join(t.TempDir(), "sentinel")
+			if tt.linkOnRepeat {
+				writeFixture(t, sentinel, oldState)
+			}
 			opens, writes := 0, 0
+			// lastInjected is the error value the latest injected failure returned, a fresh one for every open.
+			var lastInjected error
 			open := func(name string, flags int, mode fs.FileMode) (*os.File, error) {
 				opens++
-				if opens > tt.opens || name != "journal" || flags != wantFlags || mode != 0o600 {
+				if opens > maxAppendOpens || tt.opens > 0 && opens > tt.opens || name != "journal" || flags != wantFlags || mode != 0o600 {
 					t.Fatalf("unexpected open %d: %q, flags=%#x, mode=%o", opens, name, flags, mode)
 				}
+				if tt.missingForever {
+					lastInjected = &os.PathError{Op: "open", Path: name, Err: unix.ENOENT}
+					return nil, lastInjected
+				}
 				if opens <= len(tt.failures) {
-					return nil, &os.PathError{Op: "open", Path: name, Err: tt.failures[opens-1]}
+					lastInjected = &os.PathError{Op: "open", Path: name, Err: tt.failures[opens-1]}
+					return nil, lastInjected
+				}
+				if tt.linkOnRepeat {
+					if err := os.Symlink(sentinel, path); err != nil {
+						t.Fatalf("test infrastructure: stage the symbolic link before the repeat: %v", err)
+					}
 				}
 				return d.root.OpenFile(name, flags, mode)
 			}
@@ -103,19 +159,35 @@ func TestAppendFileOpenRetry(t *testing.T) {
 				writes++
 				return unix.Write(fd, data)
 			})
-			path := filepath.Join(dir, "journal")
 			matches := errors.Is(err, tt.wantErr)
 			if _, wantNonRegular := errors.AsType[*NonRegularError](tt.wantErr); wantNonRegular {
 				refusal, ok := errors.AsType[*NonRegularError](err)
 				matches = ok && refusal.Path == path
 			}
-			if opens != tt.opens || writes != tt.writes || !matches {
-				t.Fatalf("got (%d opens, %d writes, %v), want (%d, %d, %v)", opens, writes, err, tt.opens, tt.writes, tt.wantErr)
+			if writes != tt.writes || !matches {
+				t.Fatalf("got (%d opens, %d writes, %v), want (%d writes, %v)", opens, writes, err, tt.writes, tt.wantErr)
 			}
-			if tt.wantErr == nil {
+			switch {
+			case tt.opens > 0 && opens != tt.opens:
+				t.Fatalf("got %d opens, want %d: every answer but a missing entry ends the append at once, and the open that finds the entry is the last", opens, tt.opens)
+			case tt.opens == 0 && (opens < 2 || opens > maxAppendOpens):
+				t.Fatalf("got %d opens for an entry that stays missing, want at least 2 and at most %d", opens, maxAppendOpens)
+			case tt.missingForever && err != lastInjected: //nolint:errorlint // The error must be the last open's own value, not a wrapper of it.
+				// Unchanged means the very value the last open returned: not the first one, not a new wrapper of it.
+				t.Fatalf("got error %#v once the bound was used up, want the last open's own error value %#v", err, lastInjected)
+			}
+			switch {
+			case tt.wantErr == nil:
 				checkContents(t, path, newState)
-			} else if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
-				t.Fatalf("expected no journal after open failure: %v", err)
+			case tt.linkOnRepeat:
+				if target, err := os.Readlink(path); err != nil || target != sentinel {
+					t.Fatalf("the staged link after the refusal: %q, %v; want the same link to %q", target, err, sentinel)
+				}
+				checkContents(t, sentinel, oldState)
+			default:
+				if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
+					t.Fatalf("expected no journal after open failure: %v", err)
+				}
 			}
 		})
 	}
