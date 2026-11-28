@@ -22,6 +22,7 @@ import (
 	"context"
 	json "encoding/json/v2"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -426,7 +427,8 @@ func readLossReport(t *testing.T, r *os.File, port uint16) {
 	}
 }
 
-// awaitLoss reports whether done closed before deadline.
+// awaitLoss reports whether done closed before deadline. When the timer fires, done is looked at once more: both can be
+// ready at once, and a close that came in time is never reported as a timeout.
 func awaitLoss(done <-chan struct{}, deadline time.Time) bool {
 	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
@@ -434,6 +436,11 @@ func awaitLoss(done <-chan struct{}, deadline time.Time) bool {
 	case <-done:
 		return true
 	case <-timer.C:
+	}
+	select {
+	case <-done:
+		return true
+	default:
 		return false
 	}
 }
@@ -564,9 +571,15 @@ type lossChild struct {
 	outputEnd chan struct{}
 	mu        sync.Mutex
 	output    []string
-	// done is closed when the child exited; runErr is the runner's result.
+	// exited is closed as soon as the runner returned, that is once the child exited; every wait for the child's exit
+	// waits for it. done is closed once the child's output has ended too and runErr, the runner's result joined with
+	// scanErr, is published; nothing reads runErr before done.
+	exited chan struct{}
 	done   chan struct{}
 	runErr error
+	// scanErr is the error that stopped the scan of the child's output, nil at its end of file; it is written before
+	// outputEnd is closed.
+	scanErr error
 }
 
 // launch starts the worker helper's owned mode with h's descriptors and environment. The helper leaves Options.Exit
@@ -587,7 +600,7 @@ func (h *lossHandoff) start(t *testing.T, cmd *exec.Cmd, run func() error) *loss
 	t.Helper()
 	c := &lossChild{
 		stderr: new(lossBuffer), ready: make(chan string, 1), parked: make(chan struct{}), outputEnd: make(chan struct{}),
-		done: make(chan struct{}),
+		exited: make(chan struct{}), done: make(chan struct{}),
 	}
 	cmd.Stderr = c.stderr
 	r, w := io.Pipe()
@@ -612,12 +625,56 @@ func (h *lossHandoff) start(t *testing.T, cmd *exec.Cmd, run func() error) *loss
 				}
 			}
 		}
+		// The error is saved before the reader closes, and the reader closes on every end of the scan, so that the copy
+		// of the child's output never stays blocked on a pipe nobody reads.
+		c.scanErr = scanner.Err()
+		_ = r.Close()
 	}()
 	c.startedAt = time.Now()
-	go func() { defer close(c.done); c.runErr = run(); _ = w.Close() }()
+	go func() {
+		defer close(c.done)
+		err := run()
+		close(c.exited)
+		// The output ends with the writer; the result is published only once the scan has ended, with its error.
+		_ = w.Close()
+		<-c.outputEnd
+		if c.scanErr != nil {
+			err = errors.Join(err, fmt.Errorf("the child's output could not be read: %w", c.scanErr))
+		}
+		c.runErr = err
+	}()
 	// HelperCommand uses t.Context(), which is canceled before cleanups run.
-	t.Cleanup(func() { _ = h.liveW.Close(); <-c.done; _ = r.Close(); <-c.outputEnd })
+	t.Cleanup(func() {
+		_ = h.liveW.Close()
+		<-c.done
+		_ = r.Close()
+		<-c.outputEnd
+		// Output that could not be read fails the row whatever exit status it expects.
+		if c.scanErr != nil {
+			t.Errorf("the child's output could not be read: %v", c.scanErr)
+		}
+	})
 	return c
+}
+
+// awaitExit reports whether the child exited by deadline, and once it did, joins its result with joinResult. The exit
+// is the runner's return, published at once, so a scan of the output that ends later never counts against the child.
+func (c *lossChild) awaitExit(t *testing.T, deadline time.Time) bool {
+	t.Helper()
+	if !awaitLoss(c.exited, deadline) {
+		return false
+	}
+	c.joinResult(t)
+	return true
+}
+
+// joinResult waits, once the child exited, for the end of its output and the publication of its result, under a guard
+// of its own: output that does not end is a failure of the test's infrastructure, not of the worker.
+func (c *lossChild) joinResult(t *testing.T) {
+	t.Helper()
+	if !awaitLoss(c.done, time.Now().Add(lossBound)) {
+		t.Fatalf("test infrastructure: the child exited, but its output did not end within %v; not a worker fault\nstdout:\n%s\nstderr:\n%s", lossBound, c.stdout(), c.stderr)
+	}
 }
 
 func (c *lossChild) stdout() string {
@@ -635,7 +692,8 @@ func (c *lossChild) awaitReady(t *testing.T, deadline time.Time) string {
 	select {
 	case port := <-c.ready:
 		return port
-	case <-c.done:
+	case <-c.exited:
+		c.joinResult(t)
 		<-c.outputEnd
 		select {
 		case port := <-c.ready:
@@ -702,7 +760,7 @@ func runChildLoss(t *testing.T, tc lossCase) {
 		if err := h.liveW.Close(); err != nil {
 			t.Fatal(err)
 		}
-		if !awaitLoss(c.done, endedAt.Add(lossBound)) {
+		if !c.awaitExit(t, endedAt.Add(lossBound)) {
 			t.Fatalf("the worker was still running %v after its parent's end of file", lossBound)
 		}
 		<-c.outputEnd
@@ -743,18 +801,19 @@ func runChildLoss(t *testing.T, tc lossCase) {
 	refusedAlive := false
 	if tc.endWhileBlocked {
 		// Bounded from the parent's end, which comes once the worker is waiting on the token FIFO.
-		if opened := awaitLossFIFOReader(t, h.token, c.done, deadline); opened {
+		if opened := awaitLossFIFOReader(t, h.token, c.exited, deadline); opened {
 			deadline = time.Now().Add(lossBound)
 			if err := h.liveW.Close(); err != nil {
 				t.Fatal(err)
 			}
 		} else {
 			refusedAlive = true
+			c.joinResult(t)
 			t.Logf("the worker never waited on the token FIFO before it exited, with its parent alive: %v", c.runErr)
 		}
 	}
 	probes = append(probes, sendLossProbes(t, public, "sent after the launch")...)
-	if !awaitLoss(c.done, deadline) {
+	if !c.awaitExit(t, deadline) {
 		t.Errorf("the worker was still running %v after its parent's end, which came before its admission boundary (a wait at a startup step)\nstdout:\n%s\nstderr:\n%s", lossBound, c.stdout(), c.stderr)
 		return
 	}

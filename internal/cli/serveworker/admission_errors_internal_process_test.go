@@ -94,7 +94,7 @@ func TestStartupErrorsWithLiveParent(t *testing.T) {
 			} else {
 				c = h.launch(t)
 			}
-			if !awaitLoss(c.done, c.startedAt.Add(lossBound)) {
+			if !c.awaitExit(t, c.startedAt.Add(lossBound)) {
 				t.Fatalf("the worker was still running %v after its launch\nstdout:\n%s\nstderr:\n%s", lossBound, c.stdout(), c.stderr)
 			}
 			<-c.outputEnd
@@ -162,7 +162,8 @@ func TestParentEOFAfterSocketBindRemovesPath(t *testing.T) {
 			defer parkTimer.Stop()
 			select {
 			case <-c.parked:
-			case <-c.done:
+			case <-c.exited:
+				c.joinResult(t)
 				<-c.outputEnd
 				t.Fatalf("the worker exited before it looked up a setting with its socket bound: %v\nstdout:\n%s\nstderr:\n%s", c.runErr, c.stdout(), c.stderr)
 			case <-parkTimer.C:
@@ -192,7 +193,7 @@ func TestParentEOFAfterSocketBindRemovesPath(t *testing.T) {
 				if err := h.liveW.Close(); err != nil {
 					t.Fatal(err)
 				}
-				if !awaitLoss(c.done, endedAt.Add(lossBound)) {
+				if !c.awaitExit(t, endedAt.Add(lossBound)) {
 					t.Fatalf("the worker was still running %v after its parent's end", lossBound)
 				}
 				<-c.outputEnd
@@ -206,7 +207,7 @@ func TestParentEOFAfterSocketBindRemovesPath(t *testing.T) {
 			if err := h.liveW.Close(); err != nil {
 				t.Fatal(err)
 			}
-			if !awaitLoss(c.done, endedAt.Add(lossBound)) {
+			if !c.awaitExit(t, endedAt.Add(lossBound)) {
 				t.Errorf("the worker was still running %v after its parent's end, with its startup step parked before its admission boundary: the parent's end did not end it through its production exit\nstdout:\n%s\nstderr:\n%s", lossBound, c.stdout(), c.stderr)
 				return
 			}
