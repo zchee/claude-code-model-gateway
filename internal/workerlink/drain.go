@@ -206,8 +206,12 @@ func (r *Reservation) DrainChannel() (parent net.Conn, child *os.File, err error
 // ImportDrainChannel consumes the inherited file and returns the worker's owned duplex connection.
 //
 // The file is closed on success and on failure; it is marked close-on-exec before anything else is checked, and the
-// returned connection holds its own close-on-exec duplicate. Only the kind of socket is checked, a connected local
-// stream socket, not whether both directions are still open.
+// returned connection holds its own close-on-exec duplicate. The descriptor must be a connected local stream socket.
+// One whose peer has already ended is accepted on Linux and on macOS, and the bytes still queued on it at import stay
+// readable, followed by the end of input. One exception differs between the systems: a socket that can neither
+// receive nor send while still linked to a live peer is refused on macOS and accepted on Linux. While the import runs,
+// no other holder of the endpoint may read from it or reconfigure it, and a probing step that fails, even transiently,
+// refuses the channel.
 func ImportDrainChannel(file *os.File) (net.Conn, error) {
 	if file == nil {
 		return nil, errors.New("workerlink: no inherited drain channel descriptor")

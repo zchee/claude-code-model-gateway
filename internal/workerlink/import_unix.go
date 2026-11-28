@@ -83,8 +83,12 @@ func importListener(file *os.File, expected uint16) (net.Listener, error) {
 	return l, nil
 }
 
+// errNotConnected refuses a local stream socket that has never been connected.
+var errNotConnected = errors.New("a local stream socket that is not connected")
+
 // importDrainChannel takes ownership of file and closes it on every path. It marks the descriptor close-on-exec
-// first, then checks that it is a connected local stream socket and returns a connection over its own duplicate.
+// first, then checks that it is a connected local stream socket, one whose peer has already ended included, and
+// returns a connection over its own duplicate.
 func importDrainChannel(file *os.File) (net.Conn, error) {
 	if err := adoptInherited(file); err != nil {
 		return nil, err
@@ -100,16 +104,24 @@ func importDrainChannel(file *os.File) (net.Conn, error) {
 		if _, ok := sa.(*unix.SockaddrUnix); !ok {
 			return errors.New("not a local socket")
 		}
-		// A listening or unconnected local socket has no peer: ENOTCONN on Linux and on macOS (xnu
-		// bsd/kern/uipc_syscalls.c:3239-3243). A peer that only shut down its writing side still answers there; only a
-		// socket shut down in both directions is refused with EINVAL (:3232-3237), and it is of no use as a channel.
-		if _, err := unix.Getpeername(fd); err != nil {
-			if errors.Is(err, unix.ENOTCONN) {
-				return errors.New("a local stream socket that is not connected")
+		// A fresh listener or a never connected local socket has no peer: ENOTCONN on Linux and on macOS (xnu
+		// bsd/kern/uipc_syscalls.c:3240-3244). macOS fails getpeername with EINVAL before that test for a socket that
+		// can neither receive nor send (:3232-3239), the state a stream socket is left in once its peer has closed. A
+		// channel whose parent already ended is still the right kind of socket, so where the system can tell that
+		// case from the others, peerEvidence decides it from what the system reports.
+		switch _, err := unix.Getpeername(fd); {
+		case err == nil:
+			return nil
+		case errors.Is(err, unix.ENOTCONN):
+			return errNotConnected
+		case errors.Is(err, unix.EINVAL):
+			if e, ok := endedPeerEvidence(fd, err); ok {
+				return e.decide()
 			}
 			return os.NewSyscallError("getpeername", err)
+		default:
+			return os.NewSyscallError("getpeername", err)
 		}
-		return nil
 	})
 	var c net.Conn
 	if err == nil {
