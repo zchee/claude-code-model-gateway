@@ -24,6 +24,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// pidfdOpen is the pidfd_open system call that openProcess makes; the package's tests replace it to script its
+// answers.
+var pidfdOpen = unix.PidfdOpen
+
+// pidfdSendSignal is the pidfd_send_signal system call that a pidfd handle makes; the package's tests replace it to
+// record its calls.
+var pidfdSendSignal = unix.PidfdSendSignal
+
 // openProcess opens a pidfd for pid. Stop opens it before the second sample of a decision and signals through it, so
 // the signal can reach only the process that held the number when the handle was opened: if that process is still
 // alive when the signal is sent, it held the number throughout, including at the second sample, so the sample
@@ -34,7 +42,7 @@ import (
 // refuses pidfd_open with ENOSYS; nothing else falls back.
 func openProcess(pid int) (processHandle, error) {
 	for {
-		fd, err := unix.PidfdOpen(pid, 0)
+		fd, err := pidfdOpen(pid, 0)
 		switch {
 		case errors.Is(err, unix.EINTR):
 			continue
@@ -53,7 +61,7 @@ func openProcess(pid int) (processHandle, error) {
 type pidfd int
 
 func (fd pidfd) signal(sig syscall.Signal) error {
-	err := unix.PidfdSendSignal(int(fd), sig, nil, 0)
+	err := pidfdSendSignal(int(fd), sig, nil, 0)
 	if errors.Is(err, unix.ESRCH) {
 		return errProcessGone
 	}

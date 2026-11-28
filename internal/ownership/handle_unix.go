@@ -23,13 +23,16 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// kill is the kill system call that a numeric handle makes; the package's tests replace it to record its calls.
+var kill = unix.Kill
+
 // numericProcess signals a process by its number. Nothing ties the number to the process that was sampled: if that
 // process exits and the number is reused between the last sample and the signal, the signal reaches the new process.
 // The two samples taken immediately before every signal only narrow that window.
 type numericProcess int
 
 func (p numericProcess) signal(sig syscall.Signal) error {
-	err := unix.Kill(int(p), sig)
+	err := kill(int(p), sig)
 	if errors.Is(err, unix.ESRCH) {
 		return errProcessGone
 	}

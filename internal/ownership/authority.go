@@ -72,6 +72,9 @@ type Owner struct {
 	Reason string
 	// Image is the observed executable path of an identified holder, for diagnostics only.
 	Image string
+	// Record is the stored record that classified the holder as Ours, as it was read for that classification; it is
+	// the zero record for every other class.
+	Record procinfo.Record
 }
 
 // Authority resolves port owners and stops recorded processes of one state root.
