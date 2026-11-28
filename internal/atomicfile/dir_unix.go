@@ -252,3 +252,40 @@ func (d *Dir) OpenFile(name string, flag int, perm os.FileMode) (*os.File, error
 	}
 	return d.root.openRepeatingCreate(name, flag, perm, d.root.OpenFile)
 }
+
+// Names lists the entries of the held directory through a fresh open of it, so that every listing starts at its beginning.
+//
+// The listing holds every entry name except "." and "..", each once, in no promised order. A symbolic link is listed
+// by its own name and never followed.
+func (d *Dir) Names() ([]string, error) {
+	panic("not implemented")
+}
+
+// Stat returns the file information of the held directory itself.
+//
+// It reports fstat of the held descriptor, so its Sys value is a *syscall.Stat_t carrying the owner and the POSIX mode.
+func (d *Dir) Stat() (fs.FileInfo, error) {
+	panic("not implemented")
+}
+
+// OpenChildDir opens the directory name, one path component, relative to the held directory and returns it as its own
+// Dir. With create, a missing name is first made with the permission bits of perm, subject to the creation mask. An
+// existing symbolic link to a directory is followed; a link at name is never followed once name was found missing, so
+// a dangling link is left as it is and its target is never created. The caller must close the returned Dir.
+//
+// An invalid name is refused with a [DestinationError]. The mode and owner of the directory opened are neither judged
+// nor changed; Stat of the returned Dir shows them. The returned Dir stays usable after d is closed.
+func (d *Dir) OpenChildDir(name string, create bool, perm fs.FileMode) (*Dir, error) {
+	panic("not implemented")
+}
+
+// OpenRegular opens the regular file name, one path component, relative to the held directory for reading, without
+// following a symbolic link at name and without blocking; any other kind of entry is refused with a *NonRegularError.
+// It reads nothing. The caller must close the returned file.
+//
+// The kind is judged by descriptor-relative metadata of name taken without following a link, then by fstat of the
+// opened file, never from the error of an open. An invalid name is refused with a [DestinationError], and a missing
+// name gives an error matching fs.ErrNotExist.
+func (d *Dir) OpenRegular(name string) (*os.File, error) {
+	panic("not implemented")
+}

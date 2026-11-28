@@ -62,3 +62,17 @@ func (d *Dir) Remove(name string) error { return fs.ErrClosed }
 func (d *Dir) OpenFile(name string, flag int, perm os.FileMode) (*os.File, error) {
 	return nil, fs.ErrClosed
 }
+
+// Names returns fs.ErrClosed because no Dir can be opened on this platform.
+func (d *Dir) Names() ([]string, error) { return nil, fs.ErrClosed }
+
+// Stat returns fs.ErrClosed because no Dir can be opened on this platform.
+func (d *Dir) Stat() (fs.FileInfo, error) { return nil, fs.ErrClosed }
+
+// OpenChildDir returns fs.ErrClosed because no Dir can be opened on this platform.
+func (d *Dir) OpenChildDir(name string, create bool, perm fs.FileMode) (*Dir, error) {
+	return nil, fs.ErrClosed
+}
+
+// OpenRegular returns fs.ErrClosed because no Dir can be opened on this platform.
+func (d *Dir) OpenRegular(name string) (*os.File, error) { return nil, fs.ErrClosed }
