@@ -19,10 +19,12 @@ package atomicfile
 import (
 	"errors"
 	"io/fs"
+	rand "math/rand/v2"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -77,6 +79,53 @@ func (d *directory) OpenFile(base string, flags int, mode fs.FileMode) (*os.File
 		return nil, &os.PathError{Op: "open", Path: d.path(base), Err: err}
 	}
 	return os.NewFile(uintptr(fd), d.path(base)), nil
+}
+
+// linked reports whether d's directory is still linked into the file system, judged by fstat of the held descriptor:
+// a failed fstat or a link count of zero says that it is not.
+func (d *directory) linked() bool {
+	var st unix.Stat_t
+	_, err := retryEINTR(func() (int, error) { return 0, unix.Fstat(int(d.handle.Fd()), &st) })
+	runtime.KeepAlive(d)
+	return err == nil && st.Nlink > 0
+}
+
+// createRetries bounds how often openRepeatingCreate repeats a creating open that was answered with ENOENT. Hosted
+// macOS runs have seen the open system call give that answer while two or more first users created the same entry in
+// a fresh directory that still existed; why the kernel answers so is not known. Once any of them has created the
+// entry, a repeat finds it and opens it. The wait before repeat k (from 0) is k createRetryPause steps plus a random
+// part below one step, so that openers that all failed together do not repeat together; all repeats together ask
+// for less than 1.8 ms of sleep.
+const createRetries = 8
+
+// createRetryPause is the step by which the wait before each repeat of a creating open grows, and the bound of its
+// random part.
+const createRetryPause = 50 * time.Microsecond
+
+// openRepeatingCreate calls open(name, flag, perm), an open relative to d, and repeats the same call while it fails
+// with ENOENT, flag has O_CREATE and not O_EXCL, and d is still linked, at most createRetries times. A repeat that
+// succeeds opens the entry present at name at that moment, with the original flag and perm; it accepts an entry
+// another opener created meanwhile, and a truncating flag, if a caller passed one, applies to that entry. An open
+// with O_EXCL is never repeated, because a repeat could refuse an entry the failed attempt had itself created. Any
+// other error stops the repeats and is returned as open returned it, and so is ENOENT once the repeats are used up.
+//
+// The repeats ask for less than 1.8 ms of sleep in all, also while the caller holds its own mutex, and no context ends
+// them; a caller that checks its context before and after the open still gives nothing to an ended context, and
+// gets the file-system error, not the context's, when the repeats are used up. A removed directory stops the
+// repeats at once only if fstat reports no link for it; where it still reports one, the repeats are used up first.
+func (d *directory) openRepeatingCreate(name string, flag int, perm fs.FileMode, open func(string, int, fs.FileMode) (*os.File, error)) (*os.File, error) {
+	f, err := open(name, flag, perm)
+	if flag&os.O_CREATE == 0 || flag&os.O_EXCL != 0 {
+		return f, err
+	}
+	for attempt := range createRetries {
+		if !errors.Is(err, unix.ENOENT) || !d.linked() {
+			break
+		}
+		time.Sleep(time.Duration(attempt)*createRetryPause + rand.N(createRetryPause))
+		f, err = open(name, flag, perm)
+	}
+	return f, err
 }
 
 func (d *directory) Readlink(base string) (string, error) {

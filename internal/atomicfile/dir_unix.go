@@ -237,9 +237,18 @@ func (d *Dir) Remove(name string) error {
 // OpenFile opens the entry name, one path component, relative to the held directory with flag and, when it creates
 // the entry, the permission bits of perm. O_NOFOLLOW and O_CLOEXEC are always added, so a symbolic link at name is
 // never followed and no executed child inherits the file. The caller owns the returned file and must close it.
+//
+// An open with O_CREATE and without O_EXCL that fails with ENOENT is repeated with the same name, flag and perm a
+// few times, asking for less than 1.8 ms of sleep in all, while fstat of the held directory still reports a link. A
+// repeat that succeeds opens the entry present at name at that moment, with the original flag and perm: it accepts
+// an entry another opener created meanwhile, and a truncating flag, if one was passed, applies to that entry. An
+// open with O_EXCL is not repeated, because a repeat could refuse an entry the failed attempt had itself created.
+// A held directory whose fstat fails or reports no link stops the repeats at once. Any other error, or ENOENT once
+// the repeats are used up, is returned unchanged. There is no context to end the repeats; their bound keeps them
+// short.
 func (d *Dir) OpenFile(name string, flag int, perm os.FileMode) (*os.File, error) {
 	if d.root.handle == nil {
 		return nil, fs.ErrClosed
 	}
-	return d.root.OpenFile(name, flag, perm)
+	return d.root.openRepeatingCreate(name, flag, perm, d.root.OpenFile)
 }

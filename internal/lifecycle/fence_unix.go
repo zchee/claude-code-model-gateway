@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	rand "math/rand/v2"
 	"path/filepath"
 	"runtime"
 	"sync"
@@ -34,6 +35,20 @@ import (
 // fenceRetry is the pause between two attempts on a fence another holder has. The fence is held only around short
 // filesystem steps and a process start, so a short pause keeps a waiting start prompt.
 const fenceRetry = 20 * time.Millisecond
+
+// fenceCreateRetries bounds how often the creating open of the fence file is repeated after ENOENT while the state
+// root's directory is still linked, and fenceCreateRetryPause is the step of the wait before each repeat. They are the
+// bound and step of atomicfile's creating opens: hosted macOS runs have seen the open system call answer ENOENT while
+// two or more first users created the same entry in a fresh directory that still existed, and once any of them has
+// created it, a repeat opens it. The wait before repeat k (from 0) is k steps plus a random part below one step, so
+// openers that all failed together do not repeat together; all repeats together ask for less than 1.8 ms of sleep.
+// No context ends these pauses; Acquire checks its context before and after the open, so an ended context gets no
+// lease, and repeats that are used up return the file-system error. The open is repeated here rather than through
+// atomicfile.Dir because the fence keeps a raw descriptor, which an *os.File would close when collected.
+const (
+	fenceCreateRetries    = 8
+	fenceCreateRetryPause = 50 * time.Microsecond
+)
 
 // Acquire takes the root's advisory fence or returns a context or filesystem error without a lease.
 //
@@ -99,7 +114,9 @@ func (f *StartFence) Acquire(ctx context.Context) (release func() error, err err
 
 // open opens a fresh open file description of the fence file, relative to the state root's directory, creating the
 // file with mode 0600 if it is missing. A symbolic link at the leaf is never followed, an existing file is never
-// truncated, and anything but a regular file is refused, judged by fstat of the opened descriptor.
+// truncated, and anything but a regular file is refused, judged by fstat of the opened descriptor. An open answered
+// with ENOENT is repeated within fenceCreateRetries while the state root's directory is still linked; any other
+// error, or ENOENT once the repeats are used up, is returned as before.
 func (f *StartFence) open() (int, error) {
 	dir, err := atomicfile.OpenDirectoryFile(f.stateDir, 0o777)
 	if err != nil {
@@ -107,13 +124,23 @@ func (f *StartFence) open() (int, error) {
 	}
 	defer func() { _ = dir.Close() }()
 	path := filepath.Join(f.stateDir, fenceName)
-	var fd int
-	for {
-		// O_NONBLOCK keeps the open from waiting on a named pipe at the leaf; the fstat below refuses it.
-		fd, err = unix.Openat(int(dir.Fd()), fenceName, unix.O_RDWR|unix.O_CREAT|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_NOCTTY, 0o600)
-		if !errors.Is(err, unix.EINTR) {
+	dirfd := int(dir.Fd())
+	openFence := func() (int, error) {
+		for {
+			// O_NONBLOCK keeps the open from waiting on a named pipe at the leaf; the fstat below refuses it.
+			fd, err := unix.Openat(dirfd, fenceName, unix.O_RDWR|unix.O_CREAT|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_NOCTTY, 0o600)
+			if !errors.Is(err, unix.EINTR) {
+				return fd, err
+			}
+		}
+	}
+	fd, err := openFence()
+	for attempt := range fenceCreateRetries {
+		if !errors.Is(err, unix.ENOENT) || !directoryLinked(dirfd) {
 			break
 		}
+		time.Sleep(time.Duration(attempt)*fenceCreateRetryPause + rand.N(fenceCreateRetryPause))
+		fd, err = openFence()
 	}
 	runtime.KeepAlive(dir)
 	if err != nil {
@@ -127,6 +154,18 @@ func (f *StartFence) open() (int, error) {
 		return -1, closeFence(fmt.Errorf("start fence %s is not a regular file", path), fd, path)
 	}
 	return fd, nil
+}
+
+// directoryLinked reports whether the directory open as dirfd is still linked into the file system, judged by fstat
+// of that descriptor: a failed fstat or a link count of zero says that it is not.
+func directoryLinked(dirfd int) bool {
+	var st unix.Stat_t
+	for {
+		err := unix.Fstat(dirfd, &st)
+		if !errors.Is(err, unix.EINTR) {
+			return err == nil && st.Nlink > 0
+		}
+	}
 }
 
 // releaseFence unlocks the descriptor that holds the fence and then closes it, also when the unlock fails, so that

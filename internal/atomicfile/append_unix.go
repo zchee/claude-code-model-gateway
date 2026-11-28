@@ -72,12 +72,8 @@ func (d *directory) appendFile(name string, data []byte, mode fs.FileMode) error
 // Production callers must use appendFile rather than calling this step directly.
 func (d *directory) openAndAppend(name string, data []byte, mode fs.FileMode, open func(string, int, fs.FileMode) (*os.File, error), write func(int, []byte) (int, error)) (err error) {
 	const flags = unix.O_APPEND | unix.O_WRONLY | unix.O_CREAT | unix.O_NONBLOCK | unix.O_NOCTTY
-	f, err := open(name, flags, mode)
-	if errors.Is(err, unix.ENOENT) {
-		// A hosted macOS run returned ENOENT from this O_CREAT open while two first
-		// appends raced. The cause is unknown; retry once on the same directory handle.
-		f, err = open(name, flags, mode)
-	}
+	// A creating open that the kernel answers with ENOENT while d still exists is repeated as Dir.OpenFile repeats it.
+	f, err := d.openRepeatingCreate(name, flags, mode, open)
 	if errors.Is(err, unix.ELOOP) || errors.Is(err, unix.EISDIR) || errors.Is(err, unix.ENXIO) {
 		return &NonRegularError{d.path(name)}
 	}
