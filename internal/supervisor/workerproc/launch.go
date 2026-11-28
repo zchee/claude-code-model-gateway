@@ -15,7 +15,10 @@
 package workerproc
 
 import (
+	"fmt"
 	"io/fs"
+	"path/filepath"
+	"strings"
 
 	"github.com/zchee/claude-code-model-gateway/internal/procinfo"
 )
@@ -31,23 +34,55 @@ import (
 // behaves exactly as the original.
 type Launch struct {
 	// image is the resolved image the launch runs: its absolute path, device and inode.
-	image procinfo.Image //nolint:unused // Unused only until the methods are written: Image and Matches read it.
+	image procinfo.Image
 	// version is the version text the executable reported, verbatim and without a line end.
-	version string //nolint:unused // Unused only until the methods are written: Version reads it.
+	version string
 	// auth records how the choice was authorised; its zero value means no authorisation.
-	auth uint8 //nolint:unused // Unused only until the methods are written: Matches reads it.
+	auth uint8
 	// owner is the owner a stable binary was accepted with and must keep; it is not read for any other authorisation.
-	owner int //nolint:unused // Unused only until the methods are written: Matches reads it.
+	owner int
+}
+
+// The authorisations a Launch can carry, stored in Launch.auth; the zero value is none.
+const (
+	// authConfigured is the worker executable the supervisor was started with.
+	authConfigured uint8 = iota + 1
+	// authStable is a stable binary accepted by a restart, with the owner it must keep.
+	authStable
+)
+
+// validPath reports whether p is absolute, clean and free of NUL bytes.
+func validPath(p string) bool {
+	return filepath.IsAbs(p) && filepath.Clean(p) == p && !strings.ContainsRune(p, 0)
+}
+
+// valid reports whether l carries an authorisation and an image with a valid path and a nonzero inode.
+func (l Launch) valid() bool {
+	return (l.auth == authConfigured || l.auth == authStable) && validPath(l.image.Path) && l.image.Inode != 0
+}
+
+// permits reports whether e has the owner and permission bits the authorisation of l requires. A stable binary must
+// keep the owner it was accepted with and have no group or other write permission; the configured worker executable
+// has no such condition. A launch without an authorisation permits nothing.
+func (l Launch) permits(e Executable) bool {
+	switch l.auth {
+	case authConfigured:
+		return true
+	case authStable:
+		return e.UID == l.owner && e.Mode.Perm()&0o022 == 0
+	default:
+		return false
+	}
 }
 
 // Image returns the resolved absolute path, device and inode of the executable l runs; the zero Launch gives the zero Image.
 func (l Launch) Image() procinfo.Image {
-	panic("not implemented")
+	return l.image
 }
 
 // Version returns the version text the executable of l reported, without a line end; the zero Launch gives "".
 func (l Launch) Version() string {
-	panic("not implemented")
+	return l.version
 }
 
 // Executable is what an inspection found at one path after every symbolic link in it was resolved.
@@ -67,7 +102,10 @@ type Executable struct {
 // shows a regular file. Otherwise it returns the zero Launch and an error matching fs.ErrInvalid. The version text is
 // not judged here: an invalid or empty text is kept, and only makes every later version comparison refuse.
 func NewConfiguredLaunch(e Executable, version string) (Launch, error) {
-	panic("not implemented")
+	if !validPath(e.Image.Path) || e.Image.Inode == 0 || !e.Mode.IsRegular() {
+		return Launch{}, fmt.Errorf("%w: worker executable %q (inode %d, mode %v) is not a regular file at an absolute, clean path", fs.ErrInvalid, e.Image.Path, e.Image.Inode, e.Mode)
+	}
+	return Launch{image: e.Image, version: version, auth: authConfigured}, nil
 }
 
 // Matches reports whether e still shows the file that l was chosen for, with the owner and mode its authorisation requires.
@@ -76,5 +114,5 @@ func NewConfiguredLaunch(e Executable, version string) (Launch, error) {
 // inode, and a regular file; for a stable binary it also requires the owner l was accepted with and no group or
 // other write permission. The owner and permission bits of the configured worker executable are not compared.
 func (l Launch) Matches(e Executable) bool {
-	panic("not implemented")
+	return l.valid() && e.Image == l.image && e.Mode.IsRegular() && l.permits(e)
 }
