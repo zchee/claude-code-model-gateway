@@ -63,6 +63,15 @@ const ownedReportDeadline = 5 * time.Second
 // it receives, and tells the test those counts when its supervisor goes away. A child that was not given a usable
 // listener and drain channel says so and then waits for the test, so that its supervisor does not start it again and
 // again.
+//
+// The answer to a command the child has carried out always comes before its farewell. The supervisor may react to a
+// command by going away at once (a report of the wrong port, a record it cannot publish, a drain channel closed under
+// its answer), and its going away is what makes the child say goodbye and exit, so without an order the farewell and
+// the exit could overtake the answer, and the test would read a goodbye where the command's answer belongs. Both
+// orders are correct behaviour of a supervisor; the fixture, not the product, decides which one the test reads. A
+// command that has not been carried out gets no such guarantee: one that is still waiting for something the
+// supervisor or the test has to do, or one that arrives after the farewell, is answered by the farewell instead, so a
+// row whose command the child never carried out still reads a goodbye where it wants the answer and fails.
 func ownedEligibilityChild(ctx context.Context, control string) error {
 	generation := os.Getenv("MODEL_GATEWAY_WORKER_GENERATION")
 	if generation == "" || os.Getenv("MODEL_GATEWAY_CONTROL_FDS") != "3,4" {
@@ -95,9 +104,15 @@ func ownedEligibilityChild(ctx context.Context, control string) error {
 	// supervisor that hands over no usable listener or drain channel still makes the child publish a refusal, which
 	// the test reads as the failed handoff it is.
 	published := make(chan struct{})
+	// answering is held by a command from before it does anything its supervisor can react to until its answer is
+	// written, and by the farewell from before it reads the counts until the child exits; the farewell never gives it
+	// back. So a command the child began to carry out is answered before the farewell, and the farewell's counts
+	// include everything that command did.
+	var answering sync.Mutex
 	go func() {
 		_, _ = io.Copy(io.Discard, live)
 		<-published
+		answering.Lock()
 		send("parent gone %s", counts())
 		os.Exit(0)
 	}()
@@ -189,9 +204,12 @@ func ownedEligibilityChild(ctx context.Context, control string) error {
 		w.Header().Set("X-Child-Pid", strconv.Itoa(os.Getpid()))
 		w.WriteHeader(http.StatusOK)
 	})}
-	commands := bufio.NewScanner(conn)
-	for commands.Scan() {
-		command, arg, _ := strings.Cut(commands.Text(), " ")
+	// carryOut carries out one command and writes its answer while its caller holds answering. The waits for
+	// something the supervisor or the test has to do come before it, without answering held. "notice" and
+	// "drain-respond" wait inside it for what their own action started: the drain exchange ends by its read
+	// deadline or at once when the supervisor's end of the channel closes, and the held drain response is written as
+	// soon as it is let go.
+	carryOut := func(command, arg, drainVerdict string) {
 		switch command {
 		case "serve":
 			go func() { _ = srv.Serve(accepts) }()
@@ -205,7 +223,7 @@ func ownedEligibilityChild(ctx context.Context, control string) error {
 			case arg != "":
 				if reportPort, err = strconv.Atoi(arg); err != nil {
 					send("error %v", err)
-					continue
+					return
 				}
 			}
 			reported.Store(true)
@@ -215,7 +233,7 @@ func ownedEligibilityChild(ctx context.Context, control string) error {
 			}
 			if err = errors.Join(err, report.Close()); err != nil {
 				send("error %v", err)
-				continue
+				return
 			}
 			send("reported")
 		case "requests":
@@ -224,7 +242,6 @@ func ownedEligibilityChild(ctx context.Context, control string) error {
 			holdArmed.Store(true)
 			send("armed")
 		case "await-held":
-			<-held
 			send("held")
 		case "release":
 			close(releaseHeld)
@@ -233,7 +250,6 @@ func ownedEligibilityChild(ctx context.Context, control string) error {
 			accepts.armed.Store(true)
 			send("armed")
 		case "await-accept":
-			<-accepts.held
 			send("accept held")
 		case "release-accept":
 			close(accepts.release)
@@ -246,7 +262,7 @@ func ownedEligibilityChild(ctx context.Context, control string) error {
 			// One line exactly as given, with {generation} replaced by this worker's own, without waiting for an answer.
 			if _, err := io.WriteString(drain, strings.ReplaceAll(arg, "{generation}", generation)+"\n"); err != nil {
 				send("error %v", err)
-				continue
+				return
 			}
 			send("sent")
 		case "drop-notice":
@@ -260,20 +276,19 @@ func ownedEligibilityChild(ctx context.Context, control string) error {
 			}
 			if err != nil {
 				send("error %v", err)
-				continue
+				return
 			}
 			send("dropped")
 		case "drain-hold":
 			drainHeld.Store(true)
 			send("armed")
 		case "await-drain":
-			send("drain %s", <-drainArrived)
+			send("drain %s", drainVerdict)
 		case "drain-respond":
 			close(drainGo)
 			<-drainResponded
 			send("responded")
 		case "drain-result":
-			<-exchangeDone
 			send("%s", exchangeResult)
 		case "close":
 			_ = ln.Close()
@@ -286,6 +301,26 @@ func ownedEligibilityChild(ctx context.Context, control string) error {
 			send("closed")
 			os.Exit(0)
 		}
+	}
+	commands := bufio.NewScanner(conn)
+	for commands.Scan() {
+		command, arg, _ := strings.Cut(commands.Text(), " ")
+		// A wait for something the supervisor or the test has to do comes before the command is carried out, without
+		// answering held: a supervisor that goes away during it is answered by the farewell.
+		drainVerdict := ""
+		switch command {
+		case "await-held":
+			<-held
+		case "await-accept":
+			<-accepts.held
+		case "await-drain":
+			drainVerdict = <-drainArrived
+		case "drain-result":
+			<-exchangeDone
+		}
+		answering.Lock()
+		carryOut(command, arg, drainVerdict)
+		answering.Unlock()
 	}
 	if err := commands.Err(); err != nil {
 		return fmt.Errorf("read control commands: %w", err)
