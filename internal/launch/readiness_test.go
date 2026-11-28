@@ -937,8 +937,10 @@ func TestAwaitRefusesTicket(t *testing.T) {
 
 // TestAwaitCancellation: the end of the caller's context ends the wait in every step with that context's error and the
 // zero result, whatever the call in progress returns (an answer, a matching record, a live process), and no probe or
-// liveness check follows it. In the rows that cancel during the wait, a pause after the end is allowed (it returns at
-// once, so time does not pass); an already-ended context allows no call at all.
+// liveness check follows it.
+// Some mid-wait cancellation rows do not count a pause that returns immediately on the ended context. That
+// allowance does not apply to a clock reading that ends the context: no callback or record lookup may follow it.
+// An already-ended context allows no call at all.
 func TestAwaitCancellation(t *testing.T) {
 	type control struct {
 		ctx    context.Context
@@ -1346,6 +1348,274 @@ func TestAwaitUsesItsClock(t *testing.T) {
 				equal(t, want, pauses)
 				equal(t, tt.end, now.Sub(base))
 				equal(t, tt.alive, alive)
+			})
+		})
+	}
+}
+
+// steppingBack makes every reading of r's clock after the first an hour earlier than the one before it, so a wait
+// that compared two readings against a limit of zero or less would see that limit still ahead.
+func steppingBack(r launch.Readiness) launch.Readiness {
+	inner := r.Now
+	var mu sync.Mutex
+	readings := 0
+	r.Now = func() time.Time {
+		now := inner()
+		mu.Lock()
+		defer mu.Unlock()
+		back := time.Duration(readings) * time.Hour
+		readings++
+		return now.Add(-back)
+	}
+	return r
+}
+
+// cancelAtFirstReading makes the first reading of the harness's clock end the caller's context before it returns,
+// and forbids every call after that reading, the clock included. It returns the count of readings.
+func (h *harness) cancelAtFirstReading(cancel context.CancelFunc) *atomic.Int32 {
+	var readings atomic.Int32
+	h.clock = func(time.Duration) {
+		if readings.Add(1) == 1 {
+			cancel()
+			h.forbid.Store(true)
+		}
+	}
+	return &readings
+}
+
+// TestAwaitClockCancels: the clock reading that sets the deadline ends the caller's context before it returns. The
+// wait returns that context's error with the zero result after exactly that one reading: no probe, pause, second
+// reading or liveness check follows, although the probe would answer, a record matches the ticket and the process
+// lives.
+func TestAwaitClockCancels(t *testing.T) {
+	tests := map[string]struct {
+		own *launch.Ticket
+	}{
+		"error: a wait with a ticket":    {own: ticket()},
+		"error: a wait without a ticket": {},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				h := newHarness(t)
+				matchingRecord(t, h.files)
+				h.probe = func(context.Context, int) bool { return true }
+				h.alive = alwaysAlive(h.start)
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				readings := h.cancelAtFirstReading(cancel)
+				got := h.await(ctx, tt.own, quietLimit)
+				if !errors.Is(got.err, context.Canceled) {
+					t.Fatalf("Await() error = %v, want one that matches %v", got.err, context.Canceled)
+				}
+				equal(t, launch.ReadyResult{}, got.result)
+				equal(t, int32(1), readings.Load())
+				equal(t, []event(nil), h.logged())
+				equal(t, time.Duration(0), got.elapsed)
+			})
+		})
+	}
+}
+
+// TestAwaitNoTimeWhateverTheClock: a zero or negative limit starts no poll even when every reading of the clock after
+// the first is earlier than the one before, the probe would answer and a record matches the ticket. With a ticket one
+// liveness check decides the result; without one the wait times out and liveness is not consulted.
+func TestAwaitNoTimeWhateverTheClock(t *testing.T) {
+	tests := map[string]struct {
+		own        *launch.Ticket
+		timeout    time.Duration
+		alive      bool
+		want       launch.ReadyResult
+		wantEvents []event
+	}{
+		"success: a zero limit finds a live process still starting": {
+			own:        ticket(),
+			timeout:    0,
+			alive:      true,
+			want:       launch.ReadyResult{TimedOut: true, StillStarting: true},
+			wantEvents: []event{aliveAt(0)},
+		},
+		"success: a negative limit finds a live process still starting": {
+			own:        ticket(),
+			timeout:    -time.Second,
+			alive:      true,
+			want:       launch.ReadyResult{TimedOut: true, StillStarting: true},
+			wantEvents: []event{aliveAt(0)},
+		},
+		"success: a zero limit finds a process that is gone": {
+			own:        ticket(),
+			timeout:    0,
+			want:       launch.ReadyResult{TimedOut: true},
+			wantEvents: []event{aliveAt(0)},
+		},
+		"success: a zero limit without a ticket times out without a liveness check": {
+			timeout: 0,
+			want:    launch.ReadyResult{TimedOut: true},
+		},
+		"success: a negative limit without a ticket times out without a liveness check": {
+			timeout: -time.Second,
+			want:    launch.ReadyResult{TimedOut: true},
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				h := newHarness(t)
+				matchingRecord(t, h.files)
+				h.probe = func(context.Context, int) bool { return true }
+				// A wait without a ticket keeps the harness's liveness check, which fails the test.
+				if tt.own != nil {
+					h.alive = func(context.Context, int) (bool, error) { return tt.alive, nil }
+				}
+				got := awaitOn(t, steppingBack(h.readiness()), t.Context(), tt.own, tt.timeout, h.start)
+				noError(t, got.err)
+				equal(t, tt.want, got.result)
+				equal(t, tt.wantEvents, h.logged())
+				equal(t, time.Duration(0), got.elapsed)
+			})
+		})
+	}
+}
+
+// TestAwaitTicketTakenAtEntry: the wait uses the ticket as it was when Await was called. A callback that changes the
+// caller's Ticket while the wait runs changes neither the record the wait looks for nor the process whose liveness it
+// judges. The reader matches any generation when asked with an empty one, so a wait that looked up a cleared
+// generation would end at once with the message of another launch.
+func TestAwaitTicketTakenAtEntry(t *testing.T) {
+	otherGeneration := func(t *testing.T, files lifecycle.Files) {
+		t.Helper()
+		noError(t, files.WriteStartupFailure(launchedPID, new("an earlier launch"), "an old failure"))
+	}
+	// changedPID is a record that a lookup with the changed pid and the original generation would match.
+	changedPID := func(t *testing.T, files lifecycle.Files) {
+		t.Helper()
+		noError(t, files.WriteStartupFailure(otherPID, new(generation), "a record of the changed pid"))
+	}
+	clearGeneration := func(own *launch.Ticket) { own.Generation = "" }
+	changePID := func(own *launch.Ticket) { own.PID = otherPID }
+	tests := map[string]struct {
+		// record is written before the wait.
+		record func(t *testing.T, files lifecycle.Files)
+		// change alters the caller's ticket in the first probe, or in the first pause when inPause is set.
+		change  func(own *launch.Ticket)
+		inPause bool
+		// writeAtProbe writes a record of the original pid and generation inside that probe, counted from one; zero
+		// never.
+		writeAtProbe int
+		want         launch.ReadyResult
+		wantEvents   []event
+		elapsed      time.Duration
+	}{
+		"success: a probe that clears the generation leaves the lookup on the original generation": {
+			record:       otherGeneration,
+			change:       clearGeneration,
+			writeAtProbe: 3,
+			want:         launch.ReadyResult{Reason: bindFailure},
+			wantEvents:   answeredAt(3),
+			elapsed:      2 * pollInterval,
+		},
+		"success: a pause that clears the generation leaves the lookup on the original generation": {
+			record:       otherGeneration,
+			change:       clearGeneration,
+			inPause:      true,
+			writeAtProbe: 3,
+			want:         launch.ReadyResult{Reason: bindFailure},
+			wantEvents:   answeredAt(3),
+			elapsed:      2 * pollInterval,
+		},
+		"success: a probe that changes the pid leaves the lookup and the liveness check on the original pid": {
+			record:     changedPID,
+			change:     changePID,
+			want:       launch.ReadyResult{TimedOut: true, StillStarting: true},
+			wantEvents: append(polls(40), aliveAt(quietLimit)),
+			elapsed:    quietLimit,
+		},
+		"success: a pause that changes the pid leaves the lookup and the liveness check on the original pid": {
+			record:     changedPID,
+			change:     changePID,
+			inPause:    true,
+			want:       launch.ReadyResult{TimedOut: true, StillStarting: true},
+			wantEvents: append(polls(40), aliveAt(quietLimit)),
+			elapsed:    quietLimit,
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				h := newHarness(t)
+				tt.record(t, h.files)
+				own := ticket()
+				h.probe = func(_ context.Context, n int) bool {
+					if n == 1 && !tt.inPause {
+						tt.change(own)
+					}
+					if n == tt.writeAtProbe {
+						writeRecord(t, h.files, launchedPID, new(generation), bindFailure)
+					}
+					return false
+				}
+				h.pause = func(ctx context.Context, n int, d time.Duration) error {
+					if n == 1 && tt.inPause {
+						tt.change(own)
+					}
+					return sleep(ctx, d)
+				}
+				h.alive = alwaysAlive(h.start)
+				got := h.await(t.Context(), own, quietLimit)
+				noError(t, got.err)
+				equal(t, tt.want, got.result)
+				equal(t, tt.wantEvents, h.logged())
+				equal(t, tt.elapsed, got.elapsed)
+			})
+		})
+	}
+}
+
+// TestAwaitTicketTakenBeforeTheClock: the first reading of the clock replaces both the pid and the generation of the
+// caller's Ticket with another valid pair. The wait still uses the pair it was called with: a record of the original
+// pair ends it with that record's reason, and a wait that reaches the limit judges the original pid. Each row also
+// stages what the replacement pair would decide, and neither prescribes how often the clock is read.
+func TestAwaitTicketTakenBeforeTheClock(t *testing.T) {
+	tests := map[string]struct {
+		// record is written before the wait.
+		record     func(t *testing.T, files lifecycle.Files)
+		want       launch.ReadyResult
+		wantEvents []event
+		elapsed    time.Duration
+	}{
+		"success: a record of the original pair ends the wait with its reason": {
+			record:     matchingRecord,
+			want:       launch.ReadyResult{Reason: bindFailure},
+			wantEvents: answeredAt(1),
+		},
+		"success: at the limit liveness is judged for the original pid": {
+			record: func(t *testing.T, files lifecycle.Files) {
+				t.Helper()
+				noError(t, files.WriteStartupFailure(otherPID, new(opaqueGeneration), "a record of the replacement pair"))
+			},
+			want:       launch.ReadyResult{TimedOut: true, StillStarting: true},
+			wantEvents: append(polls(40), aliveAt(quietLimit)),
+			elapsed:    quietLimit,
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				h := newHarness(t)
+				tt.record(t, h.files)
+				own := ticket()
+				var readings atomic.Int32
+				h.clock = func(time.Duration) {
+					if readings.Add(1) == 1 {
+						*own = otherTicket
+					}
+				}
+				h.alive = alwaysAlive(h.start)
+				got := h.await(t.Context(), own, quietLimit)
+				noError(t, got.err)
+				equal(t, tt.want, got.result)
+				equal(t, tt.wantEvents, h.logged())
+				equal(t, tt.elapsed, got.elapsed)
 			})
 		})
 	}

@@ -389,3 +389,104 @@ func checkReads(t *testing.T, decided decision, deciding int, entries []string) 
 		}
 	}
 }
+
+// TestAwaitClockRecordReads proves with the kernel's record of opens that a matching record stays unopened when the
+// clock leaves no poll to run: a zero or negative limit under a clock whose every reading after the first is earlier
+// than the one before, and a first reading that ends the caller's context before it returns. The probe would answer
+// in every case. A wait without a ticket makes no call and opens nothing in each of these cases.
+func TestAwaitClockRecordReads(t *testing.T) {
+	tests := map[string]struct {
+		own     *launch.Ticket
+		timeout time.Duration
+		// cancelAtClock ends the caller's context in the first reading of the clock, which otherwise steps back.
+		cancelAtClock bool
+		want          launch.ReadyResult
+		wantErr       bool
+		wantLog       []string
+	}{
+		"success: a zero limit under a clock that steps back leaves a matching record unopened": {
+			own:     ticket(),
+			timeout: 0,
+			want:    launch.ReadyResult{TimedOut: true, StillStarting: true},
+			wantLog: []string{"alive"},
+		},
+		"success: a negative limit under a clock that steps back leaves a matching record unopened": {
+			own:     ticket(),
+			timeout: -time.Second,
+			want:    launch.ReadyResult{TimedOut: true, StillStarting: true},
+			wantLog: []string{"alive"},
+		},
+		"success: a clock reading that ends the caller's context is followed by no open": {
+			own:           ticket(),
+			timeout:       quietLimit,
+			cancelAtClock: true,
+			wantErr:       true,
+		},
+		"success: a wait without a ticket at a zero limit under a clock that steps back opens nothing": {
+			timeout: 0,
+			want:    launch.ReadyResult{TimedOut: true},
+		},
+		"success: a wait without a ticket at a negative limit under a clock that steps back opens nothing": {
+			timeout: -time.Second,
+			want:    launch.ReadyResult{TimedOut: true},
+		},
+		"success: a wait without a ticket whose clock reading ends the caller's context opens nothing": {
+			timeout:       quietLimit,
+			cancelAtClock: true,
+			wantErr:       true,
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				h := newHarness(t)
+				matchingRecord(t, h.files)
+				watch := watchRecordOpens(t, h.files.StateDir)
+				// The watch must see an open of the record: the test opens it once itself before the wait.
+				control, err := os.Open(filepath.Join(h.files.StateDir, failureName))
+				noError(t, err)
+				noError(t, control.Close())
+				if got := watch.drain(); got != 1 {
+					t.Fatalf("control: the watch counted %d opens of the record after the test opened it once, want 1", got)
+				}
+				l := &readLog{watch: watch}
+				h.probe = func(_ context.Context, n int) bool {
+					l.note("probe " + strconv.Itoa(n))
+					return true
+				}
+				h.pause = func(_ context.Context, n int, _ time.Duration) error {
+					l.note("wait " + strconv.Itoa(n))
+					return nil
+				}
+				// A wait without a ticket keeps the harness's liveness check, which fails the test.
+				if tt.own != nil {
+					h.alive = func(context.Context, int) (bool, error) {
+						l.note("alive")
+						return true, nil
+					}
+				}
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				r := h.readiness()
+				if tt.cancelAtClock {
+					h.cancelAtFirstReading(cancel)
+				} else {
+					r = steppingBack(r)
+				}
+				got := awaitOn(t, r, ctx, tt.own, tt.timeout, h.start)
+				l.note("")
+				if tt.wantErr {
+					if !errors.Is(got.err, context.Canceled) {
+						t.Fatalf("Await() error = %v, want one that matches %v", got.err, context.Canceled)
+					}
+				} else {
+					noError(t, got.err)
+				}
+				equal(t, tt.want, got.result)
+				if diff := gocmp.Diff(tt.wantLog, l.entries); diff != "" {
+					t.Fatalf("calls and opens of the record (-want +got):\n%s", diff)
+				}
+			})
+		})
+	}
+}
