@@ -14,11 +14,30 @@
 
 package launch
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 // publishUnderFence runs publish while the fence that acquire takes is held. An acquisition error is returned with
 // nothing published. After a successful acquisition the release is called exactly once, also when publish fails;
 // when both fail, publish's error is returned first and the release error is joined after it.
 func publishUnderFence(ctx context.Context, acquire func(context.Context) (release func() error, err error), publish func() error) error {
-	panic("not implemented")
+	release, err := acquire(ctx)
+	if err != nil {
+		return err
+	}
+	var publishErr, releaseErr error
+	func() {
+		defer func() { releaseErr = release() }()
+		publishErr = publish()
+	}()
+	switch {
+	case publishErr != nil && releaseErr != nil:
+		return errors.Join(publishErr, releaseErr)
+	case publishErr != nil:
+		return publishErr
+	default:
+		return releaseErr
+	}
 }
