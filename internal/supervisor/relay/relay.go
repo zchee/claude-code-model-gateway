@@ -79,8 +79,20 @@ func New(o Options) (http.Handler, error) {
 }
 
 // OneGeneration marks ctx so that, once a lease was handed over for the request, the request is never offered to another lease.
+// The returned context preserves ctx's values, deadline and cancellation. Standard context derivations carry the mark;
+// ctx itself is unchanged. The mark holds no state: each request delivered under it keeps its own taker and its own
+// pauses.
 func OneGeneration(ctx context.Context) context.Context {
-	panic("not implemented")
+	return context.WithValue(ctx, oneGenerationKey{}, true)
+}
+
+// oneGenerationKey is the context key of the mark OneGeneration sets.
+type oneGenerationKey struct{}
+
+// oneGeneration reports whether ctx carries the mark of OneGeneration.
+func oneGeneration(ctx context.Context) bool {
+	marked, _ := ctx.Value(oneGenerationKey{}).(bool)
+	return marked
 }
 
 // The source's fixed answers (lib/commands.js:2279-2282,2432-2440), byte for byte as JSON.stringify writes them.

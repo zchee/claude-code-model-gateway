@@ -148,11 +148,18 @@ func (h *handler) pause(ctx context.Context) waitResult {
 //     that generation even if it has ended by then, as the source decides at the moment of the failure
 //     (lib/commands.js:2384).
 //
+// A request whose context carries the mark of OneGeneration reaches one generation at most. Until a lease was handed
+// over it is delivered as any other. Once a handed-over lease failed, that lease's generation stays the request's
+// taker whether or not it is still current: no lease is asked for again, the remaining pauses run, and the attempts
+// running out or a stop lose the request to that first taker with the error type of its own failure. The taker is
+// held by this delivery alone, so two requests under one mark each have their own.
+//
 // A departure ends the attempts at once, whatever the form, and is owed nothing.
 func (h *handler) deliver(ctx context.Context, r *http.Request, target string, body []byte) (*exchange, failure) {
+	marked := oneGeneration(ctx)
 	var held *taker
 	for remaining := attemptWaits; ; remaining-- {
-		if held != nil && held.current() {
+		if held != nil && (marked || held.current()) {
 			if remaining == 0 {
 				return nil, failure{taker: held}
 			}
@@ -161,8 +168,9 @@ func (h *handler) deliver(ctx context.Context, r *http.Request, target string, b
 				return nil, failure{departed: true}
 			case stopped:
 				// The source decides a stop at the next attempt: the request stays lost to a generation still current
-				// and is retryable once that generation has ended (lib/commands.js:2363-2370).
-				if held.current() {
+				// and is retryable once that generation has ended (lib/commands.js:2363-2370). A marked request stays
+				// lost to its taker either way, since that generation may have acted on it.
+				if marked || held.current() {
 					return nil, failure{taker: held}
 				}
 				return nil, failure{}
