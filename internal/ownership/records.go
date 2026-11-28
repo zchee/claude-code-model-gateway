@@ -61,7 +61,28 @@ type Store struct {
 	// beforeRemove, when the package's own tests set it on their store, runs inside RemoveIf after the stored record
 	// has matched the expected one and before anything is unlinked, while the store's exclusion is held.
 	beforeRemove func()
+	// fault, when the package's own tests set it on their store, is called at every step of a Store operation that
+	// storeStep names, with that step and the name in the state root of the entry it concerns: the authoritative record
+	// (such as "worker.pid.json"), its decimal mirror (such as "worker.pid") or, at the release, the record lock. It
+	// is nil otherwise, and then nothing differs. At a lookup or a write it is called before the step; an error it
+	// returns is that step's error, and the step does not happen. At a release it is called after the release; an
+	// error it returns is joined to the operation's error as an error of that release.
+	fault func(step storeStep, name string) error
 }
+
+// storeStep is a step of a Store operation that the package's own tests observe or fail through Store.fault.
+type storeStep int
+
+const (
+	// storeLookup is a lookup of a record entry: finding out whether the entry exists, whether it is a regular file and
+	// what it holds. Every lookup of the authoritative record or of its mirror is one, also one that finds the entry
+	// missing; how many lookups an operation makes is not fixed.
+	storeLookup storeStep = iota + 1
+	// storeWrite is the replacement of a record entry, the authoritative record or its mirror.
+	storeWrite
+	// storeRelease is the release of the store's exclusion, after the lock was given up.
+	storeRelease
+)
 
 // Publish replaces the record name with r. A record without a start token is refused and nothing is written.
 func (s Store) Publish(name string, r procinfo.Record) error {
@@ -91,12 +112,22 @@ func (s Store) Publish(name string, r procinfo.Record) error {
 	})
 }
 
+// PublishContext is Publish with a lock wait that ends with ctx; published reports whether the authoritative record was replaced.
+func (s Store) PublishContext(ctx context.Context, name string, r procinfo.Record) (published bool, err error) {
+	panic("not implemented")
+}
+
 // Read returns the record name and repairs a stale or missing decimal mirror; a missing record is an error matching
 // fs.ErrNotExist. The mirror is repaired under the store's exclusion, so a repair never overwrites the mirror of a
 // publication that came after the record it read. A record that is valid but whose mirror could not be repaired is
 // returned with an error matching procinfo.ErrMirrorRepair.
 func (s Store) Read(name string) (procinfo.Record, error) {
 	return s.read(context.Background(), name)
+}
+
+// ReadContext is Read with a lock wait that ends with ctx.
+func (s Store) ReadContext(ctx context.Context, name string) (procinfo.Record, error) {
+	panic("not implemented")
 }
 
 // read is Read with a lock wait that ends with ctx.
@@ -131,6 +162,19 @@ func (s Store) read(ctx context.Context, name string) (procinfo.Record, error) {
 // in the same directory, so a record published after the comparison is never the one removed.
 func (s Store) RemoveIf(name string, expected procinfo.Record) (bool, error) {
 	return s.removeIf(context.Background(), name, expected)
+}
+
+// RemoveIfContext is RemoveIf with a lock wait that ends with ctx.
+func (s Store) RemoveIfContext(ctx context.Context, name string, expected procinfo.Record) (removed bool, err error) {
+	panic("not implemented")
+}
+
+// ErrRepair reports that a missing, differing, or readable but invalid record was established and its replacement could not be written.
+var ErrRepair = errors.New("model-gateway: a required repair of a process record could not be written")
+
+// Reconcile replaces the record name with r unless it already equals r, and reports whether it replaced the authoritative record.
+func (s Store) Reconcile(ctx context.Context, name string, r procinfo.Record) (wrote bool, err error) {
+	panic("not implemented")
 }
 
 // removeIf is RemoveIf with a lock wait that ends with ctx.

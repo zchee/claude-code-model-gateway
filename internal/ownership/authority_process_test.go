@@ -48,6 +48,8 @@ const fixtureLifetime = 30 * time.Second
 
 func TestGatewayFixtureHelper(t *testing.T) {
 	gatewaytest.DispatchHelper(t, map[string]gatewaytest.HelperFunc{
+		// store-outcome-reconcile reconciles one record in a child, for the store's named pipe row.
+		storeOutTReconcileHelperName: storeOutTReconcileHelper,
 		// hold binds a loopback listener, reports "pid port" on the report descriptor and stays alive until its
 		// standard input ends. Its arguments only shape its command line.
 		"hold": func(t testing.TB, _ []string) {
